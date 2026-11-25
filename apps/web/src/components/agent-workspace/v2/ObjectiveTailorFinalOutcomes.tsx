@@ -9,6 +9,7 @@ import {
 import { parseObjectiveTailorFinalOutcomesFromContent } from '@/lib/agent/session/objective-tailor-final-content'
 import { parseFinalTaskGraphSourceManifest } from '@/lib/agent/session/final-task-graph-source-manifest'
 import type { Lang } from '@/lib/i18n'
+import { ObjectiveJourneyReport } from './ObjectiveJourneyReport'
 
 const LABELS: Record<ObjectiveTailorFinalOutcomeSidecarStatus, Readonly<{ en: string; zh: string }>> = {
   ready: { en: 'Ready', zh: '已就绪' }, needs_revision: { en: 'Needs revision', zh: '需要修改' },
@@ -17,9 +18,10 @@ const LABELS: Record<ObjectiveTailorFinalOutcomeSidecarStatus, Readonly<{ en: st
 type RequestState = 'pending' | 'accepted' | 'failed'
 type SelectionState = Readonly<{ identity: string; ordinals: readonly number[] }>
 
-export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceTurnId, rootTaskId }: {
-  content: unknown; lang: Lang; sessionId?: string; sourceTurnId?: string; rootTaskId?: string | null
+export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceTurnId, rootTaskId, finalItemId }: {
+  content: unknown; lang: Lang; sessionId?: string; sourceTurnId?: string; rootTaskId?: string | null; finalItemId?: string
 }) {
+  const [expanded, setExpanded] = useState(false)
   const sidecar = parseObjectiveTailorFinalOutcomesFromContent(content)
   const contentRow = record(content), manifest = parseFinalTaskGraphSourceManifest(contentRow?.taskGraphSources)
   const graphRevision = manifest?.graphRevision ?? null
@@ -75,9 +77,16 @@ export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceT
 
   if (!sidecar) return null
   const status = requestState?.identity === identity ? requestState.status : null
-  const sourceCounts = sidecar.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA
-    ? sidecar.sourceCounts : undefined
-  return <details aria-label={copy.heading} data-agent-objective-tailor-final-outcomes='true'>
+  const v2Sidecar = sidecar.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA ? sidecar : undefined
+  const sourceCounts = v2Sidecar?.sourceCounts
+  const journeyReport = manifest && (!v2Sidecar || v2Sidecar.graphRevision === manifest.graphRevision)
+    && safeId(sessionId) && safeId(finalItemId)
+    ? <ObjectiveJourneyReport sessionId={sessionId} finalItemId={finalItemId} graphRevision={manifest.graphRevision}
+      sourceCounts={sourceCounts} slots={sidecar.slots.map(slot => ({ ordinal: slot.ordinal, tailoringStatus: slot.status }))}
+      lang={lang} enabled={expanded} />
+    : null
+  return <details aria-label={copy.heading} data-agent-objective-tailor-final-outcomes='true'
+    onToggle={event => setExpanded(event.currentTarget.open)}>
     <summary>{copy.heading}</summary>
     {sourceCounts && <section aria-label={copy.sourceCounts} data-objective-source-counts="true">
       <h3>{copy.sourceCounts}</h3>
@@ -100,6 +109,7 @@ export function ObjectiveTailorFinalOutcomes({ content, lang, sessionId, sourceT
       {status === 'accepted' && <p role='status'>{copy.accepted}</p>}
       {status === 'failed' && <p role='alert'>{copy.failed}</p>}
     </div>}
+    {journeyReport}
   </details>
 }
 

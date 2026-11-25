@@ -2,8 +2,21 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
+const journeyReportApi = vi.hoisted(() => ({
+  calls: [] as Array<{ url: string; enabled: boolean }>,
+  state: { data: null as unknown, loading: true, error: null as unknown, refetch: vi.fn() },
+}))
+
+vi.mock('@/lib/hooks', () => ({
+  useApi: (url: string, options: { enabled?: boolean } = {}) => {
+    journeyReportApi.calls.push({ url, enabled: options.enabled !== false })
+    return journeyReportApi.state
+  },
+}))
+
 import { I18nProvider, translate } from '@/lib/i18n'
 import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from '@/lib/agent/session/final-task-graph-source-manifest'
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA } from '@jobcopilot/agent-protocol'
 import { HarnessItem, ToolLifecycleCard, reducePlanSteps } from './HarnessItem'
 import type { TimelineItem } from './timeline-reducer'
 
@@ -120,6 +133,42 @@ describe('HarnessItem renderers', () => {
     expect(final).toContain('Request application review')
     expect(running).not.toContain('data-agent-objective-tailor-final-outcomes')
     expect(commentary).not.toContain('data-agent-objective-tailor-final-outcomes')
+  })
+
+  it('mounts the reloadable Objective journey reader from the persisted final-item identity', () => {
+    journeyReportApi.calls = []
+    const content = { text: 'Answer', objectiveTailorFinalOutcomes: {
+      schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: 9,
+      slots: [{ ordinal: 1, status: 'ready' }], sourceCounts: {
+        discoveredJobs: { knownCount: 2, coverage: 'complete' }, analyzedJobs: { knownCount: 1, coverage: 'partial' },
+      },
+    }, taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 9, sources: [
+      { sourceKey: 'src_' + 'A'.repeat(43), nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+    ] } }
+    const final = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ id: 'final-item-1', sessionId: 'session-1',
+      turnId: 'source-turn-1', taskId: 'root-1', phase: 'final_answer', content })} /></I18nProvider>)
+    expect(final).toContain('data-objective-journey-report="unavailable"')
+    expect(final).toContain('Loading the verified application report')
+    expect(journeyReportApi.calls).toContainEqual({
+      url: '/api/agent/sessions/session-1/final-items/final-item-1/objective-report', enabled: false,
+    })
+    expect(final).toContain('<details aria-label="Tailoring outcomes" data-agent-objective-tailor-final-outcomes="true">')
+  })
+
+  it('offers slot facts for V1 finals when their exact graph manifest is available', () => {
+    journeyReportApi.calls = []
+    const content = { text: 'Answer', objectiveTailorFinalOutcomes: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [{ ordinal: 1, status: 'ready' }],
+    }, taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 9, sources: [
+      { sourceKey: 'src_' + 'A'.repeat(43), nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+    ] } }
+    const final = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ id: 'final-item-1', sessionId: 'session-1',
+      turnId: 'source-turn-1', taskId: 'root-1', phase: 'final_answer', content })} /></I18nProvider>)
+    expect(final).toContain('data-objective-journey-report="unavailable"')
+    expect(final).not.toContain('data-objective-source-counts')
+    expect(journeyReportApi.calls).toContainEqual({
+      url: '/api/agent/sessions/session-1/final-items/final-item-1/objective-report', enabled: false,
+    })
   })
 
   it('does not render summaries for non-final, non-message, malformed, or oversized content', () => {
