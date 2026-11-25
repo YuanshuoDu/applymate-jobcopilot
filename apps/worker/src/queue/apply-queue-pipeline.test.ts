@@ -487,6 +487,35 @@ describe("apply-queue Phase 5 pipeline", () => {
       expect.objectContaining({ workflowState: "submitted" }), expect.anything());
   }, 15_000);
 
+  it("logs only bounded boundary booleans for an unsuccessful Objective provider result", async () => {
+    const approvedUrl = "https://boards.greenhouse.io/acme/jobs/123";
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.loadTaskContext.mockResolvedValueOnce({ applyUrl: approvedUrl, persona: { fullName: "Ada Lovelace" },
+      coverLetterText: null, jobTitle: "Engineer", jobCompany: "Example", jobKeywords: "typescript",
+      confirmedAnswers: {}, resumeTempPath: undefined });
+    mocks.detectFlow.mockReturnValue("greenhouse");
+    mocks.fakePage.url.mockReturnValue(approvedUrl);
+    mocks.objectiveMaterial = { approvedApplyUrl: approvedUrl, reviewedResumeContent: {},
+      reviewedCoverLetter: "Reviewed letter", confirmedAnswers: {} };
+    mocks.objectiveSubmit.mockResolvedValueOnce({ status: "manual", error: "No submit button found", durationMs: 7 });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await expect(runApplyJob()).resolves.toBeUndefined();
+      expect(mocks.objectiveSubmit).toHaveBeenCalledOnce();
+      const prefix = "OBJECTIVE_SUBMIT_BOUNDARY ";
+      const records = log.mock.calls.flatMap(([value]) => typeof value === "string" && value.startsWith(prefix) ? [value] : []);
+      expect(records).toHaveLength(1);
+      const payload = JSON.parse(records[0]!.slice(prefix.length)) as unknown;
+      expect(Object.keys(payload as Record<string, unknown>)).toEqual([
+        "armed", "candidateSeen", "fenceEntered", "taskInactive", "fenceUnavailable", "stopped", "requestStarted", "requestForwarded",
+      ]);
+      expect(payload).toEqual({ armed: false, candidateSeen: false, fenceEntered: false, taskInactive: false,
+        fenceUnavailable: false, stopped: false, requestStarted: false, requestForwarded: false });
+    } finally {
+      log.mockRestore();
+    }
+  }, 15_000);
+
   it("keeps a forwarded Objective success unknown if its durable result link fails", async () => {
     const approvedUrl = "https://boards.greenhouse.io/acme/jobs/123";
     mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");

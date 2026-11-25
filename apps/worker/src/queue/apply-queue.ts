@@ -891,6 +891,19 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         }
         if (queueCatchStarted || submissionSuperseded) return;
 
+        if (objectiveMode && harnessResult.status !== "submitted") {
+          console.log("OBJECTIVE_SUBMIT_BOUNDARY " + JSON.stringify({
+            armed: armedSubmissionIntent !== null,
+            candidateSeen: submissionCandidateSeen,
+            fenceEntered: submissionExecutionStartAttempted,
+            taskInactive: submissionTaskInactive,
+            fenceUnavailable: submissionFenceUnavailable,
+            stopped: turnStopped,
+            requestStarted: submissionRequestStarted,
+            requestForwarded: submissionRequestForwarded,
+          }));
+        }
+
         if (objectiveMode && objectiveRunnerReportedSuccess && submissionRouteState.work) await submissionRouteState.work;
 
         if (turnStopped && !submissionRequestStarted && harnessResult.status !== "submitted") {

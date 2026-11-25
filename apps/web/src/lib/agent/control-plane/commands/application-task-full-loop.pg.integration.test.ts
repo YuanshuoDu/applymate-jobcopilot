@@ -444,6 +444,14 @@ const enabled = databaseUrl !== null && redisUrl !== null
 const describeWithServices = enabled ? describe : describe.skip
 
 type Child = ChildProcess & { readonly lines: string[]; readonly errors: string[] }
+type ObjectiveSubmitBoundary = Readonly<{
+  armed: boolean; candidateSeen: boolean; fenceEntered: boolean; taskInactive: boolean
+  fenceUnavailable: boolean; stopped: boolean; requestStarted: boolean; requestForwarded: boolean
+}>
+type ObjectiveSubmitBoundaryTrace = Readonly<{ child: Child; lineOffset: number }>
+const OBJECTIVE_SUBMIT_BOUNDARY_PREFIX = "OBJECTIVE_SUBMIT_BOUNDARY "
+const OBJECTIVE_SUBMIT_BOUNDARY_KEYS = ["armed", "candidateSeen", "fenceEntered", "taskInactive",
+  "fenceUnavailable", "stopped", "requestStarted", "requestForwarded"] as const
 type FixtureStats = {
   submitCount: number
   reviewedSubmitCount: number
@@ -937,6 +945,59 @@ describe("Objective browser event diagnostic window", () => {
   })
 })
 
+describe("Objective submit boundary diagnostic window", () => {
+  const boundary: ObjectiveSubmitBoundary = { armed: true, candidateSeen: true, fenceEntered: true,
+    taskInactive: false, fenceUnavailable: false, stopped: false, requestStarted: true, requestForwarded: false }
+  const marker = OBJECTIVE_SUBMIT_BOUNDARY_PREFIX + JSON.stringify(boundary)
+
+  it("reads one exact fixed boolean record from the captured Worker window", () => {
+    expect(objectiveSubmitBoundaryFromLines([marker, "unrelated", marker], 1)).toEqual(boundary)
+  })
+
+  it("fails closed on absent, repeated, malformed, extra, or non-boolean records", () => {
+    expect(objectiveSubmitBoundaryFromLines(undefined, 0)).toBeUndefined()
+    expect(objectiveSubmitBoundaryFromLines([marker], 1)).toBeUndefined()
+    expect(objectiveSubmitBoundaryFromLines([marker, marker], 0)).toBeUndefined()
+    expect(objectiveSubmitBoundaryFromLines([OBJECTIVE_SUBMIT_BOUNDARY_PREFIX + "{"], 0)).toBeUndefined()
+    expect(objectiveSubmitBoundaryFromLines([OBJECTIVE_SUBMIT_BOUNDARY_PREFIX
+      + JSON.stringify({ ...boundary, privateValue: "hidden" })], 0)).toBeUndefined()
+    expect(objectiveSubmitBoundaryFromLines([OBJECTIVE_SUBMIT_BOUNDARY_PREFIX
+      + JSON.stringify({ ...boundary, stopped: 0 })], 0)).toBeUndefined()
+  })
+
+  it("rejects duplicate keys and invalid line offsets", () => {
+    const duplicateKey = marker.replace('"armed":true', '"armed":true,"armed":true')
+    expect(objectiveSubmitBoundaryFromLines([duplicateKey], 0)).toBeUndefined()
+    expect(objectiveSubmitBoundaryFromLines([marker], -1)).toBeUndefined()
+    expect(objectiveSubmitBoundaryFromLines([marker], 1.5)).toBeUndefined()
+    expect(objectiveSubmitBoundaryFromLines([marker], 2)).toBeUndefined()
+  })
+})
+
+describe("rootless reviewed Fill Turn DLQ projection", () => {
+  const scope = { turnId: "turn_fixture", sessionId: "session_fixture", schedulerOwnerIds: ["recovery-fixture"] }
+  const row = (payload: Record<string, unknown> = {
+    turnId: scope.turnId, sessionId: scope.sessionId, ownerId: scope.schedulerOwnerIds[0], attemptsMade: 4,
+    reason_code: "max_retries_exhausted", error_code: "objective_application_fill_unavailable",
+  }) => ({ topic: "agent.turn.dlq", aggregateId: scope.turnId,
+    idempotencyKey: `turn-dlq:${scope.turnId}:${String(payload.attemptsMade)}:${String(payload.reason_code)}`, payload })
+
+  it("projects only exact matched codes and bounded attempts", () => {
+    expect(reviewedTurnDlqDiagnostic([row()], scope)).toEqual({ reasonCode: "max_retries_exhausted",
+      errorCode: "objective_application_fill_unavailable", attempts: 4 })
+  })
+
+  it("fails closed for missing, repeated, foreign, malformed, or unrecognized rows", () => {
+    expect(reviewedTurnDlqDiagnostic([], scope)).toBeNull()
+    expect(reviewedTurnDlqDiagnostic([row(), row()], scope)).toBeNull()
+    expect(reviewedTurnDlqDiagnostic([row({ ...row().payload, sessionId: "foreign-session" })], scope)).toBeNull()
+    expect(reviewedTurnDlqDiagnostic([row({ ...row().payload, ownerId: "foreign-owner" })], scope)).toBeNull()
+    expect(reviewedTurnDlqDiagnostic([row({ ...row().payload, attemptsMade: 6 })], scope)).toBeNull()
+    expect(reviewedTurnDlqDiagnostic([row({ ...row().payload, error_code: "private-error" })], scope)).toBeNull()
+    expect(reviewedTurnDlqDiagnostic([row({ ...row().payload, extra: "hidden" })], scope)).toBeNull()
+  })
+})
+
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
@@ -1371,6 +1432,35 @@ function objectiveBrowserEventDelta(current: unknown, baseline: unknown): Object
   if ([buttonClicks, formSubmits, invalidResume, invalidCoverLetter, invalidOther].some(value => value === null)) return null
   return { buttonClicks: buttonClicks!, formSubmits: formSubmits!, invalidResume: invalidResume!,
     invalidCoverLetter: invalidCoverLetter!, invalidOther: invalidOther! }
+}
+
+function objectiveSubmitBoundaryFromLines(lines: readonly string[] | undefined,
+  lineOffset: unknown): ObjectiveSubmitBoundary | undefined {
+  if (!lines || typeof lineOffset !== "number" || !Number.isSafeInteger(lineOffset)
+    || lineOffset < 0 || lineOffset > lines.length) return undefined
+  const records = lines.slice(lineOffset).filter(line => line.startsWith(OBJECTIVE_SUBMIT_BOUNDARY_PREFIX))
+  if (records.length !== 1) return undefined
+  const encoded = records[0]!.slice(OBJECTIVE_SUBMIT_BOUNDARY_PREFIX.length)
+  try {
+    const value: unknown = JSON.parse(encoded)
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.getPrototypeOf(value) !== Object.prototype) return undefined
+    const keys = Reflect.ownKeys(value)
+    const expected = new Set<string>(OBJECTIVE_SUBMIT_BOUNDARY_KEYS)
+    if (keys.length !== expected.size || keys.some(key => typeof key !== "string" || !expected.has(key))
+      || !OBJECTIVE_SUBMIT_BOUNDARY_KEYS.every(key => {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        return descriptor?.enumerable === true && Object.hasOwn(descriptor, "value")
+      }) || JSON.stringify(value) !== encoded) return undefined
+    const row = value as Record<string, unknown>
+    if (OBJECTIVE_SUBMIT_BOUNDARY_KEYS.some(key => typeof row[key] !== "boolean")) return undefined
+    return { armed: row.armed as boolean, candidateSeen: row.candidateSeen as boolean,
+      fenceEntered: row.fenceEntered as boolean, taskInactive: row.taskInactive as boolean,
+      fenceUnavailable: row.fenceUnavailable as boolean, stopped: row.stopped as boolean,
+      requestStarted: row.requestStarted as boolean, requestForwarded: row.requestForwarded as boolean }
+  } catch {
+    return undefined
+  }
 }
 
 async function reviewedSourceStructuredResult(taskStatus: string, value: unknown, role: "writer" | "reviewer") {
@@ -1862,7 +1952,10 @@ async function objectiveSubmitTimeoutSnapshot(input: {
   sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; approvalId: string
   constraintHash: string; workerTaskId: string; slotOrdinal: number; routeGetBaseline: number
   browserEventBaseline: ObjectiveBrowserEventStats | undefined
+  boundaryTrace?: ObjectiveSubmitBoundaryTrace
 }) {
+  const objectiveSubmitBoundary = objectiveSubmitBoundaryFromLines(
+    input.boundaryTrace?.child.lines, input.boundaryTrace?.lineOffset)
   try {
     const [task, approval, starts, attempts, stats] = await Promise.all([
       testDb.applicationTask.findFirst({ where: { id: input.applicationTaskId, userId: ids.user,
@@ -1913,9 +2006,10 @@ async function objectiveSubmitTimeoutSnapshot(input: {
         && approval.scopeHash === input.constraintHash),
       exactSubmissionStartMarker: exactStartMarker,
       currentlyInRequestStartedCheckpoint: task?.status === "filling" && task.checkpoint === "submission_request_started",
+      objectiveSubmitBoundary: objectiveSubmitBoundary ?? null,
     }
   } catch {
-    return { available: false }
+    return { available: false, objectiveSubmitBoundary: objectiveSubmitBoundary ?? null }
   }
 }
 
@@ -1971,9 +2065,75 @@ const REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS = new Set([
 ])
 const OBJECTIVE_JOB_DIAGNOSTIC_STATUSES = new Set(["saved", "applied", "interview", "offer", "rejected"])
 const OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES = new Set(["draft", "ready_to_apply", "queued", "submitting", "submitted"])
+const TURN_DLQ_REASON_CODES = new Set([
+  "schema_invalid_payload", "max_retries_exhausted", "execution_failed", "lease_lost",
+  "cognitive_agenda_resume_fence_invalid",
+])
+const TURN_DLQ_ERROR_CODES = new Set([
+  "lease_not_available", "lease_lost", "invalid_payload", "cognitive_agenda_resume_fence_invalid",
+  "turn_execution_error", "objective_application_fill_unavailable",
+])
+const TURN_DLQ_ATTEMPTS_MAX = 5
 
 function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string>): string {
   return value === null || value === undefined ? "none" : typeof value === "string" && allowed.has(value) ? value : "other"
+}
+
+function exactDiagnosticRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  const record = jsonRecord(value)
+  if (!record) return null
+  const ownKeys = Reflect.ownKeys(record), expected = new Set(keys)
+  if (ownKeys.length !== expected.size || ownKeys.some(key => typeof key !== "string" || !expected.has(key))) return null
+  return keys.every(key => {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key)
+    return descriptor?.enumerable === true && Object.hasOwn(descriptor, "value")
+  }) ? record : null
+}
+
+function reviewedTurnDlqDiagnostic(rows: unknown, scope: {
+  turnId: string; sessionId: string; schedulerOwnerIds: readonly string[]
+}): { reasonCode: string; errorCode: string; attempts: number } | null {
+  if (!Array.isArray(rows) || rows.length !== 1) return null
+  const row = exactDiagnosticRecord(rows[0], ["topic", "aggregateId", "idempotencyKey", "payload"])
+  if (!row || row.topic !== "agent.turn.dlq" || row.aggregateId !== scope.turnId) return null
+  const payload = exactDiagnosticRecord(row.payload,
+    ["turnId", "sessionId", "ownerId", "attemptsMade", "reason_code", "error_code"])
+  if (!payload || payload.turnId !== scope.turnId || payload.sessionId !== scope.sessionId
+    || typeof payload.ownerId !== "string" || !scope.schedulerOwnerIds.includes(payload.ownerId)
+    || !Number.isSafeInteger(payload.attemptsMade) || Number(payload.attemptsMade) < 0
+    || Number(payload.attemptsMade) > TURN_DLQ_ATTEMPTS_MAX
+    || typeof payload.reason_code !== "string" || !TURN_DLQ_REASON_CODES.has(payload.reason_code)
+    || typeof payload.error_code !== "string" || !TURN_DLQ_ERROR_CODES.has(payload.error_code)
+    || row.idempotencyKey !== `turn-dlq:${scope.turnId}:${payload.attemptsMade}:${payload.reason_code}`) return null
+  return { reasonCode: payload.reason_code, errorCode: payload.error_code, attempts: Number(payload.attemptsMade) }
+}
+
+async function readReviewedTurnDlqDiagnostic(input: { turnId: string; sessionId: string }): Promise<{
+  reasonCode: string; errorCode: string; attempts: number
+} | null> {
+  try {
+    const dispatchRows = await testDb.agentOutbox.findMany({ where: { topic: "agent.turn.dispatch",
+      aggregateId: input.sessionId, idempotencyKey: `turn-dispatch:${input.turnId}` }, take: 2,
+      select: { topic: true, aggregateId: true, idempotencyKey: true, payload: true } })
+    const dispatch = dispatchRows.length === 1
+      ? exactDiagnosticRecord(dispatchRows[0], ["topic", "aggregateId", "idempotencyKey", "payload"]) : null
+    const payload = exactDiagnosticRecord(dispatch?.payload, ["turnId", "sessionId", "ownerId"])
+    if (!dispatch || dispatch.topic !== "agent.turn.dispatch" || dispatch.aggregateId !== input.sessionId
+      || dispatch.idempotencyKey !== `turn-dispatch:${input.turnId}` || !payload
+      || payload.turnId !== input.turnId || payload.sessionId !== input.sessionId
+      || typeof payload.ownerId !== "string" || payload.ownerId.trim() !== payload.ownerId
+      || payload.ownerId.length < 1 || payload.ownerId.length > 200) return null
+    const schedulerOwnerIds = payload.ownerId === `web:${input.turnId}`
+      ? [payload.ownerId, `agent-run:${input.turnId}`] : [payload.ownerId]
+    const rows = await testDb.agentOutbox.findMany({ where: { topic: "agent.turn.dlq", aggregateId: input.turnId,
+      AND: [{ payload: { path: ["turnId"], equals: input.turnId } },
+        { payload: { path: ["sessionId"], equals: input.sessionId } },
+        { OR: schedulerOwnerIds.map(ownerId => ({ payload: { path: ["ownerId"], equals: ownerId } })) }] }, take: 2,
+      select: { topic: true, aggregateId: true, idempotencyKey: true, payload: true } })
+    return reviewedTurnDlqDiagnostic(rows, { ...input, schedulerOwnerIds })
+  } catch {
+    return null
+  }
 }
 
 async function reviewedFillTimeoutSnapshot(input: {
@@ -2009,7 +2169,7 @@ async function reviewedFillTimeoutSnapshot(input: {
       const turn = await testDb.agentTurn.findFirst({ where: {
         id: input.fillTurnId, userId: ownerUserId, sessionId: input.sessionId, session: { userId: ownerUserId },
       }, select: { status: true, rootTaskId: true, error: true, leaseOwnerId: true, leaseExpiresAt: true } })
-      const [root, fillers, events, job] = await Promise.all([
+      const [root, fillers, events, job, turnDlq] = await Promise.all([
         turn?.rootTaskId ? testDb.subAgentTask.findFirst({ where: {
           id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: input.sessionId, turnId: input.fillTurnId,
           parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ownerUserId },
@@ -2021,6 +2181,7 @@ async function reviewedFillTimeoutSnapshot(input: {
         testDb.applicationTaskEvent.findMany({ where: { taskId: task.id, actor: "worker",
           type: { in: ["reviewed_application_fill_browser_started", "form_filled"] } }, take: 4, select: { type: true } }),
         testDb.job.findFirst({ where: { id: input.jobId, userId: ownerUserId }, select: { status: true, workflowState: true, appliedAt: true } }),
+        turn && !turn.rootTaskId ? readReviewedTurnDlqDiagnostic({ turnId: input.fillTurnId, sessionId: input.sessionId }) : null,
       ])
       return {
         databaseSnapshotAvailable: true, applicationTaskBound: true,
@@ -2044,7 +2205,7 @@ async function reviewedFillTimeoutSnapshot(input: {
           appliedAtPresent: job.appliedAt !== null } : { present: false },
         events: { browserStarted: events.some(event => event.type === "reviewed_application_fill_browser_started"),
           formFilled: events.some(event => event.type === "form_filled") },
-        fixture, runtime,
+        fixture, runtime, turnDlq,
       }
     }, Date.now() + 1_200)
   } catch {
@@ -3629,6 +3790,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         select: { status: true, workflowState: true, appliedAt: true } })
       expect(jobBeforeFinalApproval).toMatchObject({ status: "saved", workflowState: "draft", appliedAt: null })
       const { POST: submitApprovalAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
+      const objectiveSubmitBoundaryTrace = worker && !exited(worker)
+        ? { child: worker, lineOffset: worker.lines.length } : undefined
       const approvalResponse = await submitApprovalAction(apiRequest(
         `/api/agent/sessions/${sessionId}/actions`, token, "POST", {
           type: "approval_response", approvalId: submitApproval.id, decision: "approved", receiptNonce,
@@ -3707,7 +3870,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           applicationTaskId: applicationTaskId!, fillTurnId, approvalId: submitApproval.id,
           constraintHash: submitConstraintHash, workerTaskId: submitWorkerTaskId, slotOrdinal: selectedFixtureOrdinal,
           routeGetBaseline: beforeFinalApproval.objectiveGetCounts[selectedFixtureOrdinal - 1] ?? 0,
-          browserEventBaseline: beforeFinalApproval.objectiveBrowserEvents[selectedFixtureOrdinal - 1] })
+          browserEventBaseline: beforeFinalApproval.objectiveBrowserEvents[selectedFixtureOrdinal - 1],
+          boundaryTrace: objectiveSubmitBoundaryTrace })
         throw new Error(`Objective final submit timeout snapshot ${JSON.stringify(diagnostic)}`)
       }
       expect(submittedTask).toMatchObject({ id: applicationTaskId, userId: ids.user, sessionId,
