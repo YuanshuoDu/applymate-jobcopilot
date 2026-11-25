@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useEffect, useReducer, useRef, type FormEvent, type MutableRefObject } from 'react'
+import { parseReportScoreFloorDraft } from './agent-objective-start-input'
 import {
   AgentObjectiveStartCoordinator,
   ObjectiveStartCommandError,
@@ -9,6 +10,7 @@ import {
 
 export interface AgentObjectiveContextFormState extends ObjectiveContextDraft {
   allowedLocationsDraft?: string
+  reportScoreFloorDraft?: string
   open: boolean
   pending: boolean
   accepted: boolean
@@ -20,6 +22,7 @@ type FormAction =
   | { type: 'edit-objective'; value: string }
   | { type: 'edit-context'; value: string }
   | { type: 'edit-allowed-locations'; value: string }
+  | { type: 'edit-score-floor'; value: string }
   | { type: 'pending' }
   | { type: 'failed'; error: { message: string; conflict: boolean } }
   | { type: 'accepted' }
@@ -27,7 +30,7 @@ type FormAction =
   | { type: 'discard' }
 
 const initialFormState: AgentObjectiveContextFormState = {
-  objective: '', context: '', allowedLocationsDraft: '', open: false, pending: false, accepted: false, error: null,
+  objective: '', context: '', allowedLocationsDraft: '', reportScoreFloorDraft: '', open: false, pending: false, accepted: false, error: null,
 }
 
 export function objectiveContextFormReducer(
@@ -38,6 +41,7 @@ export function objectiveContextFormReducer(
   if (action.type === 'edit-objective') return { ...state, objective: action.value, error: null }
   if (action.type === 'edit-context') return { ...state, context: action.value, error: null }
   if (action.type === 'edit-allowed-locations') return { ...state, allowedLocationsDraft: action.value, error: null }
+  if (action.type === 'edit-score-floor') return { ...state, reportScoreFloorDraft: action.value, error: null }
   if (action.type === 'pending') return { ...state, pending: true, error: null }
   if (action.type === 'failed') return { ...state, pending: false, error: action.error }
   if (action.type === 'accepted') return { ...initialFormState, accepted: true }
@@ -50,15 +54,12 @@ export function objectiveContextFormReducer(
 export function isObjectiveDraftPending(state: Pick<AgentObjectiveContextFormState, "open" | "accepted">): boolean {
   return state.open && !state.accepted
 }
-
 export function canStartOrdinaryChat(objectiveDraftPending: boolean): boolean {
   return !objectiveDraftPending
 }
-
 export function isOrdinaryComposerInputLocked(objectiveStartInFlight: boolean, sessionSwitchPending: boolean): boolean {
   return objectiveStartInFlight || sessionSwitchPending
 }
-
 export function shouldReleaseInputAfterSessionSelection(
   wasEntryAvailable: boolean,
   entryAvailable: boolean,
@@ -69,6 +70,7 @@ export function shouldReleaseInputAfterSessionSelection(
 
 export function canSubmitObjectiveContext(state: AgentObjectiveContextFormState): boolean {
   return state.open && !state.pending && !state.accepted && Boolean(state.objective.trim())
+    && parseReportScoreFloorDraft(state.reportScoreFloorDraft ?? '') !== null
 }
 
 interface AgentObjectiveContextFormProps {
@@ -88,6 +90,8 @@ export function AgentObjectiveContextForm({ startLockRef, attachedFileCount = 0,
   const wasAvailableRef = useRef(available)
   const coordinatorRef = useRef<AgentObjectiveStartCoordinator | null>(null)
   if (!coordinatorRef.current) coordinatorRef.current = new AgentObjectiveStartCoordinator()
+  const scoreFloorDraft = state.reportScoreFloorDraft ?? ''
+  const invalidScoreFloor = parseReportScoreFloorDraft(scoreFloorDraft) === null
   const dispatchAction = (action: FormAction) => {
     const nextState = objectiveContextFormReducer(state, action)
     onDraftPendingChange?.(isObjectiveDraftPending(nextState))
@@ -106,11 +110,13 @@ export function AgentObjectiveContextForm({ startLockRef, attachedFileCount = 0,
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!canSubmitObjectiveContext(state) || disabled || attachedFileCount > 0 || ordinaryComposerDraftPresent || pendingRef.current || startLockRef.current) return
+    const scoreFloor = parseReportScoreFloorDraft(scoreFloorDraft)
+    if (scoreFloor === null) return
     pendingRef.current = true
     startLockRef.current = true
     onBusyChange?.(true)
     dispatchAction({ type: 'pending' })
-    void coordinatorRef.current!.start(state.objective, state.context, state.allowedLocationsDraft).then(result => {
+    void coordinatorRef.current!.start(state.objective, state.context, state.allowedLocationsDraft, undefined, undefined, scoreFloor).then(result => {
       dispatchAction({ type: 'accepted' })
       try {
         onAccepted(result.sessionId, result.objective)
@@ -184,6 +190,24 @@ export function AgentObjectiveContextForm({ startLockRef, attachedFileCount = 0,
             }}
             style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical', border: '1px solid var(--border)', borderRadius: 7, padding: 8, color: 'var(--text)', background: 'var(--bg)', font: 'inherit' }}
           />
+          <label htmlFor="agent-task-report-score-floor">Report score threshold (optional, report-only)</label>
+          <p id="agent-task-report-score-floor-help" style={{ margin: 0 }}>Count jobs with a verified score at or above this threshold (0–10).</p>
+          <input
+            id="agent-task-report-score-floor"
+            data-testid="objective-context-report-score-floor"
+            type="text"
+            inputMode="decimal"
+            aria-describedby="agent-task-report-score-floor-help"
+            aria-invalid={invalidScoreFloor}
+            value={scoreFloorDraft}
+            disabled={state.pending || disabled}
+            onChange={event => {
+              coordinatorRef.current?.draftEdited()
+              dispatchAction({ type: 'edit-score-floor', value: event.target.value })
+            }}
+            style={{ width: '100%', boxSizing: 'border-box', border: '1px solid var(--border)', borderRadius: 7, padding: 8, color: 'var(--text)', background: 'var(--bg)', font: 'inherit' }}
+          />
+          {invalidScoreFloor && <p role="alert" data-testid="objective-context-score-floor-error" style={{ margin: 0, color: '#b91c1c' }}>Enter a decimal from 0 to 10, or leave it blank.</p>}
           <label htmlFor="agent-task-background">Background and reference</label>
           <p style={{ margin: 0 }}>Optional, up to 20,000 characters. Text is sent unchanged.</p>
           <textarea

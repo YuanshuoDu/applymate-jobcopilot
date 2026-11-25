@@ -1,11 +1,14 @@
-import { schemaVersion } from "@jobcopilot/agent-protocol"
-import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared/agent-location-normalization"
+import { parseObjectiveReportScoreFloor, schemaVersion } from "@jobcopilot/agent-protocol"
 import type { ObjectiveVerificationRequirements } from "@/lib/agent/control-plane/commands/types"
+import {
+  normalizeAllowedLocationDraft,
+  ObjectiveStartCommandError,
+  validateObjectiveContextDraft,
+  type ObjectiveContextDraft,
+} from './agent-objective-start-input'
 
-export interface ObjectiveContextDraft {
-  readonly objective: string
-  readonly context: string
-}
+export { normalizeAllowedLocationDraft, ObjectiveStartCommandError, validateObjectiveContextDraft } from './agent-objective-start-input'
+export type { ObjectiveContextDraft } from './agent-objective-start-input'
 
 export interface ObjectiveStartResult {
   readonly sessionId: string
@@ -18,52 +21,14 @@ export interface ObjectiveStartResult {
 
 interface ObjectiveStartAttempt extends ObjectiveContextDraft {
   readonly verificationRequirements?: ObjectiveVerificationRequirements
+  readonly reportScoreFloor?: number
   readonly clientMessageId: string
 }
 
-export class ObjectiveStartCommandError extends Error {
-  readonly status: number
-  readonly code: string
-  readonly details: Readonly<Record<string, unknown>>
-
-  constructor(status: number, code: string, message: string, details: Readonly<Record<string, unknown>> = {}) {
-    super(message)
-    this.name = "ObjectiveStartCommandError"
-    this.status = status
-    this.code = code
-    this.details = details
-  }
-}
-
-const MAX_OBJECTIVE_BYTES = 2_000
-const MAX_CONTEXT_CHARACTERS = 20_000
 const MAX_IDENTIFIER_LENGTH = 256
 const MAX_LOCATION_DRAFT_BYTES = 2_000
 const LOCATION_REQUIREMENTS_SCHEMA_VERSION = "agent-harness.v2.objective-requirements.v2" as const
 const LOCATION_REQUIREMENT_ID = "candidate-location"
-
-export function validateObjectiveContextDraft(draft: ObjectiveContextDraft): ObjectiveContextDraft {
-  const objective = typeof draft.objective === "string" ? draft.objective.trim() : ""
-  const context = typeof draft.context === "string" ? draft.context : ""
-  if (!objective || new TextEncoder().encode(objective).byteLength > MAX_OBJECTIVE_BYTES) {
-    throw invalidInput("Objective must contain 1 to 2,000 UTF-8 bytes")
-  }
-  if (context.length > MAX_CONTEXT_CHARACTERS) {
-    throw invalidInput("Background context must be 20,000 characters or fewer")
-  }
-  return { objective, context }
-}
-
-export function normalizeAllowedLocationDraft(value: string): readonly string[] | undefined {
-  if (typeof value !== "string" || new TextEncoder().encode(value).byteLength > MAX_LOCATION_DRAFT_BYTES) {
-    throw invalidInput("Allowed locations must be 2,000 UTF-8 bytes or fewer")
-  }
-  if (value.trim() === "") return undefined
-  const entries = value.split(/\r?\n/).filter(entry => entry.trim() !== "")
-  const locations = normalizeAgentLocationAllowlist(entries)
-  if (!locations) throw invalidInput("Enter 1 to 8 allowed locations, each 128 UTF-8 bytes or fewer")
-  return locations
-}
 
 /** Coordinates explicit retries without creating a second Session or root. */
 export class AgentObjectiveStartCoordinator {
@@ -86,9 +51,16 @@ export class AgentObjectiveStartCoordinator {
     allowedLocationsDraft = "",
     existingRequirements?: ObjectiveVerificationRequirements,
     selectedSessionId?: string,
+    reportScoreFloor?: number,
   ): Promise<ObjectiveStartResult> {
     if (selectedSessionId !== undefined && !isIdentifier(selectedSessionId)) {
       return Promise.reject(invalidInput("Selected Session ID is invalid"))
+    }
+    let normalizedScoreFloor: number | undefined
+    if (reportScoreFloor !== undefined) {
+      const parsedScoreFloor = parseObjectiveReportScoreFloor(reportScoreFloor)
+      if (parsedScoreFloor === null) return Promise.reject(invalidInput("Report score threshold must be a number from 0 to 10"))
+      normalizedScoreFloor = parsedScoreFloor
     }
     let draft: ObjectiveContextDraft
     try {
@@ -121,7 +93,7 @@ export class AgentObjectiveStartCoordinator {
 
     const targetKey = selectedSessionId === undefined || (this.targetKey === "new-session" && selectedSessionId === this.sessionId)
       ? "new-session" : `session:${selectedSessionId}`
-    const identityKey = objectiveStartIdentity(targetKey, draft, verificationRequirements)
+    const identityKey = objectiveStartIdentity(targetKey, draft, verificationRequirements, normalizedScoreFloor)
     if (this.inFlight) {
       if (this.inFlightIdentityKey === identityKey) return this.inFlight
       return Promise.reject(new ObjectiveStartCommandError(
@@ -139,7 +111,8 @@ export class AgentObjectiveStartCoordinator {
     this.accepted = null
 
     if (!this.attempt || this.attemptIdentityKey !== identityKey) {
-      this.attempt = { ...draft, ...(verificationRequirements ? { verificationRequirements } : {}), clientMessageId: this.makeClientMessageId() }
+      this.attempt = { ...draft, ...(verificationRequirements ? { verificationRequirements } : {}),
+        ...(normalizedScoreFloor !== undefined ? { reportScoreFloor: normalizedScoreFloor } : {}), clientMessageId: this.makeClientMessageId() }
       this.attemptIdentityKey = identityKey
     }
     const attempt = this.attempt
@@ -181,8 +154,8 @@ export class AgentObjectiveStartCoordinator {
   }
 }
 
-function objectiveStartIdentity(targetKey: string, draft: ObjectiveContextDraft, requirements?: ObjectiveVerificationRequirements): string {
-  return JSON.stringify([targetKey, draft.objective, draft.context, requirements ?? null])
+function objectiveStartIdentity(targetKey: string, draft: ObjectiveContextDraft, requirements?: ObjectiveVerificationRequirements, scoreFloor?: number): string {
+  return JSON.stringify([targetKey, draft.objective, draft.context, requirements ?? null, ...(scoreFloor !== undefined ? [scoreFloor] : [])])
 }
 async function createObjectiveSession(attempt: ObjectiveStartAttempt, fetcher: typeof fetch): Promise<string> {
   const response = await fetcher("/api/agent/sessions", {
@@ -214,6 +187,7 @@ async function startAgentObjective(sessionId: string, attempt: ObjectiveStartAtt
       objective: attempt.objective,
       content: [{ type: "text", text: contentText }],
       ...(attempt.verificationRequirements ? { verificationRequirements: attempt.verificationRequirements } : {}),
+      ...(attempt.reportScoreFloor !== undefined ? { reportScoreFloor: attempt.reportScoreFloor } : {}),
     }),
   })
   const body: unknown = await response.json().catch(() => null)
