@@ -1,4 +1,3 @@
-import { parseTaskGraphSnapshot } from '@jobcopilot/agent-protocol'
 import { NextRequest } from 'next/server'
 
 import { isErrorResponse, ok, requireAuth } from '@/lib/api-helpers'
@@ -10,10 +9,10 @@ import {
   projectFinalTaskGraphSourceDetail,
 } from '@/lib/agent/session/final-task-graph-source-detail'
 import { parseFinalTaskGraphSourceManifest } from '@/lib/agent/session/final-task-graph-source-manifest'
+import { readFinalTaskGraphSourceSnapshot } from '@/lib/agent/session/objective-tailor-final-source-graph'
 
 export const dynamic = 'force-dynamic'
 
-const MAX_TASK_GRAPH_NODES = 11
 const FINAL_ITEM_SELECT = {
   id: true, sessionId: true, turnId: true, taskId: true, type: true, status: true, phase: true, content: true,
 } as const
@@ -59,8 +58,9 @@ async function resolveSource(userId: string, sessionId: string, finalItemId: str
   }) as unknown[]
   if (graphRows.length !== 1) return unavailable()
   const graph = record(graphRows[0])
-  const snapshot = graph ? parseTaskGraphSnapshot(graph.content) : null
-  if (!snapshot || snapshot.nodes.length < 1 || snapshot.nodes.length > MAX_TASK_GRAPH_NODES) return unavailable()
+  const sourceGraph = graph ? readFinalTaskGraphSourceSnapshot(graph.content, finalItem.content) : null
+  const snapshot = sourceGraph?.snapshot
+  if (!snapshot || snapshot.nodes.length < 1) return unavailable()
   const taskIds = [turn.rootTaskId, ...snapshot.nodes.map(node => node.taskId)]
   if (new Set(taskIds).size !== taskIds.length) return unavailable()
   const taskRows = await db.subAgentTask.findMany({
