@@ -1,5 +1,6 @@
 import type pg from "pg"
 import { createHash } from "node:crypto"
+import { canonicalTaskGraphResultJson, taskGraphResultDigest } from "@jobcopilot/shared/task-graph-verification-digest"
 import { evaluateTaskGraphVerification, evaluateTaskGraphVerificationWithExactEmptyScoutResult, evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst, evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery, taskGraphVerificationDependencyNodeKeys, taskGraphVerificationRole, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_EVIDENCE_V2_SCHEMA_VERSION, type TaskGraphVerificationContract, type TaskGraphVerificationEvaluation, type TaskGraphVerificationEvidenceProjection, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { parseTaskGraphSnapshot, canonicalTaskGraphJson, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult } from "./child-evidence.js"
@@ -10,6 +11,7 @@ import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, TASK_GRAPH_VERIFIER_VERSION,
 import { validateRoleResult, type AnalystResult } from "./role-results.js"
 import { completedZeroDiscoveryDigest, emptyAnalystCoverageDigest, hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
 import { objectiveEmptySearchCriterionIds } from "./task-graph-pg-empty-search-shortfall.js"
+export { taskGraphResultDigest } from "@jobcopilot/shared/task-graph-verification-digest"
 export { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 export type { TaskGraphVerificationScope } from "./task-graph-pg-verification-receipt-validation.js"
 type Queryable = Pick<pg.PoolClient, "query">
@@ -79,7 +81,7 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Verify
       if (!await hasNoCurrentAttemptTaskGraphToolReceipts(client, input.scope)) return unavailable(contract, "canonical_evidence_invalid")
       const projection: TaskGraphVerificationEvidenceProjection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: [], evidenceIds: [], emptyDiscoveryReceipt: { digest } }
       const evaluation = evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery(contract, projection, input.dependencies, digest), resultDigest = taskGraphResultDigest(emptyAnalyst)
-      const evidenceDigest = sha256(canonicalJson({ schemaVersion: "agent-harness.v2.task-graph.empty-analyst-receipt.v1", scope: input.scope, scoutDigest: digest, resultDigest, items: [], events: [] }))
+      const evidenceDigest = sha256(canonicalTaskGraphResultJson({ schemaVersion: "agent-harness.v2.task-graph.empty-analyst-receipt.v1", scope: input.scope, scoutDigest: digest, resultDigest, items: [], events: [] }))
       return { verified: evaluation.status === "passed", report: report(evaluation, evidenceDigest, resultDigest), evaluation, projection, structuredResult: emptyAnalyst }
     }
     const receipts = await loadTaskGraphVerificationReceipts(client, input.scope)
@@ -144,15 +146,15 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Verify
 }
 
 function persistedEmptyScoutResult(envelopeValue: unknown, resultValue: unknown): unknown | undefined {
-  try { const envelope = record(envelopeValue), parsed = validateRoleResult(resultValue, "scout"); return envelope?.status === "completed" && canonicalJson(envelope.structuredResult) === canonicalJson(resultValue) && parsed.status === "completed" && parsed.candidates.length === 0 && parsed.evidence.length === 0 ? parsed : undefined } catch { return undefined }
+  try { const envelope = record(envelopeValue), parsed = validateRoleResult(resultValue, "scout"); return envelope?.status === "completed" && canonicalTaskGraphResultJson(envelope.structuredResult) === canonicalTaskGraphResultJson(resultValue) && parsed.status === "completed" && parsed.candidates.length === 0 && parsed.evidence.length === 0 ? parsed : undefined } catch { return undefined }
 }
 function persistedStructuredResultMatches(envelopeValue: unknown, resultValue: unknown): boolean {
   const envelope = record(envelopeValue)
   if (!envelope || envelope.status !== "completed" || !Object.hasOwn(envelope, "structuredResult")) return false
-  try { return canonicalJson(envelope.structuredResult) === canonicalJson(resultValue) } catch { return false }
+  try { return canonicalTaskGraphResultJson(envelope.structuredResult) === canonicalTaskGraphResultJson(resultValue) } catch { return false }
 }
 function persistedEmptyAnalystResult(envelopeValue: unknown, resultValue: unknown): AnalystResult | undefined {
-  try { const envelope = record(envelopeValue), parsed = validateRoleResult(resultValue, "analyst"); return envelope?.status === "completed" && canonicalJson(envelope.structuredResult) === canonicalJson(resultValue) && parsed.status === "completed" && parsed.findings.length === 0 && parsed.evidence.length === 0 ? parsed as AnalystResult : undefined } catch { return undefined }
+  try { const envelope = record(envelopeValue), parsed = validateRoleResult(resultValue, "analyst"); return envelope?.status === "completed" && canonicalTaskGraphResultJson(envelope.structuredResult) === canonicalTaskGraphResultJson(resultValue) && parsed.status === "completed" && parsed.findings.length === 0 && parsed.evidence.length === 0 ? parsed as AnalystResult : undefined } catch { return undefined }
 }
 async function verifiedEmptyScoutDependencyDigest(
   client: Queryable,
@@ -186,13 +188,6 @@ function validScope(scope: TaskGraphVerificationScope): boolean {
   return [scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.taskId].every(value => typeof value === "string" && value.trim() === value && value.length > 0)
     && scope.rootTaskId === scope.parentTaskId && Number.isSafeInteger(scope.attemptCount) && scope.attemptCount >= 1
 }
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
-  const row = record(value); if (row) return `{${Object.keys(row).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(row[key])}`).join(",")}}`
-  const encoded = JSON.stringify(value); if (encoded === undefined) throw new Error("task_graph_verification_result_invalid")
-  return encoded
-}
-export function taskGraphResultDigest(value: unknown): string { return createHash("sha256").update(canonicalJson(value)).digest("hex") }
 function record(value: unknown): Row | undefined {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return undefined } })() : value
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined

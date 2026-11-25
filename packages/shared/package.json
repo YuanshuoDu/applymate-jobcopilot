@@ -42,6 +42,10 @@
       "types": "./dist/objective-job-requirement-evidence.d.ts",
       "default": "./dist/objective-job-requirement-evidence.js"
     },
+    "./task-graph-verification-digest": {
+      "types": "./dist/task-graph-verification-digest.d.ts",
+      "default": "./dist/task-graph-verification-digest.js"
+    },
     "./pinned-outbound": {
       "types": "./dist/pinned-outbound.d.ts",
       "default": "./dist/pinned-outbound.js"
