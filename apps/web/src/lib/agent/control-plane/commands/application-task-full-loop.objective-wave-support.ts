@@ -1,3 +1,5 @@
+import { waitForObjectiveProjectionWaiters } from "./application-task-full-loop.objective-restart-support"
+
 const TEST_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
 const TEST_REDIS_URL = "redis://127.0.0.1:6379/15"
 const DOMAIN = "boards.greenhouse.io"
@@ -39,6 +41,25 @@ type Input = Readonly<{
   phaseProof: unknown
 }>
 
+type PgFixtureClient = Readonly<{
+  query(sql: string, values?: unknown[]): Promise<{ rows: readonly Record<string, unknown>[] }>
+}>
+
+type ProjectionBarrierInput = Readonly<{
+  client: PgFixtureClient
+  environment: Environment
+  runId: string
+  userId: string
+  jobId: string
+}>
+
+export type ObjectiveJobProjectionBarrier = Readonly<{
+  waitUntilBlocked(): Promise<void>
+  waitUntilUnblocked(): Promise<void>
+  release(): Promise<void>
+  cleanup(): Promise<void>
+}>
+
 export async function expireObjectiveWaveRateLimitWindow(input: Input): Promise<Readonly<{
   expired: true
   completedApplications: number
@@ -46,7 +67,7 @@ export async function expireObjectiveWaveRateLimitWindow(input: Input): Promise<
   userCounterPreserved: true
 }>> {
   assertDisposableEnvironment(input.environment)
-  if (!/^[a-f0-9]{32}$/.test(input.runId) || input.userId !== `full-loop-user-${input.runId}`) {
+  if (!validRunOwner(input.runId, input.userId)) {
     throw new Error("objective_wave_rate_limit_owner_invalid")
   }
   const proof = parsePhaseProof(input.phaseProof)
@@ -68,6 +89,97 @@ export async function expireObjectiveWaveRateLimitWindow(input: Input): Promise<
     throw new Error("objective_wave_user_counter_changed")
   }
   return { expired: true, completedApplications: proof.applications.length, expectedCounter, userCounterPreserved: true }
+}
+
+export async function installObjectiveJobProjectionBarrier(
+  input: ProjectionBarrierInput,
+): Promise<ObjectiveJobProjectionBarrier> {
+  assertDisposableEnvironment(input.environment)
+  if (!validRunOwner(input.runId, input.userId)
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.jobId)) {
+    throw new Error("objective_wave_projection_barrier_identity_invalid")
+  }
+  const functionName = `amojpf_${input.runId}`, triggerName = `amojpt_${input.runId}`
+  let transactionOpen = false, lockKey: string | undefined, lockHeld = false
+  try {
+    await input.client.query("BEGIN")
+    transactionOpen = true
+    await input.client.query("SET LOCAL lock_timeout = '5s'")
+    await input.client.query("SET LOCAL statement_timeout = '5s'")
+    const hashed = await input.client.query("SELECT hashtextextended($1::text, 1338)::text AS key", [input.jobId])
+    lockKey = hashed.rows[0]?.key as string | undefined
+    if (!lockKey || !/^-?\d+$/.test(lockKey)) throw new Error("objective_wave_projection_barrier_key_invalid")
+    await input.client.query("SELECT pg_advisory_lock($1::bigint)", [lockKey])
+    lockHeld = true
+    await assertProjectionJob(input)
+    await input.client.query(projectionFunctionSql(functionName, input.userId, input.jobId))
+    await input.client.query(projectionTriggerSql(functionName, triggerName, input.userId, input.jobId))
+    await assertProjectionJob(input)
+    await input.client.query("COMMIT")
+    transactionOpen = false
+  } catch (error) {
+    if (transactionOpen) await input.client.query("ROLLBACK").catch(() => undefined)
+    if (lockHeld && lockKey) await input.client.query("SELECT pg_advisory_unlock($1::bigint)", [lockKey]).catch(() => undefined)
+    throw error
+  }
+  let released = false, cleaned = false
+  const release = async () => {
+    if (released) return
+    const result = await input.client.query("SELECT pg_advisory_unlock($1::bigint) AS released", [lockKey])
+    if (result.rows[0]?.released !== true) throw new Error("objective_wave_projection_barrier_lock_missing")
+    released = true
+  }
+  const waitForWaiters = (expected: 0 | 1) => waitForObjectiveProjectionWaiters(async () => {
+    const result = await input.client.query(
+      "SELECT count(*)::int AS waiters FROM pg_locks WHERE locktype='advisory' AND classid=(($1::bigint >> 32) & 4294967295)::oid AND objid=($1::bigint & 4294967295)::oid AND objsubid=1 AND NOT granted",
+      [lockKey],
+    )
+    return Number(result.rows[0]?.waiters)
+  }, expected)
+  return {
+    waitUntilBlocked: () => waitForWaiters(1),
+    waitUntilUnblocked: () => waitForWaiters(0),
+    release,
+    async cleanup() {
+      if (cleaned) return
+      await waitForWaiters(0)
+      await release()
+      try {
+        await input.client.query("BEGIN")
+        await input.client.query("SET LOCAL lock_timeout = '5s'")
+        await input.client.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."Job"`)
+        await input.client.query(`DROP FUNCTION IF EXISTS public."${functionName}"()`)
+        await input.client.query("COMMIT")
+      } catch (error) {
+        await input.client.query("ROLLBACK").catch(() => undefined)
+        throw error
+      }
+      cleaned = true
+    },
+  }
+}
+
+async function assertProjectionJob(input: ProjectionBarrierInput): Promise<void> {
+  const result = await input.client.query(
+    `SELECT "id" FROM public."Job" WHERE "id"=$1 AND "userId"=$2 AND "status"='saved' AND "workflowState"='draft' AND "appliedAt" IS NULL`,
+    [input.jobId, input.userId],
+  )
+  if (result.rows.length !== 1 || result.rows[0]?.id !== input.jobId) {
+    throw new Error("objective_wave_projection_barrier_job_not_preapproval")
+  }
+}
+
+function projectionFunctionSql(name: string, userId: string, jobId: string): string {
+  return `CREATE FUNCTION public."${name}"() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN IF OLD."id"='${jobId}' AND OLD."userId"='${userId}' AND OLD."status"='saved' AND OLD."workflowState"='submitting' AND OLD."appliedAt" IS NULL AND NEW."status"='applied' AND NEW."workflowState"='submitted' AND NEW."appliedAt" IS NOT NULL THEN PERFORM pg_advisory_xact_lock(hashtextextended(OLD."id"::text,1338)); END IF; RETURN NEW; END; $body$`
+}
+
+function projectionTriggerSql(functionName: string, triggerName: string, userId: string, jobId: string): string {
+  return `CREATE TRIGGER "${triggerName}" BEFORE UPDATE OF "status","workflowState","appliedAt" ON public."Job" FOR EACH ROW WHEN (OLD."id"='${jobId}' AND OLD."userId"='${userId}' AND OLD."status"='saved' AND OLD."workflowState"='submitting' AND OLD."appliedAt" IS NULL AND NEW."status"='applied' AND NEW."workflowState"='submitted' AND NEW."appliedAt" IS NOT NULL) EXECUTE FUNCTION public."${functionName}"()`
+}
+
+function validRunOwner(runId: string, userId: string): boolean {
+  const owner = `full-loop-user-${runId}`
+  return /^[a-f0-9]{32}$/.test(runId) && (userId === owner || userId === `${owner}-objective-wave`)
 }
 
 function assertDisposableEnvironment(env: Environment): void {
