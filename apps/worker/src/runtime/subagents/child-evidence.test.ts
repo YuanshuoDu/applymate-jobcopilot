@@ -797,4 +797,14 @@ describe("child evidence binding", () => {
       restored("second", "jobs.get", { job: { id: "job-1", source: "lever" } }),
     ])).toThrow("child_resume_evidence_conflict")
   })
+
+  it("processes restored artifact and read observations in their original order", () => {
+    const index = createObservedEvidenceIndex()
+    const artifact = writerResult(1, "a")
+    expect(() => hydrateObservedEvidence(index, [
+      restored("writer", "cover_letter.draft", { artifactRef: artifact.artifactRef }),
+      restored("bad-discover", "jobs.discover", { $ref: "malformed", sizeBytes: 1, sha256: "b".repeat(64) }),
+    ])).toThrow("child_resume_evidence_invalid")
+    expect(index.artifactResults.size).toBe(1)
+  })
 })
