@@ -2092,6 +2092,152 @@ async function objectiveSubmitTimeoutSnapshot(input: {
   }
 }
 
+type ObjectivePostRestartWorkerTrace = Readonly<{ children: readonly Child[] }>
+
+function objectivePostRestartWorkerStages(children: readonly Child[], workerTaskId: string | undefined) {
+  const lines = children.flatMap(child => child.lines)
+  if (!workerTaskId) return { activeCount: 0, redeliveryCount: 0, stalledCount: 0, failedCount: 0, workerReadyCount: 0 }
+  const active = lines.map(parseApplyJobActiveEvent).filter((event): event is ApplyJobActiveEvent =>
+    event?.jobId === workerTaskId)
+  const stalled = lines.filter(line => new RegExp(`^APPLY_JOB_STALLED ${escapeRegExp(workerTaskId)} `).test(line)).length
+  const failed = lines.filter(line => new RegExp(`^APPLY_JOB_FAILED ${escapeRegExp(workerTaskId)}(?: |$)`).test(line)).length
+  return {
+    activeCount: Math.min(2, active.length),
+    redeliveryCount: Math.min(2, active.filter(event => event.attemptsStarted >= 2 && event.stalledCounter >= 1).length),
+    stalledCount: Math.min(2, stalled),
+    failedCount: Math.min(2, failed),
+    workerReadyCount: Math.min(2, lines.filter(line => line === "WORKER_READY").length),
+  }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+async function objectivePostRestartTimeoutSnapshot(input: {
+  userId: string; sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; approvalId: string
+  constraintHash: string; dispatchId: string; workerTrace: ObjectivePostRestartWorkerTrace
+}) {
+  try {
+    const [task, turn, job, session, dispatch, attempts, events, wakeEvents, finalizationDispatches, activeSiblingTurns] = await Promise.all([
+      testDb.applicationTask.findFirst({ where: { id: input.applicationTaskId, userId: input.userId,
+        sessionId: input.sessionId, jobId: input.jobId, fillTurnId: input.fillTurnId }, select: {
+        status: true, checkpoint: true, workerTaskId: true, fillTurnId: true, error: true,
+      } }),
+      testDb.agentTurn.findFirst({ where: { id: input.fillTurnId, userId: input.userId, sessionId: input.sessionId }, select: {
+        status: true, rootTaskId: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true,
+      } }),
+      testDb.job.findFirst({ where: { id: input.jobId, userId: input.userId }, select: {
+        status: true, workflowState: true, appliedAt: true,
+      } }),
+      testDb.agentSession.findFirst({ where: { id: input.sessionId, userId: input.userId }, select: { status: true } }),
+      testDb.agentOutbox.findUnique({ where: { id: input.dispatchId }, select: {
+        aggregateId: true, topic: true, idempotencyKey: true, payload: true, publishedAt: true, attemptCount: true,
+      } }),
+      testDb.submissionAttempt.findMany({ where: { userId: input.userId, jobId: input.jobId, receiptId: input.approvalId,
+        constraintHash: input.constraintHash }, take: 3, select: { id: true, state: true, errorCode: true } }),
+      testDb.applicationTaskEvent.findMany({ where: { taskId: input.applicationTaskId, actor: "worker", type: { in: [
+        "objective_application_submit_result_recorded", "submission_execution_started", "submission_execution_settled",
+        "objective_application_submit_result_recovered", "objective_application_submit_finalization_queued",
+      ] } }, take: 16, select: { id: true, type: true, body: true, data: true } }),
+      testDb.agentEvent.findMany({ where: { sessionId: input.sessionId, turnId: input.fillTurnId, type: "turn.wakeup" },
+        take: 8, select: { itemId: true, payload: true } }),
+      testDb.agentOutbox.findMany({ where: { aggregateId: input.sessionId, topic: "agent.turn.dispatch",
+        idempotencyKey: `turn-dispatch:${input.fillTurnId}` }, take: 3, select: { publishedAt: true, attemptCount: true, payload: true } }),
+      testDb.agentTurn.findMany({ where: { sessionId: input.sessionId, userId: input.userId, id: { not: input.fillTurnId },
+        status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] } },
+        take: 3, select: { id: true } }),
+    ])
+    const dispatchPayload = jsonRecord(dispatch?.payload)
+    const dispatchWorkerTaskId = jsonString(dispatchPayload, "workerTaskId")
+    const workerTaskId = task?.workerTaskId ?? dispatchWorkerTaskId
+    const resultEvents = events.filter(event => event.type === "objective_application_submit_result_recorded")
+    const resultData = resultEvents.length === 1 ? jsonRecord(resultEvents[0]?.data) : null
+    const resultKeys = ["applicationTaskId", "approvalId", "applyResultId", "attemptId", "constraintHash",
+      "executionId", "fillTurnId", "jobId", "schemaVersion", "sessionId", "userId", "workerTaskId"].sort().join(",")
+    const expectedResultId = `objective-application-submit-result:${hashContent([
+      input.applicationTaskId, input.fillTurnId, input.approvalId,
+    ]).slice(7)}`
+    const exactResultReceipt = Boolean(resultData && Object.keys(resultData).sort().join(",") === resultKeys
+      && resultEvents[0]?.id === expectedResultId
+      && resultData.schemaVersion === "agent-harness.v2.objective-application-submit-result.v1"
+      && resultData.applicationTaskId === input.applicationTaskId && resultData.userId === input.userId
+      && resultData.jobId === input.jobId && resultData.sessionId === input.sessionId
+      && resultData.fillTurnId === input.fillTurnId && resultData.approvalId === input.approvalId
+      && resultData.constraintHash === input.constraintHash && resultData.workerTaskId === workerTaskId
+      && typeof resultData.executionId === "string" && typeof resultData.attemptId === "string"
+      && Number.isSafeInteger(resultData.applyResultId))
+    const applyResultId = resultData && typeof resultData.applyResultId === "number"
+      && Number.isSafeInteger(resultData.applyResultId) ? resultData.applyResultId : null
+    const applyResult = applyResultId === null ? null : await testDb.applyResult.findUnique({ where: { id: applyResultId }, select: {
+      userId: true, jobId: true, mode: true, atsType: true, flowUsed: true, status: true, error: true,
+    } })
+    const executionEvents = events.filter(event => event.type === "submission_execution_started"
+      || event.type === "submission_execution_settled")
+    const settlementCount = Math.min(2, executionEvents.filter(event => event.type === "submission_execution_settled").length)
+    const recoveryCount = Math.min(2, events.filter(event => event.type === "objective_application_submit_result_recovered").length)
+    const finalizationCount = Math.min(2, events.filter(event => event.type === "objective_application_submit_finalization_queued").length)
+    const finalizationEventId = events.find(event => event.type === "objective_application_submit_finalization_queued")?.id
+    const finalizationDispatch = finalizationEventId ? finalizationDispatches.find(dispatch => {
+      const payload = jsonRecord(dispatch.payload)
+      return payload?.turnId === input.fillTurnId && payload.sessionId === input.sessionId
+        && payload.ownerId === `wakeup:${finalizationEventId}`
+    }) : undefined
+    const approvalWakeCount = Math.min(2, wakeEvents.filter(event => event.itemId === `agent-wait:approval:${input.approvalId}`
+      && jsonString(event.payload, "toolCallId") === `application-submit:${input.applicationTaskId}`
+      && jsonString(event.payload, "status") === "approved").length)
+    const rootTaskId = typeof turn?.rootTaskId === "string" ? turn.rootTaskId : null
+    const root = rootTaskId ? await testDb.subAgentTask.findFirst({ where: { id: rootTaskId, rootTaskId, sessionId: input.sessionId,
+        turnId: input.fillTurnId, parentTaskId: null, role: "orchestrator", taskType: "root" }, select: {
+        status: true, attemptCount: true, leaseOwner: true, leaseExpiresAt: true,
+      } }) : null
+    const stages = objectivePostRestartWorkerStages(input.workerTrace.children, workerTaskId)
+    return {
+      available: true,
+      session: { status: objectiveSessionDiagnosticStatus(session?.status), activeSiblingTurnCount: Math.min(2, activeSiblingTurns.length) },
+      task: task ? { status: reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+        checkpoint: reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+        workerTaskPresent: Boolean(task.workerTaskId), workerTaskMatchesDispatch: Boolean(task.workerTaskId
+          && dispatchWorkerTaskId && task.workerTaskId === dispatchWorkerTaskId), fillTurnMatches: task.fillTurnId === input.fillTurnId,
+        errorPresent: Boolean(task.error) } : { present: false },
+      turn: turn ? { status: reviewedFillDiagnosticValue(turn.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+        rootPresent: rootTaskId !== null, revisionPresent: Number.isSafeInteger(turn.revision),
+        leaseFree: turn.leaseOwnerId === null && turn.leaseExpiresAt === null } : { present: false },
+      job: job ? { status: reviewedFillDiagnosticValue(job.status, OBJECTIVE_JOB_DIAGNOSTIC_STATUSES),
+        workflowState: reviewedFillDiagnosticValue(job.workflowState, OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES),
+        appliedAtPresent: job.appliedAt !== null } : { present: false },
+      queue: { dispatchPresent: dispatch !== null, dispatchExact: Boolean(dispatch?.aggregateId === input.sessionId
+        && dispatch.topic === "application.submit.dispatch" && dispatch.idempotencyKey?.startsWith("application-submit:")
+        && dispatchPayload?.applicationTaskId === input.applicationTaskId && dispatchPayload?.fillTurnId === input.fillTurnId
+        && dispatchWorkerTaskId), dispatchPublished: dispatch?.publishedAt instanceof Date, dispatchAttemptCount: dispatch
+        ? Math.min(2, Math.max(0, dispatch.attemptCount)) : null },
+      workerStages: stages,
+      immutableResult: { eventCount: Math.min(2, resultEvents.length), exactReceipt: exactResultReceipt,
+        attemptLinkPresent: Boolean(exactResultReceipt && attempts.length === 1 && resultData?.attemptId === attempts[0]?.id),
+        applyResultStatus: applyResult?.userId === input.userId && applyResult.jobId === input.jobId
+          && applyResult.mode === "unattended" && applyResult.atsType === "greenhouse"
+          && applyResult.flowUsed === "application.submit" && applyResult.status === "submitted" && applyResult.error === null
+          ? "submitted" : applyResult ? "other" : "missing" },
+      submissionAttempt: { count: Math.min(2, attempts.length), state: attempts.length === 1
+        ? diagnosticSubmissionAttemptState(attempts[0]?.state) : attempts.length === 0 ? null : "other",
+        errorPresent: attempts.length === 1 && Boolean(attempts[0]?.errorCode) },
+      lifecycle: {
+        executionStartedCount: Math.min(2, executionEvents.filter(event => event.type === "submission_execution_started").length),
+        executionSettledCount: settlementCount, recoveryCount, approvalWakeCount, finalizationCount,
+        finalizationDispatchCount: Math.min(2, finalizationDispatch ? 1 : 0),
+        settlementPresent: settlementCount === 1, recoveryPresent: recoveryCount === 1,
+        approvalWakePresent: approvalWakeCount === 1, finalizationPresent: finalizationCount === 1,
+        finalizationDispatchPresent: Boolean(finalizationDispatch?.publishedAt instanceof Date),
+      },
+      root: root ? { present: true, status: reviewedFillDiagnosticValue(root.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+        attemptCount: Number.isSafeInteger(root.attemptCount) ? Math.min(2, Math.max(0, root.attemptCount)) : null,
+        leaseFree: root.leaseOwner === null && root.leaseExpiresAt === null } : { present: false },
+    }
+  } catch {
+    return { available: false }
+  }
+}
+
 async function objectiveSubmitTaskErrorCategory(value: unknown): Promise<string | null> {
   if (value === "browser_manual") return "browser_manual"
   const { CAPTCHA_USER_TAKEOVER_MESSAGE, CHALLENGE_DETECTION_FAILED_MESSAGE } =
@@ -2156,6 +2302,11 @@ const TURN_DLQ_ATTEMPTS_MAX = 5
 
 function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string>): string {
   return value === null || value === undefined ? "none" : typeof value === "string" && allowed.has(value) ? value : "other"
+}
+
+function objectiveSessionDiagnosticStatus(value: unknown): string {
+  return typeof value === "string" && ["running", "waiting_for_user", "completed", "failed", "paused", "aborted", "archived"].includes(value)
+    ? value : value === null || value === undefined ? "missing" : "other"
 }
 
 function exactDiagnosticRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
@@ -4788,8 +4939,19 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         return { scopeHash: rotatedScopeHash, siteLineCursor, dispatchId }
       }
       const completeSubmittedSlot = async (slot: typeof submissionSlots[number], handoff: ObjectiveWaveHandoffProof,
-        prepared: ApprovedObjectiveSubmission, restartCount: 0 | 1) => {
-        const terminalFill = await waitForAgentTurnTerminal(handoff.fillTurnId, 180_000)
+        prepared: ApprovedObjectiveSubmission, restartCount: 0 | 1, restartTrace?: ObjectivePostRestartWorkerTrace) => {
+        let terminalFill: Awaited<ReturnType<typeof waitForAgentTurnTerminal>>
+        try {
+          terminalFill = await waitForAgentTurnTerminal(handoff.fillTurnId, 180_000)
+        } catch (error: unknown) {
+          const isKnownTerminalWait = error instanceof Error
+            && error.message.startsWith("Canonical Turn did not reach terminal state; status=")
+          if (restartCount !== 1 || !restartTrace || !isKnownTerminalWait) throw error
+          const snapshot = await objectivePostRestartTimeoutSnapshot({ userId, sessionId, jobId: slot.jobId,
+            applicationTaskId: slot.applicationTaskId, fillTurnId: handoff.fillTurnId, approvalId: prepared.approval.id,
+            constraintHash: prepared.scopeHash, dispatchId: prepared.dispatchId, workerTrace: restartTrace })
+          throw new Error(`Objective post-restart Fill Turn timeout snapshot ${JSON.stringify(snapshot)}`)
+        }
         if (terminalFill.status !== "completed") throw new Error("Objective Fill Turn did not complete")
         const task = await waitForReviewedApplicationTask(slot.jobId, value => value.id === slot.applicationTaskId
           && value.status === "submitted" && value.checkpoint === "submission_verified", 180_000, userId)
@@ -5144,7 +5306,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
               if (worker !== replacement || !exited(captured)) throw new Error("Objective restart did not replace one captured Worker")
               if (!committed) throw new Error("Objective crash recovery omitted the committed result proof")
               if (!approved) throw new Error("Objective crash recovery omitted the approved submit attempt")
-              return { proof: await completeSubmittedSlot(slot, handoff, approved, 1), restart: {
+              return { proof: await completeSubmittedSlot(slot, handoff, approved, 1,
+                { children: [captured, replacement] }), restart: {
                 projectionBlocked: true as const, committedResultBeforeCrash: true as const, capturedWorkerKilled: true as const,
                 workerExitObserved: true as const, barrierUnblocked: true as const, successorStartedOnce: true as const,
                 successorReady: true as const,
