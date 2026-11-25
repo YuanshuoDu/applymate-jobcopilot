@@ -93,7 +93,7 @@ function fixture() {
       { id: "outbox-current", ...currentOutbox, publishedAt: null, lastError: null },
     ]) },
     agentTurn: { findMany: vi.fn(async (): Promise<unknown[]> => [{
-      id: fillId, createdAt: new Date("2026-11-24T10:01:00Z"), status: "completed", source: "user",
+      id: fillId, sessionId, userId, createdAt: new Date("2026-11-24T10:01:00Z"), status: "completed", source: "user",
       executionMode: "canonical_task_graph", input: finalTurnInput, finalResponse: JSON.stringify(final), error: null,
       rootTaskId: "root-prior", completedAt: new Date(), leaseOwnerId: null, leaseExpiresAt: null,
     }]) },
@@ -155,7 +155,7 @@ describe("Objective reviewed Fill continuation", () => {
   it("defers on a non-successful latest Fill rather than opening a sibling", async () => {
     const { tx } = fixture()
     tx.agentTurn.findMany = vi.fn(async (): Promise<unknown[]> => [{
-      id: fillId, createdAt: new Date(), status: "waiting_for_approval", source: "user",
+      id: fillId, sessionId, userId, createdAt: new Date(), status: "waiting_for_approval", source: "user",
       executionMode: "canonical_task_graph", input: {}, finalResponse: null, error: null, rootTaskId: "root-prior",
       completedAt: null, leaseOwnerId: null, leaseExpiresAt: null,
     }])
