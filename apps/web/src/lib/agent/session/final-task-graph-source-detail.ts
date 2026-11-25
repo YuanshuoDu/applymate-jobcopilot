@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto'
 import {
-  parseTaskGraphSnapshot,
   projectPlanLedger,
   projectTaskGraphVerificationSummary,
   type TaskGraphVerificationDisplayNode,
@@ -19,9 +18,8 @@ import {
   type TaskGraphSourceTaskStatus,
 } from './final-task-graph-source-manifest'
 import { projectFinalAnswerContent } from './final-answer-evidence-projection'
+import { readFinalTaskGraphSourceSnapshot } from './objective-tailor-final-source-graph'
 import { parseObjectiveTailorFinalOutcomesFromContent } from './objective-tailor-final-content'
-
-const MAX_TASK_GRAPH_NODES = 11
 
 export interface FinalTaskGraphSourceDetail {
   readonly goal: string
@@ -84,8 +82,10 @@ export function projectFinalTaskGraphSourceDetail(input: {
   if (graph.id !== canonicalTaskGraphItemId(turn.rootTaskId as string) || graph.sessionId !== input.sessionId
     || graph.turnId !== finalItem.turnId || graph.taskId !== turn.rootTaskId
     || graph.type !== 'task_graph' || graph.revision !== manifest.graphRevision) return null
-  const snapshot = parseTaskGraphSnapshot(graph.content)
-  if (!snapshot || snapshot.nodes.length < 1 || snapshot.nodes.length > MAX_TASK_GRAPH_NODES) return null
+  const sourceGraph = readFinalTaskGraphSourceSnapshot(graph.content, finalItem.content)
+  if (!sourceGraph || sourceGraph.kind === 'objective-tailor' && !hasCanonicalObjectiveFinalAnswerContent(finalItem.content)) return null
+  const snapshot = sourceGraph.snapshot
+  if (snapshot.nodes.length < 1) return null
   const taskIds = [turn.rootTaskId as string, ...snapshot.nodes.map(node => node.taskId)]
   if (new Set(taskIds).size !== taskIds.length || taskIds.some(id => !boundedId(id))) return null
 
@@ -102,6 +102,7 @@ export function projectFinalTaskGraphSourceDetail(input: {
   if (taskIds.some(id => !taskById.has(id))) return null
   const root = taskById.get(turn.rootTaskId as string)
   if (!root || root.parentTaskId !== null || root.role !== 'orchestrator' || root.taskType !== 'root') return null
+  if (sourceGraph.kind === 'objective-tailor' && root.status !== 'completed') return null
   for (const id of taskIds.slice(1)) {
     const task = taskById.get(id)!
     if (task.parentTaskId !== turn.rootTaskId) return null
@@ -127,6 +128,7 @@ export function projectFinalTaskGraphSourceDetail(input: {
     const source = manifest.sources[index]!
     if (source.nodeIndex !== member.nodeIndex || source.taskStatus !== member.task.status || !sourceRoleMatches(member.task, source)
       || source.resultState === 'valid' && !roleResultMatches(member.task.result, source)) return null
+    if (sourceGraph.kind === 'objective-tailor' && !objectiveSourceMatches(member.node, member.task, source)) return null
   }
 
   const selectedSource = sources[0]!
@@ -141,12 +143,14 @@ export function projectFinalTaskGraphSourceDetail(input: {
     goal: row.goal, result: row.result, hasResult: row.result !== null && row.result !== undefined, updatedAt: row.updatedAt,
   }))
   const plan = projectPlanLedger({ sessionId: input.sessionId, revision: manifest.graphRevision,
-    rootTaskId: turn.rootTaskId, graph: graph.content, tasks: publicTasks })
+    rootTaskId: turn.rootTaskId, graph: sourceGraph.graph, tasks: publicTasks })
   const goal = plan?.nodes[selectedSource.nodeIndex]?.goal
   if (!goal) return null
+  const evidencePreview = plan?.nodes[selectedSource.nodeIndex]?.evidencePreview
+  if (sourceGraph.kind === 'objective-tailor' && (!evidencePreview || evidencePreview.role !== selectedSource.role)) return null
   const verification = plan ? projectTaskGraphVerificationSummary({ sessionId: input.sessionId,
     turnId: finalItem.turnId as string, rootTaskId: turn.rootTaskId as string, revision: manifest.graphRevision,
-    graph: graph.content, tasks: scopedRows,
+    graph: sourceGraph.graph, tasks: scopedRows,
     digestCanonicalJson: canonicalJson => createHash('sha256').update(canonicalJson, 'utf8').digest('hex'),
   }, plan)?.nodes[selectedSource.nodeIndex] : undefined
 
@@ -171,10 +175,22 @@ function sourceRoleMatches(task: Record<string, unknown>, source: FinalTaskGraph
     && !(task.role === 'auditor' && task.taskType === 'native_verification')
 }
 
+function objectiveSourceMatches(node: { templateId: string }, task: Record<string, unknown>, source: FinalTaskGraphSource): boolean {
+  const taskType = node.templateId === 'scout' ? 'job_discovery' : node.templateId === 'analyst' ? 'job_analysis' : null
+  return taskType !== null && source.role === node.templateId && source.resultState === 'valid'
+    && task.status === 'completed' && task.role === node.templateId && task.taskType === taskType
+}
+
 function hasCanonicalFinalAnswerContent(value: unknown): boolean {
   const content = record(value)
   if (!content) return false
   return projectFinalAnswerContent({ text: ownDataValue(content, 'text'), final: ownDataValue(content, 'final') }) !== null
+}
+
+function hasCanonicalObjectiveFinalAnswerContent(value: unknown): boolean {
+  const content = record(value)
+  const final = content && record(ownDataValue(content, 'final'))
+  return !!final && ownDataValue(final, 'schemaVersion') === 'agent-harness.v2.final' && hasCanonicalFinalAnswerContent(value)
 }
 
 function ownDataValue(value: Record<string, unknown>, key: string): unknown {

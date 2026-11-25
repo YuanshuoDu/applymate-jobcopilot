@@ -14,6 +14,58 @@ const content = { taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_V
 const updatedAt = new Date('2026-10-01T00:00:00.000Z')
 const finalOutcomes = { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [{ ordinal: 1, status: 'ready' }] }
 
+function objectiveSourceFixture() {
+  const sourceNodes = [
+    { key: 'wave-scout', templateId: 'scout', goal: 'Find roles', successCriteria: ['Return evidence'], dependsOn: [], depth: 1,
+      taskId: 'wave-scout-task', verification: { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'scout',
+        criteria: [{ id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 1 } }] }, verificationDisposition: 'typed' },
+    { key: 'wave-analyst', templateId: 'analyst', goal: 'Assess roles', successCriteria: ['Return evidence'], dependsOn: ['wave-scout'], depth: 2,
+      taskId: 'wave-analyst-task', verification: { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'analyst',
+        criteria: [{ id: 'finding-count', check: { kind: 'finding_count_gte', minimum: 1 } }] }, verificationDisposition: 'typed' },
+  ]
+  const slots = Array.from({ length: 8 }, (_, index) => ({ slotId: `tailor-${index + 1}`,
+    sourceAnalystNodeKey: 'wave-analyst', writerNodeKey: `wave-writer-${index + 1}`, reviewerNodeKey: `wave-reviewer-${index + 1}` }))
+  const suffix = slots.flatMap((slot, index) => [
+    { key: slot.writerNodeKey, templateId: 'cover_letter_writer', goal: 'Draft verified material', successCriteria: ['Use evidence'],
+      dependsOn: [slot.sourceAnalystNodeKey], depth: 3, taskId: `task-${slot.writerNodeKey}`, verificationDisposition: 'specialized' },
+    { key: slot.reviewerNodeKey, templateId: 'cover_letter_reviewer', goal: 'Review material', successCriteria: ['Check material'],
+      dependsOn: [slot.writerNodeKey], depth: 4, taskId: `task-${slot.reviewerNodeKey}`, verificationDisposition: 'specialized' },
+  ])
+  const objectiveGraph = { schemaVersion: 'agent-harness.v2.task-graph', rootSuccessCriteria: ['Complete the Objective'],
+    nodes: [...sourceNodes, ...suffix], objectiveTailor: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-graph.v1', sourceNodeCount: sourceNodes.length, slots,
+    } }
+  const manifestSources = sourceNodes.map((node, nodeIndex) => ({
+    sourceKey: canonicalTaskGraphSourceKey(finalItemId, 4, nodeIndex), nodeIndex, role: node.templateId,
+    taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed',
+  }))
+  const finalContent = { text: 'Verified answer', final: { schemaVersion: 'agent-harness.v2.final', response: 'Verified answer' },
+    taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 4, sources: manifestSources },
+    objectiveTailorFinalOutcomes: { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1',
+      slots: slots.map((_, index) => ({ ordinal: index + 1, status: 'ready' })) } }
+  const jobId = 'source-job-1'
+  const result = (role: 'scout' | 'analyst') => {
+    const evidenceId = `${role}-job-evidence`
+    const structuredResult = role === 'scout'
+      ? { schemaVersion: 'agent-harness.v2.subagent.result', role, status: 'completed', summary: 'Found roles',
+        candidates: [{ jobId, source: 'greenhouse', url: 'https://jobs.example/1', evidenceIds: [evidenceId] }],
+        evidence: [{ id: evidenceId, kind: 'job', ref: jobId, source: 'greenhouse' }] }
+      : { schemaVersion: 'agent-harness.v2.subagent.result', role, status: 'completed', summary: 'Assessed roles',
+        findings: [{ jobId, score: 8, evidenceIds: [evidenceId] }],
+        evidence: [{ id: evidenceId, kind: 'job', ref: jobId, source: 'greenhouse' }] }
+    return { status: 'completed', stepCount: 1, toolCallCount: 1, finalItemId: `private-${role}-final`, finalText: 'Private model text', structuredResult }
+  }
+  const root = { id: rootTaskId, sessionId, turnId, rootTaskId, parentTaskId: null, role: 'orchestrator', taskType: 'root',
+    status: 'completed', goal: 'Research roles', result: null, hasResult: false, updatedAt }
+  const tasks = [
+    { id: 'wave-scout-task', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'scout', taskType: 'job_discovery',
+      status: 'completed', goal: 'Find roles', result: result('scout'), hasResult: true, updatedAt },
+    { id: 'wave-analyst-task', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'analyst', taskType: 'job_analysis',
+      status: 'completed', goal: 'Assess roles', result: result('analyst'), hasResult: true, updatedAt },
+  ]
+  return { objectiveGraph, finalContent, tasks, manifestSources }
+}
+
 it('projects only a valid Objective Tailor sidecar on completed final answers', () => {
   expect(projectFinalAnswerTaskGraphSourceContent(finalItemId, 'final_answer', 'completed', 'Answer', undefined, null,
     { text: 'Answer', final: { response: 'Answer' }, objectiveTailorFinalOutcomes: finalOutcomes }))
@@ -188,5 +240,47 @@ describe('projectFinalTaskGraphSourceDetail', () => {
     expect(query([scoutSource, controlSource], [1])).toBeNull()
     expect(query([scoutSource], [0, 1])).toBeNull()
     expect(query([scoutSource], [1], sourceKey, [...taskRows, writerTask], extendedNodes)).toBeNull()
+  })
+
+  it('projects the typed Objective source prefix from a graph larger than the ordinary bound', () => {
+    const fixture = objectiveSourceFixture()
+    const base = input()
+    const rootTaskRow = (base.taskRows as object[])[0]!
+    const objectiveInput = (key: string) => ({
+      ...base,
+      sourceKey: key,
+      finalItem: { ...(base.finalItem as object), content: fixture.finalContent },
+      graphRows: [{ ...(base.graphRows as object[])[0], content: fixture.objectiveGraph }],
+      taskRows: [rootTaskRow, ...fixture.tasks],
+    })
+    expect(fixture.objectiveGraph.nodes).toHaveLength(18)
+    const analystKey = canonicalTaskGraphSourceKey(finalItemId, 4, 1)
+    const projected = projectFinalTaskGraphSourceDetail(objectiveInput(analystKey) as never)
+    expect(projected).toMatchObject({ role: 'analyst', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' })
+    expect(projected).not.toBeNull()
+    expect(projected?.verification.status).toBe('unavailable')
+    const scoutKey = canonicalTaskGraphSourceKey(finalItemId, 4, 0)
+    expect(projectFinalTaskGraphSourceDetail(objectiveInput(scoutKey) as never)).toMatchObject({ role: 'scout', resultState: 'valid' })
+
+    const wrongType = fixture.tasks.map(task => task.id === 'wave-analyst-task' ? { ...task, taskType: 'analyst' } : task)
+    expect(projectFinalTaskGraphSourceDetail({ ...objectiveInput(analystKey), taskRows: [rootTaskRow, ...wrongType] } as never)).toBeNull()
+    expect(projectFinalTaskGraphSourceDetail(objectiveInput(canonicalTaskGraphSourceKey(finalItemId, 4, 2)) as never)).toBeNull()
+
+    const mismatchedAnswer = { ...fixture.finalContent, final: { schemaVersion: 'agent-harness.v2.final', response: 'Different answer' } }
+    expect(projectFinalTaskGraphSourceDetail({ ...objectiveInput(analystKey),
+      finalItem: { ...(base.finalItem as object), content: mismatchedAnswer } } as never)).toBeNull()
+    const wrongSchema = { ...fixture.finalContent, final: { schemaVersion: 'wrong-version', response: fixture.finalContent.text } }
+    expect(projectFinalTaskGraphSourceDetail({ ...objectiveInput(analystKey),
+      finalItem: { ...(base.finalItem as object), content: wrongSchema } } as never)).toBeNull()
+
+    const failedTasks = fixture.tasks.map(task => task.id === 'wave-analyst-task' ? { ...task, status: 'failed' } : task)
+    const failedSources = fixture.manifestSources.map(source => source.nodeIndex === 1 ? { ...source, taskStatus: 'failed' } : source)
+    const failedContent = { ...fixture.finalContent, taskGraphSources: { ...fixture.finalContent.taskGraphSources, sources: failedSources } }
+    expect(projectFinalTaskGraphSourceDetail({ ...objectiveInput(analystKey), taskRows: [rootTaskRow, ...failedTasks],
+      finalItem: { ...(base.finalItem as object), content: failedContent } } as never)).toBeNull()
+
+    const failedRoot = rootTaskRow as Record<string, unknown>
+    expect(projectFinalTaskGraphSourceDetail({ ...objectiveInput(analystKey),
+      taskRows: [{ ...failedRoot, status: 'waiting' }, ...fixture.tasks] } as never)).toBeNull()
   })
 })
