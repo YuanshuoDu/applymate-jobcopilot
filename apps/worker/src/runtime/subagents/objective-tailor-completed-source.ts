@@ -13,7 +13,7 @@ export type CompletedObjectiveTailorSourceEvidence = Readonly<{
   witness: ObjectiveTailorWaveCompletionWitness; outcomes: readonly ObjectiveTailorWaveSlotOutcome[]
 }>
 type Input = Readonly<{ userId: string; sessionId: string; reviewTurnId: string; sourceTurnId: string; rootTaskId: string;
-  graphItemId: string; graphRevision: number; selectedSlotIds: readonly string[]; reviewTurnMode?: "active" | "completed" }>
+  graphItemId: string; graphRevision: number; selectedSlotIds: readonly string[]; reviewTurnMode?: "active" | "completed"; evidenceSlotId?: string }>
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 const MANIFEST_V1 = "agent-harness.v2.task-graph-sources.v1"
 const MANIFEST_V2 = "agent-harness.v2.task-graph-sources.v2"
@@ -75,14 +75,15 @@ async function readSource(client: Queryable, input: Input): Promise<CompletedObj
   const terminal = await readTerminalItem(client, input, scope, inventory.graphRevision, inventory, reread)
   const rootResult = record(root.rows[0]?.result)
   if (!terminal || rootResult?.status !== "completed" || rootResult.finalItemId !== terminal.finalItemId) return undefined
-  const completed = await verifyCompletedObjectiveTailorWaveSlots({ client: client as PoolClient, scope, loaded: reread,
-    selectedSlotIds: input.selectedSlotIds })
-  if (completed.status !== "ready" || completed.outcomes.length !== input.selectedSlotIds.length
-    || completed.outcomes.some(value => value.status !== "ready" || !input.selectedSlotIds.includes(value.slotId))) return undefined
   for (const slotId of input.selectedSlotIds) {
     const ordinal = Number(slotId.slice(7))
     if (terminal.outcomes.slots[ordinal - 1]?.status !== "ready") return undefined
   }
+  const evidenceSlotIds = input.evidenceSlotId ? [input.evidenceSlotId] : input.selectedSlotIds
+  const completed = await verifyCompletedObjectiveTailorWaveSlots({ client: client as PoolClient, scope, loaded: reread,
+    selectedSlotIds: evidenceSlotIds })
+  if (completed.status !== "ready" || completed.outcomes.length !== evidenceSlotIds.length
+    || completed.outcomes.some(value => value.status !== "ready" || !evidenceSlotIds.includes(value.slotId))) return undefined
   return { sourceTurnId: input.sourceTurnId, reviewTurnId: input.reviewTurnId, sourceRootTaskId: scope.rootTaskId,
     graphItemId: reread.item.id, graphRevision: reread.item.revision, finalItemId: terminal.finalItemId,
     witness: completed.witness, outcomes: completed.outcomes }
@@ -174,6 +175,8 @@ function one(result: { rows: Row[] }, id: string): boolean { return result.rows.
 function validIds(value: Input): boolean {
   return [value.userId, value.sessionId, value.reviewTurnId, value.sourceTurnId, value.rootTaskId, value.graphItemId].every(safeId)
     && Number.isSafeInteger(value.graphRevision) && value.graphRevision > 0
+    && (value.evidenceSlotId === undefined || value.reviewTurnMode === "completed"
+      && value.selectedSlotIds.includes(value.evidenceSlotId))
 }
 function reviewIntentMatches(value: unknown, input: Input): boolean {
   const turnInput = record(value), envelope = record(turnInput?.intent)
