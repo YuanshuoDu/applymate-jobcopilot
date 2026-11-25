@@ -1026,16 +1026,30 @@ describe("rootless reviewed Fill Turn DLQ projection", () => {
   })
 })
 
-async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
+async function waitLine(child: Child, expected: string, timeoutMs = 30_000, startAt = 0): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
-    const line = child.lines.find(value => value === expected || value.startsWith(`${expected} `))
+    const line = child.lines.slice(startAt).find(value => value === expected || value.startsWith(`${expected} `))
     if (line) return line
     if (exited(child)) throw new Error(`Fixture exited before ${expected}; child=${JSON.stringify(childSummary(child))}`)
     await delay(25)
   }
   throw new Error(`Fixture line ${expected} missing; child=${JSON.stringify(childSummary(child))}`)
 }
+
+describe("fixture line cursor", () => {
+  it("does not accept an exact marker from before the current attempt", async () => {
+    const marker = "OBJECTIVE_SUBMIT_RECEIVED slot=2"
+    const lines = [marker]
+    const child = { lines, errors: [], exitCode: null, signalCode: null } as unknown as Child
+    let settled = false
+    const currentAttempt = waitLine(child, marker, 500, 1).then(value => { settled = true; return value })
+    await delay(5)
+    expect(settled).toBe(false)
+    lines.push(marker)
+    await expect(currentAttempt).resolves.toBe(marker)
+  })
+})
 
 async function armLegacyFinalResponseGate(turnId: string): Promise<void> {
   if (!worker?.stdin) throw new Error("Worker fixture stdin is unavailable")
@@ -3852,6 +3866,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const { POST: submitApprovalAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
       const objectiveSubmitBoundaryTrace = worker && !exited(worker)
         ? { child: worker, lineOffset: worker.lines.length } : undefined
+      if (!site) throw new Error("Fixture site is unavailable before Objective submission")
+      const objectiveSubmitLineCursor = site.lines.length
       const approvalResponse = await submitApprovalAction(apiRequest(
         `/api/agent/sessions/${sessionId}/actions`, token, "POST", {
           type: "approval_response", approvalId: submitApproval.id, decision: "approved", receiptNonce,
@@ -3920,7 +3936,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(jsonString(submitDispatch.payload, "constraintHash")).toBe(submitConstraintHash)
       const submitWorkerTaskId = jsonString(submitDispatch.payload, "workerTaskId")
       if (!submitWorkerTaskId) throw new Error("Submit outbox Worker task identity is missing")
-      await waitForOutboxPublished(submitDispatch.id)
+      const publishedSubmitDispatch = await waitForOutboxPublished(submitDispatch.id)
 
       let submittedTask: ApplicationTaskRow
       try {
@@ -4000,13 +4016,13 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(executionSettled).toMatchObject({ body: "Submit execution settled", data: executionData })
       expect(executionStarted.createdAt.getTime()).toBeLessThanOrEqual(submitReceiptEvent.createdAt.getTime())
       expect(submitReceiptEvent.createdAt.getTime()).toBeLessThanOrEqual(executionSettled.createdAt.getTime())
-      expect(submitDispatch.publishedAt).toBeInstanceOf(Date)
+      expect(publishedSubmitDispatch.publishedAt).toBeInstanceOf(Date)
       expect(jsonRecord(submitDispatch.payload)).toMatchObject({ applicationTaskId, userId: ids.user,
         jobId: selectedJobId, sessionId, fillTurnId, receiptId: submitApproval.id, workerTaskId: submitReceipt.workerTaskId,
         submitPayload: { operation: "submit", applicationTaskId, jobId: selectedJobId, sessionId, fillTurnId } })
 
       const expectedObjectiveSubmitLine = `OBJECTIVE_SUBMIT_RECEIVED slot=${selectedFixtureOrdinal}`
-      const objectiveSubmitLine = await waitLine(site!, expectedObjectiveSubmitLine, 10_000)
+      const objectiveSubmitLine = await waitLine(site!, expectedObjectiveSubmitLine, 10_000, objectiveSubmitLineCursor)
       expect(objectiveSubmitLine).toBe(expectedObjectiveSubmitLine)
       const submittedStats = await requestFixtureStats()
       expect(submittedStats.submitCount).toBe(beforeFinalApproval.submitCount)
@@ -4128,6 +4144,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
   it("submits five approved Objective slots with one stale Resume, guarded restart, and bounded rate windows", async () => {
     await requireObjectiveStandaloneScenarioCompletion(objectiveStandaloneScenarioCompletion)
+    const waveReceiverBaseline = await requestFixtureStats()
+    expect(waveReceiverBaseline.objectiveSubmitReceipts.map(receipt => receipt.slot)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
     const userId = `${ids.user}-objective-wave`
     const sessionId = `full-loop-objective-wave-session-${runId}`
     const suffix = `full-loop-objective-wave-${runId}`
@@ -4331,8 +4349,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
       const statsBeforeDecisions = await requestFixtureStats()
       expect(statsBeforeDecisions.objectiveGetCounts).toHaveLength(8)
-      expect(statsBeforeDecisions.objectiveSubmitReceipts.every(receipt => receipt.attempts === 0
-        && receipt.validAttempts === 0 && receipt.malformedAttempts === 0)).toBe(true)
+      expect(statsBeforeDecisions.objectiveSubmitReceipts.map(receipt => [
+        receipt.slot, receipt.attempts, receipt.validAttempts, receipt.malformedAttempts,
+      ])).toEqual(waveReceiverBaseline.objectiveSubmitReceipts.map(receipt => [
+        receipt.slot, receipt.attempts, receipt.validAttempts, receipt.malformedAttempts,
+      ]))
       const staleCandidate = currentByOrdinal.get(staleOrdinal)!, staleApprovalId = approvalIdByOrdinal.get(staleOrdinal)!
       const staleApplicationTaskId = (await testDb.agentApproval.findUniqueOrThrow({ where: { id: staleApprovalId }, select: { taskId: true } })).taskId
       if (!staleApplicationTaskId) throw new Error("Stale Objective member has no ApplicationTask")
@@ -4625,6 +4646,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           || browserBinding.attemptCount !== filler.attemptCount) throw new Error("Objective browser-start Filler identity changed")
         return { task, fillTurnId, approval, scopeHash, ...filler }
       }
+      type ApprovedObjectiveSubmission = Awaited<ReturnType<typeof prepareFilledSlot>> & {
+        scopeHash: string; siteLineCursor: number
+      }
       const approveFinalSubmission = async (slot: typeof submissionSlots[number], prepared: Awaited<ReturnType<typeof prepareFilledSlot>>) => {
         const freshToken = await signedBearer(userId)
         const { GET: getApproval } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
@@ -4639,6 +4663,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         if (receiptNonce.length < 20 || !/^[a-f0-9]{64}$/.test(rotatedScopeHash)
           || rotatedScopeHash === prepared.scopeHash) throw new Error("Objective final approval receipt rotation was invalid")
         const { POST: approveAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
+        if (!site) throw new Error("Fixture site is unavailable before Objective submission")
+        const siteLineCursor = site.lines.length
         const response = await approveAction(apiRequest(`/api/agent/sessions/${sessionId}/actions`, freshToken, "POST", {
           type: "approval_response", approvalId: prepared.approval.id, decision: "approved", receiptNonce,
         }), { params: Promise.resolve({ id: sessionId }) })
@@ -4653,10 +4679,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         }
         const dispatch = await waitForOutboxPublished(dispatchId)
         if (dispatch.attemptCount !== 1 || !dispatch.publishedAt) throw new Error("Objective submit dispatch was not acknowledged once")
-        return rotatedScopeHash
+        return { scopeHash: rotatedScopeHash, siteLineCursor }
       }
       const completeSubmittedSlot = async (slot: typeof submissionSlots[number], handoff: ObjectiveWaveHandoffProof,
-        prepared: Awaited<ReturnType<typeof prepareFilledSlot>>, restartCount: 0 | 1) => {
+        prepared: ApprovedObjectiveSubmission, restartCount: 0 | 1) => {
         const terminalFill = await waitForAgentTurnTerminal(handoff.fillTurnId, 180_000)
         if (terminalFill.status !== "completed") throw new Error("Objective Fill Turn did not complete")
         const task = await waitForReviewedApplicationTask(slot.jobId, value => value.id === slot.applicationTaskId
@@ -4675,7 +4701,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           || completedFillers[0]?.leaseExpiresAt !== null || completedFillers[0]?.interruptRequestedAt !== null) {
           throw new Error("Objective completed Filler attempt changed")
         }
-        await waitLine(site!, `OBJECTIVE_SUBMIT_RECEIVED slot=${slot.routeOrdinal}`, 30_000)
+        await waitLine(site!, `OBJECTIVE_SUBMIT_RECEIVED slot=${slot.routeOrdinal}`, 30_000, prepared.siteLineCursor)
         let durable: Awaited<ReturnType<typeof readObjectiveWaveSubmissionEvidence>> = null
         const proofDeadline = Date.now() + 60_000
         while (!durable && Date.now() < proofDeadline) {
@@ -4847,12 +4873,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           },
           async approveSubmitAndReadProof(slot, handoff) {
             const prepared = await prepareFilledSlot(slot, handoff)
-            const scopeHash = await approveFinalSubmission(slot, prepared)
-            return completeSubmittedSlot(slot, handoff, { ...prepared, scopeHash }, 0)
+            const approved = await approveFinalSubmission(slot, prepared)
+            return completeSubmittedSlot(slot, handoff, { ...prepared, ...approved }, 0)
           },
           async approveSubmitWithCrashRecoveryAndReadProof(slot, handoff) {
             const prepared = await prepareFilledSlot(slot, handoff)
-            let approved = prepared
+            let approved: ApprovedObjectiveSubmission | null = null
             const captured = worker
             if (!captured || exited(captured)) throw new Error("Objective pre-submit Worker is unavailable")
             let connection: InstanceType<typeof Client> | undefined
@@ -4866,12 +4892,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                     runId, userId, jobId: slot.jobId })
                 },
                 publishFinalApproval: async () => {
-                  const scopeHash = await approveFinalSubmission(slot, prepared)
-                  approved = { ...prepared, scopeHash }
+                  approved = { ...prepared, ...await approveFinalSubmission(slot, prepared) }
                 },
                 worker: captured,
                 waitForExit: waitExit,
                 async assertCommittedResult(phase) {
+                  if (!approved) throw new Error("Objective crash recovery omitted the approved submit attempt")
                   const next = await proveCommittedResult(slot, handoff, approved, phase, committed)
                   if (phase === "blocked") committed = next
                 },
@@ -4884,6 +4910,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
               })
               if (worker !== replacement || !exited(captured)) throw new Error("Objective restart did not replace one captured Worker")
               if (!committed) throw new Error("Objective crash recovery omitted the committed result proof")
+              if (!approved) throw new Error("Objective crash recovery omitted the approved submit attempt")
               return { proof: await completeSubmittedSlot(slot, handoff, approved, 1), restart: {
                 projectionBlocked: true as const, committedResultBeforeCrash: true as const, capturedWorkerKilled: true as const,
                 workerExitObserved: true as const, barrierUnblocked: true as const, successorStartedOnce: true as const,
