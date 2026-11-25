@@ -70,6 +70,11 @@ const mocks = vi.hoisted(() => {
     readApplyQueueMaterialMode: vi.fn().mockResolvedValue("ordinary"),
     hasExactObjectiveSubmitResult: vi.fn().mockResolvedValue(false),
     objectiveSubmit: vi.fn().mockResolvedValue({ status: "submitted", durationMs: 7 }),
+    objectiveObservation: {
+      arm: vi.fn().mockReturnValue(true), accept: vi.fn().mockReturnValue(true), reject: vi.fn(),
+      forward: vi.fn().mockReturnValue(true), waitForConfirmation: vi.fn().mockResolvedValue("confirmed"),
+      outcome: vi.fn().mockReturnValue("confirmed"), dispose: vi.fn(),
+    },
     objectiveTargetSupported: vi.fn((url: unknown) => url === "https://boards.greenhouse.io/acme/jobs/123"),
     objectiveMaterial: undefined as unknown,
     acquireStartFence: vi.fn(),
@@ -250,6 +255,10 @@ vi.mock("./objective-application-submit-material.js", () => ({
   objectiveApplicationSubmitTargetSupported: mocks.objectiveTargetSupported,
   runObjectiveGreenhouseApplicationSubmit: mocks.objectiveSubmit,
 }));
+vi.mock("../flows/objective-greenhouse-submission-observation.js", () => ({
+  OBJECTIVE_SUBMISSION_START_TIMEOUT_MS: 8_000,
+  createObjectiveGreenhouseSubmissionObservation: vi.fn(() => mocks.objectiveObservation),
+}));
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }));
 
 const payload = {
@@ -428,12 +437,14 @@ describe("apply-queue Phase 5 pipeline", () => {
       task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
       material: unknown;
       page: unknown;
+      observation: { arm: (intent: { url: string; method: string }) => boolean };
     }) => {
       expect(input.material).toEqual(material);
       expect(input.page).toBe(mocks.fakePage);
       expect(input.task.beforeSubmit).toEqual(expect.any(Function));
       const intent = { url: `${approvedUrl}/application`, method: "POST" };
       await expect(input.task.beforeSubmit?.(intent)).resolves.toBe(true);
+      expect(input.observation.arm(intent)).toBe(true);
       const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
       expect(handler).toEqual(expect.any(Function));
       await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
@@ -471,9 +482,11 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.recordObjectiveSubmitResult.mockResolvedValueOnce(null);
     const frame = mocks.fakePage.mainFrame();
     mocks.fakePage.mainFrame.mockReturnValue(frame);
-    mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> } }) => {
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      observation: { arm: (intent: { url: string; method: string }) => boolean } }) => {
       const intent = { url: `${approvedUrl}/application`, method: "POST" };
       await input.task.beforeSubmit?.(intent);
+      expect(input.observation.arm(intent)).toBe(true);
       const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
       await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
         frame: () => frame, isNavigationRequest: () => true }), continue: vi.fn(),
@@ -511,9 +524,11 @@ describe("apply-queue Phase 5 pipeline", () => {
     const routeContinue = vi.fn();
     mocks.objectiveSubmit.mockImplementationOnce(async (input: {
       task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      observation: { arm: (intent: { url: string; method: string }) => boolean };
     }) => {
       const intent = { url: `${approvedUrl}/application`, method: "POST" };
       await input.task.beforeSubmit?.(intent);
+      expect(input.observation.arm(intent)).toBe(true);
       const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
       await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
         frame: () => frame, isNavigationRequest: () => true }), continue: routeContinue,
@@ -620,9 +635,11 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.recordObjectiveSubmitResult.mockRejectedValueOnce(new Error("result link unavailable"));
     const frame = mocks.fakePage.mainFrame();
     mocks.fakePage.mainFrame.mockReturnValue(frame);
-    mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> } }) => {
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      observation: { arm: (intent: { url: string; method: string }) => boolean } }) => {
       const intent = { url: `${approvedUrl}/application`, method: "POST" };
       await expect(input.task.beforeSubmit?.(intent)).resolves.toBe(true);
+      expect(input.observation.arm(intent)).toBe(true);
       const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
       await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
         frame: () => frame, isNavigationRequest: () => true }), continue: vi.fn().mockResolvedValue(undefined),
