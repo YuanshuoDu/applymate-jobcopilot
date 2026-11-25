@@ -1103,6 +1103,13 @@ function apiRequest(path: string, token: string, method: "GET" | "PATCH" | "POST
   })
 }
 
+async function getObjectiveJourneyReport(sessionId: string, finalItemId: string, token: string): Promise<Response> {
+  const { GET } = await import("@/app/api/agent/sessions/[id]/final-items/[itemId]/objective-report/route")
+  return GET(apiRequest(`/api/agent/sessions/${sessionId}/final-items/${finalItemId}/objective-report`, token, "GET"), {
+    params: Promise.resolve({ id: sessionId, itemId: finalItemId }),
+  })
+}
+
 async function jsonResponse(response: Response): Promise<Record<string, unknown>> {
   const value: unknown = await response.json()
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected a JSON API response")
@@ -1735,7 +1742,7 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "objective_single_approval_pending" | "objective_single_approval_accepted" | "objective_single_handoff_published"
   | "objective_single_fill_ready" | "objective_single_submit_approved" | "objective_single_completed"
   | "objective_wave_source_ready" | "objective_wave_set_issued" | "objective_wave_stale_retired"
-  | "objective_wave_five_decided" | "objective_wave_first_handoff" | "objective_wave_completed"
+  | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
 
 function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
@@ -4287,6 +4294,37 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(candidates.map(candidate => candidate.ordinal)).toEqual(selectedOrdinals)
       expect(new Set(candidates.map(candidate => candidate.jobId)).size).toBe(6)
 
+      if (!sidecar) throw new Error("Objective source outcome sidecar is unavailable")
+      const initialReportResponse = await getObjectiveJourneyReport(sessionId, finalItemId, token)
+      expect(initialReportResponse.status).toBe(200)
+      expect(initialReportResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+      const initialReportEnvelope = await jsonResponse(initialReportResponse)
+      const initialReport = jsonRecord(initialReportEnvelope.report)
+      if (!initialReport) throw new Error("Objective journey source report is unavailable")
+      expect(Object.keys(initialReport).sort()).toEqual([
+        "finalItemId", "graphRevision", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
+      ])
+      expect(initialReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v1",
+        finalItemId, graphRevision: graphRow.revision, reviewCoverage: "complete" })
+      const expectedSourceCounts = jsonRecord(jsonRecord(finalContent?.objectiveTailorFinalOutcomes)?.sourceCounts)
+        ?? { discoveredJobs: { knownCount: null, coverage: "unavailable" }, analyzedJobs: { knownCount: null, coverage: "unavailable" } }
+      expect(initialReport.sourceCounts).toEqual(expectedSourceCounts)
+      const initialReportSlots = Array.isArray(initialReport.slots) ? initialReport.slots.map(jsonRecord) : []
+      expect(initialReportSlots).toHaveLength(8)
+      expect(initialReportSlots.map(slot => slot?.ordinal)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+      expect(initialReportSlots.map(slot => slot?.tailoringStatus)).toEqual(sidecar.slots.map(slot => slot.status))
+      expect(initialReportSlots.map(slot => slot?.reviewStatus)).toEqual(Array(8).fill("not_requested"))
+      expect(initialReportSlots.map(slot => slot?.reviewTurnId)).toEqual(Array(8).fill(null))
+      expect(initialReportSlots.map(slot => slot?.applicationStatus)).toEqual(Array(8).fill("not_started"))
+      expect(initialReportSlots.map(slot => slot?.submissionEvidence)).toEqual(Array(8).fill(null))
+      expect(initialReportSlots.every(slot => slot && Object.keys(slot).sort().join(",") ===
+        "applicationStatus,job,ordinal,retirementReason,reviewStatus,reviewTurnId,submissionEvidence,tailoringStatus")).toBe(true)
+      // This exact navigation ID is separately bound above and canonically embeds its owner ID.
+      const initialReportJson = JSON.stringify(Object.fromEntries(Object.entries(initialReport)
+        .filter(([key]) => key !== "finalItemId")))
+      expect([sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds, ...jobIds]
+        .some(privateId => initialReportJson.includes(privateId))).toBe(false)
+
       if (sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
       worker = spawnFixture("worker", userId, "objective_wave")
       await waitLine(worker, "WORKER_READY", 90_000)
@@ -4507,6 +4545,60 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(statsAfterDeferral.submitCount).toBe(statsBeforeDecisions.submitCount)
       expect(statsAfterDeferral.reviewedSubmitCount).toBe(statsBeforeDecisions.reviewedSubmitCount)
       selectedJobFullLoopPhase("objective_wave_five_decided")
+
+      const journeyReportResponse = await getObjectiveJourneyReport(sessionId, finalItemId, token)
+      expect(journeyReportResponse.status).toBe(200)
+      expect(journeyReportResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+      const journeyReportEnvelope = await jsonResponse(journeyReportResponse)
+      const journeyReport = jsonRecord(journeyReportEnvelope.report)
+      if (!journeyReport) throw new Error("Objective journey review report is unavailable")
+      expect(Object.keys(journeyReport).sort()).toEqual([
+        "finalItemId", "graphRevision", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
+      ])
+      expect(journeyReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v1",
+        finalItemId, graphRevision: graphRow.revision, sourceCounts: expectedSourceCounts, reviewCoverage: "complete" })
+      const journeySlots = Array.isArray(journeyReport.slots) ? journeyReport.slots.map(jsonRecord) : []
+      expect(journeySlots).toHaveLength(8)
+      expect(journeySlots.map(slot => [slot?.ordinal, slot?.tailoringStatus, slot?.reviewStatus,
+        slot?.reviewTurnId, slot?.retirementReason, slot?.applicationStatus, slot?.submissionEvidence])).toEqual([
+        [1, "ready", "approved", reviewTurnId, null, "preparing", null],
+        [2, "ready", "approved", reviewTurnId, null, "preparing", null],
+        [3, "rejected", "not_requested", null, null, "not_started", null],
+        [4, "ready", "approved", reviewTurnId, null, "preparing", null],
+        [5, "ready", "approved", reviewTurnId, null, "preparing", null],
+        [6, "ready", "expired", reviewTurnId, "resume_material_changed", "not_started", null],
+        [7, "ready", "approved", reviewTurnId, null, "preparing", null],
+        [8, "rejected", "not_requested", null, null, "not_started", null],
+      ])
+      expect(journeySlots.every(slot => slot && Object.keys(slot).sort().join(",") ===
+        "applicationStatus,job,ordinal,retirementReason,reviewStatus,reviewTurnId,submissionEvidence,tailoringStatus")).toBe(true)
+      expect(journeySlots.filter(slot => slot?.tailoringStatus === "ready")
+        .every(slot => Object.keys(jsonRecord(slot?.job) ?? {}).sort().join(",") === "company,role")).toBe(true)
+      const ownedJobLabels = await testDb.job.findMany({ where: { userId, id: { in: jobIds } }, select: { id: true, company: true, role: true } })
+      const ownedJobLabelById = new Map(ownedJobLabels.map(job => [job.id, job] as const))
+      expect(ownedJobLabelById.size).toBe(8)
+      for (const candidate of candidates) {
+        const ownedJob = ownedJobLabelById.get(candidate.jobId)
+        expect(jsonRecord(journeySlots[candidate.ordinal - 1]?.job)).toEqual(ownedJob && { company: ownedJob.company, role: ownedJob.role })
+      }
+      const journeyReportJson = JSON.stringify(Object.fromEntries(Object.entries(journeyReport)
+        .filter(([key]) => key !== "finalItemId")))
+      const privateReportMarkers = [sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds, ...jobIds,
+        ...approvalIdByOrdinal.values(), ...applicationTaskIdByApprovalId.values(), staleApplicationTaskId,
+        ...candidates.flatMap(candidate => [candidate.artifactRef.artifactId, candidate.artifactRef.contentHash,
+          candidate.artifactRef.sourceDigest]), ...[...intentByApprovalId.values()].map(data => jsonString(data, "materialProofHash") ?? ""),
+        "Synthetic confirmed engineering experience for this exact role.",
+        "Synthetic authorized Resume edit after six-slot Objective review."]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+      expect(privateReportMarkers.some(value => journeyReportJson.includes(value))).toBe(false)
+
+      const foreignReportResponse = await getObjectiveJourneyReport(sessionId, finalItemId, await signedBearer(ids.foreignUser))
+      expect(foreignReportResponse.status).toBe(404)
+      expect(foreignReportResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+      const foreignReportError = jsonRecord((await jsonResponse(foreignReportResponse)).error)
+      expect(Object.keys(foreignReportError ?? {}).sort()).toEqual(["code", "details", "message"])
+      expect(foreignReportError?.code).toBe("objective_journey_report_unavailable")
+      selectedJobFullLoopPhase("objective_wave_report_verified")
 
       const { runObjectiveWaveSubmissions } = await import("./application-task-full-loop.objective-wave-submission")
       const { readObjectiveWaveSubmissionEvidence } = await import("./application-task-full-loop.objective-wave-evidence")

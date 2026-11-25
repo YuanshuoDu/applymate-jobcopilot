@@ -86,7 +86,8 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
   const taskGraphSources = item.type === 'agent_message' && item.phase === 'final_answer' && item.status === 'completed'
     ? <FinalTaskGraphSources content={item.content} sessionId={item.sessionId} finalItemId={item.id} lang={lang} /> : null
   const objectiveTailorFinalOutcomes = item.type === 'agent_message' && item.phase === 'final_answer' && item.status === 'completed'
-    ? <ObjectiveTailorFinalOutcomes content={item.content} lang={lang} sessionId={item.sessionId} sourceTurnId={item.turnId} rootTaskId={item.taskId} /> : null
+    ? <ObjectiveTailorFinalOutcomes content={item.content} lang={lang} sessionId={item.sessionId} sourceTurnId={item.turnId}
+      rootTaskId={item.taskId} finalItemId={item.id} /> : null
   return <>
     <div style={{ display: 'grid', gap: 8 }}>
       {summary && <section aria-label={summaryLabel} data-agent-final-summary="true">
