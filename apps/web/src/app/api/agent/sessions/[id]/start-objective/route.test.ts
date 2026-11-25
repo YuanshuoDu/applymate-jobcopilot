@@ -119,6 +119,18 @@ describe("start-objective command API", () => {
     expect(mocks.start).not.toHaveBeenCalled()
   })
 
+  it("forwards the optional report score floor and rejects malformed values before admission", async () => {
+    const { POST } = await import("./route")
+    const zero = await POST(request(body({ reportScoreFloor: 0 })) as never, params)
+    expect(zero.status).toBe(202)
+    expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({ reportScoreFloor: 0 }))
+
+    mocks.start.mockClear()
+    const malformed = await POST(request(body({ reportScoreFloor: 10.01 })) as never, params)
+    expect(malformed.status).toBe(422)
+    expect(mocks.start).not.toHaveBeenCalled()
+  })
+
   it("preserves an explicitly present null requirements sentinel", async () => {
     const { POST } = await import("./route")
     const response = await POST(request(body({ verificationRequirements: null })) as never, params)

@@ -167,7 +167,10 @@ export interface ObjectiveStartCommand extends CommandIdentity {
   objective: string
   content: InputContentPart[]
   verificationRequirements?: ObjectiveVerificationRequirements | null
+  reportScoreFloor?: number
 }
+
+export { objectiveReportScoreFloorTurnInput } from "./objective-report-score-floor-turn-input"
 
 /** Server-owned intent metadata persisted with the root Turn input envelope. */
 export type ServerAgentTurnIntent = TurnIntent

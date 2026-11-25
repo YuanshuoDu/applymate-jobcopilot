@@ -68,6 +68,15 @@ describe("parseObjectiveStartBody", () => {
     expect(invalid).toMatchObject({ status: 422 })
   })
 
+  it("preserves an explicit report score floor including zero and rejects malformed values", () => {
+    expect(Object.hasOwn(parseObjectiveStartBody(baseBody, request(), sessionId) as object, "reportScoreFloor")).toBe(false)
+    expect(parseObjectiveStartBody({ ...baseBody, reportScoreFloor: 0 }, request(), sessionId)).toMatchObject({ reportScoreFloor: 0 })
+    expect(parseObjectiveStartBody({ ...baseBody, reportScoreFloor: 10 }, request(), sessionId)).toMatchObject({ reportScoreFloor: 10 })
+    for (const reportScoreFloor of [null, -0.1, 10.1, "7", Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(parseObjectiveStartBody({ ...baseBody, reportScoreFloor }, request(), sessionId)).toMatchObject({ status: 422 })
+    }
+  })
+
   it("accepts and canonicalizes the versioned exact-location requirement only when enabled", () => {
     const locationRequirements = {
       schemaVersion: "agent-harness.v2.objective-requirements.v2",

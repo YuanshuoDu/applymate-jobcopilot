@@ -38,6 +38,15 @@ describe("objective start request identity", () => {
     expect(objectiveStartRequestHash({ ...ordered, content: [ordered.content[0], { type: "text", text: "Changed" }] })).not.toBe(objectiveStartRequestHash(ordered))
   })
 
+  it("preserves the historical omitted hash and binds explicit report floors to the key", () => {
+    const omitted = objectiveStartRequestHash(command)
+    expect(objectiveStartRequestHash({ ...command, reportScoreFloor: undefined })).toBe(omitted)
+    expect(objectiveStartRequestHash({ ...command, reportScoreFloor: 0 })).not.toBe(omitted)
+    expect(objectiveStartRequestHash({ ...command, reportScoreFloor: 7 })).not.toBe(
+      objectiveStartRequestHash({ ...command, reportScoreFloor: 0 }),
+    )
+  })
+
   it("keeps optional JSON fields persistence-compatible while retaining the requirements sentinel", () => {
     const withUndefinedFilename = {
       ...command,

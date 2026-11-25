@@ -16,8 +16,10 @@ const ledgerMocks = vi.hoisted(() => {
   return {
     accepted,
     lock: vi.fn(async () => undefined),
-    hash: vi.fn((value: { sessionId: string; objective: string; content: unknown; verificationRequirements?: unknown }) =>
-      JSON.stringify([value.sessionId, value.objective.trim(), value.content, Object.hasOwn(value, "verificationRequirements") ? value.verificationRequirements : "omitted"])),
+    hash: vi.fn((value: { sessionId: string; objective: string; content: unknown; verificationRequirements?: unknown; reportScoreFloor?: number }) =>
+      JSON.stringify([value.sessionId, value.objective.trim(), value.content,
+        Object.hasOwn(value, "verificationRequirements") ? value.verificationRequirements : "omitted",
+        Object.hasOwn(value, "reportScoreFloor") ? value.reportScoreFloor : "floor omitted"])),
     lookup: vi.fn(async (_tx: unknown, commandValue: { userId: string; clientMessageId: string; sessionId: string }, requestHash: string) => {
       const row = accepted.get(`${commandValue.userId}:${commandValue.clientMessageId}`)
       if (!row) return null
@@ -133,6 +135,10 @@ describe("ObjectiveStartCommandService validation", () => {
     await expect(service.start(command("Find Dublin roles", "automation"))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
     await expect(service.start(unsafeCommand({ ...command("Find roles"), verificationRequirements: { raw: "unknown" } })))
       .rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    for (const reportScoreFloor of [null, -1, 10.1, "8"]) {
+      await expect(service.start(unsafeCommand({ ...command("Find roles"), reportScoreFloor })))
+        .rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    }
     vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
     try {
       await expect(service.start(unsafeCommand({
@@ -211,6 +217,32 @@ describe("ObjectiveStartCommandService validation", () => {
     }
   })
 
+  it("passes an explicit report floor to root creation without changing verification requirements", async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1", status: "running" }]),
+      agentInput: { findFirst: vi.fn().mockResolvedValue(null) },
+      agentTurn: { findFirst: vi.fn().mockResolvedValue(null) },
+      agentOutbox: { create: vi.fn().mockResolvedValue({}) },
+    }
+    const db = { $transaction: (work: (value: unknown) => Promise<unknown>) => work(tx) } as unknown as PrismaClient
+    const createRootTurn = vi.spyOn(transaction, "createRootTurn").mockResolvedValue({
+      id: "turn_report_floor", source: "user", status: "queued", revision: 0,
+    })
+    const acceptInputFacts = vi.spyOn(transaction, "acceptInputFacts").mockResolvedValue({
+      inputId: "input_report_floor", turnId: "turn_report_floor", sequence: "1",
+    })
+    try {
+      await new ObjectiveStartCommandService(db).start(unsafeCommand({
+        ...command("Find Dublin roles"), reportScoreFloor: 0,
+      }))
+      expect(createRootTurn.mock.calls[0]?.[1]).toMatchObject({ reportScoreFloor: 0 })
+      expect(createRootTurn.mock.calls[0]?.[6]).toBeUndefined()
+    } finally {
+      createRootTurn.mockRestore()
+      acceptInputFacts.mockRestore()
+    }
+  })
+
   it("replays an identical attempt and conflicts when the same key changes requirements", async () => {
     const tx = {
       $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1", status: "running" }]),
@@ -248,6 +280,9 @@ describe("ObjectiveStartCommandService validation", () => {
       expect(replay).toMatchObject({ inputId: original.inputId, turnId: original.turnId, disposition: "duplicate" })
       await expect(service.start(unsafeCommand({
         ...command("Find Dublin roles"), verificationRequirements: replayRequirements,
+      }))).rejects.toMatchObject({ code: "objective_start_idempotency_conflict", status: 409 })
+      await expect(service.start(unsafeCommand({
+        ...command("Find Dublin roles"), verificationRequirements: validRequirements, reportScoreFloor: 0,
       }))).rejects.toMatchObject({ code: "objective_start_idempotency_conflict", status: 409 })
       expect(tx.agentTurn.create).toHaveBeenCalledOnce()
       expect(acceptInputFacts).toHaveBeenCalledOnce()

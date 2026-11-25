@@ -1187,6 +1187,7 @@ describe("AgentCommandService", () => {
       content: [...content],
       intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
       verificationRequirements,
+      reportScoreFloor: 6,
     }
     const fake = makeDb({ retryTarget: retryTarget("failed", input, "user", "canonical_task_graph") })
 
@@ -1197,6 +1198,7 @@ describe("AgentCommandService", () => {
       content,
       intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
       verificationRequirements,
+      reportScoreFloor: 6,
     })
     expect(fake.state.active?.input).toMatchObject({ retryLineage: {
       schemaVersion: "agent-harness.v2.retry-lineage.v1", predecessorTurnId: "turn_failed",

@@ -27,6 +27,7 @@ import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-histor
 import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
 import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "./context/root-task-goal-criteria-context.js"
 import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./context/task-graph-objective-progress.js"
+import { OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID } from "./objective-report-score-floor-context.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
 import { OBJECTIVE_TAILOR_WAVE_CATALOG_OBSERVATION_ID } from "./canonical-turn-objective-tailor-wave-context.js"
 import { mergeTaskGraphCurrentObservation, OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID } from "./canonical-turn-task-graph-context.js"
@@ -367,6 +368,46 @@ describe("canonical Turn context builder", () => {
     expect(waveObservation?.content).toEqual({ kind: "objective_tailor_wave_candidate_catalog", catalog: waveCatalog })
     expect(waveReader).toHaveBeenCalledOnce()
     expect(reader).not.toHaveBeenCalled()
+  })
+
+  it("reuses the immutable report-only score floor on Objective planning and strips caller observations", async () => {
+    const snapshots: StepContextRequest["snapshot"][] = []
+    const baseBuilder = { build: vi.fn(async request => {
+      snapshots.push(request.snapshot)
+      return { schemaVersion: "agent-harness.v2" as const, sessionId: request.sessionId, turnId: request.turnId,
+        stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}" }
+    }) }
+    const turnInput = { goal: "Find roles", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, reportScoreFloor: 7 }
+    const build = async (inputOverrides: Partial<Parameters<typeof createCanonicalTurnContextBuilder>[0]>) => {
+      const builder = createCanonicalTurnContextBuilder({
+        pool: { connect: async () => { throw new Error("injected readers avoid database access") } } as unknown as Pick<pg.Pool, "connect">,
+        store: store([]), baseBuilder, scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
+        turnInput, rootTaskObjective: { goal: "Find roles", successCriteria: [] },
+        planningEnabled: true, selectedJobMode: false, objectiveTaskGraphMode: true,
+        currentRootBudgetReader: async () => unavailableBudget, rootTaskHistoryDirectReader: { load: async () => [] },
+        ...inputOverrides,
+      })
+      await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "report-floor-" + snapshots.length,
+        snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], taskGraphRevision: 3,
+          toolObservations: [{ id: OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID, content: { reportScoreFloor: 99 } }] } })
+    }
+
+    await build({})
+    await build({})
+    const first = snapshots[0]?.toolObservations.find(item => item.id === OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID)
+    const second = snapshots[1]?.toolObservations.find(item => item.id === OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID)
+    expect(first?.content).toEqual({
+      schemaVersion: "agent-harness.v2.objective-report-score-floor-context.v1",
+      kind: "objective_report_score_floor", status: "requested", reportingOnly: true,
+      notVerificationCriterion: true, reportScoreFloor: 7,
+    })
+    expect(second).toEqual(first)
+    expect(snapshots[0]?.toolObservations.some(item => item.id === ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID)).toBe(false)
+
+    await build({ objectiveTaskGraphMode: false })
+    expect(snapshots[2]?.toolObservations.some(item => item.id === OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID)).toBe(false)
+    await build({ selectedJobMode: true, selectedJobHistoryReader: { load: async () => [] } })
+    expect(snapshots[3]?.toolObservations.some(item => item.id === OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID)).toBe(false)
   })
 
   it("derives the private Root goal revision from the persisted Turn and matching Root objective", () => {

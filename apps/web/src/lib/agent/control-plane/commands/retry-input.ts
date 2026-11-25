@@ -1,4 +1,5 @@
-import { REVIEWED_APPLICATION_REVIEW_INTENT, TurnIntentSchema, validate, type InputContentPart, type TurnIntent } from '@jobcopilot/agent-protocol'
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, parseObjectiveReportScoreFloor, REVIEWED_APPLICATION_REVIEW_INTENT,
+  TurnIntentSchema, validate, type InputContentPart, type TurnIntent } from '@jobcopilot/agent-protocol'
 
 import { retryInputInvalid } from './errors'
 import {
@@ -25,8 +26,9 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): {
   selectedJobPreparation?: { jobId: string }
   intent?: TurnIntent
   verificationRequirements?: ObjectiveVerificationRequirements | null
+  reportScoreFloor?: number
 } {
-  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation', 'intent', 'verificationRequirements', 'retryLineage']) ||
+  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation', 'intent', 'verificationRequirements', 'reportScoreFloor', 'retryLineage']) ||
     !boundedGoal(value.goal) || (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
     !Array.isArray(value.content) || value.content.length < 1 || value.content.length > MAX_RETRY_PARTS) throw retryInputInvalid(turnId)
   if (Object.hasOwn(value, 'retryLineage') && !parseRetryLineageReceipt(value.retryLineage)) throw retryInputInvalid(turnId)
@@ -64,12 +66,20 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): {
         !objectiveLocationVerificationEnabled()) throw retryInputInvalid(turnId)
     }
   }
+  const hasReportScoreFloor = Object.hasOwn(value, 'reportScoreFloor')
+  const reportScoreFloor = hasReportScoreFloor ? parseObjectiveReportScoreFloor(value.reportScoreFloor) : null
+  if (hasReportScoreFloor && (reportScoreFloor === null ||
+    intent?.kind !== OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind ||
+    intent.version !== OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version || selectedJobPreparation !== undefined)) {
+    throw retryInputInvalid(turnId)
+  }
   return {
     goal,
     content,
     ...(selectedJobPreparation ? { selectedJobPreparation } : {}),
     ...(intent ? { intent } : {}),
     ...(Object.hasOwn(value, 'verificationRequirements') ? { verificationRequirements } : {}),
+    ...(hasReportScoreFloor ? { reportScoreFloor: reportScoreFloor! } : {}),
   }
 }
 

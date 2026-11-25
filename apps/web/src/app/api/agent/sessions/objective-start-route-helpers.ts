@@ -1,4 +1,4 @@
-import { AgentInputCommandSchema, assertValid, schemaVersion, type InputContentPart } from "@jobcopilot/agent-protocol"
+import { AgentInputCommandSchema, assertValid, parseObjectiveReportScoreFloor, schemaVersion, type InputContentPart } from "@jobcopilot/agent-protocol"
 import { NextResponse } from "next/server"
 
 import { MAX_ATTACHMENT_REFS, MAX_CONTENT_PARTS, MAX_TEXT_PART_LENGTH } from "./command-route-helpers"
@@ -14,6 +14,7 @@ export type ParsedObjectiveStartCommand = {
   objective: string
   content: InputContentPart[]
   verificationRequirements?: ObjectiveVerificationRequirements | null
+  reportScoreFloor?: number
 }
 
 type RecordBody = Record<string, unknown>
@@ -84,7 +85,7 @@ export function parseObjectiveStartBody(
   request: Request,
   sessionId: string,
 ): ParsedObjectiveStartCommand | NextResponse {
-  if (!isRecord(body) || !exactKeys(body, ["schemaVersion", "clientMessageId", "objective", "content", "verificationRequirements"])) {
+  if (!isRecord(body) || !exactKeys(body, ["schemaVersion", "clientMessageId", "objective", "content", "verificationRequirements", "reportScoreFloor"])) {
     return invalid("Unsupported or forbidden objective start field")
   }
   const clientMessageId = trimmedString(body.clientMessageId)
@@ -110,10 +111,14 @@ export function parseObjectiveStartBody(
       }
     }
   }
+  const hasScoreFloor = Object.hasOwn(body, "reportScoreFloor")
+  const reportScoreFloor = hasScoreFloor ? parseObjectiveReportScoreFloor(body.reportScoreFloor) : null
+  if (hasScoreFloor && reportScoreFloor === null) return invalid("Objective report score floor must be a number from 0 to 10")
   return {
     clientMessageId,
     objective,
     content,
     ...(hasRequirements ? { verificationRequirements } : {}),
+    ...(hasScoreFloor ? { reportScoreFloor: reportScoreFloor! } : {}),
   }
 }

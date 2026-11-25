@@ -23,6 +23,7 @@ import {
 } from "./context/root-task-goal-criteria-context.js"
 import { resolveRootTaskVerificationRequirements } from "./context/root-task-objective.js"
 import { taskGraphObjectiveProgressObservation, TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./context/task-graph-objective-progress.js"
+import { objectiveReportScoreFloorObservation, OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID } from "./objective-report-score-floor-context.js"
 import {
   appendCanonicalSelectedJobHistory, appendCanonicalSelectedJobHistoryOutcomes,
   type DirectSelectedJobHistoryReader, type SelectedJobHistoryReader,
@@ -166,8 +167,12 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
         verificationRequirements = rootTaskVerificationRequirementsObservation(input.turnInput)
       }
       const toolObservations = snapshot.toolObservations.filter(observation => observation.id !== ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID
-        && observation.id !== TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID)
+        && observation.id !== TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID
+        && observation.id !== OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID)
       if (verificationRequirements) toolObservations.push(verificationRequirements)
+      const reportScoreFloor = input.objectiveTaskGraphMode === true && input.planningEnabled && !input.selectedJobMode
+        && hasObjectiveTaskGraphIntent(input.turnInput) ? objectiveReportScoreFloorObservation(input.turnInput) : undefined
+      if (reportScoreFloor) toolObservations.push(reportScoreFloor)
       const objectiveProgress = taskGraphObjectiveProgressObservation({
         resolution: objectiveRequirements, observations: toolObservations,
         taskGraphRevision: snapshot.taskGraphRevision, rootTaskId: input.rootTaskId,

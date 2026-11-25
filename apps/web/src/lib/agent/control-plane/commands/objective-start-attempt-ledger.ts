@@ -1,5 +1,5 @@
 import { Prisma, type PrismaClient } from "@prisma/client"
-import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate, type InputContentPart } from "@jobcopilot/agent-protocol"
+import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, parseObjectiveReportScoreFloor, TurnIntentSchema, validate, type InputContentPart } from "@jobcopilot/agent-protocol"
 
 import { objectiveStartIdempotencyConflict } from "./errors"
 import { stateWithAvailableReceiptTarget } from "./objective-start-attempt-read-model"
@@ -106,6 +106,8 @@ async function findLegacyObjectiveStart(tx: CommandTransaction, userId: string, 
   const requirementsPresent = turnInput !== null && Object.hasOwn(turnInput, "verificationRequirements")
   const rawRequirements = turnInput?.verificationRequirements
   const requirements = rawRequirements === null ? null : parseObjectiveVerificationRequirements(rawRequirements)
+  const scoreFloorPresent = turnInput !== null && Object.hasOwn(turnInput, "reportScoreFloor")
+  const reportScoreFloor = scoreFloorPresent ? parseObjectiveReportScoreFloor(turnInput?.reportScoreFloor) : null
   if (input.userId !== userId || input.session.userId !== userId || input.targetTurn.userId !== userId
     || input.sessionId !== input.targetTurn.sessionId || input.targetTurn.id !== input.targetTurnId
     || input.clientMessageId !== clientMessageId
@@ -114,7 +116,8 @@ async function findLegacyObjectiveStart(tx: CommandTransaction, userId: string, 
     || typeof objective !== "string" || !objective || objective !== objective.trim()
     || !Array.isArray(content) || !content.every((part) => validate(InputContentPartSchema, part))
     || !samePersistedJson(content, input.content)
-    || (requirementsPresent && rawRequirements !== null && requirements === null)) return { kind: "unverified" }
+    || (requirementsPresent && rawRequirements !== null && requirements === null)
+    || (scoreFloorPresent && reportScoreFloor === null)) return { kind: "unverified" }
 
   const event = await tx.agentEvent.findFirst({
     where: { sessionId: input.sessionId, idempotencyKey: `agent-command:${clientMessageId}` },
@@ -131,6 +134,7 @@ async function findLegacyObjectiveStart(tx: CommandTransaction, userId: string, 
     userId, clientMessageId, sessionId: input.sessionId, objective,
     content: content as InputContentPart[],
     ...(requirementsPresent ? { verificationRequirements: requirements } : {}),
+    ...(scoreFloorPresent ? { reportScoreFloor: reportScoreFloor! } : {}),
   })
   return {
     kind: "accepted", requestHash,
