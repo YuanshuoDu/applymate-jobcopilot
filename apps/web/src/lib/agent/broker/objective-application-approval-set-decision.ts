@@ -7,6 +7,7 @@ import { readObjectiveApplicationResumeWitness } from "../approval/objective-app
 import { sameObjectiveApplicationResumeWitness } from "@jobcopilot/shared"
 import { ApprovalStoreError } from "../approval/types"
 import { loadLockedObjectiveApprovalSetMembers, parseObjectiveApprovalSetMemberEnvelope } from "./objective-approval-set-decision-data"
+import { recordObjectiveApplicationApprovalRetirement, type ObjectiveApplicationApprovalRetirementReason } from "./objective-application-approval-retirement"
 import { waitNotFound, waitNotPending, waitRevisionMismatch, waitScopeMismatch } from "./errors"
 import type { LoadedObjectiveApprovalSetMember, ObjectiveApprovalSetMember } from "./objective-approval-set-decision-data"
 
@@ -198,17 +199,18 @@ export async function decideObjectiveApplicationApprovalSetMemberInTransaction(
   if (turn.revision !== input.expectedRevision) throw waitRevisionMismatch(input.expectedRevision, turn.revision)
 
   const setExpired = new Date(set.expiresAt) <= now, pending = members.filter(({ row }) => row.status === "pending")
-  const stale = new Set<string>()
+  const stale = new Map<string, ObjectiveApplicationApprovalRetirementReason>()
   for (const member of pending) {
-    if (setExpired || member.row.expiresAt! <= now) { stale.add(member.member.approvalId); continue }
+    if (setExpired || member.row.expiresAt! <= now) { stale.set(member.row.id, "approval_ttl_reached"); continue }
     try {
       await assertApprovalFreshnessInTransaction(tx, { id: member.row.id, userId: input.userId, sessionId: input.sessionId, turnId: input.expectedTurnId })
     } catch (error) {
-      if (error instanceof ApprovalStoreError && error.code === "approval_revision_mismatch") stale.add(member.row.id)
-      else throw error
+      if (error instanceof ApprovalStoreError && error.code === "approval_revision_mismatch") { stale.set(member.row.id, "approval_revision_changed"); continue }
+      throw error
     }
     const current = await readObjectiveApplicationResumeWitness(tx, { userId: input.userId, jobId: member.member.jobId })
-    if (!current || !sameObjectiveApplicationResumeWitness(member.member.resumeWitness, current)) stale.add(member.row.id)
+    if (!current) stale.set(member.row.id, "resume_witness_unavailable")
+    else if (!sameObjectiveApplicationResumeWitness(member.member.resumeWitness, current)) stale.set(member.row.id, "resume_material_changed")
   }
   let selectedStatus: DecisionStatus = input.decision
   let selectedSource: ObjectiveApprovalSetSourceInput | null = null
@@ -218,7 +220,7 @@ export async function decideObjectiveApplicationApprovalSetMemberInTransaction(
       slotOrdinal: selected.slotOrdinal, member: selected.member }
     const freshness = await hooks.verifySource(tx, selectedSource)
     if (freshness !== "current" && freshness !== "stale") throw waitScopeMismatch()
-    if (freshness === "stale") { stale.add(selected.row.id); selectedStatus = "expired" }
+    if (freshness === "stale") { stale.set(selected.row.id, "completed_source_changed"); selectedStatus = "expired" }
   }
   const resulting = members.map(({ row }) => row.status === "pending"
     ? row.id === selected.row.id ? selectedStatus : stale.has(row.id) ? "expired" : "pending"
@@ -227,6 +229,7 @@ export async function decideObjectiveApplicationApprovalSetMemberInTransaction(
   const nextTurnRevision = setCompleted ? turn.revision + 1 : turn.revision
   for (const member of pending) if (stale.has(member.row.id)) {
     await updateMember(tx, member, "expired", now)
+    await recordObjectiveApplicationApprovalRetirement(tx, member, set.setId, set.sourceTurnId, stale.get(member.row.id)!)
     await appendMemberOutcome(tx, member, set.setId, itemId, "expired", nextTurnRevision,
       member.row.id === selected.row.id ? input.clientMessageId : undefined,
       member.row.id === selected.row.id ? input.decision : undefined, member.row.id === selected.row.id ? input.expectedRevision : undefined)
