@@ -1,6 +1,8 @@
 import { Prisma, type PrismaClient } from "@prisma/client"
 import {
   buildReviewedFillHandoffOutboxData,
+  OBJECTIVE_REVIEWED_FILL_HANDOFF_TOPIC,
+  parseObjectiveReviewedFillHandoffOutboxRow,
   parseReviewedFillHandoffOutboxRow,
   type ReviewedFillHandoffIntent,
 } from "@jobcopilot/shared"
@@ -11,6 +13,7 @@ import { AutoApplyError } from "@/lib/auto-apply-guards"
 import { ReviewedFillHandoffDeferredError } from "./reviewed-fill-handoff"
 import { ReviewedFillSourceBindingError, readAcceptedReviewedFillSource } from "./reviewed-fill-source-binding"
 import { acknowledgeExistingReviewedFillHandoff, assertReviewedFillLaunchAllowed } from "./reviewed-fill-admission"
+import { processObjectiveReviewedFillHandoffOutbox } from "./objective-reviewed-fill-dispatch"
 
 type EnqueueClient = Prisma.TransactionClient
 type ApprovedRow = {
@@ -89,6 +92,13 @@ export async function processReviewedFillHandoffOutbox(
   if (!identity(outboxId)) throw new ReviewedFillHandoffOutboxNotFoundError()
   const row = await db.agentOutbox.findUnique({ where: { id: outboxId },
     select: { id: true, topic: true, aggregateId: true, idempotencyKey: true, payload: true, publishedAt: true } })
+  if (!row) throw new ReviewedFillHandoffOutboxNotFoundError()
+  if (row.topic === OBJECTIVE_REVIEWED_FILL_HANDOFF_TOPIC) {
+    const objective = parseObjectiveReviewedFillHandoffOutboxRow({ id: row.id, topic: row.topic,
+      aggregateId: row.aggregateId, idempotencyKey: row.idempotencyKey, payload: row.payload })
+    if (!objective) return "terminal"
+    return row.publishedAt !== null ? "duplicate" : processObjectiveReviewedFillHandoffOutbox(db, objective)
+  }
   if (!row || row.topic !== "agent.reviewed-fill.dispatch") throw new ReviewedFillHandoffOutboxNotFoundError()
   const parsed = intentFromRow(row)
   if (!parsed) return "terminal"

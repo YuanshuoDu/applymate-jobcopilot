@@ -71,6 +71,18 @@ describe("apply-results exact-attempt writes", () => {
 
     expect(query).not.toHaveBeenCalledWith(expect.stringContaining("INSERT INTO apply_results"), expect.anything());
   });
+
+  it("inserts through the caller's transaction client without opening another connection", async () => {
+    const { module, query, pool } = await loadMockedApplyResults();
+    const client = { query } as unknown as PoolClient;
+
+    await expect(module.insertApplyResultWithClient(client, {
+      userId: "user-1", jobId: "job-1", status: "submitted", flowUsed: "application.submit",
+    })).resolves.toBe(19);
+
+    expect(pool.connect).not.toHaveBeenCalled();
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO apply_results"), expect.any(Array));
+  });
 });
 
 describe.runIf(RUN_INTEGRATION)("apply-results (integration — real Postgres)", () => {

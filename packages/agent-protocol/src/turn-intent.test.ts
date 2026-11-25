@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
 import { validate } from './validation.js'
+import { OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA } from './objective-application-review-intent.js'
 import {
+  OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT,
   OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
   REVIEWED_APPLICATION_REVIEW_INTENT,
   SELECTED_JOB_BATCH_PREPARATION_INTENT,
@@ -14,6 +16,11 @@ describe('closed Turn intents', () => {
     expect(validate(TurnIntentSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)).toBe(true)
     expect(validate(TurnIntentSchema, { kind: 'interactive_discovery_shortlist', version: 1 })).toBe(true)
     expect(validate(TurnIntentSchema, { ...REVIEWED_APPLICATION_REVIEW_INTENT, sourceTurnId: 'source-turn-1', jobId: 'job-1' })).toBe(true)
+    const objectiveReviewIntent = { ...OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT, selection: {
+      schema: OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, sourceTurnId: 'source-1', rootTaskId: 'root-1',
+      graphItemId: 'graph-1', graphRevision: 2, slotOrdinals: [1, 3],
+    } }
+    expect(validate(TurnIntentSchema, objectiveReviewIntent)).toBe(true)
   })
 
   it('rejects unknown kinds, versions, and extra fields', () => {
@@ -32,6 +39,8 @@ describe('closed Turn intents', () => {
       { ...REVIEWED_APPLICATION_REVIEW_INTENT, sourceTurnId: 'source-turn-1', jobId: 'x'.repeat(257) },
       { ...REVIEWED_APPLICATION_REVIEW_INTENT, sourceTurnId: 'source-turn-1', jobId: 'job-1', clientControlled: true },
       { kind: 'reviewed_application_review', version: 2, sourceTurnId: 'source-turn-1' },
+      { ...OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT, selection: { schema: OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA,
+        sourceTurnId: 'source-1', rootTaskId: 'root-1', graphItemId: 'graph-1', graphRevision: 2, slotOrdinals: [1], jobId: 'client-job' } },
     ]) expect(validate(TurnIntentSchema, intent)).toBe(false)
   })
 })

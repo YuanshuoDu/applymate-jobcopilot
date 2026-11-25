@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
   loadAndDispatchReview: vi.fn(),
+  finalizeObjectiveSubmit: vi.fn(),
   prepareSetup: vi.fn(),
   createBatchRuntime: vi.fn(),
   prepareBatchRuntime: vi.fn(),
@@ -9,6 +10,9 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("./canonical-reviewed-application-review-dispatch.js", () => ({
   loadAndDispatchCanonicalReviewedApplicationReview: mocks.loadAndDispatchReview,
+}))
+vi.mock("./canonical-objective-application-submit-finalizer.js", () => ({
+  finalizeCanonicalObjectiveApplicationSubmit: mocks.finalizeObjectiveSubmit,
 }))
 vi.mock("./canonical-turn-runtime-turn-setup.js", () => ({
   prepareCanonicalTurnSetup: mocks.prepareSetup,
@@ -48,7 +52,7 @@ describe("prepareCanonicalTurnReviewedBatchSetup", () => {
   })
 
   it("forwards reviewed setup options, installs the batch gate, and keeps the review wait port", async () => {
-    const setupOptions = { stateLoader: vi.fn() }
+    const setupOptions = { stateLoader: vi.fn().mockResolvedValue({ source: "user", resume: { stepCount: 2 } }) }
     const durableWaitPort = { marker: "review-port" }
     const state = { source: "user" }
     const scopedState = { source: "user", scoped: true }
@@ -56,6 +60,7 @@ describe("prepareCanonicalTurnReviewedBatchSetup", () => {
     const runtime = { checkCandidate: vi.fn() }
     const setup = { state, selectedJobMode: false, selectedJobBatch, root: { id: "root-1" } }
     mocks.loadAndDispatchReview.mockResolvedValue({ result: undefined, setupOptions, durableWaitPort })
+    mocks.finalizeObjectiveSubmit.mockResolvedValue(undefined)
     mocks.prepareSetup.mockResolvedValue(setup)
     mocks.prepareBatchRuntime.mockReturnValue({ state: scopedState, runtime })
 
@@ -63,6 +68,7 @@ describe("prepareCanonicalTurnReviewedBatchSetup", () => {
       setup, state: scopedState, selectedJobRootMode: true, batchRuntime: runtime, durableWaitPort,
     })
     expect(mocks.prepareSetup).toHaveBeenCalledWith(expect.objectContaining({ options: setupOptions, batchCompletionGate: mocks.createBatchRuntime }))
+    expect(mocks.finalizeObjectiveSubmit).toHaveBeenCalledWith(expect.objectContaining({ state: { source: "user", resume: { stepCount: 2 } } }))
     expect(mocks.prepareBatchRuntime).toHaveBeenCalledWith(expect.objectContaining({
       state, selectedJobBatch, root: setup.root, commandPort: { marker: "command-port" },
     }))
@@ -72,10 +78,25 @@ describe("prepareCanonicalTurnReviewedBatchSetup", () => {
 
   it("returns setup failures before constructing a batch runtime", async () => {
     const earlyResult = { status: "failed", summary: "setup-unavailable" }
-    mocks.loadAndDispatchReview.mockResolvedValue({ result: undefined, setupOptions: {}, durableWaitPort: {} })
+    mocks.loadAndDispatchReview.mockResolvedValue({ result: undefined,
+      setupOptions: { stateLoader: vi.fn().mockResolvedValue({ source: "automation" }) }, durableWaitPort: {} })
+    mocks.finalizeObjectiveSubmit.mockResolvedValue(undefined)
     mocks.prepareSetup.mockResolvedValue({ earlyResult })
 
     await expect(prepareCanonicalTurnReviewedBatchSetup(input())).resolves.toEqual({ earlyResult })
+    expect(mocks.prepareBatchRuntime).not.toHaveBeenCalled()
+  })
+
+  it("does not build model setup after the exact Objective submit finalizer handles the Turn", async () => {
+    const state = { source: "user", resume: { stepCount: 3 } }
+    const setupOptions = { stateLoader: vi.fn().mockResolvedValue(state) }
+    const durableWaitPort = { marker: "review-port" }
+    const terminal = { status: "completed", summary: "objective_submit_finalized" }
+    mocks.loadAndDispatchReview.mockResolvedValue({ result: undefined, setupOptions, durableWaitPort })
+    mocks.finalizeObjectiveSubmit.mockResolvedValue(terminal)
+
+    await expect(prepareCanonicalTurnReviewedBatchSetup(input())).resolves.toEqual({ earlyResult: terminal })
+    expect(mocks.prepareSetup).not.toHaveBeenCalled()
     expect(mocks.prepareBatchRuntime).not.toHaveBeenCalled()
   })
 })

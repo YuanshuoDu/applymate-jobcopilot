@@ -15,6 +15,9 @@ import { checkRateLimit } from "../../rate-limit.js"
 import type { SubagentLease } from "./types.js"
 import { executeApplicationFillForReview, type ApplicationFillStageObservation } from "./application-fill-for-review.js"
 import { readSelectedJobReviewedArtifactWithClient, type SelectedJobReviewedArtifact } from "../selected-job-reviewed-artifact-read.js"
+import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, buildObjectiveApplicationResumeWitness,
+  type ObjectiveApplicationResumeMaterial, type ObjectiveReviewedFillSource } from "@jobcopilot/shared"
+import type { ObjectiveReviewedApplicationFillEvidence } from "../objective-reviewed-application-fill-read.js"
 
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }))
 vi.mock("../../cloak/pool.js", () => ({ withCloakContext: vi.fn() }))
@@ -29,6 +32,11 @@ vi.mock("../../flows/index.js", () => ({ executeBrowserFill: vi.fn() }))
 vi.mock("../../queue/unattended-apply-control.js", () => ({ evaluateUnattendedApplyControl: vi.fn() }))
 vi.mock("../../rate-limit.js", () => ({ checkRateLimit: vi.fn() }))
 vi.mock("../selected-job-reviewed-artifact-read.js", () => ({ readSelectedJobReviewedArtifactWithClient: vi.fn() }))
+const objectiveReader = vi.hoisted(() => ({ fromPool: vi.fn(), withClient: vi.fn() }))
+vi.mock("../objective-reviewed-application-fill-read.js", () => ({
+  readObjectiveReviewedApplicationFillSourceFromPool: objectiveReader.fromPool,
+  readObjectiveReviewedApplicationFillSource: objectiveReader.withClient,
+}))
 
 const browserPageMock = {
   goto: vi.fn(async (): Promise<Awaited<ReturnType<Page["goto"]>>> => null),
@@ -50,6 +58,16 @@ const reviewedMaterial: SelectedJobReviewedArtifact = {
 const reviewedTurnInput = { reviewedApplicationMaterialSource: {
   schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: reviewedMaterial.sourceTurnId,
 } }
+const objectiveResume: ObjectiveApplicationResumeMaterial = { name: "Approved tailored resume",
+  content: { basics: { name: "Approved applicant" }, experience: [{ company: "Example" }] }, templateId: "modern",
+  templateOptions: { accent: "blue" }, kind: "adapted", targetJobId: "job-1", parentResumeId: "resume-base", basicsDetached: false }
+const objectiveResumeWitness = buildObjectiveApplicationResumeWitness({ userId: "user-1", jobId: "job-1", resumeId: "resume-approved",
+  finalResumeAssignmentRevision: 4, materialRevision: 7, material: objectiveResume })!
+const objectiveSource: ObjectiveReviewedFillSource = { schemaVersion: OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+  approvalId: `objective-review:objective-review-${"a".repeat(40)}:2`, reviewTurnId: "review-turn-1", materialProofHash: "b".repeat(64) }
+const objectiveTurnInput = { reviewedApplicationMaterialSource: objectiveSource }
+const objectiveEvidence = { source: objectiveSource, approvedIntent: {} as never, proof: {} as never,
+  reviewedArtifact: reviewedMaterial, resumeWitness: objectiveResumeWitness, resumeContent: objectiveResume.content } as ObjectiveReviewedApplicationFillEvidence
 
 function context(overrides: Record<string, unknown> = {}): FillContextFixture {
   return {
@@ -308,6 +326,57 @@ describe("executeApplicationFillForReview", () => {
       reviewedCoverLetterHash: expect.stringMatching(/^[a-f0-9]{64}$/), attemptCount: 1,
     })
     expect(JSON.stringify(completion?.reviewedFillReadback)).not.toContain(reviewedMaterial.content)
+  })
+
+  it("uses the fenced approved Objective Resume unchanged even when Job keywords are present", async () => {
+    const { pool, queries } = poolFor(context({ turnInput: objectiveTurnInput, jobKeywords: "new keywords" }))
+    objectiveReader.fromPool.mockResolvedValue(objectiveEvidence)
+    objectiveReader.withClient.mockResolvedValue(objectiveEvidence)
+    configureCoverLetterField(() => reviewedMaterial.content)
+    vi.mocked(executeBrowserFill).mockResolvedValue({ status: "manual", error: null, durationMs: 3, reviewReady: true,
+      log: [{ field: "coverLetter", selector: "textarea#cover-letter", action: "fill", phase: "completed" }] } as HarnessResult)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+    const browserInput = vi.mocked(executeBrowserFill).mock.calls[0]?.[0]
+    const binding = queries.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO "application_task_events"'))
+    const eventData = JSON.parse(String(binding?.[1]?.[3])) as Record<string, unknown>
+    const completion = vi.mocked(completeApplicationFillForReview).mock.calls[0]?.[1]
+
+    expect(result).toMatchObject({ status: "completed", result: { status: "filled_for_user_review" } })
+    expect(generateResumePdf).toHaveBeenCalledWith("user-1", objectiveResume.content)
+    expect(tailorResumeKeywords).not.toHaveBeenCalled()
+    expect(browserInput).toMatchObject({ submit: false, jobKeywords: "new keywords", persona: { coverLetter: reviewedMaterial.content } })
+    expect(eventData).toMatchObject({ schemaVersion: "agent-harness.v2.objective-reviewed-fill-browser-start.v1", objectiveSource })
+    expect(JSON.stringify(eventData)).not.toContain(JSON.stringify(objectiveResume.content))
+    expect(completion?.reviewedFillReadback).toMatchObject({ schemaVersion: "agent-harness.v2.objective-reviewed-fill-readback.v1", objectiveSource })
+  })
+
+  it("does not start a browser when the Objective source changes between exact Resume read and claim", async () => {
+    const changed = { ...objectiveEvidence, resumeWitness: { ...objectiveResumeWitness, materialRevision: 8 } }
+    const { pool, queries } = poolFor(context({ turnInput: objectiveTurnInput }))
+    objectiveReader.fromPool.mockResolvedValue(objectiveEvidence)
+    objectiveReader.withClient.mockResolvedValue(changed)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "fill_start_conflict" })
+    expect(generateResumePdf).toHaveBeenCalledWith("user-1", objectiveResume.content)
+    expect(withCloakContext).not.toHaveBeenCalled()
+    expect(queries.mock.calls.some(([sql]) => String(sql).includes('INSERT INTO "application_task_events"'))).toBe(false)
+  })
+
+  it("routes Objective completion replay and browser-active uncertainty before fresh source preparation", async () => {
+    const replayPool = poolFor(context({ turnInput: objectiveTurnInput, taskStatus: "waiting_for_authorization", checkpoint: "form_filled",
+      sessionStatus: "waiting_for_user", turnStatus: "waiting_for_approval" })).pool
+    await expect(executeApplicationFillForReview({ pool: replayPool, lease: lease() })).resolves.toMatchObject({ status: "completed" })
+    expect(objectiveReader.fromPool).not.toHaveBeenCalled()
+    expect(withCloakContext).not.toHaveBeenCalled()
+
+    const uncertainPool = poolFor(context({ turnInput: objectiveTurnInput, checkpoint: "browser_active" })).pool
+    await expect(executeApplicationFillForReview({ pool: uncertainPool, lease: lease() }))
+      .resolves.toMatchObject({ status: "waiting_for_user", failureReason: "fill_outcome_uncertain" })
+    expect(objectiveReader.fromPool).not.toHaveBeenCalled()
+    expect(withCloakContext).not.toHaveBeenCalled()
   })
 
   it("returns the stale_review wait produced by reviewed completion without claiming success", async () => {

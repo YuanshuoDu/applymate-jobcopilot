@@ -5,12 +5,18 @@ const mocks = vi.hoisted(() => ({
   acquireSourceMaterialFence: vi.fn(),
   hasReviewedSubmissionArtifact: vi.fn(),
   readReviewedApplicationSubmitMaterial: vi.fn(),
+  hasObjectiveSubmissionManifestEvidence: vi.fn(),
+  readObjectiveReviewedApplicationSubmitMaterial: vi.fn(),
 }))
 vi.mock("../queue/application-submit-fence.js", () => ({ withExactAttemptFence: mocks.withExactAttemptFence }))
 vi.mock("./source-material-fence.js", () => ({ acquireSourceMaterialFence: mocks.acquireSourceMaterialFence }))
 vi.mock("./reviewed-application-submit-material.js", () => ({
   hasReviewedSubmissionArtifact: mocks.hasReviewedSubmissionArtifact,
   readReviewedApplicationSubmitMaterial: mocks.readReviewedApplicationSubmitMaterial,
+}))
+vi.mock("./objective-reviewed-application-submit-material.js", () => ({
+  hasObjectiveSubmissionManifestEvidence: mocks.hasObjectiveSubmissionManifestEvidence,
+  readObjectiveReviewedApplicationSubmitMaterial: mocks.readObjectiveReviewedApplicationSubmitMaterial,
 }))
 
 import { withReviewedApplicationSubmitRequestFence } from "./reviewed-application-submit-request-fence.js"
@@ -23,6 +29,12 @@ const source = (sourceTurnId = "source-turn-1") => ({
   reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId },
 })
 const resourceHash = "a".repeat(64), materialHash = "c".repeat(64), answersHash = "d".repeat(64)
+const objectiveSource = {
+  schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1",
+  approvalId: `objective-review:objective-review-${"e".repeat(40)}:2`,
+  reviewTurnId: "review-turn-1", materialProofHash: "f".repeat(64),
+} as const
+const objectiveTurnInput = { reviewedApplicationMaterialSource: objectiveSource }
 const approval = {
   userId: scope.userId, sessionId: scope.sessionId, turnId: scope.fillTurnId, taskId: scope.applicationTaskId, jobId: scope.jobId,
   toolCallId: `application-submit:${scope.applicationTaskId}`, type: "submit_application", status: "consumed",
@@ -73,6 +85,8 @@ function resetMocks() {
   mocks.acquireSourceMaterialFence.mockReset().mockResolvedValue(undefined)
   mocks.hasReviewedSubmissionArtifact.mockReset().mockResolvedValue(false)
   mocks.readReviewedApplicationSubmitMaterial.mockReset().mockResolvedValue({ artifactHash: resourceHash })
+  mocks.hasObjectiveSubmissionManifestEvidence.mockReset().mockResolvedValue(false)
+  mocks.readObjectiveReviewedApplicationSubmitMaterial.mockReset().mockResolvedValue({ artifactHash: resourceHash, objectiveSource })
 }
 
 describe("reviewed application submit request source fence", () => {
@@ -115,6 +129,7 @@ describe("reviewed application submit request source fence", () => {
 
     expect(mocks.acquireSourceMaterialFence).toHaveBeenCalledWith(client, [scope.userId])
     expect(mocks.hasReviewedSubmissionArtifact).toHaveBeenCalledWith(client, scope)
+    expect(mocks.hasObjectiveSubmissionManifestEvidence).toHaveBeenCalledWith(client, scope)
     expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
   })
 
@@ -129,6 +144,71 @@ describe("reviewed application submit request source fence", () => {
     expect(mocks.acquireSourceMaterialFence).toHaveBeenCalledWith(client, [scope.userId])
     expect(mocks.hasReviewedSubmissionArtifact).toHaveBeenCalledWith(client, scope)
     expect(mocks.readReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
+  })
+
+  it("does not downgrade an absent selector when an Objective submission manifest exists", async () => {
+    resetMocks()
+    mocks.hasObjectiveSubmissionManifestEvidence.mockResolvedValueOnce(true)
+    const { client } = fixture({ inputs: [{}, {}] })
+    await expect(withReviewedApplicationSubmitRequestFence(client, scope, "marker", undefined, async () => "sent"))
+      .resolves.toEqual({ kind: "invalid" })
+    expect(mocks.hasObjectiveSubmissionManifestEvidence).toHaveBeenCalledWith(client, scope)
+    expect(mocks.readObjectiveReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
+  })
+
+  it("rechecks the exact Objective marker with the same consumed approval at the marker", async () => {
+    resetMocks()
+    const { client } = fixture({ inputs: [objectiveTurnInput, objectiveTurnInput] })
+    await expect(withReviewedApplicationSubmitRequestFence(client, scope, "marker", undefined,
+      async sourceTurnId => sourceTurnId ?? "objective")).resolves.toEqual({
+      kind: "current", value: "objective", sourceTurnId: null, objectiveSource,
+    })
+    expect(mocks.readObjectiveReviewedApplicationSubmitMaterial).toHaveBeenCalledWith({
+      client, identity: scope, turnInput: objectiveTurnInput,
+      approval: { resourceHash, materialHash, answersHash }, phase: "marker",
+    })
+  })
+
+  it("rejects Objective marker removal or swap before the request boundary", async () => {
+    resetMocks()
+    const swapped = { reviewedApplicationMaterialSource: { ...objectiveSource, materialProofHash: "1".repeat(64) } }
+    const removed = fixture({ phase: "boundary", inputs: [objectiveTurnInput, {}] })
+    await expect(withReviewedApplicationSubmitRequestFence(removed.client, scope, "boundary",
+      { kind: "objective", source: objectiveSource }, async () => "sent")).resolves.toEqual({ kind: "invalid" })
+
+    resetMocks()
+    const changed = fixture({ phase: "boundary", inputs: [objectiveTurnInput, swapped] })
+    await expect(withReviewedApplicationSubmitRequestFence(changed.client, scope, "boundary",
+      { kind: "objective", source: objectiveSource }, async () => "sent")).resolves.toEqual({ kind: "invalid" })
+    expect(mocks.readObjectiveReviewedApplicationSubmitMaterial).not.toHaveBeenCalled()
+  })
+
+  it("rejects current Objective material or approval drift at the paused boundary", async () => {
+    resetMocks()
+    mocks.readObjectiveReviewedApplicationSubmitMaterial.mockResolvedValueOnce(null)
+    const { client } = fixture({ phase: "boundary", inputs: [objectiveTurnInput, objectiveTurnInput] })
+    await expect(withReviewedApplicationSubmitRequestFence(client, scope, "boundary",
+      { kind: "objective", source: objectiveSource }, async () => "sent")).resolves.toEqual({ kind: "invalid" })
+    expect(mocks.readObjectiveReviewedApplicationSubmitMaterial).toHaveBeenCalledWith({
+      client, identity: scope, turnInput: objectiveTurnInput,
+      approval: { resourceHash, materialHash, answersHash }, phase: "boundary",
+    })
+  })
+
+  it("rejects a mismatched Objective manifest hash or selector proof", async () => {
+    resetMocks()
+    mocks.readObjectiveReviewedApplicationSubmitMaterial.mockResolvedValueOnce({ artifactHash: "0".repeat(64), objectiveSource })
+    const wrongHash = fixture({ inputs: [objectiveTurnInput, objectiveTurnInput] })
+    await expect(withReviewedApplicationSubmitRequestFence(wrongHash.client, scope, "marker", undefined, async () => "sent"))
+      .resolves.toEqual({ kind: "invalid" })
+
+    resetMocks()
+    mocks.readObjectiveReviewedApplicationSubmitMaterial.mockResolvedValueOnce({
+      artifactHash: resourceHash, objectiveSource: { ...objectiveSource, materialProofHash: "1".repeat(64) },
+    })
+    const wrongProof = fixture({ inputs: [objectiveTurnInput, objectiveTurnInput] })
+    await expect(withReviewedApplicationSubmitRequestFence(wrongProof.client, scope, "marker", undefined, async () => "sent"))
+      .resolves.toEqual({ kind: "invalid" })
   })
 
   it("rejects a changed or removed selector rather than downgrading the reviewed request", async () => {

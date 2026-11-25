@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { loadTaskContext } from "./load-task-context.js";
+import { loadTaskContext, readApplyQueueMaterialMode } from "./load-task-context.js";
 import type { Pool, QueryResult } from "pg";
 
 function mockPool(userRow: Record<string, unknown> | null, jobRow: Record<string, unknown> | null): Pool {
@@ -103,5 +103,103 @@ describe("loadTaskContext", () => {
     // Empty key/value should NOT appear
     expect(ctx.persona[""]).toBeUndefined();
     expect(ctx.persona.emptyVal).toBeUndefined();
+  });
+
+  it("loads Objective context without reading resume, answers, or cover-letter material", async () => {
+    const calls: string[] = [];
+    const pool = {
+      query: async (sql: string) => {
+        calls.push(String(sql));
+        if (sql.includes('"User"')) return { rows: [{ accountStatus: "active", name: "Ada", email: "ada@example.com", personaFields: [] }] };
+        if (sql.includes('"Job"')) return { rows: [{ role: "Engineer", company: "Example", keywords: "TypeScript", url: "https://boards.greenhouse.io/acme/jobs/123" }] };
+        return { rows: [] };
+      },
+    } as unknown as Pool;
+
+    const context = await loadTaskContext(pool, "user-1", "job-1", "https://fallback.invalid", "task-1", { objectiveOnly: true });
+
+    expect(context).toMatchObject({ jobTitle: "Engineer", jobCompany: "Example", applyUrl: "https://boards.greenhouse.io/acme/jobs/123",
+      coverLetterText: null, confirmedAnswers: {} });
+    expect(context.resumeTempPath).toBeUndefined();
+    expect(calls.some(sql => sql.includes('FROM "Resume"'))).toBe(false);
+    expect(calls.some(sql => sql.includes("confirmedAnswers") || sql.includes("description") || sql.includes('"coverLetter"'))).toBe(false);
+  });
+
+  it("does not use a queued URL when the owned Objective Job has no URL", async () => {
+    const pool = mockPool({ accountStatus: "active", personaFields: [] }, {
+      role: "Engineer", company: "Example", keywords: "TypeScript", url: null,
+    });
+    await expect(loadTaskContext(pool, "user-1", "job-1", "https://queued.invalid", "task-1", { objectiveOnly: true }))
+      .rejects.toThrow("Objective application target is unavailable.");
+  });
+});
+
+const objectiveSource = {
+  schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1",
+  approvalId: `objective-review:objective-review-${"a".repeat(40)}:2`,
+  reviewTurnId: "review-turn-1",
+  materialProofHash: "b".repeat(64),
+};
+
+function modePool(input: unknown, events: Array<Record<string, unknown>> = [], failEvents = false): Pool {
+  return {
+    query: async (sql: string) => {
+      if (String(sql).includes("FROM agent_turns")) return { rows: [{ input }] };
+      if (String(sql).includes('FROM "application_task_events"')) {
+        if (failEvents) throw new Error("unavailable");
+        if (String(sql).includes("SELECT EXISTS")) return { rows: [{ present: events.some(event =>
+          event.type === "objective_application_review_approved"
+          || event.type === "reviewed_application_fill_browser_started"
+            && (event.schemaVersion === "agent-harness.v2.objective-reviewed-fill-browser-start.v1" || event.hasObjectiveSource === true)) }] };
+        return { rows: events.some(event => event.type === "objective_submission_manifest_recorded") ? [{ id: "manifest-event" }] : [] };
+      }
+      return { rows: [] };
+    },
+  } as unknown as Pool;
+}
+
+const modeIdentity = {
+  applicationTaskId: "task-1", userId: "user-1", jobId: "job-1", sessionId: "session-1", fillTurnId: "turn-1",
+  approvalId: "receipt-1", constraintHash: "c".repeat(64),
+};
+
+describe("readApplyQueueMaterialMode", () => {
+  it("selects Objective only from the exact persisted Objective marker", async () => {
+    await expect(readApplyQueueMaterialMode(modePool({ reviewedApplicationMaterialSource: objectiveSource }), modeIdentity))
+      .resolves.toBe("objective");
+  });
+
+  it.each([
+    { reviewedApplicationMaterialSource: { ...objectiveSource, extra: true } },
+    { reviewedApplicationMaterialSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v2" } },
+  ])("blocks malformed or unknown persisted Objective markers", async input => {
+    await expect(readApplyQueueMaterialMode(modePool(input), modeIdentity)).resolves.toBe("blocked");
+  });
+
+  it("blocks a removed Objective marker when exact task-scoped V3 evidence remains", async () => {
+    const events = [{ type: "objective_application_review_approved", schemaVersion: null, hasObjectiveSource: false }];
+    await expect(readApplyQueueMaterialMode(modePool({}, events), modeIdentity)).resolves.toBe("blocked");
+  });
+
+  it("blocks a legacy selector if an Objective browser-start or manifest event exists", async () => {
+    const selected = { reviewedApplicationMaterialSource: {
+      schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn-1",
+    } };
+    const events = [{ type: "reviewed_application_fill_browser_started",
+      schemaVersion: "agent-harness.v2.objective-reviewed-fill-browser-start.v1", hasObjectiveSource: true }];
+    await expect(readApplyQueueMaterialMode(modePool(selected, events), modeIdentity)).resolves.toBe("blocked");
+    await expect(readApplyQueueMaterialMode(modePool({}, [{ type: "objective_submission_manifest_recorded" }]), modeIdentity))
+      .resolves.toBe("blocked");
+  });
+
+  it("keeps ordinary and selected-job V1 selectors on the existing path", async () => {
+    await expect(readApplyQueueMaterialMode(modePool({}), modeIdentity)).resolves.toBe("ordinary");
+    await expect(readApplyQueueMaterialMode(modePool({ reviewedApplicationMaterialSource: {
+      schemaVersion: "agent-harness.v2.selected-job-reviewed-fill-source.v1", sourceTurnId: "source-turn-1",
+    } }), modeIdentity)).resolves.toBe("ordinary");
+  });
+
+  it("fails closed when the exact persisted mode cannot be read", async () => {
+    await expect(readApplyQueueMaterialMode(modePool({}, [], true), modeIdentity)).resolves.toBe("blocked");
   });
 });

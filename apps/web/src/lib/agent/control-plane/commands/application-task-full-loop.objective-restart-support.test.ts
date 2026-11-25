@@ -1,0 +1,114 @@
+import { describe, expect, it, vi } from "vitest"
+import type { ObjectiveJobProjectionBarrier } from "./application-task-full-loop.objective-wave-support"
+import {
+  restartObjectiveWorkerAtProjectionBarrier,
+  waitForObjectiveProjectionWaiters,
+  type ObjectiveRestartWorker,
+} from "./application-task-full-loop.objective-restart-support"
+
+function barrier(events: string[], failCleanup = false): ObjectiveJobProjectionBarrier {
+  return {
+    waitUntilBlocked: async () => { events.push("blocked") },
+    waitUntilUnblocked: async () => { events.push("unblocked") },
+    release: async () => { events.push("release") },
+    cleanup: async () => {
+      events.push("cleanup")
+      if (failCleanup) throw new Error("trigger cleanup failed")
+    },
+  }
+}
+
+type FakeWorker = ObjectiveRestartWorker & Readonly<{ markExited(): void }>
+
+function worker(events: string[], name: string): FakeWorker {
+  const state: { exitCode: number | null; signalCode: string | null } = { exitCode: null, signalCode: null }
+  return {
+    get exitCode() { return state.exitCode },
+    get signalCode() { return state.signalCode },
+    kill(signal) { events.push(`${name}:${signal}`); return true },
+    markExited() { state.signalCode = "SIGKILL" },
+  }
+}
+
+function input(events: string[], options: { failBlocked?: boolean; failReady?: boolean; failCleanup?: boolean } = {}) {
+  const original = worker(events, "first")
+  const successor = worker(events, "second")
+  const projectionBarrier = barrier(events, options.failCleanup)
+  const waitForExit = vi.fn(async (child: FakeWorker) => {
+    events.push(child === original ? "first-exit" : "second-exit")
+    child.markExited()
+    return true
+  })
+  return {
+    original,
+    successor,
+    waitForExit,
+    args: {
+      installBarrier: async () => { events.push("install"); return projectionBarrier },
+      publishFinalApproval: async () => { events.push("approve") },
+      worker: original,
+      waitForExit,
+      assertCommittedResult: async (phase: "blocked" | "crashed") => {
+        events.push(`result-${phase}`)
+        if (phase === "blocked" && options.failBlocked) throw new Error("receipt check failed")
+      },
+      startExactlyOneWorker: () => { events.push("spawn"); return successor },
+      waitUntilReady: async (_worker: FakeWorker, timeoutMs: number) => {
+        events.push("ready")
+        expect(timeoutMs).toBe(90_000)
+        if (options.failReady) throw new Error("readiness failed")
+      },
+    },
+  }
+}
+
+describe("Objective projection restart support", () => {
+  it("installs before approval and restarts once only after the blocked result survives SIGKILL", async () => {
+    const events: string[] = []
+    const scenario = input(events)
+    const result = await restartObjectiveWorkerAtProjectionBarrier(scenario.args)
+    expect(result).toBe(scenario.successor)
+    expect(events).toEqual([
+      "install", "approve", "blocked", "result-blocked", "first:SIGKILL", "first-exit",
+      "unblocked", "result-crashed", "cleanup", "spawn", "ready",
+    ])
+    expect(scenario.waitForExit).toHaveBeenCalledOnce()
+  })
+
+  it("kills the blocked Worker and cleans the barrier without starting a successor when proof fails", async () => {
+    const events: string[] = []
+    const scenario = input(events, { failBlocked: true })
+    await expect(restartObjectiveWorkerAtProjectionBarrier(scenario.args)).rejects.toThrow("receipt check failed")
+    expect(events).toEqual([
+      "install", "approve", "blocked", "result-blocked", "first:SIGKILL", "first-exit", "unblocked", "cleanup",
+    ])
+  })
+
+  it("kills a partially started successor if readiness fails", async () => {
+    const events: string[] = []
+    const scenario = input(events, { failReady: true })
+    await expect(restartObjectiveWorkerAtProjectionBarrier(scenario.args)).rejects.toThrow("readiness failed")
+    expect(events.slice(-3)).toEqual(["ready", "second:SIGKILL", "second-exit"])
+  })
+
+  it("preserves both the original proof failure and cleanup failure", async () => {
+    const events: string[] = []
+    const scenario = input(events, { failBlocked: true, failCleanup: true })
+    let failure: unknown
+    try { await restartObjectiveWorkerAtProjectionBarrier(scenario.args) } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).errors).toEqual([
+      new Error("receipt check failed"), new Error("trigger cleanup failed"),
+    ])
+    expect(events).not.toContain("spawn")
+  })
+
+  it("waits for the exact expected waiter count and rejects ambiguous counts", async () => {
+    const reads = vi.fn().mockResolvedValueOnce(0).mockResolvedValueOnce(1)
+    const waiting = waitForObjectiveProjectionWaiters(reads, 1)
+    await new Promise(resolve => setTimeout(resolve, 60))
+    await waiting
+    await expect(waitForObjectiveProjectionWaiters(async () => 2, 1)).rejects
+      .toThrow("objective_wave_projection_barrier_waiter_count_invalid")
+  })
+})

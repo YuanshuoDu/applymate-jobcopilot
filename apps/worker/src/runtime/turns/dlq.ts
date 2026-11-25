@@ -7,6 +7,7 @@ import { TurnLeaseError, type LeasePool, type TurnJobPayload } from "./lease.js"
 export const TURN_MAX_ATTEMPTS = 5
 export const TURN_DLQ_TOPIC = "agent.turn.dlq"
 export const COGNITIVE_AGENDA_RESUME_FENCE_INVALID = "cognitive_agenda_resume_fence_invalid"
+export const OBJECTIVE_APPLICATION_FILL_UNAVAILABLE = "objective_application_fill_unavailable"
 
 export type TurnFailureReasonCode =
   | "schema_invalid_payload"
@@ -70,6 +71,7 @@ function errorCode(error: unknown): string {
   if (error instanceof TurnLeaseError) return error.code
   if (error instanceof Error && error.name === "TurnQueuePayloadError") return "invalid_payload"
   if (isResumeFenceFailure(error)) return COGNITIVE_AGENDA_RESUME_FENCE_INVALID
+  if (error instanceof Error && error.message === OBJECTIVE_APPLICATION_FILL_UNAVAILABLE) return OBJECTIVE_APPLICATION_FILL_UNAVAILABLE
   return "turn_execution_error"
 }
 

@@ -2,9 +2,11 @@ import type { Queue } from "bullmq"
 import type { Pool, PoolClient } from "pg"
 import { matchesApplyTaskSubmitPayload, type ApplyTaskPayload, type ApplyTaskSubmitIdentity, type ApplyTaskSubmitPayload } from "@jobcopilot/shared"
 import { reconcileClaimedSubmissionUncertain } from "../db/submission-guard.js"
+import { hasObjectiveSubmitResultCandidate, hasObjectiveSubmitResultCandidateWithClient, recoverObjectiveSubmitAfterTerminal } from "./objective-application-submit-terminal-recovery.js"
 import {
   isValidApplicationSubmitTerminalObservation,
   matchesExactApplicationSubmitTerminalProof,
+  readTerminalSubmitAttemptDisposition,
   type ApplicationSubmitIdentity,
   type ApplicationSubmitTerminalObservation,
 } from "./application-submit-fence.js"
@@ -174,19 +176,6 @@ async function removeTerminalJobAfterProof(
   return "removed"
 }
 
-async function terminalAttemptDisposition(client: PoolClient, intent: SubmitOutboxIntent): Promise<"claimed" | "uncertain" | "final" | "stale"> {
-  const task = (await client.query<{ status: string; checkpoint: string | null }>(`SELECT "status", "checkpoint" FROM "application_tasks"
-    WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 AND "workerTaskId" = $6 FOR UPDATE`,
-  [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.workerTaskId])).rows[0]
-  if (!task) return "stale"
-  if (task.status === "filling" && ["browser_active", "submission_request_started"].includes(task.checkpoint ?? "")) return "claimed"
-  if (task.status === "waiting_for_user" && task.checkpoint === "submission_uncertain") return "uncertain"
-  if (["submitted", "failed"].includes(task.status) || task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" ||
-    task.status === "waiting_for_user" && ["submission_blocked", "user_takeover"].includes(task.checkpoint ?? "") ||
-    task.status === "cancelled" && task.checkpoint === "turn_stopped_before_submit") return "final"
-  return "stale"
-}
-
 export async function reconcileClaimedTerminalSubmit(
   pool: Pool, queue: SubmitOutboxQueue, intent: SubmitOutboxIntent, observed?: SubmitTerminalObservation,
 ): Promise<SubmitDeliveryState | "reconciled" | "unchanged"> {
@@ -198,12 +187,24 @@ export async function reconcileClaimedTerminalSubmit(
     sessionId: intent.sessionId, fillTurnId: intent.fillTurnId,
     approvalId: intent.receiptId, constraintHash: intent.constraintHash,
   }
-  let fencedDelivery: SubmitDeliveryState | undefined
   let terminalOutcomeDurable = false
-  const reconciled = await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId, async client => {
+  const objectiveIntent = { ...identity, workerTaskId: intent.workerTaskId }, objectiveCandidate = await hasObjectiveSubmitResultCandidate(pool, objectiveIntent)
+  if (objectiveCandidate) {
+    const objectiveRecovery = await recoverObjectiveSubmitAfterTerminal(pool, objectiveIntent, async client => {
+      const current = await inspectSubmitDelivery(queue, intent, true)
+      if (current === "terminal" && await observedTerminalJob(queue, intent)) return "queue_terminal"
+      if (current === "absent" && observed && isValidApplicationSubmitTerminalObservation(observed)) return "terminal_callback"
+      return current === "absent" && (await readTerminalProof(client, intent)).valid ? "persisted_terminal_proof" : null
+    })
+    if (objectiveRecovery === "superseded") return "unchanged"
+    if (objectiveRecovery === "recovered" || objectiveRecovery === "already_settled") terminalOutcomeDurable = true
+  }
+  let fencedDelivery: SubmitDeliveryState | undefined
+  const reconciled = terminalOutcomeDurable ? false : await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId, async client => {
+    if (!objectiveCandidate && await hasObjectiveSubmitResultCandidateWithClient(client, objectiveIntent)) return false
     fencedDelivery = await inspectSubmitDelivery(queue, intent, true)
     if (fencedDelivery !== "terminal" && fencedDelivery !== "absent") return false
-    const disposition = await terminalAttemptDisposition(client, intent)
+    const disposition = await readTerminalSubmitAttemptDisposition(client, { ...identity, workerTaskId: intent.workerTaskId })
     if (disposition === "final") { terminalOutcomeDurable = true; return false }
     if (disposition === "stale") return false
     if (fencedDelivery === "absent") {

@@ -3,21 +3,31 @@ import type { AgentApproval } from "@jobcopilot/agent-protocol"
 import type { PoolClient } from "pg"
 
 import { InMemoryArtifactToolStore } from "./artifact-tools.js"
+import { BrowserApplicationSubmitError } from "./browser-submit-provider.js"
 import { createApplicationSubmitTool, type SubmissionApprovalStore, type SubmissionAttemptStore } from "./application-submit-tool.js"
-import type { ApplicationTarget, SubmissionAttempt } from "../../db/application-submit-repo.js"
+import type { ApplicationTarget, SubmissionAttempt, SubmissionClaimAuthorizer, SubmissionSourceSelection } from "../../db/application-submit-repo.js"
 import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
 import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
-import type { ReviewedApplicationFillSourceSelection } from "@jobcopilot/shared"
 
 const userId = "user-a"
 const jobId = "job-a"
 const constraintHash = "c".repeat(64)
 const reviewedRead = vi.hoisted(() => vi.fn())
 const reviewedArtifact = vi.hoisted(() => vi.fn())
+const objectiveRead = vi.hoisted(() => vi.fn())
+const objectiveEvidence = vi.hoisted(() => vi.fn())
 vi.mock("../../db/reviewed-application-submit-material.js", () => ({
   readReviewedApplicationSubmitMaterial: reviewedRead, hasReviewedSubmissionArtifact: reviewedArtifact,
 }))
+vi.mock("../../db/objective-reviewed-application-submit-material.js", () => ({
+  readObjectiveReviewedApplicationSubmitMaterial: objectiveRead, hasObjectiveSubmissionManifestEvidence: objectiveEvidence,
+}))
 const identity: ApplicationSubmitIdentity = { sessionId: "session-a", fillTurnId: "turn-a", applicationTaskId: "application-a", userId, jobId, approvalId: "receipt-a", constraintHash }
+const objectiveSource = { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1",
+  approvalId: `objective-review:objective-review-${"a".repeat(40)}:2`, reviewTurnId: "review-turn-a", materialProofHash: "b".repeat(64) } as const
+const objectiveSelection: SubmissionSourceSelection = { kind: "objective", source: objectiveSource }
+const objectiveMaterial = { reviewedResumeContent: { basics: { name: "Candidate" } }, reviewedCoverLetter: "Approved private letter",
+  confirmedAnswers: { city: "Dublin" }, approvedApplyUrl: "https://boards.greenhouse.io/acme/jobs/123" }
 function target(): ApplicationTarget { return { id: jobId, userId, jobId, company: "Acme", role: "Engineer", applyUrl: "https://jobs.example/apply", source: "greenhouse" } }
 function approval(resourceHash: string, status: "approved" | "consumed" = "approved"): AgentApproval {
   return {
@@ -32,8 +42,8 @@ class Attempts implements SubmissionAttemptStore {
   readonly rows = new Map<string, SubmissionAttempt>()
   superseded = false
   audit: string[] = []
-  constructor(readonly source: ReviewedApplicationFillSourceSelection = { kind: "absent" }) {}
-  async reserveAndConsume(attemptIdentity: ApplicationSubmitIdentity, authorize: (client: PoolClient, mode: "new" | "replay", source: ReviewedApplicationFillSourceSelection) => Promise<{ kind: "authorized"; artifactHash: string; reviewedCoverLetter?: string } | { kind: "fenced" }>) {
+  constructor(readonly source: SubmissionSourceSelection = { kind: "absent" }) {}
+  async reserveAndConsume(attemptIdentity: ApplicationSubmitIdentity, authorize: SubmissionClaimAuthorizer) {
     if (this.superseded) { this.audit.push("claim"); return { kind: "fenced" as const } }
     const existing = this.rows.get(attemptIdentity.approvalId)
     const authorization = await authorize({} as PoolClient, existing ? "replay" : "new", this.source)
@@ -43,7 +53,8 @@ class Attempts implements SubmissionAttemptStore {
     const attempt: SubmissionAttempt = { id: "attempt-a", userId: attemptIdentity.userId, jobId: attemptIdentity.jobId, receiptId: attemptIdentity.approvalId, constraintHash: attemptIdentity.constraintHash, artifactHash: authorization.artifactHash, state: "reserved", responseRef: null, errorCode: null, createdAt: now, updatedAt: now }
     this.rows.set(attemptIdentity.approvalId, attempt)
     return { kind: "reserved" as const, attempt, artifactHash: authorization.artifactHash,
-      ...(authorization.reviewedCoverLetter ? { reviewedCoverLetter: authorization.reviewedCoverLetter } : {}) }
+      ...(authorization.reviewedCoverLetter ? { reviewedCoverLetter: authorization.reviewedCoverLetter } : {}),
+      ...(authorization.objectiveMaterial ? { objectiveMaterial: authorization.objectiveMaterial } : {}) }
   }
   async isCurrent() { if (this.superseded) this.audit.push("pre_submit"); return !this.superseded }
   async markSubmitted(_identity: ApplicationSubmitIdentity, responseRef: string) {
@@ -65,7 +76,7 @@ function context(overrides: Record<string, unknown> = {}) {
   return { scope: { userId }, sessionId: identity.sessionId, turnId: identity.fillTurnId, stepId: "application.submit", taskId: identity.applicationTaskId, signal: new AbortController().signal, capabilities: ["submission"], reportProgress: vi.fn(), ...overrides }
 }
 function input(overrides: Record<string, unknown> = {}) { return { applicationTargetId: jobId, receiptId: identity.approvalId, constraintHash, ...overrides } }
-function harness(options: { resourceHash?: string; approvalError?: string; target?: ApplicationTarget | null; source?: ReviewedApplicationFillSourceSelection } = {}) {
+function harness(options: { resourceHash?: string; approvalError?: string; target?: ApplicationTarget | null; source?: SubmissionSourceSelection } = {}) {
   const artifacts = new InMemoryArtifactToolStore()
   const base = artifacts.registerBase({ id: "artifact-a", type: "resume", jobId, userId, content: "verified resume" })
   const attempts = new Attempts(options.source)
@@ -87,7 +98,7 @@ function harness(options: { resourceHash?: string; approvalError?: string; targe
 }
 
 describe("application.submit typed tool", () => {
-  beforeEach(() => { reviewedRead.mockReset(); reviewedArtifact.mockReset() })
+  beforeEach(() => { reviewedRead.mockReset(); reviewedArtifact.mockReset(); objectiveRead.mockReset(); objectiveEvidence.mockReset() })
   it("matches the bare approved digest to the exact persisted artifact hash before submission", async () => {
     const tested = harness()
     await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "submitted", confirmationId: "confirmation-1" })
@@ -107,6 +118,22 @@ describe("application.submit typed tool", () => {
     })
     await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "submitted" })
     expect(tested.submit).toHaveBeenCalledOnce()
+  })
+
+  it("validates the legacy artifact before the initial submission guard", async () => {
+    const tested = harness(), order: string[] = []
+    const read = tested.artifacts.read.bind(tested.artifacts)
+    vi.spyOn(tested.artifacts, "read").mockImplementation(async (...args) => {
+      order.push("artifact")
+      return read(...args)
+    })
+    vi.spyOn(tested.attempts, "isCurrent").mockImplementation(async () => {
+      order.push("guard")
+      return false
+    })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "submission_guard_denied" })
+    expect(order).toEqual(["artifact", "guard"])
+    expect(tested.submit).not.toHaveBeenCalled()
   })
 
   it("returns the durable confirmation on a duplicate without calling the provider", async () => {
@@ -201,6 +228,100 @@ describe("application.submit typed tool", () => {
     expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
     expect(reviewedRead).toHaveBeenCalledWith(expect.objectContaining({ currentSource: false }))
     expect(tested.submit).not.toHaveBeenCalled()
+  })
+
+  it("does not consume an Objective receipt without the separate Objective provider capability", async () => {
+    const tested = harness({ source: objectiveSelection })
+    objectiveRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), packet: objectiveMaterial, objectiveSource })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "submission_attempt_fenced" })
+    expect(tested.approvals.inspectSubmissionInTransaction).not.toHaveBeenCalled()
+    expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
+    expect(tested.submit).not.toHaveBeenCalled()
+  })
+
+  it("does not consume Objective approval when the dedicated provider rejects the exact destination", async () => {
+    const tested = harness({ source: objectiveSelection })
+    objectiveRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), packet: objectiveMaterial, objectiveSource })
+    Object.assign(tested.submit, { acceptsObjectiveReviewedApplicationMaterial: true as const,
+      supportsObjectiveApplicationSubmitTarget: () => false })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "submission_attempt_fenced" })
+    expect(tested.approvals.inspectSubmissionInTransaction).toHaveBeenCalledOnce()
+    expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
+    expect(tested.submit).not.toHaveBeenCalled()
+  })
+
+  it("passes the exact transient Objective packet and approved URL only after fresh claim", async () => {
+    const tested = harness({ source: objectiveSelection })
+    const artifactList = vi.spyOn(tested.artifacts, "listForUser")
+    objectiveRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), packet: objectiveMaterial, objectiveSource })
+    Object.assign(tested.submit, { acceptsObjectiveReviewedApplicationMaterial: true as const,
+      supportsObjectiveApplicationSubmitTarget: (url: unknown) => url === objectiveMaterial.approvedApplyUrl })
+    const result = await tested.tool.execute(context(), input())
+    expect(result).toMatchObject({ status: "submitted", output: { confirmationId: "confirmation-1" } })
+    expect(objectiveRead).toHaveBeenCalledWith(expect.objectContaining({
+      identity, turnInput: { reviewedApplicationMaterialSource: objectiveSource }, phase: "authorize",
+    }))
+    expect(tested.submit).toHaveBeenCalledWith(expect.objectContaining({
+      target: expect.objectContaining({ applyUrl: objectiveMaterial.approvedApplyUrl }), objectiveMaterial,
+    }))
+    expect(tested.submit.mock.calls[0]?.[0]).not.toHaveProperty("artifact")
+    expect(artifactList).not.toHaveBeenCalled()
+    expect(tested.approvals.consumeSubmissionInTransaction).toHaveBeenCalledOnce()
+    expect(JSON.stringify(result)).not.toContain("Approved private letter")
+  })
+
+  it("replays an exact Objective receipt without rereading material or calling the provider", async () => {
+    const tested = harness({ source: objectiveSelection })
+    tested.attempts.rows.set(identity.approvalId, { ...tested.attempts.rows.get(identity.approvalId),
+      id: "attempt-a", userId, jobId, receiptId: identity.approvalId, constraintHash,
+      artifactHash: tested.base.hash.slice("sha256:".length), state: "submitted", responseRef: "prior-confirmation",
+      errorCode: null, createdAt: new Date(), updatedAt: new Date() })
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "replayed", confirmationId: "prior-confirmation" })
+    expect(objectiveRead).not.toHaveBeenCalled()
+    expect(tested.approvals.consumeSubmissionInTransaction).not.toHaveBeenCalled()
+    expect(tested.submit).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["No submit button found", "objective_submit_control_unavailable"],
+    [undefined, "objective_submit_confirmation_missing"],
+  ] as const)("stores Objective manual reason %s privately and replays only browser_manual", async (message, privateReason) => {
+    const tested = harness({ source: objectiveSelection })
+    objectiveRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), packet: objectiveMaterial, objectiveSource })
+    Object.assign(tested.submit, { acceptsObjectiveReviewedApplicationMaterial: true as const,
+      supportsObjectiveApplicationSubmitTarget: (url: unknown) => url === objectiveMaterial.approvedApplyUrl })
+    tested.submit.mockRejectedValueOnce(new BrowserApplicationSubmitError({ status: "manual",
+      ...(message ? { error: message } : {}), durationMs: 1 }, true))
+
+    const first = await tested.tool.execute(context(), input())
+    expect(first).toMatchObject({ status: "failed", errorCode: "browser_manual", output: null })
+    expect(JSON.stringify(first)).not.toContain("No submit button found")
+    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: privateReason })
+
+    const replay = await tested.tool.execute(context(), input())
+    expect(replay).toMatchObject({ status: "failed", errorCode: "browser_manual", output: null })
+    expect(JSON.stringify(replay)).not.toContain(privateReason)
+    expect(tested.submit).toHaveBeenCalledOnce()
+    expect(objectiveRead).toHaveBeenCalledOnce()
+  })
+
+  it("preserves legacy browser_manual codes and ignores untrusted Objective subtypes", async () => {
+    const legacy = harness()
+    legacy.submit.mockRejectedValueOnce(new BrowserApplicationSubmitError({ status: "manual",
+      error: "No submit button found", durationMs: 1 }))
+    await expect(legacy.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "browser_manual" })
+    expect(legacy.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: "browser_manual" })
+    await expect(legacy.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "browser_manual" })
+
+    const tested = harness({ source: objectiveSelection })
+    objectiveRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), packet: objectiveMaterial, objectiveSource })
+    Object.assign(tested.submit, { acceptsObjectiveReviewedApplicationMaterial: true as const,
+      supportsObjectiveApplicationSubmitTarget: () => true })
+    tested.submit.mockRejectedValueOnce(Object.assign(new Error("private message"), {
+      provider: "browser", statusCode: 409, code: "objective_submit_control_unavailable",
+    }))
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "failed", errorCode: "browser_409" })
+    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "failed", errorCode: "browser_409" })
   })
 
   it("fails closed when the approved artifact hash is stale", async () => {

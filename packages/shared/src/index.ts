@@ -47,6 +47,23 @@ export {
   type ReviewedFillHandoffOutboxData,
   type ReviewedFillHandoffOutboxRow,
 } from "./agent-reviewed-fill-handoff.js";
+export {
+  OBJECTIVE_REVIEWED_FILL_HANDOFF_SCHEMA,
+  OBJECTIVE_REVIEWED_FILL_HANDOFF_TOPIC,
+  OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+  buildObjectiveReviewedFillHandoffOutboxData,
+  objectiveApplicationApprovedIntentId,
+  objectiveReviewedFillHandoffIdempotencyKey,
+  parseObjectiveApplicationApprovedIntent,
+  parseObjectiveReviewedFillHandoffOutboxRow,
+  parseObjectiveReviewedFillSource,
+  type ObjectiveApplicationApprovedIntent,
+  type ObjectiveReviewedFillHandoffIdentity,
+  type ObjectiveReviewedFillHandoffIntent,
+  type ObjectiveReviewedFillHandoffOutboxData,
+  type ObjectiveReviewedFillHandoffOutboxRow,
+  type ObjectiveReviewedFillSource,
+} from "./agent-objective-reviewed-fill.js";
 export { hashAgentReceiptValue } from "./agent-receipt.js";
 export {
   bindReviewedApplicationSubmissionMaterial,
@@ -65,13 +82,33 @@ export {
   type ReviewedApplicationSubmissionMaterial,
 } from "./application-submission-material.js";
 export {
+  OBJECTIVE_REVIEWED_FILL_BROWSER_START_SCHEMA,
+  parseObjectiveReviewedApplicationFillBrowserStartEvent,
   parseReviewedApplicationFillBrowserStartEvent,
   parseReviewedApplicationFillSource,
   REVIEWED_APPLICATION_FILL_BROWSER_START_SCHEMA,
   REVIEWED_APPLICATION_FILL_SOURCE_SCHEMA,
+  type ObjectiveReviewedApplicationFillBrowserStartBinding,
   type ReviewedApplicationFillBrowserStartBinding,
   type ReviewedApplicationFillSourceSelection,
 } from "./application-reviewed-fill-proof.js";
+export {
+  buildObjectiveApplicationSubmissionManifest,
+  hashObjectiveApplicationSubmissionMaterial,
+  parseObjectiveApplicationSubmissionManifest,
+  parseObjectiveApplicationSubmissionManifestEvent,
+  parseObjectiveApplicationSubmissionMaterial,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_ACTOR,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_BODY,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_SCHEMA,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE,
+  OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_SCHEMA,
+  OBJECTIVE_APPLICATION_SUBMISSION_MATERIAL_SCHEMA,
+  type ObjectiveApplicationSubmissionManifestEvent,
+  type ObjectiveApplicationSubmissionManifestEventScope,
+  type ObjectiveApplicationSubmissionManifest,
+  type ObjectiveApplicationSubmissionMaterial,
+} from "./agent-objective-application-submit.js";
 
 export {
   buildAgentSourceMaterialFenceKey,
@@ -82,6 +119,12 @@ export { normalizeAgentLocation, normalizeAgentLocationAllowlist } from "./agent
 export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type ExternalApiErrorCode, type SharedExternalApiUsage, recordSharedExternalApiUsage } from "./external-api-usage.js";
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";
 export { canonicalJson, CanonicalJsonError, hashContent } from "./canonical-json.js";
+export {
+  OBJECTIVE_APPLICATION_REVIEW_MEMBER_PROOF_SCHEMA,
+  buildObjectiveApplicationReviewMemberProof,
+  parseObjectiveApplicationReviewMemberProof,
+  type ObjectiveApplicationReviewMemberProof,
+} from "./objective-application-review-member-proof.js";
 export {
   OBJECTIVE_APPLICATION_RESUME_WITNESS_SCHEMA,
   buildObjectiveApplicationResumeWitness,

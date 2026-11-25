@@ -1,9 +1,23 @@
 import type pg from "pg"
 import type { TurnLease } from "./turns/lease.js"
+import type { ResumeContent } from "../db/resume-pdf.js"
+import type { FlowType } from "../flows/index.js"
+import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, parseObjectiveReviewedFillSource } from "@jobcopilot/shared"
+import { acquireSourceMaterialFence } from "../db/source-material-fence.js"
 import { reviewedApplicationFillSelector } from "./reviewed-application-fill-binding.js"
+import type { ObjectiveReviewedApplicationFillEvidence } from "./objective-reviewed-application-fill-read.js"
 
 /** A positive marker carries no ApplicationTask identity into model-visible context. */
 export type ApplicationFillPreparation = Readonly<{ available: true }>
+export type ApplicationFillContext = {
+  applicationTaskId: string; jobId: string; turnInput: unknown; applicationUserId: string; applicationSessionId: string | null
+  fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; taskStatus: string; checkpoint: string | null
+  resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown; jobUserId: string; jobUrl: string | null
+  jobTitle: string; jobCompany: string; jobKeywords: string | null; jobDescription: string | null; jobCoverLetter: string | null
+  accountStatus: string; userName: string | null; userEmail: string; userPhone: string | null; userLocation: string | null
+  userLinkedin: string | null; personaFields: unknown; resumeContent: unknown; coverLetterContent: string | null
+  sessionUserId: string; sessionStatus: string; turnUserId: string; turnSessionId: string; turnStatus: string
+}
 
 type BoundApplicationTask = {
   id: string
@@ -47,11 +61,33 @@ export async function loadApplicationFillPreparation(
       || task.fillTurnUserId !== lease.userId || task.fillTurnSessionId !== lease.sessionId) {
       throw new Error("application_fill_binding_invalid")
     }
+    const objectiveMarker = objectiveSourceMarker(task.turnInput)
+    if (objectiveMarker && (task.status !== "filling" || task.checkpoint !== "taskgraph_fill_queued")) {
+      throw new Error("objective_application_fill_unavailable")
+    }
     if (task.status === "filling" && task.checkpoint === "browser_active") {
       return await commitUnavailable(client, () => { committed = true })
     }
     if (task.status !== "filling" || task.checkpoint !== "taskgraph_fill_queued") {
       throw new Error("application_fill_state_invalid")
+    }
+
+    if (objectiveMarker) {
+      const source = parseObjectiveReviewedFillSource(task.turnInput)
+      if (!source) throw new Error("objective_application_fill_unavailable")
+      await acquireSourceMaterialFence(client, [lease.userId])
+      const { readObjectiveReviewedApplicationFillSource } = await import("./objective-reviewed-application-fill-read.js")
+      const evidence: ObjectiveReviewedApplicationFillEvidence | undefined = await readObjectiveReviewedApplicationFillSource(client, { userId: lease.userId,
+        sessionId: lease.sessionId, fillTurnId: lease.turnId, applicationTaskId: task.id, jobId: task.jobId,
+        turnInput: task.turnInput, phase: "prepare", now })
+      if (!evidence || evidence.source.approvalId !== source.approvalId
+        || evidence.source.reviewTurnId !== source.reviewTurnId
+        || evidence.source.materialProofHash !== source.materialProofHash) {
+        throw new Error("objective_application_fill_unavailable")
+      }
+      await client.query("COMMIT")
+      committed = true
+      return Object.freeze({ available: true })
     }
 
     const selector = reviewedApplicationFillSelector(task.turnInput)
@@ -97,4 +133,68 @@ async function commitUnavailable(client: Pick<pg.PoolClient, "query">, markCommi
   await client.query("COMMIT")
   markCommitted()
   return undefined
+}
+
+export function buildApplicationFillInput(row: ApplicationFillContext, reviewedSourceSelected: boolean) {
+  if (!row.resumeId || !row.resumeContent) throw new Error("resume_unavailable")
+  if (!reviewedSourceSelected && row.coverLetterId && row.coverLetterContent === null) throw new Error("cover_letter_unavailable")
+  const resumeContent = parseResumeContent(row.resumeContent)
+  const persona: Record<string, string> = { fullName: row.userName ?? "", email: row.userEmail,
+    phone: row.userPhone ?? "", location: row.userLocation ?? "", linkedinUrl: row.userLinkedin ?? "" }
+  if (Array.isArray(row.personaFields)) for (const item of row.personaFields) {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const value = item as Record<string, unknown>
+      if (typeof value.key === "string" && value.key.trim() && typeof value.value === "string") persona[value.key] = value.value
+    }
+  }
+  if (!reviewedSourceSelected && (row.coverLetterContent || row.jobCoverLetter)) persona.coverLetter = row.coverLetterContent ?? row.jobCoverLetter ?? ""
+  return { applyUrl: safeApplyUrl(row.jobUrl), jobTitle: (row.jobTitle || "Application").slice(0, 256),
+    jobCompany: (row.jobCompany || "Company").slice(0, 256), jobKeywords: (row.jobKeywords ?? "").slice(0, 8000),
+    jobDescription: (row.jobDescription ?? "").slice(0, 20_000), persona, resumeContent, confirmedAnswers: parseAnswers(row.confirmedAnswers) }
+}
+
+export function urlPattern(value: string): string {
+  const segments = new URL(value).pathname.replace(/^\/+/, "").split("/")
+  return `${segments.slice(0, 2).join("/")}/`
+}
+
+export function isAllowedDestination(raw: string, flow: FlowType, approved: string): boolean {
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== "https:" || url.username || url.password) return false
+    const host = url.hostname.toLowerCase()
+    if (flow === "greenhouse") return host === "boards.greenhouse.io" || host.endsWith(".greenhouse.io")
+    if (flow === "lever") return ["jobs.lever.co", "jobs.eu.lever.co", "app.lever.co"].includes(host)
+    if (flow === "workday") return host.endsWith(".myworkdayjobs.com")
+    if (flow === "smartrecruiters") return ["jobs.smartrecruiters.com", "careers.smartrecruiters.com"].includes(host)
+    if (flow === "personio") return host.endsWith(".jobs.personio.com")
+    return url.origin === new URL(approved).origin
+  } catch { return false }
+}
+
+function parseResumeContent(value: unknown): ResumeContent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("resume_invalid")
+  return value as ResumeContent
+}
+function parseAnswers(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] =>
+    Boolean(entry[0].trim()) && typeof entry[1] === "string" && Boolean(entry[1].trim())))
+}
+function safeApplyUrl(value: string | null): string {
+  if (!value || value.length > 2048) throw new Error("apply_url_invalid")
+  const url = new URL(value)
+  if (url.protocol !== "https:" || url.username || url.password) throw new Error("apply_url_invalid")
+  return url.toString()
+}
+
+function objectiveSourceMarker(value: unknown): boolean {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false
+    const envelope = Object.getOwnPropertyDescriptor(value, "reviewedApplicationMaterialSource")
+    const marker = envelope && Object.hasOwn(envelope, "value") ? envelope.value : undefined
+    if (!marker || typeof marker !== "object" || Array.isArray(marker)) return false
+    const schema = Object.getOwnPropertyDescriptor(marker, "schemaVersion")
+    return !!schema && Object.hasOwn(schema, "value") && schema.value === OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA
+  } catch { return false }
 }

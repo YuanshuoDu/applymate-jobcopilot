@@ -4,8 +4,10 @@ import { findCurrentDraftHeadWithClient, findReviewReceiptWithClient } from "../
 import { readSelectedJobSourceDigestWithClient } from "./selected-job-artifact-context.js"
 import { readCurrentScheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
 import { selectedJobArtifactCompletionGateWithWitness } from "../selected-job-completion-gate.js"
+import { selectedJobReviewedDraftEvidenceWithWitness } from "./selected-job-reviewed-draft-evidence.js"
 import { projectTaskGraphResult } from "./task-graph-result-projection.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
+import type { TaskGraphCurrentState } from "./task-graph-command-port.js"
 import type { ObjectiveTailorWaveOccupiedSlot } from "./objective-tailor-wave-inventory.js"
 import type { ObjectiveTailorCorrectionProof } from "./objective-tailor-correction-witness.js"
 import type { ObjectiveTailorWaveSlotOutcome, ObjectiveTailorWaveSlotStatus } from "../canonical-objective-tailor-wave-completion.js"
@@ -22,11 +24,26 @@ export async function readObjectiveTailorCorrectionCompletion(input: Readonly<{
   client: PoolClient; lease: TurnLease; root: Pick<SubagentTaskRecord, "id" | "attemptCount">; loaded: LoadedGraph
   scope: GraphIdentityScope; slot: ObjectiveTailorWaveOccupiedSlot
 }>): Promise<ObjectiveTailorWaveSlotOutcome | undefined> {
+  return readCompletion(input)
+}
+
+/** Rebuilds one settled correction slot without requiring the completed source Turn's old lease. */
+export async function readCompletedObjectiveTailorCorrectionEvidence(input: Readonly<{
+  client: PoolClient; loaded: LoadedGraph; scope: GraphIdentityScope; slot: ObjectiveTailorWaveOccupiedSlot
+}>): Promise<ObjectiveTailorWaveSlotOutcome | undefined> {
+  return readCompletion(input)
+}
+
+async function readCompletion(input: Readonly<{
+  client: PoolClient; loaded: LoadedGraph; scope: GraphIdentityScope; slot: ObjectiveTailorWaveOccupiedSlot
+  lease?: TurnLease; root?: Pick<SubagentTaskRecord, "id" | "attemptCount">
+}>): Promise<ObjectiveTailorWaveSlotOutcome | undefined> {
+  const loadedRevision = input.loaded.item?.revision
   const correction = input.slot.correction, proof = correction?.proof
   if (!correction || !proof || proof.slotId !== input.slot.slotId || proof.candidateWitness.candidate.jobId !== input.slot.jobId
     || proof.prior.writerTaskId !== input.slot.writerTaskId || proof.prior.reviewerTaskId !== input.slot.reviewerTaskId
     || canonicalTaskGraphJson(proof.candidateWitness) !== canonicalTaskGraphJson(input.slot.witness)
-    || proof.graphRevision + 1 !== proof.admittedRevision || proof.admittedRevision > (input.loaded.item?.revision ?? 0)) return undefined
+    || proof.graphRevision + 1 !== proof.admittedRevision || loadedRevision === undefined || proof.admittedRevision > loadedRevision) return undefined
   const { snapshot, state, tasks } = input.loaded
   if (!snapshot || !state) return undefined
   const marker = snapshot.objectiveTailor?.slots.filter(value => value.slotId === proof.slotId)
@@ -73,27 +90,35 @@ export async function readObjectiveTailorCorrectionCompletion(input: Readonly<{
       reviewReceipt: receiptIdentity(receipt), currentSourceDigest }
   const checkedReceipt: { value: AgentArtifactReviewReceipt | null } = { value: null }
   const checkedHead: { value: Awaited<ReturnType<typeof findCurrentDraftHeadWithClient>> | undefined } = { value: undefined }
-  const checked = await selectedJobArtifactCompletionGateWithWitness({
-    commandPort: { readCurrent: async () => ({ revision: input.loaded.item!.revision, nodes: [
+  const graph: TaskGraphCurrentState = { revision: loadedRevision, nodes: [
       { key: writerNode.key, templateId: writerNode.templateId, goal: writerNode.goal, successCriteria: writerNode.successCriteria,
         dependsOn: [], taskId: writerNode.taskId, status: writerTask.status, readiness: "terminal", resultSummary: null,
         resultProjection: draft, failureReason: null },
       { key: reviewerNode.key, templateId: reviewerNode.templateId, goal: reviewerNode.goal, successCriteria: reviewerNode.successCriteria,
         dependsOn: reviewerNode.dependsOn, taskId: reviewerNode.taskId, status: reviewerTask.status, readiness: "terminal", resultSummary: null,
         resultProjection: review, failureReason: null },
-    ] }) }, lease: input.lease, root: input.root, selectedJobId: input.slot.jobId,
-    readCurrentDraftHead: async headScope => {
-      const head = await findCurrentDraftHeadWithClient(input.client, headScope)
-      checkedHead.value = head
-      return head
-    },
-    readCurrentSourceDigest: () => readSelectedJobSourceDigestWithClient(input.client, input.scope.userId, input.slot.jobId),
-    readCurrentReviewReceipt: async receiptScope => {
-      const found = await findReviewReceiptWithClient(input.client, receiptScope)
-      checkedReceipt.value = found
-      return found
-    },
-  })
+    ] }
+  const readCurrentDraftHead = async (headScope: Parameters<typeof findCurrentDraftHeadWithClient>[1]) => {
+    const head = await findCurrentDraftHeadWithClient(input.client, headScope)
+    checkedHead.value = head
+    return head
+  }
+  const readCurrentReviewReceipt = async (receiptScope: Parameters<typeof findReviewReceiptWithClient>[1]) => {
+    const found = await findReviewReceiptWithClient(input.client, receiptScope)
+    checkedReceipt.value = found
+    return found
+  }
+  const checked = input.lease && input.root
+    ? await selectedJobArtifactCompletionGateWithWitness({
+      commandPort: { readCurrent: async () => graph }, lease: input.lease, root: input.root, selectedJobId: input.slot.jobId,
+      readCurrentDraftHead, readCurrentSourceDigest: () => readSelectedJobSourceDigestWithClient(input.client, input.scope.userId, input.slot.jobId),
+      readCurrentReviewReceipt,
+    })
+    : await selectedJobReviewedDraftEvidenceWithWitness({
+      graph, userId: input.scope.userId, sessionId: input.scope.sessionId, selectedJobId: input.slot.jobId,
+      readCurrentDraftHead, readCurrentSourceDigest: () => readSelectedJobSourceDigestWithClient(input.client, input.scope.userId, input.slot.jobId),
+      readCurrentReviewReceipt,
+    })
   const verified = checkedReceipt.value
   if (!checked.ok) {
     if (checkedHead.value !== undefined && (checkedHead.value === null || !sameRef(ref, checkedHead.value))

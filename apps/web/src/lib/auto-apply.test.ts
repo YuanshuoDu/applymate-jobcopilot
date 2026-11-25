@@ -5,6 +5,7 @@ import { hashAgentReceiptValue } from "@jobcopilot/shared";
 
 const mocks = vi.hoisted(() => ({
   approvalFindFirst: vi.fn(),
+  fillReservationFindFirst: vi.fn(),
   transaction: vi.fn(),
   transactionCommit: vi.fn(),
   txTaskFindFirst: vi.fn(),
@@ -14,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   txTaskEventFindFirst: vi.fn(),
   txTaskEventCreate: vi.fn(),
   outboxFindUnique: vi.fn(),
+  txOutboxFindMany: vi.fn(),
   outboxCreate: vi.fn(),
   txActivityCreate: vi.fn(),
   taskUpdate: vi.fn(),
@@ -33,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   startApplicationFillForReview: vi.fn(),
   reviewedSubmitMaterial: vi.fn(),
   lockAndRereadReviewedSubmitMaterial: vi.fn(),
+  objectiveSubmitReplay: vi.fn(),
 }));
 let transactionClient: unknown;
 
@@ -58,6 +61,9 @@ vi.mock("@/lib/agent/approval/reviewed-submit-material", async importOriginal =>
   ...(await importOriginal<typeof import("@/lib/agent/approval/reviewed-submit-material")>()),
   resolveReviewedSubmitMaterial: mocks.reviewedSubmitMaterial,
   lockAndRereadReviewedSubmitMaterial: mocks.lockAndRereadReviewedSubmitMaterial,
+}));
+vi.mock("@/lib/agent/approval/objective-submit-approval-replay", () => ({
+  readObjectiveSubmitApprovalReplay: mocks.objectiveSubmitReplay,
 }));
 vi.mock("@/lib/runtime-feature-flags", () => ({ isRuntimeFeatureEnabled: mocks.runtimeFeatureEnabled }));
 vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement, isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }));
@@ -115,20 +121,25 @@ describe("auto-apply authorization", () => {
     mocks.txTaskFindFirst.mockResolvedValue({ status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null, resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
     mocks.txTaskEventFindMany.mockResolvedValue([]);
     mocks.txTaskEventFindFirst.mockResolvedValue(null);
+    mocks.txOutboxFindMany.mockResolvedValue([]);
     mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1" });
     mocks.coverLetterFindFirst.mockResolvedValue({ id: "cover_1" });
     mocks.jobFindFirst.mockResolvedValue({
       company: "Acme", description: "Join the platform team with Acme. Build products.", source: "lever", url: input.applyUrl,
     });
     mocks.userFindUnique.mockResolvedValue({ accountStatus: "active" });
-    mocks.approvalLock.mockResolvedValue([{ id: "approval_1" }]);
+    mocks.approvalLock.mockImplementation(async (query: { sql?: string }) => query.sql?.includes('FROM "application_tasks"')
+      ? [{ id: "application_1", sessionId: "session_1" }]
+      : [{ id: "approval_1" }]);
+    mocks.fillReservationFindFirst.mockResolvedValue(null);
     transactionClient = {
       applicationTask: { findFirst: mocks.txTaskFindFirst, updateMany: mocks.txTaskUpdateMany },
+      agentApproval: { findFirst: mocks.fillReservationFindFirst },
       resume: { findFirst: mocks.resumeFindFirst },
       coverLetter: { findFirst: mocks.coverLetterFindFirst },
       job: { updateMany: mocks.jobUpdateMany },
       applicationTaskEvent: { findMany: mocks.txTaskEventFindMany, findFirst: mocks.txTaskEventFindFirst, create: mocks.txTaskEventCreate },
-      agentOutbox: { findUnique: mocks.outboxFindUnique, create: mocks.outboxCreate },
+      agentOutbox: { findUnique: mocks.outboxFindUnique, findMany: mocks.txOutboxFindMany, create: mocks.outboxCreate },
       activity: { create: mocks.txActivityCreate },
       $queryRaw: mocks.approvalLock,
     };
@@ -157,6 +168,7 @@ describe("auto-apply authorization", () => {
     mocks.startApplicationFillForReview.mockResolvedValue({ inputId: "input_1", turnId: "turn_fill_1", sequence: "1", disposition: "started" });
     mocks.reviewedSubmitMaterial.mockResolvedValue({ mode: "legacy" });
     mocks.lockAndRereadReviewedSubmitMaterial.mockImplementation(async (_tx, _scope, proof) => proof.mode !== "unavailable");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "not_objective" });
     vi.stubEnv("ENABLE_APPLICATION_FILL_TASKGRAPH", "0");
   });
 
@@ -217,6 +229,94 @@ describe("auto-apply authorization", () => {
     expect(mocks.reviewedSubmitMaterial).toHaveBeenCalledWith(expect.anything(), scope);
     expect(mocks.lockAndRereadReviewedSubmitMaterial).toHaveBeenCalledWith(expect.anything(), scope, proof);
     expect(mocks.approvalLock.mock.calls[0]?.[0]?.values).toContain(approval.materialHash);
+  });
+
+  it("queues a saved Objective V3 Job from draft only after the exact locked proof", async () => {
+    const approval = await makeApproval();
+    const proof = { mode: "reviewed" as const, ready: true as const, resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash,
+      objectiveSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1" as const,
+        approvalId: "objective-review:set_1:6", reviewTurnId: "review_turn_1", materialProofHash: "d".repeat(64) },
+      fillTurnCreatedAt: new Date("2026-11-24T12:00:00Z") };
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    mocks.reviewedSubmitMaterial.mockResolvedValueOnce(proof);
+    mocks.jobUpdateMany.mockImplementationOnce(async ({ where }: { where: Record<string, unknown> }) => {
+      expect(where).toMatchObject({ id: input.jobId, userId: input.userId, url: input.applyUrl, status: "saved",
+        workflowState: { in: ["draft", "ready_to_apply"] }, appliedAt: null });
+      return { count: 1 };
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).resolves.toMatchObject({ taskId: expect.stringMatching(/^apply-submit-/) });
+
+    expect(mocks.lockAndRereadReviewedSubmitMaterial).toHaveBeenCalledWith(expect.anything(), expect.anything(), proof);
+    expect(mocks.txTaskEventCreate).toHaveBeenCalledOnce();
+    expect(mocks.outboxCreate).toHaveBeenCalledOnce();
+  });
+
+  it.each(["legacy", "selected ordinary"] as const)("keeps %s material ready-only when a Job is still draft", async mode => {
+    const approval = await makeApproval();
+    const proof = mode === "legacy" ? { mode: "legacy" as const } : { mode: "reviewed" as const, ready: true as const,
+      resourceHash: approval.resourceHash, materialHash: approval.materialHash, answersHash: approval.answersHash };
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    mocks.reviewedSubmitMaterial.mockResolvedValueOnce(proof);
+    mocks.jobUpdateMany.mockImplementationOnce(async ({ where }: { where: Record<string, unknown> }) => {
+      expect(where.workflowState).toBe("ready_to_apply");
+      expect(where.appliedAt).toBeUndefined();
+      return { count: 0 };
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.transactionCommit).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
+  it("does not queue a draft Job when the locked Objective proof is stale", async () => {
+    const approval = await makeApproval();
+    const proof = { mode: "reviewed" as const, ready: true as const, resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash,
+      objectiveSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1" as const,
+        approvalId: "objective-review:set_1:6", reviewTurnId: "review_turn_1", materialProofHash: "d".repeat(64) },
+      fillTurnCreatedAt: new Date("2026-11-24T12:00:00Z") };
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    mocks.reviewedSubmitMaterial.mockResolvedValueOnce(proof);
+    mocks.lockAndRereadReviewedSubmitMaterial.mockResolvedValueOnce(false);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["already applied", { status: "applied", workflowState: "submitted", appliedAt: new Date() }],
+    ["already queued", { status: "saved", workflowState: "queued", appliedAt: null }],
+  ] as const)("does not queue an Objective Job that is %s", async (_label, currentJob) => {
+    const approval = await makeApproval();
+    const proof = { mode: "reviewed" as const, ready: true as const, resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash,
+      objectiveSource: { schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1" as const,
+        approvalId: "objective-review:set_1:6", reviewTurnId: "review_turn_1", materialProofHash: "d".repeat(64) },
+      fillTurnCreatedAt: new Date("2026-11-24T12:00:00Z") };
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    mocks.reviewedSubmitMaterial.mockResolvedValueOnce(proof);
+    mocks.jobUpdateMany.mockImplementationOnce(async ({ where }: { where: Record<string, unknown> }) => {
+      const workflow = where.workflowState as string | { in?: readonly string[] };
+      const workflowMatches = typeof workflow === "string" ? workflow === currentJob.workflowState
+        : workflow.in?.includes(currentJob.workflowState) === true;
+      const appliedMatches = !Object.hasOwn(where, "appliedAt") || currentJob.appliedAt === null;
+      return { count: where.status === currentJob.status && workflowMatches && appliedMatches ? 1 : 0 };
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
   });
 
   it("rejects unavailable or mismatched reviewed proof before opening the transaction", async () => {
@@ -388,6 +488,10 @@ describe("auto-apply authorization", () => {
 
   it("resumes a queue_retry only with the exact unexpired approved receipt and no committed intent", async () => {
     const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "retryable" });
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1",
+      fillTurnUserId: "user_1", workerTaskId: null, status: "waiting_for_authorization", checkpoint: "queue_retry",
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "waiting_for_authorization", checkpoint: "queue_retry", workerTaskId: null,
       resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
 
@@ -396,10 +500,15 @@ describe("auto-apply authorization", () => {
     expect(result.taskId).toMatch(/^apply-submit-[a-f0-9]{64}$/);
     expect(mocks.txTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ checkpoint: "queue_retry" }) }));
     expect(mocks.outboxFindUnique).toHaveBeenCalledWith(expect.objectContaining({ where: { idempotencyKey: expect.any(String) } }));
-    expect(mocks.txTaskEventFindFirst).toHaveBeenCalledWith({ where: { taskId: input.applicationTaskId, type: "submission_queued", AND: [
-      { data: { path: ["workerTaskId"], equals: expect.stringMatching(/^apply-submit-/) } },
-      { data: { path: ["fillTurnId"], equals: "turn_1" } }, { data: { path: ["receiptId"], equals: "approval_1" } },
-    ] }, select: { id: true } });
+    expect(mocks.txOutboxFindMany).toHaveBeenCalledWith({ where: { topic: "application.submit.dispatch", aggregateId: "session_1", AND: [
+      { payload: { path: ["applicationTaskId"], equals: input.applicationTaskId } },
+      { payload: { path: ["fillTurnId"], equals: "turn_1" } },
+    ] }, take: 2, select: { id: true } });
+    expect(mocks.txTaskEventFindFirst).toHaveBeenCalledWith({ where: { taskId: input.applicationTaskId,
+      type: "submission_queued", data: { path: ["fillTurnId"], equals: "turn_1" } }, select: { id: true } });
+    expect(mocks.txTaskEventFindFirst).toHaveBeenCalledWith({ where: { taskId: input.applicationTaskId,
+      type: { in: ["submission_execution_started", "submission_execution_settled"] },
+      data: { path: ["fillTurnId"], equals: "turn_1" } }, select: { id: true } });
     expect(mocks.txTaskEventCreate.mock.calls[0]?.[0]?.data?.data).toMatchObject({ receiptId: "approval_1" });
     expect(mocks.txTaskEventCreate).toHaveBeenCalledTimes(1);
     expect(mocks.outboxCreate).toHaveBeenCalledTimes(1);
@@ -407,8 +516,67 @@ describe("auto-apply authorization", () => {
     mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "waiting_for_authorization", checkpoint: "queue_retry", workerTaskId: null,
       resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
     mocks.outboxFindUnique.mockResolvedValueOnce(null);
-    mocks.txTaskEventFindFirst.mockResolvedValueOnce({ id: "already-queued-event" });
+    mocks.txTaskEventFindFirst.mockResolvedValueOnce({ id: "already-queued-event", data: { fillTurnId: "turn_1",
+      workerTaskId: "different-attempt", receiptId: "different-receipt" } });
     await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("no longer ready");
+  });
+
+  it("does not retry an Objective intent when any scoped queued event or outbox exists", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "retryable" });
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1",
+      fillTurnUserId: "user_1", workerTaskId: null, status: "waiting_for_authorization", checkpoint: "queue_retry",
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "waiting_for_authorization", checkpoint: "queue_retry", workerTaskId: null,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
+    mocks.txOutboxFindMany.mockResolvedValueOnce([{ id: "other-scoped-attempt" }]);
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("no longer ready");
+    expect(mocks.txOutboxFindMany).toHaveBeenCalledOnce();
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a concurrent worker claim", { status: "waiting_for_authorization", checkpoint: "queue_retry", workerTaskId: "other-worker" }],
+    ["a changed checkpoint", { status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null }],
+  ])("does not overwrite %s after the unlocked Objective retry probe", async (_name, lockedState) => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "retryable" });
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1",
+      fillTurnUserId: "user_1", workerTaskId: null, status: "waiting_for_authorization", checkpoint: "queue_retry",
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.txTaskFindFirst.mockResolvedValueOnce({ ...lockedState, resumeId: "resume_1", coverLetterId: null,
+      confirmedAnswers: null, question: null });
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("no longer ready");
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.txOutboxFindMany).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges an exact accepted Objective intent without rereading current materials or writing", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "committed", taskId: "apply-submit-existing" });
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).resolves.toEqual({ taskId: "apply-submit-existing" });
+    expect(mocks.reviewedSubmitMaterial).not.toHaveBeenCalled();
+    expect(mocks.lockAndRereadReviewedSubmitMaterial).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("does not let a replay-only V3 request create an intent from form_filled", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    mocks.objectiveSubmitReplay.mockResolvedValue({ kind: "invalid" });
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("existing submission intent");
+    expect(mocks.reviewedSubmitMaterial).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
   });
 
   it("refuses queue_retry when a matching intent is already persisted or material changed", async () => {
@@ -728,6 +896,17 @@ describe("auto-apply authorization", () => {
     await expect(queueApplicationFill(input)).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ operation: "fill" }));
     expect(mocks.startApplicationFillForReview).not.toHaveBeenCalled();
+  });
+
+  it("denies a reserved Objective task before using the legacy ApplyQueue when TaskGraph is disabled", async () => {
+    mocks.fillReservationFindFirst.mockResolvedValueOnce({ id: `objective-review:objective-review-${"a".repeat(40)}:1` });
+    const { queueApplicationFill } = await import("./auto-apply");
+
+    await expect(queueApplicationFill(input)).rejects.toThrow("no longer ready");
+
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+    expect(mocks.taskEventCreate).not.toHaveBeenCalled();
   });
 
   it("never sends a reviewed-source fill through the legacy ApplyQueue path", async () => {

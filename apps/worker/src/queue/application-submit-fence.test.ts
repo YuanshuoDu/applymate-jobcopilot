@@ -7,6 +7,8 @@ import {
   lockApplicationSubmitFence,
   matchesExactApplicationSubmitTerminalProof,
   recordSubmissionExecutionSettled,
+  recordSubmissionExecutionSettledWithClient,
+  readTerminalSubmitAttemptDisposition,
   type ApplicationSubmitIdentity,
 } from "./application-submit-fence.js"
 
@@ -35,6 +37,20 @@ const terminalProof = {
 }
 
 describe("application submit fence", () => {
+  it.each([
+    [{ status: "filling", checkpoint: "submission_request_started" }, "claimed"],
+    [{ status: "waiting_for_user", checkpoint: "submission_uncertain" }, "uncertain"],
+    [{ status: "submitted", checkpoint: "submission_verified" }, "final"],
+    [{ status: "filling", checkpoint: "browser_active" }, "claimed"],
+    [{ status: "other", checkpoint: null }, "stale"],
+  ] as const)("classifies the exact locked attempt state", async (task, expected) => {
+    const query = vi.fn(async (_sql: string, _values?: unknown[]) => ({ rows: [task], rowCount: 1 }))
+    const exactClient = { query } as unknown as PoolClient
+    await expect(readTerminalSubmitAttemptDisposition(exactClient, { ...identity, workerTaskId: "bull-a" })).resolves.toBe(expected)
+    expect(query.mock.calls[0]?.[0]).toContain('"workerTaskId" = $6 FOR UPDATE')
+    expect(query.mock.calls[0]?.[1]).toEqual([identity.applicationTaskId, identity.userId, identity.jobId, identity.sessionId, identity.fillTurnId, "bull-a"])
+  })
+
   it("matches exact terminal proof and requires failed attempts to be exhausted", () => {
     expect(isValidApplicationSubmitTerminalObservation(terminalProof)).toBe(true)
     expect(matchesExactApplicationSubmitTerminalProof(terminalProof, terminalProofIdentity)).toBe(true)
@@ -149,6 +165,21 @@ describe("application submit fence", () => {
     expect(transactionCalls.filter(sql => sql === "COMMIT")).toHaveLength(2)
     expect(pool.connect).toHaveBeenCalledTimes(4)
     expect(release).toHaveBeenCalledTimes(4)
+  })
+
+  it("can append the same settled proof inside an already fenced caller transaction", async () => {
+    const test = client()
+    const scope = { ...identity, workerTaskId: "bull-a", executionId: "execution-a" }
+
+    await expect(recordSubmissionExecutionSettledWithClient(test.client, scope)).resolves.toBe(true)
+
+    expect(test.query).toHaveBeenCalledOnce()
+    expect(String(test.query.mock.calls[0]?.[0])).toContain("submission_execution_started")
+    expect(String(test.query.mock.calls[0]?.[0])).toContain("submission_execution_settled")
+    expect(test.query.mock.calls[0]?.[1]?.slice(0, 9)).toEqual([
+      identity.applicationTaskId, "bull-a", "execution-a", identity.userId, identity.jobId,
+      identity.sessionId, identity.fillTurnId, identity.approvalId, identity.constraintHash,
+    ])
   })
 
   it("preserves a false settlement result when the later projection fails", async () => {

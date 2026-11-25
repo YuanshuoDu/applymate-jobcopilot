@@ -5,6 +5,7 @@ import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { detectCaptcha } from "../cloak/captcha.js";
 import { insertApplyResult, getPool, type InsertApplyResult } from "../db/apply-results.js";
+import { recordObjectiveApplicationSubmitResult } from "../db/objective-application-submit-result.js";
 import * as legacyFillOutcomes from "./legacy-apply-outcomes.js";
 import {
   claimUnattendedSubmission,
@@ -13,7 +14,7 @@ import {
 } from "../db/submission-guard.js";
 import { checkBudget, incrementBudget } from "../db/budget.js";
 import { findFormPattern, recordPatternFailure, upsertFormPattern } from "../db/form-patterns.js";
-import { loadTaskContext } from "../db/load-task-context.js";
+import { loadTaskContext, readApplyQueueMaterialMode, type ApplyQueueMaterialMode } from "../db/load-task-context.js";
 import { AgentHarness } from "../harness/agent-harness.js";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
 import type { FlowType } from "../flows/index.js";
@@ -50,8 +51,10 @@ import {
 import { redisConnection } from "../redis.js";
 import { createPgApplicationSubmitTool, type ApplicationSubmitOutput } from "../runtime/tools/application-submit-tool.js";
 import { recordSubmissionExecutionSettled, type ApplicationSubmitIdentity } from "./application-submit-fence.js";
+import { hasExactObjectiveSubmitResult } from "./objective-application-submit-terminal-recovery.js";
 import { reconcileTerminalSubmitJob } from "./application-submit-outbox-terminal-recovery.js";
 import { createBrowserApplicationSubmitProvider } from "../runtime/tools/browser-submit-provider.js";
+import { objectiveApplicationSubmitTargetSupported, runObjectiveGreenhouseApplicationSubmit } from "./objective-application-submit-material.js";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import { linkAbortSignals } from "../runtime/interrupt/bridge.js";
 import {
@@ -111,6 +114,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     let approvedTurnScope: ApplicationSubmissionStartScope | null = null;
     let turnStopped = false;
     let submissionRequestStarted = false;
+    let submissionRequestForwarded = false;
+    let objectiveRunnerReportedSuccess = false;
+    let objectiveResultCorrelationRequired = false;
+    let objectiveRunnerConfirmationId: string | null = null;
     let submissionExecutionStartAttempted = false;
     let submissionContextCloseConfirmed = false;
     let submissionPageCloseConfirmed = false;
@@ -200,12 +207,18 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         console.warn(`[apply-worker] Skipping suspended account for job=${jobId}`);
         return;
       }
+      const materialMode: ApplyQueueMaterialMode = operation === "submit" && submissionIdentity
+        ? await readApplyQueueMaterialMode(getPool(), submissionIdentity)
+        : "ordinary";
+      if (materialMode === "blocked") throw new Error("Application material source is invalid or unavailable.");
+      const objectiveMode = materialMode === "objective";
+      if (objectiveMode && submissionIdentity && await hasExactObjectiveSubmitResult(getPool(), { ...submissionIdentity, workerTaskId })) return;
       if (operation === "fill" && !await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
         console.warn(`[apply-worker] Skipping stale or revoked application task for job=${jobId}`);
         return;
       }
-      const initialControl = await evaluateUnattendedApplyControl(getPool(), applyUrl, userId);
-      if (!initialControl.allowed) {
+      const initialControl = objectiveMode ? null : await evaluateUnattendedApplyControl(getPool(), applyUrl, userId);
+      if (initialControl && !initialControl.allowed) {
         const handedOff = await handOffUnavailableUnattendedTask({
           applicationTaskId,
           operation,
@@ -222,8 +235,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         return;
       }
 
-      const limit = await checkRateLimit(userId, domain);
-      if (!limit.allowed) {
+      const limit = objectiveMode ? null : await checkRateLimit(userId, domain);
+      if (limit && !limit.allowed) {
         const retryMs = limit.retryAfterMs ?? 60_000;
         console.warn(
           `[apply-worker] Rate-limited: user=${userId} domain=${domain}, retry in ${retryMs}ms`
@@ -232,12 +245,22 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       }
 
       // Load real persona + job data from DB
-      ctx = await loadTaskContext(getPool(), userId, jobId, applyUrl, applicationTaskId);
+      ctx = objectiveMode
+        ? await loadTaskContext(getPool(), userId, jobId, applyUrl, applicationTaskId, { objectiveOnly: true })
+        : await loadTaskContext(getPool(), userId, jobId, applyUrl, applicationTaskId);
       const taskCtx = ctx; // non-null const for use inside async callbacks
-      const control = taskCtx.applyUrl === applyUrl
-        ? initialControl
-        : await evaluateUnattendedApplyControl(getPool(), taskCtx.applyUrl, userId);
+      const control = !objectiveMode && taskCtx.applyUrl === applyUrl && initialControl
+        ? initialControl : await evaluateUnattendedApplyControl(getPool(), taskCtx.applyUrl, userId);
+      if (objectiveMode && (!objectiveApplicationSubmitTargetSupported(taskCtx.applyUrl) || control.flow !== "greenhouse")) {
+        throw new Error("Objective application target is not supported.");
+      }
+      if (objectiveMode && control.allowed) {
+        const host = new URL(taskCtx.applyUrl).hostname.replace(/^www\./, "");
+        const objectiveLimit = await checkRateLimit(userId, host);
+        if (!objectiveLimit.allowed) throw new Error(`RATE_LIMITED:${objectiveLimit.retryAfterMs ?? 60_000}`);
+      }
       if (!control.allowed) {
+        if (objectiveMode) throw new Error("Objective application is temporarily unavailable.");
         const handedOff = await handOffUnavailableUnattendedTask({
           applicationTaskId,
           operation,
@@ -303,17 +326,15 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           return;
         }
 
-        browserAttemptStarted = true;
-        console.log(
-          `[apply-worker] Navigating to ${taskCtx.applyUrl} (user=${userId}, job=${jobId}, dryRun=${dryRun ?? false})`
-        );
-
-        await page.goto(taskCtx.applyUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: 30_000,
-        });
-        if (!isAllowedAtsDestination(page.url(), flow, taskCtx.applyUrl)) {
-          throw new Error("Application page redirected outside the approved ATS origin.");
+        if (!objectiveMode) {
+          browserAttemptStarted = true;
+          console.log(
+            `[apply-worker] Navigating to ${taskCtx.applyUrl} (user=${userId}, job=${jobId}, dryRun=${dryRun ?? false})`
+          );
+          await page.goto(taskCtx.applyUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+          if (!isAllowedAtsDestination(page.url(), flow, taskCtx.applyUrl)) {
+            throw new Error("Application page redirected outside the approved ATS origin.");
+          }
         }
 
         let challengeBoundary: "captcha" | "detection_error" | null = null;
@@ -573,6 +594,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                       await releaseSubmissionFence(true);
                       await continuation;
                       if (continuationFailed) throw continuationFailure;
+                      submissionRequestForwarded = true;
                     } catch (error: unknown) {
                       submissionFenceUnavailable = true;
                       console.warn(
@@ -788,7 +810,37 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         if (hasCanonicalReceipt) {
           if (!approvedTurnScope) throw new Error("Approved application submission is missing its durable Turn scope.");
           const submit = createBrowserApplicationSubmitProvider({
-            run: runBrowserFlow,
+            run: objectiveMode ? async () => ({ status: "submission_blocked", error: "Objective material is required.", durationMs: 0 }) : runBrowserFlow,
+            ...(objectiveMode ? {
+              supportsObjectiveTarget: url => url === taskCtx.applyUrl
+                && control.flow === "greenhouse" && objectiveApplicationSubmitTargetSupported(url),
+              runObjective: async ({ target, material, beforeSubmit }) => {
+                if (material.approvedApplyUrl !== taskCtx.applyUrl
+                  || !objectiveApplicationSubmitTargetSupported(material.approvedApplyUrl)) {
+                  return { status: "submission_blocked", error: "Approved Objective target changed.", durationMs: 0 };
+                }
+                browserAttemptStarted = true;
+                console.log(`[apply-worker] Navigating to approved Objective target (job=${jobId}).`);
+                await page.goto(material.approvedApplyUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+                if (!isAllowedAtsDestination(page.url(), "greenhouse", material.approvedApplyUrl)) {
+                  return { status: "submission_blocked", error: "Approved Objective target redirected outside Greenhouse.", durationMs: 0 };
+                }
+                if (!await challengeAllowsAction()) return {
+                  status: "manual", error: challengeBoundary === "detection_error"
+                    ? CHALLENGE_DETECTION_FAILED_MESSAGE : CAPTCHA_USER_TAKEOVER_MESSAGE, durationMs: 0,
+                };
+                const objectiveTask: ApplyTask = {
+                  jobId, applyUrl: material.approvedApplyUrl, persona: taskCtx.persona,
+                  jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, jobKeywords: taskCtx.jobKeywords,
+                  resumePath: "", dryRun: dryRun ?? false, allowSubmit: true, confirmedAnswers: material.confirmedAnswers,
+                  beforeSubmit: async intent => {
+                    if (!await beforeSubmit(intent)) return false;
+                    return applyTask.beforeSubmit ? applyTask.beforeSubmit(intent) : true;
+                  },
+                };
+                return runObjectiveGreenhouseApplicationSubmit({ userId, task: objectiveTask, material, page });
+              },
+            } : {}),
             confirmationId: `application:${applicationTaskId}`,
             postSubmitUrl: () => page.url(),
           });
@@ -815,6 +867,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           }
           if (queueCatchStarted) return;
           usedFlow = "application.submit";
+          if (objectiveMode && toolResult.status === "submitted") {
+            objectiveRunnerReportedSuccess = true;
+            objectiveRunnerConfirmationId = toolResult.confirmationId;
+          }
           harnessResult = toolResult.status === "submitted" || toolResult.status === "replayed"
             ? { status: "submitted", turns: toolResult.status === "replayed" ? 0 : 1, durationMs: Date.now() - startedAt, error: null, log: [] }
             : {
@@ -834,6 +890,21 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           harnessResult = await runBrowserFlow();
         }
         if (queueCatchStarted || submissionSuperseded) return;
+
+        if (objectiveMode && harnessResult.status !== "submitted") {
+          console.log("OBJECTIVE_SUBMIT_BOUNDARY " + JSON.stringify({
+            armed: armedSubmissionIntent !== null,
+            candidateSeen: submissionCandidateSeen,
+            fenceEntered: submissionExecutionStartAttempted,
+            taskInactive: submissionTaskInactive,
+            fenceUnavailable: submissionFenceUnavailable,
+            stopped: turnStopped,
+            requestStarted: submissionRequestStarted,
+            requestForwarded: submissionRequestForwarded,
+          }));
+        }
+
+        if (objectiveMode && objectiveRunnerReportedSuccess && submissionRouteState.work) await submissionRouteState.work;
 
         if (turnStopped && !submissionRequestStarted && harnessResult.status !== "submitted") {
           harnessResult = { ...harnessResult, status: "failed", error: TURN_STOPPED_MESSAGE };
@@ -886,19 +957,30 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         }
 
         const durationMs = Date.now() - startedAt;
+        const recordObjectiveSuccess = objectiveMode && objectiveRunnerReportedSuccess && harnessResult.status === "submitted";
+        if (objectiveMode && harnessResult.status === "submitted" && !recordObjectiveSuccess) {
+          submissionSuperseded = true;
+          return;
+        }
+        objectiveResultCorrelationRequired = recordObjectiveSuccess;
         resultWriteStarted = true;
         try {
-          const resultId = await insertApplyResult({
-            userId,
-            jobId,
-            status: harnessResult.status as InsertApplyResult["status"],
-            mode: "unattended",
-            atsType: flow ?? "unknown",
-            flowUsed: usedFlow,
-            error: harnessResult.error ?? null,
-            durationMs,
-            submissionIdentity: submissionIdentity!,
-          });
+          const resultId = recordObjectiveSuccess
+            ? await recordObjectiveApplicationSubmitResult({ pool: getPool(),
+                execution: { ...submissionIdentity!, workerTaskId, executionId }, runnerStatus: "submitted",
+                confirmationId: objectiveRunnerConfirmationId, durationMs, requestStarted: submissionRequestStarted,
+                requestContinued: submissionRequestForwarded, fenceUnavailable: submissionFenceUnavailable })
+            : await insertApplyResult({
+                userId,
+                jobId,
+                status: harnessResult.status as InsertApplyResult["status"],
+                mode: "unattended",
+                atsType: flow ?? "unknown",
+                flowUsed: usedFlow,
+                error: harnessResult.error ?? null,
+                durationMs,
+                submissionIdentity: submissionIdentity!,
+              });
           if (resultId === null) { submissionSuperseded = true; return; }
           resultWritten = true;
         } catch (error: unknown) {
@@ -963,6 +1045,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             isSubmitted ? "submitted" : submissionUncertain || requiresUserTakeover ? "waiting_for_user" : isSubmissionBlocked ? "waiting_for_authorization" : "failed",
             isSubmitted ? "submission_verified" : submissionUncertain ? "submission_uncertain" : turnStopped && !submissionRequestStarted ? "turn_stopped_before_submit" : isSubmissionBlocked ? "submission_blocked" : requiresUserTakeover ? USER_TAKEOVER_CHECKPOINT : "execution_failed",
             harnessResult.error ?? null, operation === "submit" ? "submit" : "fill", submissionIdentity ?? undefined,
+            ...(recordObjectiveSuccess ? [{ preserveRunnableSession: true }] as const : []),
           );
           if (taskWrite === "superseded") { submissionSuperseded = true; return; }
           applicationTaskFinalized = true;
@@ -1035,7 +1118,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         resultWritten = true;
       } else {
         const status = mayHaveOpenedBrowser || browserAttemptStarted ? "manual" : "failed";
-        if (!resultWritten && !resultWriteStarted) {
+        if (!resultWritten && !resultWriteStarted && !objectiveResultCorrelationRequired) {
           resultWriteStarted = true;
           try {
             const resultId = await insertApplyResult({

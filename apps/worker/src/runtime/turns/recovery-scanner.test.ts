@@ -1,9 +1,36 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA } from "@jobcopilot/shared"
 
 const sessionControlRecovery = vi.hoisted(() => ({ run: vi.fn() }))
+const objectiveRecovery = vi.hoisted(() => ({ settlement: vi.fn(), inspectWake: vi.fn(), hasEvidence: vi.fn(), eventId: vi.fn(), receipt: vi.fn(),
+  hasPublishedWake: vi.fn(), rootMatches: vi.fn(), parseRootWait: vi.fn(), parkedWait: vi.fn(), persistWakeupDispatch: vi.fn() }))
+const objectiveFillFailureRecovery = vi.hoisted(() => ({ run: vi.fn() }))
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 vi.mock("../session-control/pause-recovery.js", () => ({ reconcilePendingSessionControls: sessionControlRecovery.run }))
+vi.mock("../../db/objective-application-submit-settlement.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../db/objective-application-submit-settlement.js")>()),
+  readObjectiveApplicationSubmitSettlement: objectiveRecovery.settlement,
+}))
+vi.mock("../wakeup/resume-objective-final-submit-wait.js", () => ({ inspectObjectiveFinalSubmitWake: objectiveRecovery.inspectWake }))
+vi.mock("./recovery-scanner-objective-submit.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("./recovery-scanner-objective-submit.js")>()),
+  hasObjectiveApplicationSubmitFinalizationEvidenceWithClient: objectiveRecovery.hasEvidence,
+  objectiveApplicationSubmitFinalizationEventId: objectiveRecovery.eventId,
+  objectiveApplicationSubmitFinalizationReceiptFor: objectiveRecovery.receipt,
+  hasPublishedObjectiveSubmitWakeWithClient: objectiveRecovery.hasPublishedWake,
+  objectiveSubmitRootWaitMatchesApproval: objectiveRecovery.rootMatches,
+  parseObjectiveSubmitRootWait: objectiveRecovery.parseRootWait,
+  hasParkedObjectiveRootWaitWithClient: objectiveRecovery.parkedWait,
+}))
+vi.mock("./recovery-scanner-objective-fill-failure.js", () => ({ recoverObjectiveFillPrestartFailures: objectiveFillFailureRecovery.run }))
+vi.mock("./recovery-scanner-storage.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("./recovery-scanner-storage.js")>()),
+  persistWakeupTurnDispatchInTransaction: objectiveRecovery.persistWakeupDispatch,
+}))
+
+const reviewedSource = { schemaVersion: OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA,
+  approvalId: `objective-review:objective-review-${"a".repeat(40)}:1`, reviewTurnId: "review-turn-1", materialProofHash: "b".repeat(64) }
 
 import { dispatchPendingTurnOutbox, persistTurnDispatch, reclaimExpiredTurns, repairLegacyTurnDispatchAggregates, recoverTurnQueue, turnJobId } from "./recovery-scanner.js"
 import { markTurnDispatchClaimed } from "./turn-queue.js"
@@ -27,7 +54,7 @@ function matchingLegacyRows(rows: unknown[]): unknown[] {
   })
 }
 
-function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = [], lineageRows: readonly unknown[] = [{ id: "turn_1" }]) {
+function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = [], lineageRows: readonly unknown[] = [{ id: "turn_1" }], objectiveError: Error | null = null) {
   const calls: Array<[string, unknown[]?]> = []
   const open = sessionStatus !== null && !["aborted", "archived"].includes(sessionStatus)
   const client = {
@@ -37,6 +64,11 @@ function pool(rows: unknown[] = [], sessionStatus: string | null = "running", qu
       if (sql.includes("WITH candidates AS")) {
         const candidates = matchingLegacyRows(legacyRows)
         return open ? { rows: candidates, rowCount: candidates.length } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('FROM "agent_sessions" AS session') && sql.includes('JOIN "agent_turns" AS turn')
+        && sql.includes("reviewedApplicationMaterialSource")) {
+        if (objectiveError) throw objectiveError
+        return { rows: [], rowCount: 0 }
       }
       if (sql.includes('WHERE turn."id" = $1') && sql.includes("FOR UPDATE OF turn, session")) return { rows: lineageRows, rowCount: lineageRows.length }
       if (sql.includes('WHERE turn."id" = $1') && sql.includes("FOR UPDATE OF turn, turnSession")) return { rows: lineageRows, rowCount: lineageRows.length }
@@ -54,6 +86,17 @@ function pool(rows: unknown[] = [], sessionStatus: string | null = "running", qu
 describe("Turn recovery scanner", () => {
   beforeEach(() => {
     sessionControlRecovery.run.mockReset().mockResolvedValue({ scanned: 0, reconciled: 0, failed: 0 })
+    objectiveRecovery.settlement.mockReset()
+    objectiveRecovery.inspectWake.mockReset().mockResolvedValue("acknowledge")
+    objectiveRecovery.hasEvidence.mockReset().mockResolvedValue(false)
+    objectiveRecovery.eventId.mockReset().mockReturnValue("finalization-event-1")
+    objectiveRecovery.receipt.mockReset().mockReturnValue({ schemaVersion: "objective-finalization" })
+    objectiveRecovery.hasPublishedWake.mockReset().mockResolvedValue(true)
+    objectiveRecovery.rootMatches.mockReset().mockReturnValue(true)
+    objectiveRecovery.parseRootWait.mockReset().mockReturnValue({ kind: "explicit_approval", waitId: "approval-1" })
+    objectiveRecovery.parkedWait.mockReset().mockResolvedValue(true)
+    objectiveRecovery.persistWakeupDispatch.mockReset().mockResolvedValue(true)
+    objectiveFillFailureRecovery.run.mockReset().mockResolvedValue(0)
   })
 
   it("includes pause and resume reconciliation in each root recovery pass", async () => {
@@ -74,6 +117,86 @@ describe("Turn recovery scanner", () => {
 
     expect(log).toHaveBeenCalledWith("[turn-recovery] session control scan failed:", error)
     log.mockRestore()
+  })
+
+  it("keeps normal recovery and dispatch running when Objective prestart discovery rejects", async () => {
+    const fake = pool(
+      [{ id: "dispatch_normal", aggregateId: "session_1", payload: { turnId: "turn_2", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 0 }],
+      "running", [{ id: "turn_2", sessionId: "session_1" }], [], [{ id: "turn_1" }, { id: "turn_2" }],
+    )
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    objectiveFillFailureRecovery.run.mockRejectedValueOnce(new Error("private database detail"))
+
+    await expect(recoverTurnQueue(fake.pool, queue, "owner_1")).resolves.toMatchObject({ reclaimed: 1, dispatched: 1 })
+
+    expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_2", sessionId: "session_1", ownerId: "owner_1" },
+      { jobId: turnJobId("turn_2", 0), attempts: 5 })
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining("private database detail"))
+    log.mockRestore()
+  })
+
+  it("counts a rootless Objective failure settlement without changing the ordinary scanner path", async () => {
+    const fake = pool(), tick = new Date("2026-11-25T10:00:00.000Z")
+    objectiveFillFailureRecovery.run.mockResolvedValueOnce(2)
+
+    await expect(recoverTurnQueue(fake.pool, { add: vi.fn() }, "owner_1", tick)).resolves.toMatchObject({ reclaimed: 1, repaired: 2 })
+
+    expect(objectiveFillFailureRecovery.run).toHaveBeenCalledWith(fake.pool, expect.any(Number), tick)
+  })
+
+  it("timestamps a recovered finalization receipt at insert time, after the settled result", async () => {
+    const tick = new Date("2026-11-20T10:00:00.000Z"), sessionId = "session_1", turnId = "turn_1", rootTaskId = "root_1"
+    const task = { id: "application_1", userId: "user_1", jobId: "job_1", sessionId, fillTurnId: turnId,
+      fillTurnSessionId: sessionId, fillTurnUserId: "user_1", workerTaskId: "bull-1", status: "submitted",
+      checkpoint: "submission_verified", completedAt: new Date("2026-11-20T10:01:00.000Z") }
+    const approvalId = `application-fill:${task.id}:${turnId}`, constraintHash = "a".repeat(64)
+    const wakeItemId = `agent-wait:approval:${approvalId}`
+    const wakeEvent = { eventId: "wake-event-1", sessionId, turnId, itemId: wakeItemId, type: "turn.wakeup",
+      payload: { waitKind: "approval", waitId: approvalId, itemId: wakeItemId, turnId,
+        toolCallId: `application-submit:${task.id}`, status: "approved", nextTurnRevision: 4 } }
+    const calls: Array<[string, unknown[]?]> = []
+    const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
+      calls.push([sql, values])
+      if (sql.includes('FROM "agent_sessions" AS session') && sql.includes("reviewedApplicationMaterialSource")) {
+        return { rows: [{ userId: "user_1", sessionId, turnId, rootTaskId, updatedAt: tick }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_sessions"') && sql.includes('"status" IN (\'running\',\'waiting_for_user\') FOR UPDATE')) {
+        return { rows: [{ id: sessionId, status: "running" }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_events" AS pause')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_turns" WHERE "id"=$1')) return { rows: [{ id: turnId, rootTaskId, source: "user",
+        executionMode: "canonical_task_graph", input: { reviewedApplicationMaterialSource: reviewedSource }, status: "waiting_for_approval", revision: 4,
+        leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns" WHERE "sessionId"=$1')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('"attemptCount"')) return { rows: [{ id: rootTaskId, status: "waiting_for_user",
+        attemptCount: 1, result: {}, failureReason: null, leaseOwner: null, leaseExpiresAt: null,
+        interruptRequestedAt: null, closedAt: null }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler_1", status: "completed", leaseOwner: null,
+        leaseExpiresAt: null, interruptRequestedAt: null }], rowCount: 1 }
+      if (sql.includes('FROM "application_tasks"')) return { rows: [task], rowCount: 1 }
+      if (sql.includes('FROM "Job"')) return { rows: [{ id: task.jobId, status: "applied", workflowState: "submitted", appliedAt: tick }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"') && sql.includes('"payload"')) return { rows: [wakeEvent], rowCount: 1 }
+      if (sql.includes("submission_execution_settled")) return { rows: [{ id: "settled_1", actor: "worker", body: "Submit execution settled",
+        data: { applicationTaskId: task.id, userId: task.userId, jobId: task.jobId, sessionId, fillTurnId: turnId,
+          approvalId, constraintHash, workerTaskId: task.workerTaskId, executionId: "execution_1" } }], rowCount: 1 }
+      if (sql.includes('INSERT INTO "application_task_events"')) return { rows: [{ id: values?.[0] }], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
+      return { rows: [], rowCount: 0 }
+    }), release: vi.fn() }
+    const fakePool = { connect: vi.fn().mockResolvedValue(client) }
+    objectiveRecovery.settlement.mockResolvedValue({ resultLinkEventId: "result-link-1", fillTurnStatus: "waiting_for_approval" })
+    objectiveRecovery.eventId.mockReturnValue("finalization-event-1")
+    objectiveRecovery.parseRootWait.mockReturnValue({ kind: "explicit_approval", waitId: approvalId })
+
+    await recoverTurnQueue(fakePool as never, { add: vi.fn() }, "scanner_1", tick)
+
+    const insert = calls.find(([sql]) => sql.includes('INSERT INTO "application_task_events"'))
+    expect(insert?.[0]).toContain("clock_timestamp()")
+    expect(insert?.[0]).not.toContain("$6")
+    expect(insert?.[1]).toHaveLength(5)
+    const turnUpdate = calls.find(([sql]) => sql.includes('UPDATE "agent_turns"'))
+    expect(turnUpdate?.[1]?.[0]).toBe(tick)
   })
 
   it("rejects an invalid dispatch batch size before touching the database", async () => {
@@ -176,6 +299,72 @@ describe("Turn recovery scanner", () => {
     expect(legacyIndex).toBeGreaterThanOrEqual(0)
     expect(legacyIndex).toBeLessThan(reclaimIndex)
     expect(legacyIndex).toBeLessThan(queuedIndex)
+  })
+
+  it("continues ordinary dispatch when Objective submit candidate discovery fails", async () => {
+    const fake = pool(
+      [{ id: "dispatch_normal", aggregateId: "session_1", payload: { turnId: "turn_2", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 0 }],
+      "running", [{ id: "turn_2", sessionId: "session_1" }], [], [{ id: "turn_1" }, { id: "turn_2" }], new Error("private database detail"),
+    )
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+    const report = await recoverTurnQueue(fake.pool, queue, "owner_1", new Date("2026-09-01T00:00:00.000Z"))
+
+    expect(report).toMatchObject({ reclaimed: 1, repaired: 1, dispatched: 1 })
+    expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_2", sessionId: "session_1", ownerId: "owner_1" },
+      { jobId: turnJobId("turn_2", 0), attempts: 5 })
+    expect(log).toHaveBeenCalledWith("[turn-recovery] objective submit discovery failed")
+    expect(log.mock.calls.flat()).not.toContain("private database detail")
+    log.mockRestore()
+  })
+
+  it("discovers both healthy Objective Root projections after approval", async () => {
+    const fake = pool()
+    await recoverTurnQueue(fake.pool, { add: vi.fn() }, "owner_1", new Date("2026-09-01T00:00:00.000Z"))
+    const sql = fake.calls.find(([text]) => text.includes("reviewedApplicationMaterialSource"))?.[0] ?? ""
+    expect(sql).toContain(`root."status" IN ('waiting','waiting_for_user')`)
+  })
+
+  it("contains one Objective candidate failure and continues with other candidates and dispatch", async () => {
+    let sessionLocks = 0
+    const candidateRows = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_bad", rootTaskId: "root_bad", updatedAt: new Date("2026-09-01T00:00:00Z") },
+      { userId: "user_2", sessionId: "session_2", turnId: "turn_next", rootTaskId: "root_next", updatedAt: new Date("2026-09-01T00:01:00Z") },
+    ]
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("WITH candidates AS") || sql.includes("WITH stale")) return { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_sessions" AS session') && sql.includes('JOIN "agent_turns" AS turn')
+          && sql.includes("reviewedApplicationMaterialSource")) return { rows: candidateRows, rowCount: 2 }
+        if (sql.includes('SELECT "id","status" FROM "agent_sessions"')) {
+          sessionLocks += 1
+          if (sessionLocks === 1) throw new Error("private candidate detail")
+          return { rows: [], rowCount: 0 }
+        }
+        if (sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) return { rows: [{ id: "turn_normal", sessionId: "session_1", dispatchId: null }] }
+        if (sql.includes('SELECT dispatch."id", dispatch."aggregateId"')) return { rows: [{ id: "outbox_normal", aggregateId: "session_1",
+          payload: { turnId: "turn_normal", sessionId: "session_1", ownerId: "recovery_owner" }, attemptCount: 0 }] }
+        if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: "session_1" }] }
+        if (sql.includes('SELECT dispatch."id" FROM "agent_outbox"')) return { rows: [{ id: "outbox_normal" }] }
+        if (sql.includes('SELECT turn."id", turn."source"')) return { rows: [{ id: "turn_normal", source: "user", executionMode: "interactive" }] }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const fakePool = { connect: vi.fn().mockResolvedValue(client) }
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+    const report = await recoverTurnQueue(fakePool, queue, "recovery_owner", new Date("2026-09-01T00:02:00Z"))
+
+    expect(sessionLocks).toBe(2)
+    expect(report).toMatchObject({ reclaimed: 0, repaired: 1, dispatched: 1 })
+    expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_normal", sessionId: "session_1", ownerId: "recovery_owner" },
+      { jobId: turnJobId("turn_normal", 0), attempts: 5 })
+    expect(log).toHaveBeenCalledWith("[turn-recovery] objective submit candidate failed")
+    expect(log.mock.calls.flat()).not.toContain("private candidate detail")
+    log.mockRestore()
   })
 
   it("repairs a published legacy aggregate before rearming an expired Turn", async () => {

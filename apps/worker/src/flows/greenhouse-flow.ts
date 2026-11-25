@@ -27,10 +27,18 @@ const COVER_LETTER_SELECTORS = [
 export async function runGreenhouseFlow(
   page: Page,
   task: ApplyTask,
-  options?: { reviewedCoverLetter: string },
+  options?: { reviewedCoverLetter: string; objectiveReviewedSubmission?: true },
 ): Promise<HarnessResult> {
   const startedAt = Date.now();
-  if (options && !validReviewedCoverLetter(options.reviewedCoverLetter, task.persona.coverLetter)) return { status: "manual", error: "Reviewed cover letter could not be safely filled.", durationMs: Date.now() - startedAt, reviewReady: false, log: [] };
+  const objectiveSubmission = options?.objectiveReviewedSubmission === true;
+  if (objectiveSubmission && (task.allowSubmit !== true || typeof task.beforeSubmit !== "function"
+    || !task.resumePath || task.resumePath.startsWith("db:"))) {
+    return { status: "submission_blocked", error: "Objective submission prerequisites were unavailable.", durationMs: Date.now() - startedAt, log: [] };
+  }
+  if (options && !validReviewedCoverLetter(options.reviewedCoverLetter, task.persona.coverLetter)) return {
+    status: objectiveSubmission ? "submission_blocked" : "manual",
+    error: "Reviewed cover letter could not be safely filled.", durationMs: Date.now() - startedAt, reviewReady: false, log: [],
+  };
   if (task.dryRun) {
     console.log("[greenhouse-flow] Dry-run: skipping all fills and submit");
     return { status: "dry-run", turns: 1, durationMs: Date.now() - startedAt, log: [] };
@@ -39,8 +47,8 @@ export async function runGreenhouseFlow(
   const log: Array<{ field?: string; selector?: string; action: string }> = [];
   let filled = 0;
 
-  if (options && !await fillReviewedCoverLetter(page, options.reviewedCoverLetter, log)) {
-    return { status: "manual", error: "Reviewed cover letter could not be safely filled.", durationMs: Date.now() - startedAt, reviewReady: false, log };
+  if (options && !await fillReviewedCoverLetter(page, options.reviewedCoverLetter, log, objectiveSubmission)) {
+    return { status: objectiveSubmission ? "submission_blocked" : "manual", error: "Reviewed cover letter could not be safely filled.", durationMs: Date.now() - startedAt, reviewReady: false, log };
   }
   if (options) filled++;
 
@@ -70,7 +78,11 @@ export async function runGreenhouseFlow(
   }
 
   if (task.resumePath && !task.resumePath.startsWith("db:")) {
-    if (await uploadResume(page, RESUME_SELECTORS, task.resumePath, log)) filled++;
+    const uploaded = await uploadResume(page, RESUME_SELECTORS, task.resumePath, log);
+    if (uploaded) filled++;
+    if (objectiveSubmission && !uploaded) {
+      return { status: "submission_blocked", error: "Approved Resume upload was not confirmed.", durationMs: Date.now() - startedAt, log };
+    }
   }
 
   if (!options && task.persona.coverLetter) {
@@ -80,9 +92,12 @@ export async function runGreenhouseFlow(
   // Sensitive custom questions are only filled from answers explicitly
   // confirmed for this application task, never from the shared Persona.
   await fillCustomQuestions(page, task.persona, log, task.confirmedAnswers);
+  if (objectiveSubmission && !await reviewedCoverLetterIsExact(page, options!.reviewedCoverLetter)) {
+    return { status: "submission_blocked", error: "Approved cover letter could not be confirmed.", durationMs: Date.now() - startedAt, log };
+  }
 
   // Submit
-  if (options || task.allowSubmit !== true) {
+  if ((options && !objectiveSubmission) || task.allowSubmit !== true) {
     return { status: "manual", turns: 1, error: "Form filled and ready for user review.", durationMs: Date.now() - startedAt, log, reviewReady: true };
   }
   const submitSelectors = [
@@ -123,13 +138,21 @@ function validReviewedCoverLetter(content: string, personaValue: string | undefi
   return content.length > 0 && content.length <= 2000 && content === personaValue;
 }
 
-async function fillReviewedCoverLetter(page: Page, content: string, log: Array<{ field?: string; selector?: string; action: string }>): Promise<boolean> {
+async function fillReviewedCoverLetter(page: Page, content: string, log: Array<{ field?: string; selector?: string; action: string }>, requireReadback = false): Promise<boolean> {
   const selector = COVER_LETTER_SELECTORS.join(", ");
   try {
     const field = page.locator(selector);
     if (await field.count() !== 1 || !await field.isVisible() || await field.inputValue() !== "") return false;
     await field.fill(content);
+    if (requireReadback && await field.inputValue() !== content) return false;
     log.push({ field: "coverLetter", selector, action: "fill" });
     return true;
+  } catch { return false; }
+}
+
+async function reviewedCoverLetterIsExact(page: Page, content: string): Promise<boolean> {
+  try {
+    const field = page.locator(COVER_LETTER_SELECTORS.join(", "));
+    return await field.count() === 1 && await field.isVisible() && await field.inputValue() === content;
   } catch { return false; }
 }

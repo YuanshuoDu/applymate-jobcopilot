@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { COGNITIVE_AGENDA_RESUME_FENCE_INVALID, classifyTurnFailure, recordTurnDlq } from "./dlq.js"
+import { COGNITIVE_AGENDA_RESUME_FENCE_INVALID, OBJECTIVE_APPLICATION_FILL_UNAVAILABLE, classifyTurnFailure, recordTurnDlq } from "./dlq.js"
 import { TurnLeaseError } from "./lease.js"
 
 function fakePool() {
@@ -42,5 +42,24 @@ describe("Turn DLQ classification", () => {
     const fake = fakePool()
     await recordTurnDlq(fake.pool, { turnId: "turn_1", sessionId: "session_1" }, 4, "max_retries_exhausted", new Error(COGNITIVE_AGENDA_RESUME_FENCE_INVALID))
     expect(JSON.stringify(fake.calls)).toContain(COGNITIVE_AGENDA_RESUME_FENCE_INVALID)
+  })
+
+  it("preserves only the exact Objective fill sentinel without exposing error text", async () => {
+    const exact = fakePool()
+    await recordTurnDlq(exact.pool, { turnId: "turn_1", sessionId: "session_1" }, 1, "execution_failed",
+      new Error(OBJECTIVE_APPLICATION_FILL_UNAVAILABLE))
+    const insert = exact.calls.find(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))
+    const event = JSON.parse(String(insert?.[1]?.[4])) as Record<string, unknown>
+    expect(event).toMatchObject({ attemptsMade: 1, reason_code: "execution_failed",
+      error_code: OBJECTIVE_APPLICATION_FILL_UNAVAILABLE })
+    expect(JSON.stringify(event)).not.toContain("message")
+
+    const nearMatch = fakePool()
+    await recordTurnDlq(nearMatch.pool, { turnId: "turn_2", sessionId: "session_2" }, 1, "execution_failed",
+      new Error(`${OBJECTIVE_APPLICATION_FILL_UNAVAILABLE}: private resume detail`))
+    const nearInsert = nearMatch.calls.find(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))
+    const nearEvent = JSON.parse(String(nearInsert?.[1]?.[4])) as Record<string, unknown>
+    expect(nearEvent.error_code).toBe("turn_execution_error")
+    expect(JSON.stringify(nearEvent)).not.toContain("private resume detail")
   })
 })

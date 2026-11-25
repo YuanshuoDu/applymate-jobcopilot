@@ -19,6 +19,11 @@ const scope = {
   applicationTaskId: "task_1", jobId: "job_1", approvalId: "approval_1", constraintHash: "b".repeat(64),
   workerTaskId: "worker_1", executionId: "execution_1",
 };
+const objectiveSource = {
+  schemaVersion: "agent-harness.v2.objective-reviewed-fill-source.v1",
+  approvalId: `objective-review:objective-review-${"e".repeat(40)}:2`,
+  reviewTurnId: "review-turn-1", materialProofHash: "f".repeat(64),
+}
 
 function fakePool(turnStatus = "in_progress", interrupted = false, markerRowCount = 1, markerCommitFails = false) {
   readTurnState.mockResolvedValue({ sessionStatus: "running", turnStatus, interrupted });
@@ -47,7 +52,7 @@ function fakePool(turnStatus = "in_progress", interrupted = false, markerRowCoun
 }
 
 beforeEach(() => {
-  requestFence.mockImplementation(async (
+  requestFence.mockReset().mockImplementation(async (
     _client: unknown, _identity: unknown, _phase: unknown, expectedSourceTurnId: string | null | undefined,
     work: () => Promise<unknown>,
   ) => ({ kind: "current", value: await work(), sourceTurnId: expectedSourceTurnId ?? null }));
@@ -167,6 +172,26 @@ describe("application submission Stop probe", () => {
     expect(clients.every(client => client.release.mock.calls.length === 1)).toBe(true);
     await fence.release(false);
   });
+
+  it("carries the full Objective selector from the committed marker to the paused boundary", async () => {
+    const { pool, clients } = fakePool();
+    requestFence.mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+      kind: "current", value: await work(), sourceTurnId: null, objectiveSource,
+    })).mockImplementationOnce(async (_client, _scope, _phase, expected) => {
+      expect(expected).toEqual({ kind: "objective", source: objectiveSource })
+      return { kind: "invalid" }
+    })
+
+    await expect(acquireApplicationSubmissionStartFence(pool, scope)).resolves.toMatchObject({ state: "uncertain" })
+    await expect(requestFence.mock.results[0]?.value).resolves.toMatchObject({ objectiveSource })
+
+    expect(requestFence).toHaveBeenNthCalledWith(1, expect.anything(), scope, "marker", undefined, expect.any(Function))
+    expect(requestFence).toHaveBeenNthCalledWith(2, expect.anything(), scope, "boundary",
+      { kind: "objective", source: objectiveSource }, expect.any(Function))
+    expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT")
+    expect(clients[1]?.query).toHaveBeenLastCalledWith("ROLLBACK")
+    expect(clients[1]?.release).toHaveBeenCalledOnce()
+  })
 
   it("keeps a boundary verification error uncertain after the durable marker", async () => {
     const { pool, clients } = fakePool();

@@ -7,10 +7,13 @@ import type { CanonicalExecutionProjection } from "./canonical-execution-project
 import type { CanonicalSessionProjection } from "./canonical-session-projection.js"
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
 import type { TurnEngineOptions } from "./turns/turn-engine-types.js"
+import { OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA } from "@jobcopilot/agent-protocol"
 import { resolveProductionAgentFlags } from "./production-agent-flags.js"
 
 const reviewTurn = vi.hoisted(() => ({ run: vi.fn() }))
+const objectiveReviewTurn = vi.hoisted(() => ({ run: vi.fn() }))
 vi.mock("./canonical-reviewed-application-review-turn.js", () => ({ runCanonicalReviewedApplicationReviewTurn: reviewTurn.run }))
+vi.mock("./canonical-objective-application-review-turn.js", () => ({ runCanonicalObjectiveApplicationReviewTurn: objectiveReviewTurn.run }))
 
 import { dispatchCanonicalReviewedApplicationReview } from "./canonical-reviewed-application-review-dispatch.js"
 
@@ -22,6 +25,9 @@ const NOW = new Date("2026-11-21T10:00:00Z")
 describe("canonical reviewed application review dispatch", () => {
   beforeEach(() => reviewTurn.run.mockReset().mockResolvedValue({ status: "waiting_for_approval", stepCount: 0,
     toolCallCount: 0, waitId: "reviewed-application-review:turn-review" }))
+
+  beforeEach(() => objectiveReviewTurn.run.mockReset().mockResolvedValue({ status: "waiting_for_approval", stepCount: 0,
+    toolCallCount: 0, waitId: "objective-review-set" }))
 
   it("issues only an eligible user Turn under a root with no allowed actions", async () => {
     const f = fixture()
@@ -54,9 +60,29 @@ describe("canonical reviewed application review dispatch", () => {
     expect(ordinary.rootTasks.ensure).not.toHaveBeenCalled()
     expect(ordinary.execution.start).not.toHaveBeenCalled()
   })
+
+  it("routes the exact objective review intent only when its server feature gate is enabled", async () => {
+    const intent = { kind: "objective_application_review", version: 1, selection: {
+      schema: OBJECTIVE_APPLICATION_REVIEW_INTENT_SCHEMA, sourceTurnId: "source-turn", rootTaskId: "source-root",
+      graphItemId: "source-graph", graphRevision: 9, slotOrdinals: [1, 2],
+    } } as Extract<NonNullable<CanonicalTurnState["intent"]>, { kind: "objective_application_review" }>
+    const f = fixture({ intent })
+    await expect(dispatchCanonicalReviewedApplicationReview(f.input)).resolves.toEqual({
+      status: "waiting_for_approval", summary: undefined, waitId: "objective-review-set",
+    })
+    expect(objectiveReviewTurn.run).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-review", intent, rootInputId: "review-input" }))
+    expect(reviewTurn.run).not.toHaveBeenCalled()
+
+    const disabled = fixture({ intent }, false)
+    await expect(dispatchCanonicalReviewedApplicationReview(disabled.input)).resolves.toMatchObject({
+      status: "failed", summary: "objective_application_review_runtime_unavailable",
+    })
+    expect(objectiveReviewTurn.run).toHaveBeenCalledOnce()
+    expect(disabled.rootTasks.finish).toHaveBeenCalledOnce()
+  })
 })
 
-function fixture(overrides: Partial<CanonicalTurnState> = {}) {
+function fixture(overrides: Partial<CanonicalTurnState> = {}, objectiveTailorEnabled = true) {
   const state: CanonicalTurnState = {
     scope: { userId: lease.userId }, goal: "Review application materials", source: "user", rootInputId: "review-input",
     intent, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {}, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
@@ -69,8 +95,9 @@ function fixture(overrides: Partial<CanonicalTurnState> = {}) {
   const issue = vi.fn(async () => ({ status: "waiting" as const, approvalId: "approval-review", waitItemId: "wait-review" }))
   const contextBuilderFactory = vi.fn(() => ({} as TurnEngineOptions["contextBuilder"]))
   const options = { productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1",
-    ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }),
-    taskGraphCommandPort: {} as TaskGraphCommandPort, reviewedApplicationReviewIssuer: issue, contextBuilderFactory }
+    ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1", ...(objectiveTailorEnabled ? { ENABLE_AGENT_OBJECTIVE_TAILOR: "1" } : {}) }),
+    taskGraphCommandPort: {} as TaskGraphCommandPort, reviewedApplicationReviewIssuer: issue,
+    objectiveApplicationReviewIssuer: vi.fn(), objectiveApplicationReviewSetStateReader: vi.fn(), contextBuilderFactory }
   const input = { pool: { connect: vi.fn() } as unknown as pg.Pool, lease, signal: new AbortController().signal, state, options,
     rootTasks, executionProjection: execution, sessionProjection: session, now: () => NOW,
     coordinationEnabled: true, childExecutionEnabled: true, consumeWaitOutcomes: true }

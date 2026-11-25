@@ -5,6 +5,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useI18n } from '@/lib/i18n'
 
 import { createAgentApprovalMessageId, isCurrentAgentApprovalRequest, postAgentApprovalDecision, type ApprovalDecision } from './approval-action'
+import { ObjectiveApplicationReviewSetCard } from './ObjectiveApplicationReviewSetCard'
 import type { ApprovalLedgerActionRef, ApprovalLedgerApproval, ApprovalLedgerProjection, ApprovalLedgerProjectionStatus } from './approval-ledger-view'
 import type { SupervisorTurnSummary } from './task-tree-projection'
 
@@ -69,7 +70,9 @@ export function AgentApprovalLedgerCard({ ledger, sessionId, turns, onAccepted, 
     })
   }, [onAccepted, selectionKey, sessionId])
 
-  if (ledger.approvals.length === 0) return null
+  const reviewTurnIds = objectiveReviewTurnIds(ledger.pendingActions)
+  if (ledger.approvals.length === 0 && reviewTurnIds.length === 0) return null
+  const ordinaryPendingActions = ledger.pendingActions.filter(action => !isObjectiveReviewMember(action))
   const terminalApprovals = ledger.approvals.filter(approval => approval.status !== 'pending').slice(0, 8)
   return (
     <section data-agent-approval-ledger="true" aria-label={t('agent.approvalLedger.title')} style={cardStyle}>
@@ -79,11 +82,20 @@ export function AgentApprovalLedgerCard({ ledger, sessionId, turns, onAccepted, 
       </div>
       <div style={summaryStyle}><span>{t('agent.approvalLedger.pending')}</span><strong>{ledger.pendingCount}</strong></div>
       <div data-agent-approval-ledger-rows="true" style={rowsStyle}>
-        {ledger.pendingActions.map(actionRef => <PendingApprovalRow key={actionRef.approvalId} actionRef={actionRef} sessionId={sessionId} turns={turns} submitting={Boolean(submitting[actionRef.approvalId])} feedback={feedback[actionRef.approvalId]} onDecision={handleDecision} t={t} />)}
+        {ordinaryPendingActions.map(actionRef => <PendingApprovalRow key={actionRef.approvalId} actionRef={actionRef} sessionId={sessionId} turns={turns} submitting={Boolean(submitting[actionRef.approvalId])} feedback={feedback[actionRef.approvalId]} onDecision={handleDecision} t={t} />)}
+        {reviewTurnIds.map(turnId => <ObjectiveApplicationReviewSetCard key={sessionId + ':' + turnId} sessionId={sessionId} turnId={turnId} refreshKey={selectionKey} onAccepted={onAccepted} />)}
         {terminalApprovals.map((approval, index) => <ApprovalRow key={`${index}-${approval.status}`} approval={approval} t={t} />)}
       </div>
     </section>
   )
+}
+
+export function isObjectiveReviewMember(action: ApprovalLedgerActionRef): boolean {
+  return action.action === 'review_application' && /^objective-review:objective-review-[a-f0-9]{40}:[1-8]$/.test(action.approvalId)
+}
+
+export function objectiveReviewTurnIds(actions: readonly ApprovalLedgerActionRef[]): string[] {
+  return [...new Set(actions.filter(isObjectiveReviewMember).map(action => action.turnId))].slice(0, 8)
 }
 
 function PendingApprovalRow({ actionRef, sessionId, turns, submitting, feedback, onDecision, t }: {

@@ -102,6 +102,7 @@ function harness(options: {
   })
   const tx = {
     $queryRaw: query,
+    agentApproval: { findFirst: vi.fn(async () => null) },
     agentTurn: {
       findFirst: vi.fn(async (args: unknown) => {
         const where = (args as { where: Row }).where

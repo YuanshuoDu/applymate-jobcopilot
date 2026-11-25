@@ -19,6 +19,35 @@ function reviewedPage(options: { count?: number; visible?: boolean; value?: stri
   return { page, field };
 }
 
+function objectivePage(options: { upload?: boolean; readback?: boolean; lateChange?: boolean } = {}) {
+  const events: string[] = []
+  let coverValue = ""
+  let readCount = 0
+  const cover = {
+    first() { return this }, count: vi.fn().mockResolvedValue(1), isVisible: vi.fn().mockResolvedValue(true),
+    inputValue: vi.fn(async () => { events.push("cover-read"); readCount++; return options.lateChange && readCount >= 3 ? "changed after fill" : coverValue }),
+    fill: vi.fn(async (value: string) => { events.push("cover-fill"); coverValue = options.readback === false ? "" : value }),
+  }
+  const upload = {
+    first() { return this }, count: vi.fn().mockResolvedValue(options.upload === false ? 0 : 1),
+    isVisible: vi.fn().mockResolvedValue(true),
+    setInputFiles: vi.fn(async () => { events.push("upload") }),
+  }
+  const submit = {
+    first() { return this }, count: vi.fn().mockResolvedValue(1), isVisible: vi.fn().mockResolvedValue(true),
+    evaluate: vi.fn(async () => ({ url: "https://boards.greenhouse.io/acme/apply", method: "POST" })),
+    click: vi.fn(async () => { events.push("click") }),
+  }
+  const page = {
+    url: () => "https://boards.greenhouse.io/acme/jobs/1/application",
+    title: async () => "Application Submitted",
+    locator: vi.fn((selector: string) => selector === COVER_LETTER_UNION ? cover
+      : selector.includes("resume") || selector.includes("file") ? upload : submit),
+    $$: vi.fn().mockResolvedValue([]), waitForLoadState: vi.fn().mockResolvedValue(undefined),
+  } as unknown as Page
+  return { page, events, cover, upload, submit }
+}
+
 function reviewedTask(content: string) {
   return { jobId: "job-1", applyUrl: "https://boards.greenhouse.io/booking/jobs/123", persona: { coverLetter: content }, jobTitle: "Engineer", jobCompany: "Booking", resumePath: "db:resume" };
 }
@@ -197,6 +226,45 @@ describe("runGreenhouseFlow", () => {
     expect(result.status).toBe("submission_blocked");
     expect(result.error).toContain("denied");
   });
+
+  it("submits Objective material only after exact letter readback and approved Resume upload", async () => {
+    const { page, events, upload } = objectivePage()
+    const beforeSubmit = vi.fn(async () => { events.push("guard"); return true })
+    const result = await runGreenhouseFlow(page, {
+      ...reviewedTask("Approved letter"), resumePath: "/tmp/approved-resume.pdf", allowSubmit: true, beforeSubmit,
+    }, { reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true })
+
+    expect(result.status).toBe("submitted")
+    expect(upload.setInputFiles).toHaveBeenCalledWith("/tmp/approved-resume.pdf")
+    expect(events).toEqual(["cover-read", "cover-fill", "cover-read", "upload", "cover-read", "guard", "click"])
+  })
+
+  it.each([
+    ["letter readback mismatch", { readback: false }, 0],
+    ["approved Resume upload missing", { upload: false }, 0],
+    ["cover letter changes after other fields", { lateChange: true }, 1],
+  ])("does not submit when %s", async (_name, options, uploadCalls) => {
+    const { page, events, upload } = objectivePage(options)
+    const beforeSubmit = vi.fn(async () => { events.push("guard"); return true })
+    const result = await runGreenhouseFlow(page, {
+      ...reviewedTask("Approved letter"), resumePath: "/tmp/approved-resume.pdf", allowSubmit: true, beforeSubmit,
+    }, { reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true })
+
+    expect(result.status).toBe("submission_blocked")
+    expect(upload.setInputFiles).toHaveBeenCalledTimes(uploadCalls)
+    expect(events).not.toContain("guard")
+    expect(events).not.toContain("click")
+  })
+
+  it("rejects Objective submit prerequisites before touching the page", async () => {
+    const { page, events } = objectivePage()
+    const result = await runGreenhouseFlow(page, {
+      ...reviewedTask("Approved letter"), resumePath: "db:resume", allowSubmit: false,
+    }, { reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true })
+
+    expect(result.status).toBe("submission_blocked")
+    expect(events).toEqual([])
+  })
 });
 
 describe("detectFlow", () => {

@@ -49,6 +49,22 @@ type ApplicationFillTask = {
   confirmedAnswers?: unknown
 }
 
+/** Detects a reserved Objective task even when its grouped receipt is not approved. */
+export async function hasObjectiveApplicationFillReservation(
+  tx: CommandTransaction,
+  identity: Pick<CommandIdentity, "userId" | "sessionId"> & { applicationTaskId: string },
+): Promise<boolean> {
+  const row = await tx.agentApproval.findFirst({
+    where: { taskId: identity.applicationTaskId, userId: identity.userId, sessionId: identity.sessionId,
+      type: "review_application", OR: [
+        { id: { startsWith: "objective-review:objective-review-" } },
+        { payload: { path: ["schema"], equals: "objective-application-approval-set-member.v1" } },
+      ] },
+    select: { id: true },
+  })
+  return row !== null
+}
+
 /** Preserve Session → Turn → filler → application-task lock order for stopped retries. */
 export async function lockApplicationFillTask(
   tx: CommandTransaction,
@@ -102,7 +118,10 @@ export async function assertApplicationFillPreflight(
   tx: CommandTransaction,
   applicationTaskId: string,
   identity: Pick<CommandIdentity, "userId" | "sessionId">,
+  options: Readonly<{ allowObjectiveReservation?: true }> = {},
 ): Promise<void> {
+  if (options.allowObjectiveReservation !== true
+    && await hasObjectiveApplicationFillReservation(tx, { ...identity, applicationTaskId })) throw unavailable()
   const rows = await tx.$queryRaw<PersistedApplicationMaterial[]>(Prisma.sql`
     SELECT app."jobId", app."resumeId", app."coverLetterId"
     FROM "application_tasks" AS app

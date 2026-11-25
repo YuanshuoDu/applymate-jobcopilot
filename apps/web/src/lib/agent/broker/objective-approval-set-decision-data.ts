@@ -1,25 +1,28 @@
 import { Prisma } from "@prisma/client"
 import { hashApprovalScope, isApprovalHash, parseObjectiveApplicationApprovalSet, type ObjectiveApplicationApprovalSet } from "@jobcopilot/agent-protocol"
-import { parseObjectiveApplicationResumeWitness, type ObjectiveApplicationResumeWitness } from "@jobcopilot/shared"
+import { parseObjectiveApplicationReviewMemberProof,
+  type ObjectiveApplicationReviewMemberProof, type ObjectiveApplicationResumeWitness } from "@jobcopilot/shared"
 
 import { protocolScope } from "../approval/types"
 import { waitScopeMismatch } from "./errors"
 
 type Tx = Prisma.TransactionClient
 type Input = Readonly<{ userId: string; sessionId: string; expectedTurnId: string; approvalId: string }>
-type JsonRecord = Record<string, unknown>
 export type ObjectiveApprovalSetMemberEnvelope = Readonly<{
-  schema: "objective-application-approval-set-member.v1"; setId: string; sourceTurnId: string; slotOrdinal: number; proof: JsonRecord
+  schema: "objective-application-approval-set-member.v1"; setId: string; sourceTurnId: string; slotOrdinal: number
+  proof: ObjectiveApplicationReviewMemberProof
 }>
 export type ObjectiveApprovalSetMember = Readonly<{
   approvalId: string; taskId: string | null; userId: string; sessionId: string; turnId: string; jobId: string
-  toolCallId: string; scopeHash: string; revision: number; expiresAt: Date; proof: JsonRecord; resumeWitness: ObjectiveApplicationResumeWitness
+  toolCallId: string; scopeHash: string; revision: number; expiresAt: Date
+  proof: ObjectiveApplicationReviewMemberProof; resumeWitness: ObjectiveApplicationResumeWitness
 }>
 export type LoadedObjectiveApprovalSetMember = Readonly<{
   slotOrdinal: number; row: Prisma.AgentApprovalGetPayload<{}>; member: ObjectiveApprovalSetMember
 }>
 
 const MEMBER_SCHEMA = "objective-application-approval-set-member.v1"
+type JsonRecord = Record<string, unknown>
 
 function record(value: unknown): JsonRecord | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -35,13 +38,12 @@ function record(value: unknown): JsonRecord | null {
 }
 
 export function parseObjectiveApprovalSetMemberEnvelope(value: unknown): ObjectiveApprovalSetMemberEnvelope | null {
-  const row = record(value)
-  if (!row || Reflect.ownKeys(row).length !== 5 || row.schema !== MEMBER_SCHEMA
+  const row = exactRecord(value, ["schema", "setId", "sourceTurnId", "slotOrdinal", "proof"])
+  const proof = parseObjectiveApplicationReviewMemberProof(row?.proof)
+  if (!row || !proof || row.schema !== MEMBER_SCHEMA
     || typeof row.setId !== "string" || !row.setId.trim() || typeof row.sourceTurnId !== "string" || !row.sourceTurnId.trim()
     || !Number.isSafeInteger(row.slotOrdinal) || Number(row.slotOrdinal) < 1 || Number(row.slotOrdinal) > 8) return null
-  const proof = record(row.proof)
-  return proof && Object.hasOwn(proof, "resumeWitness")
-    ? row as unknown as ObjectiveApprovalSetMemberEnvelope : null
+  return { schema: MEMBER_SCHEMA, setId: row.setId, sourceTurnId: row.sourceTurnId, slotOrdinal: row.slotOrdinal as number, proof }
 }
 
 async function validScopeHash(row: Prisma.AgentApprovalGetPayload<{}>): Promise<boolean> {
@@ -81,13 +83,17 @@ export async function loadLockedObjectiveApprovalSetMembers(
   const result: LoadedObjectiveApprovalSetMember[] = []
   for (const expected of approvalSet.members) {
     const row = byId.get(expected.approvalId), envelope = row && parseObjectiveApprovalSetMemberEnvelope(row.payload)
-    const witness = envelope && parseObjectiveApplicationResumeWitness(envelope.proof.resumeWitness)
-    if (!row || !envelope || !witness || envelope.setId !== approvalSet.setId || envelope.sourceTurnId !== approvalSet.sourceTurnId
+    const proof = envelope?.proof
+    if (!row || !envelope || !proof || !proof.resumeWitness) return failClosed()
+    const witness = proof.resumeWitness
+    if (envelope.setId !== approvalSet.setId || envelope.sourceTurnId !== approvalSet.sourceTurnId
       || envelope.slotOrdinal !== expected.slotOrdinal || row.id !== expected.approvalId || row.userId !== input.userId
       || row.sessionId !== input.sessionId || row.turnId !== input.expectedTurnId || row.type !== "review_application"
       || row.jobId === null || row.toolCallId === null || row.expiresAt === null || !Number.isSafeInteger(row.revision)
       || row.revision < 0 || row.expiresAt.toISOString() !== approvalSet.expiresAt || !["pending", "approved", "rejected", "expired"].includes(row.status)
-      || witness.userId !== row.userId || witness.jobId !== row.jobId || jobs.has(row.jobId) || calls.has(row.toolCallId)
+      || witness.userId !== row.userId || witness.jobId !== row.jobId || proof.source.sourceTurnId !== approvalSet.sourceTurnId
+      || proof.source.jobId !== row.jobId || proof.source.slotOrdinal !== expected.slotOrdinal || row.materialHash !== proof.materialProofHash
+      || jobs.has(row.jobId) || calls.has(row.toolCallId)
       || !await validScopeHash(row)) return failClosed()
     jobs.add(row.jobId); calls.add(row.toolCallId)
     result.push({ slotOrdinal: expected.slotOrdinal, row, member: {
@@ -97,6 +103,13 @@ export async function loadLockedObjectiveApprovalSetMembers(
     } })
   }
   return result
+}
+
+function exactRecord(value: unknown, keys: readonly string[]): JsonRecord | null {
+  const row = record(value)
+  if (!row) return null
+  const actual = Reflect.ownKeys(row)
+  return actual.length === keys.length && actual.every(key => typeof key === "string" && keys.includes(key)) ? row : null
 }
 
 function failClosed(): never { throw waitScopeMismatch() }

@@ -19,6 +19,7 @@ export type ApplicationSubmitTerminalObservation = Readonly<{
   attemptsMade: number
   attempts: number
 }>
+export type ApplicationSubmitTerminalAttemptDisposition = "claimed" | "uncertain" | "final" | "stale"
 type ExactTerminalProofIdentity = Omit<ApplicationSubmitIdentity, "approvalId"> & Readonly<{ workerTaskId: string; receiptId: string }>
 
 export function isValidApplicationSubmitTerminalObservation(value: unknown): value is ApplicationSubmitTerminalObservation {
@@ -37,6 +38,21 @@ export function matchesExactApplicationSubmitTerminalProof(value: unknown, expec
     && data.jobId === expected.jobId && data.sessionId === expected.sessionId && data.fillTurnId === expected.fillTurnId
     && data.workerTaskId === expected.workerTaskId && data.approvalId === expected.receiptId
     && data.receiptId === expected.receiptId && data.constraintHash === expected.constraintHash
+}
+
+export async function readTerminalSubmitAttemptDisposition(
+  client: PoolClient, intent: ApplicationSubmitIdentity & Readonly<{ workerTaskId: string }>,
+): Promise<ApplicationSubmitTerminalAttemptDisposition> {
+  const task = (await client.query<{ status: string; checkpoint: string | null }>(`SELECT "status", "checkpoint" FROM "application_tasks"
+    WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 AND "workerTaskId" = $6 FOR UPDATE`,
+  [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.workerTaskId])).rows[0]
+  if (!task) return "stale"
+  if (task.status === "filling" && ["browser_active", "submission_request_started"].includes(task.checkpoint ?? "")) return "claimed"
+  if (task.status === "waiting_for_user" && task.checkpoint === "submission_uncertain") return "uncertain"
+  if (["submitted", "failed"].includes(task.status) || task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" ||
+    task.status === "waiting_for_user" && ["submission_blocked", "user_takeover"].includes(task.checkpoint ?? "") ||
+    task.status === "cancelled" && task.checkpoint === "turn_stopped_before_submit") return "final"
+  return "stale"
 }
 
 export class ApplicationSubmitFenceError extends Error {
@@ -98,6 +114,33 @@ export async function appendFencedSubmitAudit(client: PoolClient, identity: Appl
   )
 }
 
+/** Inserts the exact settled event inside the caller's already fenced transaction. */
+export async function recordSubmissionExecutionSettledWithClient(client: PoolClient, scope: ApplicationSubmissionExecution): Promise<boolean> {
+  if (!validIdentity(scope) || !scope.workerTaskId.trim() || !scope.executionId.trim()) return false
+  const result = await client.query(
+    `WITH starts AS (
+      SELECT 1 FROM "application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_execution_started'
+        AND "actor" = 'worker' AND "data"->>'workerTaskId' = $2
+    )
+    INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
+    SELECT $10, $1, 'submission_execution_settled', 'worker', 'Submit execution settled',
+      jsonb_build_object('executionId', $3::text, 'workerTaskId', $2::text, 'applicationTaskId', $1::text, 'userId', $4::text,
+        'jobId', $5::text, 'sessionId', $6::text, 'fillTurnId', $7::text, 'approvalId', $8::text, 'constraintHash', $9::text), NOW()
+    WHERE (SELECT COUNT(*) FROM starts) = 1
+      AND EXISTS (SELECT 1 FROM "application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_execution_started'
+        AND "actor" = 'worker' AND "data"->>'workerTaskId' = $2 AND "data"->>'executionId' = $3
+        AND "data"->>'applicationTaskId' = $1 AND "data"->>'userId' = $4 AND "data"->>'jobId' = $5
+        AND "data"->>'sessionId' = $6 AND "data"->>'fillTurnId' = $7 AND "data"->>'approvalId' = $8
+        AND "data"->>'constraintHash' = $9)
+      AND NOT EXISTS (SELECT 1 FROM "application_task_events" WHERE "taskId" = $1
+        AND "type" = 'submission_execution_settled' AND "actor" = 'worker' AND "data"->>'workerTaskId' = $2)
+    RETURNING "id"`,
+    [scope.applicationTaskId, scope.workerTaskId, scope.executionId, scope.userId, scope.jobId,
+      scope.sessionId, scope.fillTurnId, scope.approvalId, scope.constraintHash, `evt_${randomUUID()}`],
+  )
+  return result.rowCount === 1
+}
+
 /** Persist terminal proof only for the invocation that atomically wrote its start event. */
 export async function recordSubmissionExecutionSettled(pool: Pool, scope: ApplicationSubmissionExecution): Promise<boolean> {
   if (!validIdentity(scope) || !scope.workerTaskId.trim() || !scope.executionId.trim()) return false
@@ -108,30 +151,7 @@ export async function recordSubmissionExecutionSettled(pool: Pool, scope: Applic
   try {
     await client.query("BEGIN"); transactionOpen = true
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
-    const fenced = await withExactAttemptFence(client, scope, async () => {
-      const result = await client.query(
-        `WITH starts AS (
-          SELECT 1 FROM "application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_execution_started'
-            AND "actor" = 'worker' AND "data"->>'workerTaskId' = $2
-        )
-        INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
-        SELECT $10, $1, 'submission_execution_settled', 'worker', 'Submit execution settled',
-          jsonb_build_object('executionId', $3::text, 'workerTaskId', $2::text, 'applicationTaskId', $1::text, 'userId', $4::text,
-            'jobId', $5::text, 'sessionId', $6::text, 'fillTurnId', $7::text, 'approvalId', $8::text, 'constraintHash', $9::text), NOW()
-        WHERE (SELECT COUNT(*) FROM starts) = 1
-          AND EXISTS (SELECT 1 FROM "application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_execution_started'
-            AND "actor" = 'worker' AND "data"->>'workerTaskId' = $2 AND "data"->>'executionId' = $3
-            AND "data"->>'applicationTaskId' = $1 AND "data"->>'userId' = $4 AND "data"->>'jobId' = $5
-            AND "data"->>'sessionId' = $6 AND "data"->>'fillTurnId' = $7 AND "data"->>'approvalId' = $8
-            AND "data"->>'constraintHash' = $9)
-          AND NOT EXISTS (SELECT 1 FROM "application_task_events" WHERE "taskId" = $1
-            AND "type" = 'submission_execution_settled' AND "actor" = 'worker' AND "data"->>'workerTaskId' = $2)
-        RETURNING "id"`,
-        [scope.applicationTaskId, scope.workerTaskId, scope.executionId, scope.userId, scope.jobId,
-          scope.sessionId, scope.fillTurnId, scope.approvalId, scope.constraintHash, `evt_${randomUUID()}`],
-      )
-      return result.rowCount === 1
-    })
+    const fenced = await withExactAttemptFence(client, scope, () => recordSubmissionExecutionSettledWithClient(client, scope))
     if (fenced.kind === "superseded") await appendFencedSubmitAudit(client, scope, "submission_execution_settled")
     await client.query("COMMIT"); transactionOpen = false
     if (fenced.kind === "current") {

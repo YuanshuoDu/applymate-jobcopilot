@@ -37,7 +37,7 @@ export async function writeApplicationFillWaitWithClient(
       "completedAt" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "sessionId" = $2 AND "revision" = $3
       AND "status" IN ('in_progress', 'waiting_for_user', 'waiting_for_dependency') RETURNING "id"`, [lease.turnId, lease.sessionId, input.turnRevision, input.now])
   if (turnUpdate.rowCount !== 1) throw new Error("application_fill_wait_turn_conflict")
-  await client.query(`UPDATE "agent_sessions" SET "status" = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = $2 WHERE "id" = $1 AND "userId" = $3`, [lease.sessionId, input.now, lease.userId])
+  await client.query(`UPDATE "agent_sessions" SET "status" = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = $2 WHERE "id" = $1 AND "userId" = $3 AND "status" <> 'paused'`, [lease.sessionId, input.now, lease.userId])
   return "waiting"
 }
 

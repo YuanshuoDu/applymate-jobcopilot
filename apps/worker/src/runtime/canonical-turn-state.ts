@@ -1,5 +1,5 @@
 import type pg from "pg"
-import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, TurnIntentSchema, validate, type TenantScope, type RepositoryJsonValue, type TurnIntent, type TurnSource } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, parseObjectiveApplicationReviewIntent, SELECTED_JOB_BATCH_PREPARATION_INTENT, TurnIntentSchema, validate, type TenantScope, type RepositoryJsonValue, type TurnIntent, type TurnSource } from "@jobcopilot/agent-protocol"
 import { loadCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-loader.js"
 import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
@@ -55,20 +55,16 @@ function json(value: unknown): RepositoryJsonValue {
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined).map(([key, child]) => [key, json(child)]))
   return null
 }
-
 function eventPayload(value: unknown): Row { const payload = object(value); return object(payload.payload ?? payload) }
 function turnGoal(value: unknown): string {
-  const root = object(value)
-  const input = object(root.input)
+  const root = object(value), input = object(root.input)
   const source = Object.keys(input).length > 0 ? input : root
   const goal = source.goal ?? source.content
   if (typeof goal !== "string" || !goal.trim()) throw new Error("turn_goal_missing")
   return goal.trim()
 }
-
 function turnIntent(value: unknown): CanonicalTurnIntent | undefined {
-  const root = object(value)
-  const input = object(root.input)
+  const root = object(value), input = object(root.input)
   const source = Object.keys(input).length > 0 ? input : root
   if (!Object.hasOwn(source, "intent")) return undefined
   const intent = source.intent
@@ -77,6 +73,10 @@ function turnIntent(value: unknown): CanonicalTurnIntent | undefined {
   if (parsed.kind === INTERACTIVE_DISCOVERY_INTENT.kind) return INTERACTIVE_DISCOVERY_INTENT
   if (parsed.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind) return OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT
   if (parsed.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind) return SELECTED_JOB_BATCH_PREPARATION_INTENT
+  if (parsed.kind === "objective_application_review") {
+    const selection = parseObjectiveApplicationReviewIntent(parsed.selection); if (!selection) throw new Error("turn_intent_invalid")
+    return { ...parsed, selection: { ...selection, slotOrdinals: [...selection.slotOrdinals] } }
+  }
   if (parsed.kind === "reviewed_application_review") return parsed
   throw new Error("turn_intent_invalid")
 }

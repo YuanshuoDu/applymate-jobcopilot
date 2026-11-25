@@ -2,7 +2,7 @@ import type { Pool } from "pg"
 import { unlinkSync } from "node:fs"
 import { withCloakContext } from "../../cloak/pool.js"
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait, type ApplicationFillCompletionStaleGate } from "../../db/application-task-completion.js"
-import { generateResumePdf, type ResumeContent } from "../../db/resume-pdf.js"
+import { generateResumePdf } from "../../db/resume-pdf.js"
 import { findFormPattern } from "../../db/form-patterns.js"
 import { tailorResumeKeywords } from "../../db/tailor-resume.js"
 import { detectBrowserWait, type HarnessResult } from "../../harness/agent-harness.js"
@@ -12,16 +12,18 @@ import { executeBrowserFill, type FlowType } from "../../flows/index.js"
 import type { ReviewedFillExecutionPhase } from "../../flows/browser-fill-executor.js"
 import { evaluateUnattendedApplyControl } from "../../queue/unattended-apply-control.js"
 import { checkRateLimit } from "../../rate-limit.js"
-import type { ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
+import type { ObjectiveReviewedApplicationFillReadback, ReviewedApplicationFillReadback } from "../../db/reviewed-application-fill-completion.js"
 import { claimApplicationFillBrowserStart, reviewedApplicationFillSelector, type BrowserStartClaim } from "../reviewed-application-fill-binding.js"
-import { reviewedMaterialWasFilled } from "./application-fill-reviewed-readback.js"
+import { buildApplicationFillInput, isAllowedDestination, urlPattern, type ApplicationFillContext } from "../application-fill-preparation.js"
+import type { ObjectiveReviewedApplicationFillEvidence } from "../objective-reviewed-application-fill-read.js"
+import { objectiveReviewedMaterialWasFilled, reviewedMaterialWasFilled } from "./application-fill-reviewed-readback.js"
 import type { SubagentExecutionResult, SubagentLease } from "./types.js"
 type WaitDetail = "captcha_required" | "authentication_required" | "mfa_required" | "unknown_sensitive_field" | "required_field" | "stale_review" | "review_required" | "fill_outcome_uncertain" | "unattended_apply_unavailable" | "cancelled"; type WaitCheckpoint = "fill_outcome_uncertain" | "form_answer_required"
 export type ApplicationFillAcquisitionPhase = "before_control_read" | "before_pattern_read" | "context_requested" | "page_acquired" | "navigation_returned" | "navigation_response_success" | "navigation_response_unavailable" | "destination_allowed" | "destination_rejected" | "wait_detection_returned" | "outer_wait_clear" | "outer_wait_detected" | "executor_started" | ReviewedFillExecutionPhase | "fill_returned" | "callback_settled" | "context_returned"
 export type ApplicationFillStageObservation =
   | Readonly<{ stage: "entry_validation" | "wait_persistence" | "completion"; outcome: "accepted" | "rejected" | "waiting" | "completed" | "stale" | "conflict" | "failed" | "cancelled" | "unavailable"; leaseLost: boolean; signalAborted: boolean; staleGate?: ApplicationFillCompletionStaleGate }>
   | Readonly<{ stage: "browser_acquisition"; phase: ApplicationFillAcquisitionPhase }>
-type StageObserver = (event: ApplicationFillStageObservation) => void; type FillContext = { applicationTaskId: string; jobId: string; turnInput: unknown; applicationUserId: string; applicationSessionId: string | null; fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; taskStatus: string; checkpoint: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown; jobUserId: string; jobUrl: string | null; jobTitle: string; jobCompany: string; jobKeywords: string | null; jobDescription: string | null; jobCoverLetter: string | null; accountStatus: string; userName: string | null; userEmail: string; userPhone: string | null; userLocation: string | null; userLinkedin: string | null; personaFields: unknown; resumeContent: unknown; coverLetterContent: string | null; sessionUserId: string; sessionStatus: string; turnUserId: string; turnSessionId: string; turnStatus: string }
+type StageObserver = (event: ApplicationFillStageObservation) => void; type FillContext = ApplicationFillContext
 const LOAD_CONTEXT_SQL = [
   'SELECT app."id" AS "applicationTaskId", app."jobId", turn."input" AS "turnInput", app."userId" AS "applicationUserId", app."sessionId" AS "applicationSessionId", app."fillTurnId", app."fillTurnSessionId", app."fillTurnUserId", app."status" AS "taskStatus", app."checkpoint", app."resumeId", app."coverLetterId", app."confirmedAnswers", job."userId" AS "jobUserId", job.url AS "jobUrl", job.role AS "jobTitle", job.company AS "jobCompany", job.keywords AS "jobKeywords", job.description AS "jobDescription", job."coverLetter" AS "jobCoverLetter", usr."accountStatus", usr.name AS "userName", usr.email AS "userEmail", usr.phone AS "userPhone", usr.location AS "userLocation", usr.linkedin AS "userLinkedin", usr."personaFields",',
   'resume.content AS "resumeContent", cover.content AS "coverLetterContent", session."userId" AS "sessionUserId", session.status AS "sessionStatus", turn."userId" AS "turnUserId", turn."sessionId" AS "turnSessionId", turn.status AS "turnStatus"',
@@ -34,6 +36,7 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
   const { pool, lease } = input, invalidLease = validateLease(lease)
   if (input.stageObserver) observeStage(input.stageObserver, { stage: "entry_validation", outcome: invalidLease ? "rejected" : "accepted", leaseLost: invalidLease === "lease_lost", signalAborted: Boolean(lease.signal?.aborted) })
   if (invalidLease) return failed(invalidLease)
+  if (typeof lease.turnId !== "string" || !lease.turnId.trim()) return failed("fill_lease_invalid")
   if (lease.interruptRequestedAt || lease.signal.aborted) return acknowledgeCancellation(pool, lease)
   let context: FillContext | null
   try {
@@ -42,8 +45,9 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
   if (!context || !matchesLeaseScope(context, lease)) return failed("fill_scope_mismatch")
   const reviewedSelector = reviewedApplicationFillSelector(context.turnInput)
   if (reviewedSelector.kind === "invalid") return failed("fill_reviewed_source_invalid")
+  let objectiveEvidence: ObjectiveReviewedApplicationFillEvidence | undefined
   const observeAcquisitionPhase = (phase: ApplicationFillAcquisitionPhase) => {
-    if (reviewedSelector.kind === "selected") observeStage(input.stageObserver, { stage: "browser_acquisition", phase })
+    if (reviewedSelector.kind === "selected" || reviewedSelector.kind === "objective") observeStage(input.stageObserver, { stage: "browser_acquisition", phase })
   }
   if (needsCompletionReplay(context)) {
     const completion = input.stageObserver ? await completeForReview(pool, lease, input.stageObserver) : await completeApplicationFillForReview(pool, { lease })
@@ -55,9 +59,21 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
   if (context.checkpoint === "browser_active") return wait(pool, lease, "fill_outcome_uncertain", "fill_outcome_uncertain", undefined, input.stageObserver)
   if (context.checkpoint !== "taskgraph_fill_queued") return failed("fill_checkpoint_invalid")
   if (!["running", "waiting_for_user"].includes(context.sessionStatus) || !["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(context.turnStatus)) return failed("fill_turn_inactive")
-  let task: ReturnType<typeof buildFillInput>
+  if (reviewedSelector.kind === "objective") {
+    const { readObjectiveReviewedApplicationFillSourceFromPool } = await import("../objective-reviewed-application-fill-read.js")
+    objectiveEvidence = await readObjectiveReviewedApplicationFillSourceFromPool(pool, { userId: lease.userId,
+      sessionId: lease.sessionId, fillTurnId: lease.turnId, applicationTaskId: context.applicationTaskId,
+      jobId: context.jobId, turnInput: context.turnInput, phase: "prepare" })
+    if (!objectiveEvidence || objectiveEvidence.source.materialProofHash !== reviewedSelector.source.materialProofHash
+      || objectiveEvidence.source.approvalId !== reviewedSelector.source.approvalId
+      || objectiveEvidence.source.reviewTurnId !== reviewedSelector.source.reviewTurnId) {
+      return preBrowserFailure(pool, lease, "objective_application_fill_unavailable")
+    }
+  }
+  let task: ReturnType<typeof buildApplicationFillInput>
   try {
-    task = buildFillInput(context, reviewedSelector.kind === "selected")
+    task = buildApplicationFillInput(objectiveEvidence ? { ...context, resumeContent: objectiveEvidence.resumeContent } : context,
+      reviewedSelector.kind !== "absent")
   } catch { return preBrowserFailure(pool, lease, "fill_material_unavailable") }
   let control: Awaited<ReturnType<typeof evaluateUnattendedApplyControl>>
   try {
@@ -65,10 +81,13 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
     if (!rate.allowed) return preBrowserFailure(pool, lease, "fill_rate_limited")
   } catch { return preBrowserFailure(pool, lease, "fill_preflight_unavailable") }
   let resumePath: string
-  try { resumePath = await generateResumePdf(lease.userId, tailorResumeKeywords(task.resumeContent, task.jobKeywords)) }
+  try { resumePath = await generateResumePdf(lease.userId,
+    objectiveEvidence ? task.resumeContent : tailorResumeKeywords(task.resumeContent, task.jobKeywords)) }
   catch { return preBrowserFailure(pool, lease, "fill_material_unavailable") }
   let start: BrowserStartClaim
-  try { start = await claimApplicationFillBrowserStart({ pool, lease, expectedSelector: reviewedSelector, applicationTaskId: context.applicationTaskId, jobId: context.jobId }) }
+  try { start = await claimApplicationFillBrowserStart({ pool, lease, expectedSelector: reviewedSelector,
+    ...(objectiveEvidence ? { expectedObjectiveResumeWitness: objectiveEvidence.resumeWitness } : {}),
+    applicationTaskId: context.applicationTaskId, jobId: context.jobId }) }
   catch { discardResume(resumePath); return lease.signal.aborted ? acknowledgeCancellation(pool, lease) : failed("fill_prestart_unavailable") }
   if (start.status === "already_started") { discardResume(resumePath); return wait(pool, lease, "fill_outcome_uncertain", "fill_outcome_uncertain", undefined, input.stageObserver) }
   if (start.status !== "claimed") { discardResume(resumePath); return start.status === "stale" || lease.signal.aborted || lease.interruptRequestedAt ? acknowledgeCancellation(pool, lease) : failed("fill_start_conflict") }
@@ -113,13 +132,15 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
           jobDescription: task.jobDescription,
           resumePath,
           submit: false,
-        }, { page, pattern, aiAvailable: true, harnessConfig: { userId: lease.userId, signal: lease.signal }, ...(start.reviewedMaterial && control.flow === "greenhouse" ? { reviewedCoverLetter: { content: start.reviewedMaterial.content } } : {}), ...(reviewedSelector.kind === "selected" && input.stageObserver ? { reviewedPhaseObserver: observeAcquisitionPhase } : {}) })
+        }, { page, pattern, aiAvailable: true, harnessConfig: { userId: lease.userId, signal: lease.signal }, ...(start.reviewedMaterial && control.flow === "greenhouse" ? { reviewedCoverLetter: { content: start.reviewedMaterial.content } } : {}), ...(reviewedSelector.kind !== "absent" && reviewedSelector.kind !== "invalid" && input.stageObserver ? { reviewedPhaseObserver: observeAcquisitionPhase } : {}) })
         observeAcquisitionPhase("fill_returned")
         if (lease.signal.aborted || result.classification === "cancelled") return cancelledOutcome()
         if (result.waitReason) return { kind: "wait" as const, detail: waitDetail(result.waitReason) }
         if (result.reviewReady) {
           await fillCustomQuestions(page, task.persona, [], task.confirmedAnswers)
-          const reviewedFillReadback = start.reviewedMaterial ? await reviewedMaterialWasFilled(page, result, start.reviewedMaterial, lease, context.applicationTaskId) : undefined
+          const reviewedFillReadback = start.objectiveEvidence && start.reviewedMaterial
+            ? await objectiveReviewedMaterialWasFilled(page, result, start.reviewedMaterial, start.objectiveEvidence.source, lease, context.applicationTaskId)
+            : start.reviewedMaterial ? await reviewedMaterialWasFilled(page, result, start.reviewedMaterial, lease, context.applicationTaskId) : undefined
           if (start.reviewedMaterial && !reviewedFillReadback) return { kind: "wait" as const, detail: "review_required" as const }
           const needs = safeNeeds(await inspectFormReviewNeeds(page))
           if (needs.missing.length || needs.sensitive.length) {
@@ -170,7 +191,8 @@ async function preBrowserFailure(pool: Pool, lease: SubagentLease, reason: strin
 }
 function cancelledOutcome() { return { kind: "wait" as const, detail: "cancelled" as const } }; function needsCompletionReplay(row: FillContext): boolean { return row.turnStatus === "waiting_for_approval" && ((row.taskStatus === "waiting_for_authorization" && row.checkpoint === "form_filled" && row.sessionStatus === "waiting_for_user") || (row.taskStatus === "filling" && row.checkpoint === "submission_authorized" && ["running", "waiting_for_user"].includes(row.sessionStatus)) || (row.taskStatus === "waiting_for_authorization" && row.checkpoint === "queue_retry" && ["running", "waiting_for_user"].includes(row.sessionStatus))) }
 function discardResume(path: string): void { try { unlinkSync(path) } catch { /* temporary file may already be gone */ } }; function observeStage(observer: StageObserver | undefined, event: ApplicationFillStageObservation): void { if (observer) try { observer(event) } catch {} }
-async function completeForReview(pool: Pool, lease: SubagentLease, observer?: StageObserver, reviewedFillReadback?: ReviewedApplicationFillReadback) {
+async function completeForReview(pool: Pool, lease: SubagentLease, observer?: StageObserver,
+  reviewedFillReadback?: ReviewedApplicationFillReadback | ObjectiveReviewedApplicationFillReadback) {
   try {
     let staleGate: ApplicationFillCompletionStaleGate | undefined
     const result = await completeApplicationFillForReview(pool, { lease, ...(reviewedFillReadback ? { reviewedFillReadback } : {}), ...(observer ? { onStaleGate: (gate: ApplicationFillCompletionStaleGate) => { staleGate = gate } } : {}) })
@@ -184,52 +206,6 @@ async function wait(pool: Pool, lease: SubagentLease, checkpoint: WaitCheckpoint
     if (observer) observeStage(observer, { stage: "wait_persistence", outcome: result.status === "waiting" ? "waiting" : result.status, leaseLost: result.status === "stale" && !lease.signal.aborted, signalAborted: lease.signal.aborted })
     return result.status === "waiting" ? { status: "waiting_for_user", failureReason: detail } : failed(lease.signal.aborted ? "fill_cancelled" : result.status === "stale" ? "lease_lost" : "fill_wait_conflict")
   } catch { if (observer) observeStage(observer, { stage: "wait_persistence", outcome: "unavailable", leaseLost: false, signalAborted: lease.signal.aborted }); return failed("fill_wait_persistence_unavailable") }
-}
-function buildFillInput(row: FillContext, reviewedSourceSelected: boolean) {
-  if (!row.resumeId || !row.resumeContent) throw new Error("resume_unavailable")
-  if (!reviewedSourceSelected && row.coverLetterId && row.coverLetterContent === null) throw new Error("cover_letter_unavailable")
-  const resumeContent = parseResumeContent(row.resumeContent)
-  const persona: Record<string, string> = {
-    fullName: row.userName ?? "", email: row.userEmail, phone: row.userPhone ?? "",
-    location: row.userLocation ?? "", linkedinUrl: row.userLinkedin ?? "",
-  }
-  if (Array.isArray(row.personaFields)) for (const item of row.personaFields) {
-    if (item && typeof item === "object" && !Array.isArray(item)) {
-      const value = item as Record<string, unknown>
-      if (typeof value.key === "string" && value.key.trim() && typeof value.value === "string") persona[value.key] = value.value
-    }
-  }
-  if (!reviewedSourceSelected && (row.coverLetterContent || row.jobCoverLetter)) persona.coverLetter = row.coverLetterContent ?? row.jobCoverLetter ?? ""
-  return {
-    applyUrl: safeApplyUrl(row.jobUrl),
-    jobTitle: (row.jobTitle || "Application").slice(0, 256),
-    jobCompany: (row.jobCompany || "Company").slice(0, 256),
-    jobKeywords: (row.jobKeywords ?? "").slice(0, 8000),
-    jobDescription: (row.jobDescription ?? "").slice(0, 20_000),
-    persona,
-    resumeContent,
-    confirmedAnswers: parseAnswers(row.confirmedAnswers),
-  }
-}
-function parseResumeContent(value: unknown): ResumeContent { if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("resume_invalid"); return value as ResumeContent }
-function parseAnswers(value: unknown): Record<string, string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
-  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => Boolean(entry[0].trim()) && typeof entry[1] === "string" && Boolean(entry[1].trim())))
-}
-function safeApplyUrl(value: string | null): string { if (!value || value.length > 2048) throw new Error("apply_url_invalid"); const url = new URL(value); if (url.protocol !== "https:" || url.username || url.password) throw new Error("apply_url_invalid"); return url.toString() }
-function urlPattern(value: string): string { const segments = new URL(value).pathname.replace(/^\/+/, "").split("/"); return `${segments.slice(0, 2).join("/")}/` }
-function isAllowedDestination(raw: string, flow: FlowType, approved: string): boolean {
-  try {
-    const url = new URL(raw)
-    if (url.protocol !== "https:" || url.username || url.password) return false
-    const host = url.hostname.toLowerCase()
-    if (flow === "greenhouse") return host === "boards.greenhouse.io" || host.endsWith(".greenhouse.io")
-    if (flow === "lever") return ["jobs.lever.co", "jobs.eu.lever.co", "app.lever.co"].includes(host)
-    if (flow === "workday") return host.endsWith(".myworkdayjobs.com")
-    if (flow === "smartrecruiters") return ["jobs.smartrecruiters.com", "careers.smartrecruiters.com"].includes(host)
-    if (flow === "personio") return host.endsWith(".jobs.personio.com")
-    return url.origin === new URL(approved).origin
-  } catch { return false }
 }
 function waitDetail(reason: NonNullable<Awaited<ReturnType<typeof detectBrowserWait>>>["reason"]): WaitDetail { return reason === "captcha" ? "captcha_required" : reason === "login_required" ? "authentication_required" : reason === "mfa_required" ? "mfa_required" : reason === "stale_review" ? "stale_review" : "unknown_sensitive_field" }; function waitDetailFromResult(result: HarnessResult): WaitDetail { return result.classification === "cancelled" ? "cancelled" : result.classification === "browser_crash" ? "fill_outcome_uncertain" : result.classification === "untrusted_input" ? "unknown_sensitive_field" : "review_required" }
 function safeNeeds(needs: FormReviewNeeds): FormReviewNeeds { const safe = (fields: FormReviewNeeds["missing"]) => fields.map(({ key, label }) => ({ key, label: label.slice(0, 200) })); return { missing: safe(needs.missing), sensitive: safe(needs.sensitive) } }

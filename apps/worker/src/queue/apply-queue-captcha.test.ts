@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => {
     insertApplyResult: vi.fn().mockResolvedValue(1),
     query: vi.fn().mockResolvedValue({ rowCount: 1 }),
     loadTaskContext: vi.fn(),
+    readApplyQueueMaterialMode: vi.fn().mockResolvedValue("ordinary"),
     detectCaptcha: vi.fn(),
     detectFlow: vi.fn(),
     runGreenhouseFlow: vi.fn(),
@@ -100,6 +101,7 @@ vi.mock("../db/form-patterns.js", () => ({
 }));
 vi.mock("../db/load-task-context.js", () => ({
   loadTaskContext: mocks.loadTaskContext,
+  readApplyQueueMaterialMode: mocks.readApplyQueueMaterialMode,
 }));
 vi.mock("../harness/agent-harness.js", () => ({
   AgentHarness: vi.fn().mockImplementation(() => ({
@@ -211,6 +213,7 @@ describe("apply-queue CAPTCHA handling", () => {
     mocks.workerHandler = undefined;
     mocks.fakePage.goto.mockResolvedValue(undefined);
     mocks.fakePage.url.mockReturnValue(payload.applyUrl);
+    mocks.readApplyQueueMaterialMode.mockResolvedValue("ordinary");
     mocks.withCloakContext.mockImplementation(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
       await fn(mocks.fakePage);
     });

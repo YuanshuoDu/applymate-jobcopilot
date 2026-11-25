@@ -1,18 +1,20 @@
 import { describe, expect, it, vi } from "vitest"
-import { assertApplicationFillPreflight, assertApplicationFillRetryReady, isApplicationFillRetryReadyProjection, lockApplicationFillTask } from "./application-fill-preflight"
+import { assertApplicationFillPreflight, assertApplicationFillRetryReady, hasObjectiveApplicationFillReservation, isApplicationFillRetryReadyProjection, lockApplicationFillTask } from "./application-fill-preflight"
 
 type Query = { strings?: readonly string[]; values?: readonly unknown[] }
 type Row = Record<string, unknown>
 type Filler = { id: string; status: string; leaseOwner: string | null; leaseExpiresAt: Date | null; role?: string; taskType?: string }
 
-function fixture(materialRows: Array<{ jobId: string; resumeId: string | null; coverLetterId: string | null }>, coverRows: Array<{ id: string }> = []) {
+function fixture(materialRows: Array<{ jobId: string; resumeId: string | null; coverLetterId: string | null }>,
+  coverRows: Array<{ id: string }> = [], reserved = false) {
   const query = vi.fn(async (input: unknown) => {
     const sql = ((input as Query).strings ?? []).join(" ")
     if (sql.includes('FROM "application_tasks" AS app')) return materialRows
     if (sql.includes('FROM "CoverLetter" AS cover')) return coverRows
     throw new Error(`unexpected preflight query: ${sql}`)
   })
-  return { query, tx: { $queryRaw: query } as never }
+  const findReservation = vi.fn(async () => reserved ? { id: "objective-review:reserved" } : null)
+  return { query, findReservation, tx: { $queryRaw: query, agentApproval: { findFirst: findReservation } } as never }
 }
 
 function retryFixture(fillers: Filler[], turn: Row | null = { id: "turn-1", status: "interrupted" }) {
@@ -98,6 +100,15 @@ describe("application fill persisted-material preflight", () => {
     await expect(assertApplicationFillPreflight(test.tx, "task-1", { userId: "user-1", sessionId: "session-1" }))
       .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
     expect(test.query).toHaveBeenCalledOnce()
+  })
+
+  it("denies a reserved Objective task on generic preflight and permits the dedicated verified caller", async () => {
+    const test = fixture([{ jobId: "job-1", resumeId: "resume-1", coverLetterId: null }], [], true)
+    await expect(assertApplicationFillPreflight(test.tx, "task-1", retryIdentity))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(test.query).not.toHaveBeenCalled()
+    await expect(assertApplicationFillPreflight(test.tx, "task-1", retryIdentity, { allowObjectiveReservation: true }))
+      .resolves.toBeUndefined()
   })
 
   it("fails closed when the persisted cover letter is unavailable for this user and job", async () => {
@@ -331,5 +342,36 @@ describe("application fill persisted-material preflight", () => {
 
     await expect(assertApplicationFillRetryReady(test.tx, stoppedTask, retryIdentity))
       .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+  })
+})
+
+describe("Objective application fill reservation", () => {
+  it("matches owner, session, task and review type without filtering by receipt status", async () => {
+    const findFirst = vi.fn(async () => ({ id: "objective-review:objective-review-set:3" }))
+    const tx = { agentApproval: { findFirst } } as never
+    await expect(hasObjectiveApplicationFillReservation(tx, {
+      applicationTaskId: "task-1", userId: "user-1", sessionId: "session-1",
+    })).resolves.toBe(true)
+    expect(findFirst).toHaveBeenCalledWith({
+      where: { taskId: "task-1", userId: "user-1", sessionId: "session-1", type: "review_application", OR: [
+        { id: { startsWith: "objective-review:objective-review-" } },
+        { payload: { path: ["schema"], equals: "objective-application-approval-set-member.v1" } },
+      ] }, select: { id: true },
+    })
+  })
+
+  it("recognizes a historical Objective proof envelope regardless of status", async () => {
+    const findFirst = vi.fn(async () => ({ id: "nonstandard-receipt-id" }))
+    const tx = { agentApproval: { findFirst } } as never
+    await expect(hasObjectiveApplicationFillReservation(tx, {
+      applicationTaskId: "task-1", userId: "user-1", sessionId: "session-1",
+    })).resolves.toBe(true)
+  })
+
+  it("leaves an ordinary selected-job approval unreserved", async () => {
+    const tx = { agentApproval: { findFirst: vi.fn(async () => null) } } as never
+    await expect(hasObjectiveApplicationFillReservation(tx, {
+      applicationTaskId: "task-1", userId: "user-1", sessionId: "session-1",
+    })).resolves.toBe(false)
   })
 })

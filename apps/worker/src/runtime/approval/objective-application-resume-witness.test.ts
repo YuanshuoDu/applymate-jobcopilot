@@ -5,7 +5,7 @@ import {
   sameObjectiveApplicationResumeWitness,
   type ObjectiveApplicationResumeMaterial,
 } from "@jobcopilot/shared"
-import { readObjectiveApplicationResumeWitness } from "./objective-application-resume-witness.js"
+import { readObjectiveApplicationResumeMaterial, readObjectiveApplicationResumeWitness } from "./objective-application-resume-witness.js"
 
 const scope = { userId: "user-1", jobId: "job-1" }
 const material: ObjectiveApplicationResumeMaterial = {
@@ -41,6 +41,18 @@ describe("Worker objective application Resume witness reader", () => {
     expect(sql).toContain("FOR SHARE OF job, resume")
     expect(values).toEqual([scope.jobId, scope.userId])
     expect(sql).not.toMatch(/\b(?:BEGIN|COMMIT|ROLLBACK)\b/i)
+  })
+
+  it("returns the adapted content alongside its witness from the same joined row", async () => {
+    const { client, query } = reader()
+    const result = await readObjectiveApplicationResumeMaterial(client, scope)
+    expect(result).toEqual({
+      witness: buildObjectiveApplicationResumeWitness({
+        ...scope, resumeId: "resume-1", finalResumeAssignmentRevision: 3, materialRevision: 2, material,
+      }),
+      resumeContent: material.content,
+    })
+    expect(query).toHaveBeenCalledOnce()
   })
 
   it("returns null without broad reads for invalid scope, missing or duplicate rows", async () => {

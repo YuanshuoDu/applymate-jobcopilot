@@ -61,7 +61,7 @@ export function withExactSubmissionWrite<T>(
  * The only source-changing submission wrapper: acquire the shared user fence
  * before any attempt/owner lock, and use only for Job status writes.
  */
-async function withExactSubmissionSourceWrite<T>(
+export async function withExactSubmissionSourceWrite<T>(
   pool: Pool,
   identity: ApplicationSubmitIdentity,
   phase: string,
@@ -158,7 +158,7 @@ export async function reconcileClaimedSubmissionUncertain(
       const status = statuses.includes("filling") ? "running"
         : statuses.some(value => value === "waiting_for_user" || value === "waiting_for_authorization") ? "waiting_for_user" : "completed";
       await client.query(`UPDATE agent_sessions SET status = $2, "completedAt" = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END, "updatedAt" = NOW()
-        WHERE id = $1 AND status NOT IN ('aborted', 'archived', 'completed', 'failed')`, [sessionId, status]);
+        WHERE id = $1 AND status NOT IN ('aborted', 'archived', 'completed', 'failed') AND status <> 'paused'`, [sessionId, status]);
     }
     return true;
   });

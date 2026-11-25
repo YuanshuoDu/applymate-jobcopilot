@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto"
 import type { Pool, PoolClient } from "pg"
-import { parseReviewedApplicationFillSource, type ReviewedApplicationFillSourceSelection } from "@jobcopilot/shared"
+import { parseObjectiveReviewedFillSource, parseReviewedApplicationFillSource, type ObjectiveReviewedFillSource,
+  type ReviewedApplicationFillSourceSelection } from "@jobcopilot/shared"
 import { appendFencedSubmitAudit, lockApplicationSubmitFence, type ApplicationSubmitIdentity } from "../queue/application-submit-fence.js"
 import { acquireSourceMaterialFence } from "./source-material-fence.js"
+import type { ObjectiveReviewedApplicationSubmitPacket } from "./objective-reviewed-application-submit-material.js"
 
 export type SubmissionAttemptState = "reserved" | "submitted" | "failed"
 export type ApplicationTarget = { readonly id: string; readonly userId: string; readonly jobId: string; readonly company: string; readonly role: string; readonly applyUrl: string; readonly source: string | null }
@@ -10,9 +12,13 @@ export type SubmissionAttempt = {
   readonly id: string; readonly userId: string; readonly jobId: string; readonly receiptId: string; readonly constraintHash: string; readonly artifactHash: string
   readonly state: SubmissionAttemptState; readonly responseRef: string | null; readonly errorCode: string | null; readonly createdAt: Date; readonly updatedAt: Date
 }
-export type SubmissionAuthorization = { readonly kind: "authorized"; readonly artifactHash: string; readonly reviewedCoverLetter?: string } | { readonly kind: "fenced" }
-export type SubmissionClaim = { readonly kind: "reserved" | "replay"; readonly attempt: SubmissionAttempt; readonly artifactHash: string; readonly reviewedCoverLetter?: string } | { readonly kind: "fenced" }
-export type SubmissionClaimAuthorizer = (client: PoolClient, mode: "new" | "replay", source: ReviewedApplicationFillSourceSelection) => Promise<SubmissionAuthorization>
+export type SubmissionSourceSelection = ReviewedApplicationFillSourceSelection | Readonly<{ kind: "objective"; source: ObjectiveReviewedFillSource }>
+export type SubmissionAuthorization = { readonly kind: "authorized"; readonly artifactHash: string; readonly reviewedCoverLetter?: string; readonly objectiveMaterial?: ObjectiveReviewedApplicationSubmitPacket } | { readonly kind: "fenced" }
+export type SubmissionClaim =
+  | { readonly kind: "reserved"; readonly attempt: SubmissionAttempt; readonly artifactHash: string; readonly reviewedCoverLetter?: string; readonly objectiveMaterial?: ObjectiveReviewedApplicationSubmitPacket }
+  | { readonly kind: "replay"; readonly attempt: SubmissionAttempt; readonly artifactHash: string }
+  | { readonly kind: "fenced" }
+export type SubmissionClaimAuthorizer = (client: PoolClient, mode: "new" | "replay", source: SubmissionSourceSelection) => Promise<SubmissionAuthorization>
 export type SubmissionAttemptWrite = { readonly kind: "updated"; readonly attempt: SubmissionAttempt } | { readonly kind: "fenced" }
 
 export class ApplicationSubmitRepositoryError extends Error {
@@ -61,8 +67,19 @@ async function withTransaction<T>(pool: Pool, userId: string, work: (client: Poo
 function matches(attempt: SubmissionAttempt, identity: ApplicationSubmitIdentity): boolean {
   return attempt.userId === identity.userId && attempt.jobId === identity.jobId && attempt.receiptId === identity.approvalId && attempt.constraintHash === identity.constraintHash
 }
-function sameSource(left: ReviewedApplicationFillSourceSelection, right: ReviewedApplicationFillSourceSelection): boolean {
-  return left.kind === right.kind && (left.kind !== "selected" || (right.kind === "selected" && left.sourceTurnId === right.sourceTurnId))
+function parseSubmitSource(input: unknown): SubmissionSourceSelection {
+  const reviewed = parseReviewedApplicationFillSource(input)
+  if (reviewed.kind !== "invalid") return reviewed
+  const objective = parseObjectiveReviewedFillSource(input)
+  return objective ? { kind: "objective", source: objective } : reviewed
+}
+function sameSource(left: SubmissionSourceSelection, right: SubmissionSourceSelection): boolean {
+  if (left.kind !== right.kind) return false
+  if (left.kind === "selected") return right.kind === "selected" && left.sourceTurnId === right.sourceTurnId
+  if (left.kind === "objective") return right.kind === "objective" && left.source.schemaVersion === right.source.schemaVersion
+    && left.source.approvalId === right.source.approvalId
+    && left.source.reviewTurnId === right.source.reviewTurnId && left.source.materialProofHash === right.source.materialProofHash
+  return true
 }
 
 export function createApplicationSubmitRepository(pool: Pool) {
@@ -78,7 +95,7 @@ export function createApplicationSubmitRepository(pool: Pool) {
             'SELECT "input" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3',
             [identity.fillTurnId, identity.sessionId, identity.userId],
           )
-          const hinted = hintRows.rows.length === 1 ? parseReviewedApplicationFillSource(hintRows.rows[0]!.input) : { kind: "invalid" as const }
+          const hinted = hintRows.rows.length === 1 ? parseSubmitSource(hintRows.rows[0]!.input) : { kind: "invalid" as const }
           if (hinted.kind !== "absent") await acquireSourceMaterialFence(client, [identity.userId])
           if (await lockApplicationSubmitFence(client, identity) === "superseded") {
             await appendFencedSubmitAudit(client, identity, "claim")
@@ -88,10 +105,12 @@ export function createApplicationSubmitRepository(pool: Pool) {
             'SELECT "input" FROM "agent_turns" WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3',
             [identity.fillTurnId, identity.sessionId, identity.userId],
           )
-          const source = turnRows.rows.length === 1 ? parseReviewedApplicationFillSource(turnRows.rows[0]!.input) : { kind: "invalid" as const }
+          const source = turnRows.rows.length === 1 ? parseSubmitSource(turnRows.rows[0]!.input) : { kind: "invalid" as const }
           if (!sameSource(hinted, source) || source.kind === "invalid") return { kind: "fenced" }
           const existingRow = await client.query<Record<string, unknown>>(`SELECT ${attemptColumns} FROM "submission_attempt" WHERE "receiptId" = $1 FOR UPDATE`, [identity.approvalId])
           const existing = existingRow.rows[0] ? asAttempt(existingRow.rows[0]) : null
+          const objectiveEvidence = source.kind === "objective" || source.kind === "absent"
+            && await (await import("./objective-reviewed-application-submit-material.js")).hasObjectiveSubmissionManifestEvidence(client, identity)
           if (existing) {
             if (!matches(existing, identity)) throw new ApplicationSubmitRepositoryError("idempotency_conflict", "This approval is already bound to a different submission attempt.")
             const authorization = await authorize(client, "replay", source)
@@ -102,6 +121,7 @@ export function createApplicationSubmitRepository(pool: Pool) {
             if (authorization.artifactHash !== existing.artifactHash) throw new ApplicationSubmitRepositoryError("idempotency_conflict", "This approval no longer matches its original artifact.")
             return { kind: "replay", attempt: existing, artifactHash: existing.artifactHash }
           }
+          if (objectiveEvidence && source.kind !== "objective") return { kind: "fenced" }
           const authorization = await authorize(client, "new", source)
           if (authorization.kind === "fenced") {
             await appendFencedSubmitAudit(client, identity, "claim")
@@ -113,7 +133,8 @@ export function createApplicationSubmitRepository(pool: Pool) {
             [randomUUID(), identity.userId, identity.jobId, identity.approvalId, identity.constraintHash, authorization.artifactHash],
           )
           return { kind: "reserved", attempt: asAttempt(result.rows[0] ?? {}), artifactHash: authorization.artifactHash,
-            ...(authorization.reviewedCoverLetter ? { reviewedCoverLetter: authorization.reviewedCoverLetter } : {}) }
+            ...(authorization.reviewedCoverLetter ? { reviewedCoverLetter: authorization.reviewedCoverLetter } : {}),
+            ...(authorization.objectiveMaterial ? { objectiveMaterial: authorization.objectiveMaterial } : {}) }
         })
       } catch (error: unknown) {
         if (isUniqueViolation(error)) throw new ApplicationSubmitRepositoryError("idempotency_replay", "This approval already has a submission attempt.")

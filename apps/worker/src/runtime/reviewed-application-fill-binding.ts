@@ -1,16 +1,22 @@
 import { randomUUID } from "node:crypto"
 import type { Pool, PoolClient } from "pg"
+import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA, canonicalJson,
+  parseObjectiveReviewedFillSource, type ObjectiveReviewedFillSource, type ObjectiveApplicationResumeWitness } from "@jobcopilot/shared"
 import { acquireSourceMaterialFence } from "../db/source-material-fence.js"
 import type { SelectedJobReviewedArtifact } from "./selected-job-reviewed-artifact-read.js"
 import type { SubagentLease } from "./subagents/types.js"
+import type { ObjectiveReviewedApplicationFillEvidence } from "./objective-reviewed-application-fill-read.js"
 
 const SELECTOR_SCHEMA = "agent-harness.v2.selected-job-reviewed-fill-source.v1"
 const BINDING_SCHEMA = "agent-harness.v2.reviewed-application-fill-browser-start.v1"
+export const OBJECTIVE_REVIEWED_FILL_BROWSER_START_SCHEMA = "agent-harness.v2.objective-reviewed-fill-browser-start.v1" as const
 const BINDING_BODY = "Reviewed application material bound to browser-start attempt."
 
 export type ReviewedApplicationFillSelector = Readonly<{ kind: "absent" | "invalid" }>
   | Readonly<{ kind: "selected"; sourceTurnId: string }>
-export type BrowserStartClaim = Readonly<{ status: "claimed"; reviewedMaterial?: SelectedJobReviewedArtifact }>
+  | Readonly<{ kind: "objective"; source: ObjectiveReviewedFillSource }>
+export type BrowserStartClaim = Readonly<{ status: "claimed"; reviewedMaterial?: SelectedJobReviewedArtifact;
+  objectiveEvidence?: ObjectiveReviewedApplicationFillEvidence }>
   | Readonly<{ status: "already_started" | "stale" | "conflict" }>
 
 type Queryable = Pick<PoolClient, "query">
@@ -22,10 +28,23 @@ export function reviewedApplicationFillSelector(value: unknown): ReviewedApplica
   const input = plainRecord(value)
   if (!input) return { kind: "invalid" }
   if (!Object.hasOwn(input, "reviewedApplicationMaterialSource")) return { kind: "absent" }
+  const objective = parseObjectiveReviewedFillSource(value)
+  if (objective) return { kind: "objective", source: objective }
   const source = plainRecord(input.reviewedApplicationMaterialSource)
+  if (source?.schemaVersion === OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA) return { kind: "invalid" }
   if (!source || Object.keys(source).sort().join(",") !== "schemaVersion,sourceTurnId"
     || source.schemaVersion !== SELECTOR_SCHEMA || !text(source.sourceTurnId, 256)) return { kind: "invalid" }
   return { kind: "selected", sourceTurnId: source.sourceTurnId }
+}
+
+export function sameReviewedApplicationFillSelector(left: ReviewedApplicationFillSelector, right: ReviewedApplicationFillSelector): boolean {
+  if (left.kind !== right.kind) return false
+  switch (left.kind) {
+    case "absent": case "invalid": return true
+    case "selected": return right.kind === "selected" && left.sourceTurnId === right.sourceTurnId
+    case "objective": return right.kind === "objective" && left.source.approvalId === right.source.approvalId
+      && left.source.reviewTurnId === right.source.reviewTurnId && left.source.materialProofHash === right.source.materialProofHash
+  }
 }
 
 /** Fence reviewed source writes, re-read the selector/proof, and atomically claim browser start. */
@@ -33,18 +52,20 @@ export async function claimApplicationFillBrowserStart(input: {
   pool: Pool
   lease: SubagentLease
   expectedSelector: ReviewedApplicationFillSelector
+  expectedObjectiveResumeWitness?: ObjectiveApplicationResumeWitness
   applicationTaskId: string
   jobId: string
 }): Promise<BrowserStartClaim> {
   const { lease, expectedSelector } = input
-  if (expectedSelector.kind === "invalid" || !text(input.applicationTaskId, 256) || !text(input.jobId, 256)) return { status: "conflict" }
+  const fillTurnId = lease.turnId
+  if (expectedSelector.kind === "invalid" || !text(fillTurnId, 256) || !text(input.applicationTaskId, 256) || !text(input.jobId, 256)) return { status: "conflict" }
   const client = await input.pool.connect()
   let open = false
   try {
     await client.query("BEGIN")
     open = true
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
-    if (expectedSelector.kind === "selected") await acquireSourceMaterialFence(client, [lease.userId])
+    if (expectedSelector.kind === "selected" || expectedSelector.kind === "objective") await acquireSourceMaterialFence(client, [lease.userId])
 
     const session = await client.query<{ status: string }>(
       'SELECT status FROM agent_sessions WHERE id=$1 AND "userId"=$2 FOR UPDATE', [lease.sessionId, lease.userId])
@@ -76,17 +97,29 @@ export async function claimApplicationFillBrowserStart(input: {
     if (app.rows[0]!.checkpoint !== "taskgraph_fill_queued") return await txResult(client, "ROLLBACK", { status: "conflict" })
 
     const persistedSelector = reviewedApplicationFillSelector(turn.rows[0]!.input)
-    if (!sameSelector(expectedSelector, persistedSelector)) return await txResult(client, "ROLLBACK", { status: "conflict" })
+    if (!sameReviewedApplicationFillSelector(expectedSelector, persistedSelector)) return await txResult(client, "ROLLBACK", { status: "conflict" })
     const prior = await client.query<{ id: string }>(
       `SELECT "id" FROM "application_task_events" WHERE "taskId"=$1
        AND "type"='reviewed_application_fill_browser_started' AND "data"->>'fillTurnId'=$2 LIMIT 2`, [app.rows[0]!.id, lease.turnId])
     if (prior.rows.length !== 0) return await txResult(client, "ROLLBACK", { status: "conflict" })
+    let objectiveEvidence: ObjectiveReviewedApplicationFillEvidence | undefined
+    if (expectedSelector.kind === "objective") {
+      const { readObjectiveReviewedApplicationFillSource } = await import("./objective-reviewed-application-fill-read.js")
+      objectiveEvidence = await readObjectiveReviewedApplicationFillSource(client, {
+        userId: lease.userId, sessionId: lease.sessionId, fillTurnId, applicationTaskId: input.applicationTaskId,
+        jobId: input.jobId, turnInput: turn.rows[0]!.input, phase: "browser_start" })
+    }
     const reviewedMaterial = expectedSelector.kind === "selected"
       ? await readCurrentReviewedMaterial(client, lease, input.jobId, expectedSelector.sourceTurnId)
-      : undefined
-    if (expectedSelector.kind === "selected" && !reviewedMaterial) return await txResult(client, "ROLLBACK", { status: "conflict" })
+      : objectiveEvidence?.reviewedArtifact
+    if (expectedSelector.kind === "selected" && !reviewedMaterial || expectedSelector.kind === "objective"
+      && (!objectiveEvidence || !input.expectedObjectiveResumeWitness
+        || canonicalJson(objectiveEvidence.resumeWitness) !== canonicalJson(input.expectedObjectiveResumeWitness))) {
+      return await txResult(client, "ROLLBACK", { status: "conflict" })
+    }
 
-    if (reviewedMaterial) await insertBindingEvent(client, lease, app.rows[0]!, reviewedMaterial)
+    if (reviewedMaterial) await insertBindingEvent(client, lease, app.rows[0]!, reviewedMaterial,
+      expectedSelector.kind === "objective" ? expectedSelector.source : undefined)
     const updated = await client.query(
       `UPDATE application_tasks AS app SET "checkpoint"='browser_active', "updatedAt"=NOW()
        WHERE app."id"=$1 AND app."userId"=$2 AND app."jobId"=$3 AND app."sessionId"=$4 AND app."fillTurnId"=$5
@@ -104,7 +137,7 @@ export async function claimApplicationFillBrowserStart(input: {
     if (updated.rowCount !== 1) return await txResult(client, "ROLLBACK", { status: "conflict" })
     await client.query("COMMIT")
     open = false
-    return { status: "claimed", ...(reviewedMaterial ? { reviewedMaterial } : {}) }
+    return { status: "claimed", ...(reviewedMaterial ? { reviewedMaterial } : {}), ...(objectiveEvidence ? { objectiveEvidence } : {}) }
   } catch (error) {
     if (open) await client.query("ROLLBACK").catch(() => undefined)
     throw error
@@ -117,9 +150,11 @@ async function readCurrentReviewedMaterial(client: Queryable, lease: SubagentLea
   return proof?.jobId === jobId && proof.sourceTurnId === sourceTurnId ? proof : null
 }
 
-async function insertBindingEvent(client: Queryable, lease: SubagentLease, app: LockedApplicationTask, proof: SelectedJobReviewedArtifact): Promise<void> {
+async function insertBindingEvent(client: Queryable, lease: SubagentLease, app: LockedApplicationTask, proof: SelectedJobReviewedArtifact,
+  objectiveSource?: ObjectiveReviewedFillSource): Promise<void> {
   const data = {
-    schemaVersion: BINDING_SCHEMA, userId: lease.userId, sessionId: lease.sessionId, fillTurnId: lease.turnId,
+    schemaVersion: objectiveSource ? OBJECTIVE_REVIEWED_FILL_BROWSER_START_SCHEMA : BINDING_SCHEMA,
+    ...(objectiveSource ? { objectiveSource } : {}), userId: lease.userId, sessionId: lease.sessionId, fillTurnId: lease.turnId,
     jobId: app.jobId, applicationTaskId: app.id, fillerTaskId: lease.id, attemptCount: lease.attemptCount,
     leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt.toISOString(), sourceTurnId: proof.sourceTurnId,
     rootTaskId: proof.rootTaskId, graphRevision: proof.graphRevision, writerTaskId: proof.writerTaskId,
@@ -132,9 +167,6 @@ async function insertBindingEvent(client: Queryable, lease: SubagentLease, app: 
     [randomUUID(), app.id, BINDING_BODY, JSON.stringify(data)])
 }
 
-function sameSelector(left: ReviewedApplicationFillSelector, right: ReviewedApplicationFillSelector): boolean {
-  return left.kind === right.kind && (left.kind !== "selected" || (right.kind === "selected" && left.sourceTurnId === right.sourceTurnId))
-}
 function plainRecord(value: unknown): Record<string, unknown> | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null

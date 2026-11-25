@@ -1,6 +1,6 @@
 import type { Pool } from "pg"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { buildReviewedFillHandoffOutboxData } from "@jobcopilot/shared"
+import { buildObjectiveReviewedFillHandoffOutboxData, buildReviewedFillHandoffOutboxData } from "@jobcopilot/shared"
 import { drainReviewedFillHandoffOutbox, startReviewedFillHandoffOutboxPublisher } from "./reviewed-fill-handoff-outbox.js"
 
 type Entry = {
@@ -9,12 +9,16 @@ type Entry = {
 }
 const identity = { userId: "user_1", sessionId: "session_1", applicationTaskId: "application_1", approvalId: "approval_1", predecessorTurnId: "turn_1" }
 const data = buildReviewedFillHandoffOutboxData(identity)!
+const objectiveSetId = `objective-review-${"a".repeat(40)}`
+const objectiveApprovalId = `objective-review:${objectiveSetId}:3`
+const objectiveIdentity = { ...identity, approvalId: objectiveApprovalId }
+const objectiveData = buildObjectiveReviewedFillHandoffOutboxData(objectiveIdentity)!
 const endpointUrl = "https://web.example/api/internal/agent-runtime/reviewed-fill"
 const options = { endpointUrl, secret: "worker-secret", fetch: vi.fn(), batchSize: 10 }
 afterEach(() => vi.unstubAllEnvs())
 
 function entry(id: string, createdAt: string, payload: unknown = data.payload,
-  handoff: typeof data = data): Entry {
+  handoff: Pick<Entry, "topic" | "aggregateId" | "idempotencyKey"> = data): Entry {
   return { id, ...handoff, payload, createdAt: new Date(createdAt), publishedAt: null, attemptCount: 0 }
 }
 
@@ -28,7 +32,8 @@ function fixture(rows: Entry[]) {
       const after = sql.includes('("createdAt", "id") >')
         ? { createdAt: String(values[1]), id: String(values[2]) } : null
       const limit = Number(values[after ? 3 : 1])
-      const found = rows.filter(row => row.topic === values[0] && row.publishedAt === null)
+      const topics = Array.isArray(values[0]) ? values[0] as string[] : []
+      const found = rows.filter(row => topics.includes(row.topic) && row.publishedAt === null)
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
         .filter(row => !after || dateCursor(row.createdAt) > after.createdAt || dateCursor(row.createdAt) === after.createdAt && row.id > after.id)
         .slice(0, limit).map(row => ({ ...row, createdAtCursor: dateCursor(row.createdAt) }))
@@ -60,6 +65,33 @@ function response(status: number, body: string | object, redirected = false, con
 }
 
 describe("reviewed fill handoff outbox publisher", () => {
+  it("publishes the distinct Objective topic through the authenticated handoff bridge", async () => {
+    const state = fixture([entry("objective_outbox_1", "2026-01-01T00:00:00.000Z", objectiveData.payload, objectiveData)])
+    const fetcher = vi.fn<typeof fetch>(async (_input, _init) => response(200, { status: "queued" }))
+    const count = await drainReviewedFillHandoffOutbox(state.pool, { ...options, fetch: fetcher })
+
+    expect(count).toBe(1)
+    expect(state.rows[0]?.topic).toBe(objectiveData.topic)
+    expect(state.rows[0]?.publishedAt).toBeInstanceOf(Date)
+    expect(state.rows[0]?.attemptCount).toBe(1)
+    expect(fetcher).toHaveBeenCalledOnce()
+    const [url, init] = fetcher.mock.calls[0]!
+    expect(url).toBe(endpointUrl)
+    expect(JSON.parse(String(init?.body))).toEqual({ outboxId: "objective_outbox_1" })
+    expect(state.statements[0]).toContain('"topic" = ANY($1::text[])')
+  })
+
+  it("keeps an Objective row pending when an older Web bridge returns 404", async () => {
+    const state = fixture([entry("objective_outbox_404", "2026-01-01T00:00:00.000Z", objectiveData.payload, objectiveData)])
+    const fetcher = vi.fn(async () => response(404, { status: "terminal" }))
+    await expect(drainReviewedFillHandoffOutbox(state.pool, { ...options, fetch: fetcher })).resolves.toBe(0)
+
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(state.rows[0]?.publishedAt).toBeNull()
+    expect(state.rows[0]?.attemptCount).toBe(0)
+    expect(state.statements.some(sql => sql.startsWith("UPDATE"))).toBe(false)
+  })
+
   it.each(["queued", "duplicate", "terminal"] as const)("publishes only after exact %s acknowledgement", async status => {
     const state = fixture([entry("outbox_1", "2026-01-01T00:00:00.000Z")])
     const fetcher = vi.fn<typeof fetch>(async (_input, _init) => response(200, { status }))

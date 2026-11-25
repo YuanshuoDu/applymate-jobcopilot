@@ -1,13 +1,17 @@
 import { Prisma, type PrismaClient } from "@prisma/client"
-import { hashApprovalNonce, hashApprovalScope, type ApprovalScope } from "@jobcopilot/agent-protocol"
 import {
   bindReviewedApplicationSubmissionMaterial, buildApplicationSubmissionManifest, hashAgentReceiptValue,
   hashApplicationSubmissionMaterial, isApplicationSubmissionManifest,
+  OBJECTIVE_REVIEWED_FILL_HANDOFF_SCHEMA, parseObjectiveReviewedFillSource,
   parseReviewedApplicationFillBrowserStartEvent, parseReviewedApplicationFillSource,
-  type LegacyApplicationSubmissionMaterial,
+  type LegacyApplicationSubmissionMaterial, type ObjectiveReviewedFillSource,
 } from "@jobcopilot/shared"
 import { hashArtifactContent } from "../artifacts/hash"
 import { acquireSourceMaterialFence } from "../source-material-fence"
+import { readObjectiveReviewedFillAuthority, type ObjectiveReviewedFillAuthority } from "./objective-reviewed-fill-authority"
+import { bareResourceHash, hasObjectiveSubmissionManifestSignal, resolveObjectiveReviewedSubmitMaterial, signedReceiptMatches,
+  type ObjectiveAuthorityContext } from "./objective-reviewed-submit-material"
+export { replayReceiptScopeMatches } from "./objective-reviewed-submit-material"
 
 const START_EVENT = "reviewed_application_fill_browser_started"
 const REVIEWED_MANIFEST_SCHEMA = "agent-harness.application-submission.v2"
@@ -16,105 +20,134 @@ const TASK_REF_PREFIX = "application-task:"
 type Client = Pick<PrismaClient, "agentApproval" | "agentArtifact" | "agentTurn" | "applicationTask" | "applicationTaskEvent" | "subAgentTask">
 export type ReviewedSubmitMaterialInput = Readonly<{ userId: string; sessionId: string; applicationTaskId: string; jobId: string; fillTurnId: string; approvalId: string; receiptNonce: string }>
 type Input = ReviewedSubmitMaterialInput
-type ReceiptRow = { id: string; userId: string; sessionId: string; turnId: string; jobId: string; taskId: string | null; type: string; status: string
-  toolCallId: string | null; payload: unknown; resourceHash: string | null; materialHash: string | null; answersHash: string | null; scopeHash: string | null
-  nonceHash: string | null; revision: number; expiresAt: Date | null }
 type ArtifactRow = { id: string; userId: string; jobId: string; artifactType: string; lifecycle: string; baseId: string | null; baseHash: string | null
   content: unknown; hash: string; constraintHash: string; provenanceRefs: unknown; evidenceRefs: unknown; previousHash: string | null; version: number }
-type ReplayReceipt = Readonly<{ nonceHash: string | null; resourceHash: string | null; materialHash: string | null; answersHash: string | null
-  expiresAt: Date | null; sessionId: string | null; turnId: string | null; toolCallId: string | null; jobId: string | null; revision: number; scopeHash: string | null }>
 type MaterialResult =
   | Readonly<{ mode: "legacy" }>
-  | Readonly<{ mode: "reviewed"; ready: true; resourceHash: string; materialHash: string; answersHash: string }>
+  | Readonly<{ mode: "reviewed"; ready: true; resourceHash: string; materialHash: string; answersHash: string;
+      objectiveSource?: ObjectiveReviewedFillSource; fillTurnCreatedAt?: Date }>
   | Readonly<{ mode: "unavailable" }>
 
 const UNAVAILABLE: MaterialResult = Object.freeze({ mode: "unavailable" })
 
 /** Acquire the shared source fence and the submit scope in the established row-lock order. */
-export async function lockReviewedSubmitSourceScope(tx: Prisma.TransactionClient, input: Input): Promise<boolean> {
+export async function lockReviewedSubmitSourceScope(tx: Prisma.TransactionClient, input: Input, expected?: MaterialResult): Promise<boolean> {
+  return await lockReviewedSubmitSourceScopeWithAuthority(tx, input, expected) !== null
+}
+
+async function lockReviewedSubmitSourceScopeWithAuthority(
+  tx: Prisma.TransactionClient, input: Input, expected?: MaterialResult,
+): Promise<Readonly<{ objectiveAuthority?: ObjectiveReviewedFillAuthority }> | null> {
   await acquireSourceMaterialFence(tx, [input.userId])
   const session = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "agent_sessions" WHERE "id" = ${input.sessionId} AND "userId" = ${input.userId} FOR UPDATE
   `)
-  if (!exactlyLocked(session, input.sessionId)) return false
-  const turn = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-    SELECT "id" FROM "agent_turns" WHERE "id" = ${input.fillTurnId} AND "sessionId" = ${input.sessionId}
+  if (!exactlyLocked(session, input.sessionId)) return null
+  let objectiveAuthority: ObjectiveReviewedFillAuthority | undefined
+  if (expected?.mode === "reviewed" && expected.objectiveSource) {
+    const source = expected.objectiveSource
+    const predecessor = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
+      SELECT "id", "status" FROM "agent_turns" WHERE "id" = ${source.reviewTurnId} AND "sessionId" = ${input.sessionId}
+        AND "userId" = ${input.userId} FOR UPDATE
+    `)
+    if (predecessor.length !== 1 || predecessor[0]?.id !== source.reviewTurnId || predecessor[0]?.status !== "completed"
+      || !expected.fillTurnCreatedAt || !Number.isFinite(expected.fillTurnCreatedAt.getTime())) return null
+    try {
+      objectiveAuthority = await readObjectiveReviewedFillAuthority(tx, { schemaVersion: OBJECTIVE_REVIEWED_FILL_HANDOFF_SCHEMA,
+        userId: input.userId, sessionId: input.sessionId, applicationTaskId: input.applicationTaskId,
+        approvalId: source.approvalId, predecessorTurnId: source.reviewTurnId }, expected.fillTurnCreatedAt)
+      if (objectiveAuthority.jobId !== input.jobId || !sameObjectiveSource(objectiveAuthority.source, source)) return null
+    } catch { return null }
+  }
+  const turn = await tx.$queryRaw<Array<{ id: string; status?: string; createdAt?: Date }>>(Prisma.sql`
+    SELECT "id", "status", "createdAt" FROM "agent_turns" WHERE "id" = ${input.fillTurnId} AND "sessionId" = ${input.sessionId}
       AND "userId" = ${input.userId} FOR UPDATE
   `)
-  if (!exactlyLocked(turn, input.fillTurnId)) return false
+  if (!exactlyLocked(turn, input.fillTurnId)) return null
+  if (expected?.mode === "reviewed" && expected.objectiveSource
+    && (turn[0]?.status !== "waiting_for_approval" || !(turn[0]?.createdAt instanceof Date)
+      || turn[0].createdAt.getTime() !== expected.fillTurnCreatedAt?.getTime())) return null
   const task = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "application_tasks" WHERE "id" = ${input.applicationTaskId} AND "userId" = ${input.userId}
       AND "sessionId" = ${input.sessionId} AND "fillTurnId" = ${input.fillTurnId} AND "jobId" = ${input.jobId} FOR UPDATE
   `)
-  if (!exactlyLocked(task, input.applicationTaskId)) return false
+  if (!exactlyLocked(task, input.applicationTaskId)) return null
   const job = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "Job" WHERE "id" = ${input.jobId} AND "userId" = ${input.userId} FOR UPDATE
   `)
-  if (!exactlyLocked(job, input.jobId)) return false
+  if (!exactlyLocked(job, input.jobId)) return null
   const approval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "agent_approvals" WHERE "id" = ${input.approvalId} AND "userId" = ${input.userId}
       AND "sessionId" = ${input.sessionId} AND "taskId" = ${input.applicationTaskId} AND "turnId" = ${input.fillTurnId}
       AND "jobId" = ${input.jobId} AND "type" = 'submit_application' FOR UPDATE
   `)
-  return exactlyLocked(approval, input.approvalId)
+  if (!exactlyLocked(approval, input.approvalId)) return null
+  return objectiveAuthority ? { objectiveAuthority } : {}
 }
-
 export function sameReviewedSubmitMaterialSnapshot(left: MaterialResult, right: MaterialResult): boolean {
   if (left.mode === "unavailable" || right.mode !== left.mode) return false
   return left.mode === "legacy" || (right.mode === "reviewed" && left.resourceHash === right.resourceHash
-    && left.materialHash === right.materialHash && left.answersHash === right.answersHash)
+    && left.materialHash === right.materialHash && left.answersHash === right.answersHash
+    && sameObjectiveSnapshot(left, right))
 }
-
 export async function lockAndRereadReviewedSubmitMaterial(tx: Prisma.TransactionClient, input: Input, expected: MaterialResult): Promise<boolean> {
-  return await lockReviewedSubmitSourceScope(tx, input)
-    && sameReviewedSubmitMaterialSnapshot(expected, await resolveReviewedSubmitMaterial(tx, input))
+  const locks = await lockReviewedSubmitSourceScopeWithAuthority(tx, input, expected)
+  return Boolean(locks && sameReviewedSubmitMaterialSnapshot(expected, await resolveReviewedSubmitMaterial(tx, input,
+    locks.objectiveAuthority ? { objectiveAuthority: { tx, authority: locks.objectiveAuthority } } : {})))
 }
-
-export function submitMaterialHashesMatch(proof: MaterialResult, approval: Pick<ReceiptRow, "resourceHash" | "materialHash" | "answersHash">,
+export function submitMaterialHashesMatch(proof: MaterialResult,
+  approval: Readonly<{ resourceHash: string | null; materialHash: string | null; answersHash: string | null }>,
   legacyMaterialHash: string, legacyAnswersHash: string): boolean {
   if (proof.mode === "unavailable") return false
   return proof.mode === "legacy" ? approval.materialHash === legacyMaterialHash && approval.answersHash === legacyAnswersHash
     : approval.resourceHash === proof.resourceHash && approval.materialHash === proof.materialHash && approval.answersHash === proof.answersHash
 }
 
-export async function replayReceiptScopeMatches(approval: ReplayReceipt,
-input: Pick<Input, "userId" | "receiptNonce">): Promise<boolean> {
-  if (!approval.nonceHash || !approval.resourceHash || !approval.materialHash || !approval.answersHash || !approval.expiresAt
-    || !approval.sessionId || !approval.turnId || !approval.toolCallId || !approval.jobId || !input.receiptNonce) return false
-  const nonceHash = await hashApprovalNonce(input.receiptNonce)
-  const scope: ApprovalScope = { userId: input.userId, sessionId: approval.sessionId, turnId: approval.turnId, jobId: approval.jobId,
-    toolCallId: approval.toolCallId, action: "submit_application", resourceHash: approval.resourceHash,
-    materialHash: approval.materialHash, answersHash: approval.answersHash, revision: approval.revision,
-    nonceHash, expiresAt: approval.expiresAt.toISOString() }
-  return nonceHash === approval.nonceHash && await hashApprovalScope(scope) === approval.scopeHash
-}
-
 function exactlyLocked(rows: readonly { id: string }[], expectedId: string): boolean {
   return rows.length === 1 && rows[0]?.id === expectedId
+}
+function sameObjectiveSnapshot(left: Extract<MaterialResult, { mode: "reviewed" }>,
+  right: Extract<MaterialResult, { mode: "reviewed" }>): boolean {
+  if (Boolean(left.objectiveSource) !== Boolean(right.objectiveSource)) return false
+  return !left.objectiveSource || Boolean(right.objectiveSource && left.fillTurnCreatedAt && right.fillTurnCreatedAt
+    && left.fillTurnCreatedAt.getTime() === right.fillTurnCreatedAt.getTime()
+    && sameObjectiveSource(left.objectiveSource, right.objectiveSource))
+}
+function sameObjectiveSource(left: ObjectiveReviewedFillSource, right: ObjectiveReviewedFillSource): boolean {
+  return left.schemaVersion === right.schemaVersion && left.approvalId === right.approvalId
+    && left.reviewTurnId === right.reviewTurnId && left.materialProofHash === right.materialProofHash
 }
 
 /**
  * Read-only preflight; every result is advisory. Call again on the existing transaction client after
  * taking the #1159 source fence, then Session, Turn, ApplicationTask and Job locks, in that order.
  */
-export async function resolveReviewedSubmitMaterial(client: Client, input: Input): Promise<MaterialResult> {
+export async function resolveReviewedSubmitMaterial(client: Client, input: Input,
+  options: { objectiveAuthority?: ObjectiveAuthorityContext } = {}): Promise<MaterialResult> {
   try {
     if (![input.userId, input.sessionId, input.applicationTaskId, input.jobId, input.fillTurnId, input.approvalId, input.receiptNonce]
       .every(value => typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256)) return UNAVAILABLE
     const taskRows = await client.applicationTask.findMany({
       where: { id: input.applicationTaskId, userId: input.userId, sessionId: input.sessionId, jobId: input.jobId, fillTurnId: input.fillTurnId },
       take: 2, select: { id: true, userId: true, sessionId: true, jobId: true, fillTurnId: true, fillTurnSessionId: true,
-        fillTurnUserId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
+        fillTurnUserId: true, status: true, checkpoint: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
     })
     if (taskRows.length !== 1) return UNAVAILABLE
     const task = taskRows[0]!
     const turns = await client.agentTurn.findMany({
       where: { id: input.fillTurnId, userId: input.userId, sessionId: input.sessionId, source: "user" },
-      take: 2, select: { id: true, userId: true, sessionId: true, source: true, rootTaskId: true, input: true },
+      take: 2, select: { id: true, userId: true, sessionId: true, source: true, status: true, rootTaskId: true, input: true,
+        executionMode: true, createdAt: true },
     })
     if (turns.length !== 1) return UNAVAILABLE
     const turn = turns[0]!
     if (turn.id !== input.fillTurnId || turn.userId !== input.userId || turn.sessionId !== input.sessionId || turn.source !== "user") return UNAVAILABLE
+    const objectiveSource = parseObjectiveReviewedFillSource(turn.input)
+    if (objectiveSource) {
+      const objective = await resolveObjectiveReviewedSubmitMaterial(client, input, task, turn,
+        (legacyMaterial, hashes) => signedReceiptMatches(client, input, legacyMaterial, hashes), options.objectiveAuthority)
+      return objective ?? UNAVAILABLE
+    }
     const selection = parseReviewedApplicationFillSource(turn.input)
     if (selection.kind === "invalid") return UNAVAILABLE
     if (selection.kind === "absent") {
@@ -123,6 +156,7 @@ export async function resolveReviewedSubmitMaterial(client: Client, input: Input
         take: 1, select: { id: true },
       })
       if (starts.length !== 0) return UNAVAILABLE
+      if (await hasObjectiveSubmissionManifestSignal(client, input.applicationTaskId, input.fillTurnId)) return UNAVAILABLE
       const artifacts = await client.agentArtifact.findMany({
         where: { id: `application:${task.id}`, userId: input.userId, jobId: input.jobId },
         take: 2, select: { content: true },
@@ -157,7 +191,7 @@ export async function resolveReviewedSubmitMaterial(client: Client, input: Input
     const resourceHash = bareResourceHash(artifactRows[0]!.hash)
     if (!resourceHash) return UNAVAILABLE
     const materialHash = await hashApplicationSubmissionMaterial(reviewed)
-    if (!materialHash || !await signedReceiptMatches(client, input, material, resourceHash, materialHash, answersHash)) return UNAVAILABLE
+    if (!materialHash || !await signedReceiptMatches(client, input, material, { resourceHash, materialHash, answersHash })) return UNAVAILABLE
     return { mode: "reviewed", ready: true, resourceHash, materialHash, answersHash }
   } catch {
     return UNAVAILABLE
@@ -202,33 +236,6 @@ function artifactMatches(row: ArtifactRow, input: Input, manifest: unknown): boo
   } catch { return false }
 }
 
-async function signedReceiptMatches(client: Client, input: Input, material: LegacyApplicationSubmissionMaterial,
-  resourceHash: string, materialHash: string, answersHash: string): Promise<boolean> {
-  const rows = await client.agentApproval.findMany({
-    where: { id: input.approvalId, userId: input.userId, sessionId: input.sessionId, taskId: input.applicationTaskId,
-      turnId: input.fillTurnId, jobId: input.jobId, type: "submit_application", status: { in: ["approved", "consumed"] } }, take: 2,
-    select: { id: true, userId: true, sessionId: true, turnId: true, taskId: true, jobId: true, type: true, status: true,
-      toolCallId: true, payload: true, resourceHash: true, materialHash: true, answersHash: true, scopeHash: true,
-      nonceHash: true, revision: true, expiresAt: true },
-  })
-  if (rows.length !== 1) return false
-  const approval = rows[0]! as ReceiptRow
-  if (approval.id !== input.approvalId || approval.userId !== input.userId || approval.sessionId !== input.sessionId
-    || approval.turnId !== input.fillTurnId || approval.taskId !== input.applicationTaskId || approval.jobId !== input.jobId
-    || approval.type !== "submit_application" || !["approved", "consumed"].includes(approval.status)
-    || approval.toolCallId !== `application-submit:${input.applicationTaskId}` || !matchesLegacyPayload(approval.payload, material)
-    || approval.resourceHash !== resourceHash
-    || approval.materialHash !== materialHash || approval.answersHash !== answersHash || !approval.scopeHash || !approval.nonceHash
-    || !Number.isSafeInteger(approval.revision) || approval.revision < 0 || !(approval.expiresAt instanceof Date)
-    || !Number.isFinite(approval.expiresAt.getTime())) return false
-  const nonceHash = await hashApprovalNonce(input.receiptNonce)
-  if (nonceHash !== approval.nonceHash) return false
-  const scope: ApprovalScope = { userId: input.userId, sessionId: input.sessionId, turnId: input.fillTurnId, jobId: input.jobId,
-    toolCallId: approval.toolCallId, action: "submit_application", resourceHash, materialHash, answersHash,
-    revision: approval.revision, nonceHash, expiresAt: approval.expiresAt.toISOString() }
-  return await hashApprovalScope(scope) === approval.scopeHash
-}
-
 function exactSingleRef(value: unknown, expected: string): boolean {
   return Array.isArray(value) && value.length === 1 && value[0] === expected
 }
@@ -240,21 +247,4 @@ function hasReviewedManifestVersion(value: unknown): boolean {
     const commitment = Object.getOwnPropertyDescriptor(value, "reviewedCoverLetterHash")
     return Boolean(commitment || descriptor && (!descriptor.enumerable || !("value" in descriptor) || descriptor.value === REVIEWED_MANIFEST_SCHEMA))
   } catch { return true }
-}
-function matchesLegacyPayload(value: unknown, expected: LegacyApplicationSubmissionMaterial): boolean {
-  const keys = ["applicationTaskId", "jobId", "resumeId", "coverLetterId"] as const
-  try {
-    if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return false
-    const own = Reflect.ownKeys(value)
-    if (own.length !== keys.length || !own.every(key => typeof key === "string" && keys.includes(key as typeof keys[number]))) return false
-    const row = value as Record<string, unknown>
-    return keys.every(key => {
-      const descriptor = Object.getOwnPropertyDescriptor(row, key)
-      return Boolean(descriptor?.enumerable && "value" in descriptor) && row[key] === expected[key]
-    })
-  } catch { return false }
-}
-function bareResourceHash(value: string): string | null {
-  const match = /^sha256:([a-f0-9]{64})$/.exec(value)
-  return match?.[0] === value ? match[1]! : null
 }

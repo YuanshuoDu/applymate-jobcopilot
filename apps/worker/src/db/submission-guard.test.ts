@@ -183,7 +183,7 @@ describe("submission guard", () => {
       { rowCount: 1, rows: [{ sessionId: "session-1" }] },
       { rowCount: 1, rows: [] },
       { rowCount: 1, rows: [{ status: "waiting_for_user" }] },
-      { rowCount: 1, rows: [] },
+      { rowCount: 0, rows: [] },
     );
 
     await expect(reconcileClaimedSubmissionUncertain(pool, identity, "bull-1", async () => true)).resolves.toBe(true);
@@ -197,6 +197,7 @@ describe("submission guard", () => {
     ]);
     expect(String(query.mock.calls[3]?.[0])).toContain("INSERT INTO application_task_events");
     expect(String(query.mock.calls[5]?.[0])).toContain("UPDATE agent_sessions");
+    expect(String(query.mock.calls[5]?.[0])).toContain("status <> 'paused'");
     expect(query.mock.calls.some(([sql]) => String(sql).includes("ready_to_apply"))).toBe(false);
   });
 
