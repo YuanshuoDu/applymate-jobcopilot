@@ -190,14 +190,14 @@ export function createObjectiveSubmissionFenceAcquisition(input: Readonly<{
         if (latePoolCheckouts.get(pool) === previous) latePoolCheckouts.delete(pool)
       }
       let abandoned = false
-      let acquired: PoolClient | null = null
+      const acquired: { client: PoolClient | null } = { client: null }
       const pending = Promise.resolve().then(() => {
         if (controller.signal.aborted) throw new Error("Objective submission fence acquisition ended.")
         return pool.connect()
       })
       const checkout = pending.then(client => {
         if (abandoned || controller.signal.aborted) { client.release(); return null }
-        acquired = client
+        acquired.client = client
         return client
       })
       const drain = checkout.then(() => undefined, () => undefined)
@@ -208,8 +208,8 @@ export function createObjectiveSubmissionFenceAcquisition(input: Readonly<{
       ])
       if (outcome.kind === "aborted" || controller.signal.aborted) {
         abandoned = true
-        acquired?.release()
-        acquired = null
+        acquired.client?.release()
+        acquired.client = null
         void drain.then(() => { if (latePoolCheckouts.get(pool) === drain) latePoolCheckouts.delete(pool) })
         return null
       }
@@ -218,7 +218,7 @@ export function createObjectiveSubmissionFenceAcquisition(input: Readonly<{
         throw outcome.error
       }
       if (latePoolCheckouts.get(pool) === drain) latePoolCheckouts.delete(pool)
-      acquired = null
+      acquired.client = null
       let tracked: ObjectiveSubmissionFenceClient | undefined
       tracked = trackClient(outcome.client, controller.signal, () => { if (tracked) clients.delete(tracked) })
       if (!tracked.isReleased) clients.add(tracked)

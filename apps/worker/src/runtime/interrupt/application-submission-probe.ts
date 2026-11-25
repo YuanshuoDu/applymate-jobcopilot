@@ -56,7 +56,7 @@ export async function acquireApplicationSubmissionStartFence(
     reserved?.release()
   }
   try {
-    markerLease = await acquisition.connect(pool)
+    markerLease = (await acquisition.connect(pool)) ?? undefined
     markerClient = markerLease?.queryClient
     if (!markerClient) return declined(acquisition.cancellation() === "timed_out" ? "unavailable" : "cancelled", releasePermitOnce)
     const markerConnection = markerClient
@@ -102,7 +102,7 @@ export async function acquireApplicationSubmissionStartFence(
     // A user may bind a successor between persisting the marker and sending the
     // request. Reacquire the same exact lock order and only then release the
     // paused browser route; a superseded payload never reaches the ATS.
-    boundaryLease = await acquisition.connect(pool)
+    boundaryLease = (await acquisition.connect(pool)) ?? undefined
     boundaryClient = boundaryLease?.queryClient
     if (!boundaryClient) return declined("uncertain", releasePermitOnce)
     const boundary = boundaryClient
