@@ -6,7 +6,7 @@ import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, ty
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 import { buildTaskGraphFinalSidecars } from "./subagents/objective-tailor-final-sidecar.js"
 import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA } from "./subagents/objective-tailor-final-summary-binding.js"
-import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA } from "@jobcopilot/agent-protocol"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 import type { GraphTaskRow, LoadedGraph } from "./subagents/task-graph-pg-state.js"
@@ -52,13 +52,19 @@ function followUpGraphBinding(): TaskGraphFinalSummaryBinding {
 }
 
 function waveGraphBinding(): TaskGraphFinalSummaryBinding {
-  const rootTaskId = "root-wave", taskRows: GraphTaskRow[] = ["source-a", "source-b"].map((id, index) => ({
-    id, role: "scout", taskType: "research", status: "completed", failureReason: null,
-    result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
-      candidates: [], evidence: [], summary: `Source ${index + 1}.` } },
-  }))
+  const rootTaskId = "root-wave"
+  const taskRows: GraphTaskRow[] = [
+    { id: "source-a", role: "scout", taskType: "job_discovery", status: "completed", failureReason: null,
+      result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+        candidates: [{ jobId: "job-wave", source: "fixture", url: null, evidenceIds: ["source-job"] }],
+        evidence: [{ id: "source-job", kind: "job", ref: "job-wave", source: "fixture" }], summary: "Scout source." } } },
+    { id: "source-b", role: "analyst", taskType: "job_analysis", status: "completed", failureReason: null,
+      result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+        findings: [{ jobId: "job-wave", score: 8, evidenceIds: ["analysis-job"] }],
+        evidence: [{ id: "analysis-job", kind: "job", ref: "job-wave", source: "fixture" }], summary: "Analyst source." } } },
+  ]
   const graphRevision = 12, loaded = { rootTaskId, item: { id: taskGraphItemId(rootTaskId), revision: graphRevision, content: {}, createdAt: new Date(0) },
-    snapshot: { nodes: taskRows.map((row, nodeIndex) => ({ taskId: row.id, key: `source-${nodeIndex + 1}`, templateId: "scout" })) },
+    snapshot: { nodes: taskRows.map((row, nodeIndex) => ({ taskId: row.id, key: `source-${nodeIndex + 1}`, templateId: row.role })) },
     state: { revision: graphRevision }, tasks: new Map(taskRows.map(row => [row.id, row])) } as unknown as LoadedGraph
   const base = buildTaskGraphFinalSummaryBinding(loaded)
   if (!base) throw new Error("Expected a current wave TaskGraph binding")
@@ -149,8 +155,9 @@ describe("deterministic finalizer", () => {
 
   it("persists only the bound settled slot statuses and rejects missing or misplaced sidecars", () => {
     const binding = waveGraphBinding(), responseText = buildGroundedTaskGraphFinalResponse(binding), terminal = boundTerminal(binding, responseText)
-    const sidecar = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
-      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }] }
+    const sidecar = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: 12,
+      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }],
+      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } } }
     expect(terminal.finalContent.objectiveTailorFinalOutcomes).toEqual(sidecar)
     expect(terminal.finalContent.final).not.toHaveProperty("objectiveTailorFinalOutcomes")
     expect(JSON.parse(terminal.response)).not.toHaveProperty("objectiveTailorFinalOutcomes")
@@ -158,6 +165,16 @@ describe("deterministic finalizer", () => {
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent, objectiveTailorFinalOutcomes: undefined }, terminal.response, terminal.finalItemId)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
       objectiveTailorFinalOutcomes: { ...sidecar, slots: [{ ordinal: 1, status: "failed" }, { ordinal: 2, status: "needs_revision" }] } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      objectiveTailorFinalOutcomes: { ...sidecar, graphRevision: 13 } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      objectiveTailorFinalOutcomes: { ...sidecar, sourceCounts: { ...sidecar.sourceCounts,
+        discoveredJobs: { knownCount: 2, coverage: "complete" } } } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      objectiveTailorFinalOutcomes: { ...sidecar, sourceCounts: { ...sidecar.sourceCounts,
+        analyzedJobs: { knownCount: 1, coverage: "partial" } } } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      objectiveTailorFinalOutcomes: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, slots: sidecar.slots } }, terminal.response, terminal.finalItemId)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
       final: { ...terminal.finalContent.final, objectiveTailorFinalOutcomes: sidecar } }, terminal.response, terminal.finalItemId)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,

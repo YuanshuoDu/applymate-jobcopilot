@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest"
-import { TASK_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import {
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+  TASK_GRAPH_SCHEMA_VERSION,
+} from "@jobcopilot/agent-protocol"
 import { projectFinalAnswerContent } from "./final-answer-evidence-projection"
 import { canonicalTaskGraphSourceKey } from "./final-task-graph-source-detail"
 import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from "./final-task-graph-source-manifest"
@@ -368,9 +372,15 @@ describe("agent stream redaction", () => {
   })
 
   it("streams only a canonical TaskGraph source manifest beside the ordinary final answer", () => {
-    const objectiveTailorFinalOutcomes = { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [
-      { ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'rejected' },
-    ] }
+    const objectiveTailorFinalOutcomes = {
+      schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+      graphRevision: 19,
+      slots: [{ ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'rejected' }],
+      sourceCounts: {
+        discoveredJobs: { knownCount: 0, coverage: 'complete' },
+        analyzedJobs: { knownCount: 3, coverage: 'partial' },
+      },
+    }
     const source = { sourceKey: canonicalTaskGraphSourceKey("final-item", 3, 0), nodeIndex: 0,
       role: "scout", taskStatus: "completed", resultState: "missing" }
     const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 3, sources: [source] }
@@ -394,6 +404,19 @@ describe("agent stream redaction", () => {
     expect(invalidSidecar).toEqual({ itemId: 'final-item', status: 'completed', content: { text: 'Safe answer', taskGraphSources: manifest } })
     const nonFinal = redactStreamEventPayload('item.delta', { content: { objectiveTailorFinalOutcomes: objectiveTailorFinalOutcomes } }, identity)
     expect(JSON.stringify(nonFinal)).not.toContain('objectiveTailorFinalOutcomes')
+  })
+
+  it('keeps historical V1 final outcomes slot-only', () => {
+    const legacy = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, slots: [
+      { ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'needs_revision' },
+    ] }
+    const projected = redactStreamEventPayload('item.completed', { itemId: 'final-item', status: 'completed', content: {
+      text: 'Safe answer', final: { response: 'Safe answer' }, objectiveTailorFinalOutcomes: legacy,
+    } }, { ...identity, itemId: 'final-item' }) as { content: Record<string, unknown> }
+
+    expect(projected.content.objectiveTailorFinalOutcomes).toEqual(legacy)
+    expect(projected.content.objectiveTailorFinalOutcomes).not.toHaveProperty('graphRevision')
+    expect(projected.content.objectiveTailorFinalOutcomes).not.toHaveProperty('sourceCounts')
   })
 
   it("redacts nested credential, resume, and raw payload keys", () => {
