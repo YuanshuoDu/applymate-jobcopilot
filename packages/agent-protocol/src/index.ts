@@ -219,6 +219,7 @@ export type { ObjectiveTailorGraph } from './objective-tailor-graph.js'
 export {
   OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
   OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
   OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_STATUSES,
   parseObjectiveTailorFinalOutcomeSidecar,
 } from './objective-tailor-final-outcome-sidecar.js'
@@ -226,4 +227,6 @@ export type {
   ObjectiveTailorFinalOutcomeSidecar,
   ObjectiveTailorFinalOutcomeSidecarStatus,
   ObjectiveTailorFinalOutcomeSidecarV2,
+  ObjectiveTailorFinalOutcomeSidecarV3,
+  ObjectiveTailorReportedScoreFloor,
 } from './objective-tailor-final-outcome-sidecar.js'

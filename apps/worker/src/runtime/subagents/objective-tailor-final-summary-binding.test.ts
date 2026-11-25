@@ -3,7 +3,7 @@ import { createHash } from "node:crypto"
 import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphState, parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
-import { buildTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { buildTaskGraphFinalSummaryBinding, sameTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import { buildCurrentTaskGraphFinalSummaryBinding, OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA, renderObjectiveTailorFinalOutcome } from "./objective-tailor-final-summary-binding.js"
 import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection,
   objectiveTailorWavePairPlan } from "./objective-tailor-wave-witness.js"
@@ -101,6 +101,10 @@ describe("Objective Tailor final summary binding", () => {
     expect(binding?.objectiveTailorFinalOutcome?.slots.map(({ ordinal, status }) => ({ ordinal, status }))).toEqual([
       { ordinal: 1, status: "ready" }, ...Array.from({ length: 7 }, (_, index) => ({ ordinal: index + 2, status: "needs_revision" })),
     ])
+    expect(binding?.objectiveTailorFinalOutcome?.reportedScoreFloor).toEqual({ status: "not_requested" })
+    const changedFloor = { ...binding!, objectiveTailorFinalOutcome: { ...binding!.objectiveTailorFinalOutcome!,
+      reportedScoreFloor: { status: "complete" as const, minimumScore: 7, minimumFindings: 1, aggregation: "any" as const, qualifyingJobCount: 0 } } }
+    expect(sameTaskGraphFinalSummaryBinding(binding, changedFloor)).toBe(false)
     expect(client.query).toHaveBeenCalledTimes(1)
     const sql = client.query.mock.calls[0]?.[0] as string
     expect(sql).toContain("clock_timestamp()")

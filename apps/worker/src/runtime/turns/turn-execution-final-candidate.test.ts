@@ -8,7 +8,7 @@ import type { StepContext } from "../context/step-context-builder.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA } from "../subagents/objective-tailor-final-summary-binding.js"
-import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA } from "@jobcopilot/agent-protocol"
 import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 import { taskGraphItemId, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
@@ -78,9 +78,10 @@ describe("atomic TaskGraph finalization recovery", () => {
 
     expect(outcome.kind).toBe("completed")
     const recorded = saved[0] as { response: string; terminal: { finalContent: Record<string, unknown> } }
-    expect(recorded.terminal.finalContent.objectiveTailorFinalOutcomes).toEqual({ schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+    expect(recorded.terminal.finalContent.objectiveTailorFinalOutcomes).toEqual({ schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
       graphRevision: 12, slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }],
-      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } } })
+      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } },
+      reportedScoreFloor: { status: "unavailable" } })
     expect(recorded.terminal.finalContent.final).not.toHaveProperty("objectiveTailorFinalOutcomes")
     expect(JSON.parse(recorded.response)).not.toHaveProperty("objectiveTailorFinalOutcomes")
     expect(JSON.stringify(recorded.terminal.finalContent.objectiveTailorFinalOutcomes)).not.toMatch(/root-wave|source-a|source-b|graphDigest|evidenceDigest/)

@@ -1,7 +1,7 @@
 import {
-  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
   parseObjectiveTailorFinalOutcomeSidecar,
-  type ObjectiveTailorFinalOutcomeSidecarV2,
+  type ObjectiveTailorFinalOutcomeSidecarV3,
 } from "@jobcopilot/agent-protocol"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import { buildTaskGraphFinalSourceManifest } from "./task-graph-final-source-manifest.js"
@@ -10,11 +10,11 @@ import { hasObjectiveTailorFinalOutcome, readBoundObjectiveTailorFinalOutcome } 
 export type ObjectiveTailorFinalOutcomeSidecarRead =
   | Readonly<{ status: "absent" }>
   | Readonly<{ status: "invalid" }>
-  | Readonly<{ status: "ready"; sidecar: ObjectiveTailorFinalOutcomeSidecarV2 }>
+  | Readonly<{ status: "ready"; sidecar: ObjectiveTailorFinalOutcomeSidecarV3 }>
 
 export type TaskGraphFinalSidecars = Readonly<{
   taskGraphSources?: Exclude<ReturnType<typeof buildTaskGraphFinalSourceManifest>, null>
-  objectiveTailorFinalOutcomes?: ObjectiveTailorFinalOutcomeSidecarV2
+  objectiveTailorFinalOutcomes?: ObjectiveTailorFinalOutcomeSidecarV3
 }>
 
 export function readObjectiveTailorFinalOutcomeSidecar(value: unknown): ObjectiveTailorFinalOutcomeSidecarRead {
@@ -23,13 +23,18 @@ export function readObjectiveTailorFinalOutcomeSidecar(value: unknown): Objectiv
   if (!outcome) return { status: "invalid" }
   const sourceCounts = readSourceCounts(value, outcome.graphRevision)
   if (!sourceCounts) return { status: "invalid" }
+  const floor = outcome.reportedScoreFloor ?? { status: "unavailable" as const }
+  const reportedScoreFloor = floor.status === "complete"
+    ? { status: "complete" as const, minimumScore: floor.minimumScore,
+      qualifyingJobCount: floor.qualifyingJobCount } : { status: floor.status }
   const sidecar = parseObjectiveTailorFinalOutcomeSidecar({
-    schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+    schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
     graphRevision: outcome.graphRevision,
     slots: outcome.slots.map(slot => ({ ordinal: slot.ordinal, status: slot.status })),
     sourceCounts,
+    reportedScoreFloor,
   })
-  return sidecar?.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA
+  return sidecar?.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA
     ? { status: "ready", sidecar } : { status: "invalid" }
 }
 
@@ -38,7 +43,7 @@ export function objectiveTailorFinalOutcomeSidecarMatches(binding: unknown, valu
   if (read.status === "invalid") return false
   if (read.status === "absent") return value === undefined
   const parsed = parseObjectiveTailorFinalOutcomeSidecar(value)
-  return Boolean(parsed?.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA && sameSidecar(read.sidecar, parsed))
+  return Boolean(parsed?.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA && sameSidecar(read.sidecar, parsed))
 }
 
 export function buildTaskGraphFinalSidecars(binding: TaskGraphFinalSummaryBinding, finalItemId: string): TaskGraphFinalSidecars | null {
@@ -52,11 +57,12 @@ export function buildTaskGraphFinalSidecars(binding: TaskGraphFinalSummaryBindin
   }
 }
 
-function sameSidecar(left: ObjectiveTailorFinalOutcomeSidecarV2, right: ObjectiveTailorFinalOutcomeSidecarV2): boolean {
+function sameSidecar(left: ObjectiveTailorFinalOutcomeSidecarV3, right: ObjectiveTailorFinalOutcomeSidecarV3): boolean {
   return left.graphRevision === right.graphRevision && left.slots.length === right.slots.length
     && left.slots.every((slot, index) => slot.ordinal === right.slots[index]?.ordinal && slot.status === right.slots[index]?.status)
     && sameCount(left.sourceCounts.discoveredJobs, right.sourceCounts.discoveredJobs)
     && sameCount(left.sourceCounts.analyzedJobs, right.sourceCounts.analyzedJobs)
+    && JSON.stringify(left.reportedScoreFloor) === JSON.stringify(right.reportedScoreFloor)
 }
 
 function readSourceCounts(value: unknown, graphRevision: number): Readonly<{ discoveredJobs: unknown; analyzedJobs: unknown }> | null {
@@ -65,7 +71,7 @@ function readSourceCounts(value: unknown, graphRevision: number): Readonly<{ dis
   return { discoveredJobs: counts.discoveredJobs, analyzedJobs: counts.analyzedJobs }
 }
 
-function sameCount(left: ObjectiveTailorFinalOutcomeSidecarV2["sourceCounts"]["discoveredJobs"], right: ObjectiveTailorFinalOutcomeSidecarV2["sourceCounts"]["discoveredJobs"]): boolean {
+function sameCount(left: ObjectiveTailorFinalOutcomeSidecarV3["sourceCounts"]["discoveredJobs"], right: ObjectiveTailorFinalOutcomeSidecarV3["sourceCounts"]["discoveredJobs"]): boolean {
   return left.knownCount === right.knownCount && left.coverage === right.coverage
 }
 function record(value: unknown): Record<string, unknown> | null {

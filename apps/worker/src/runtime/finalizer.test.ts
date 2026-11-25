@@ -6,7 +6,7 @@ import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, ty
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 import { buildTaskGraphFinalSidecars } from "./subagents/objective-tailor-final-sidecar.js"
 import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA } from "./subagents/objective-tailor-final-summary-binding.js"
-import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA } from "@jobcopilot/agent-protocol"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 import type { GraphTaskRow, LoadedGraph } from "./subagents/task-graph-pg-state.js"
@@ -155,9 +155,10 @@ describe("deterministic finalizer", () => {
 
   it("persists only the bound settled slot statuses and rejects missing or misplaced sidecars", () => {
     const binding = waveGraphBinding(), responseText = buildGroundedTaskGraphFinalResponse(binding), terminal = boundTerminal(binding, responseText)
-    const sidecar = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: 12,
+    const sidecar = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, graphRevision: 12,
       slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }],
-      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } } }
+      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } },
+      reportedScoreFloor: { status: "unavailable" } }
     expect(terminal.finalContent.objectiveTailorFinalOutcomes).toEqual(sidecar)
     expect(terminal.finalContent.final).not.toHaveProperty("objectiveTailorFinalOutcomes")
     expect(JSON.parse(terminal.response)).not.toHaveProperty("objectiveTailorFinalOutcomes")

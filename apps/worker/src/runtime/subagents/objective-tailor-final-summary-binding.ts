@@ -3,30 +3,29 @@ import type { PoolClient } from "pg"
 import { parseObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import { isTaskGraphTerminal } from "../planning/task-graph-transition-rules.js"
 import type { TurnLease } from "../turns/lease.js"
-import { verifyCanonicalObjectiveTailorWaveCompletion, type ObjectiveTailorWaveCompletionWitness,
-  type ObjectiveTailorWaveSlotStatus } from "../canonical-objective-tailor-wave-completion.js"
+import {
+  verifyCanonicalObjectiveTailorWaveCompletion,
+  type ObjectiveTailorWaveCompletionWitness,
+  type ObjectiveTailorWaveSlotStatus,
+} from "../canonical-objective-tailor-wave-completion.js"
 import { parseObjectiveTailorCorrectionProof } from "./objective-tailor-correction-witness.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { LoadedGraph } from "./task-graph-pg-state.js"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import {
+  deriveObjectiveReportedScoreFloorFromLoaded,
+  parseObjectiveTailorFinalOutcome,
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA,
+  type ObjectiveTailorFinalOutcomeProjection,
+} from "./objective-reported-score-floor.js"
+export { parseObjectiveTailorFinalOutcome, OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA }
+export type { ObjectiveTailorFinalOutcomeProjection }
 
 type OrdinarySummaryBuilder = (loaded: LoadedGraph, historical?: ReadonlySet<number>, resolved?: ReadonlySet<string>) => TaskGraphFinalSummaryBinding | null
 
-export const OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA = "agent-harness.v2.objective-tailor-final-outcome.v1" as const
 const DIGEST = /^[a-f0-9]{64}$/
 type SettledStatus = Exclude<ObjectiveTailorWaveSlotStatus, "pending">
 const SLOT_STATUSES: readonly SettledStatus[] = ["ready", "needs_revision", "rejected", "stale", "failed"]
-
-export type ObjectiveTailorFinalOutcomeProjection = Readonly<{
-  schemaVersion: typeof OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA
-  graphRevision: number
-  rootAttemptCount: number
-  graphDigest: string
-  sourceNodeCount: number
-  sourceGraphDigest: string
-  sourceStatusDigest: string
-  slots: readonly Readonly<{ ordinal: number; status: SettledStatus; evidenceDigest: string }>[]
-}>
 export type ObjectiveTailorFinalSummaryRead = Readonly<{ status: "unmarked" | "invalid" }>
   | Readonly<{ status: "ready"; root: Readonly<{ id: string; attemptCount: number }>; projection: ObjectiveTailorFinalOutcomeProjection }>
 
@@ -41,9 +40,18 @@ export async function buildCurrentTaskGraphFinalSummaryBinding(input: Readonly<{
   const prefix = summaryPrefix(input.loaded, read.projection.sourceNodeCount)
   const history = prefixHistory(input.historicalNodeIndices, read.projection.sourceNodeCount, input.loaded.snapshot!.nodes.length)
   const base = input.buildOrdinary(prefix, history, input.resolvedRepairTaskIds)
-  if (!base || base.graphRevision !== read.projection.graphRevision || base.rootTaskId !== input.loaded.rootTaskId
-    || base.graphItemId !== input.loaded.item?.id) return null
-  return { ...base, objectiveTailorFinalOutcome: read.projection }
+  if (!base || base.graphRevision !== read.projection.graphRevision
+    || base.rootTaskId !== input.loaded.rootTaskId || base.graphItemId !== input.loaded.item?.id) return null
+  if (!base.members) return null
+  const reportedScoreFloor = deriveObjectiveReportedScoreFloorFromLoaded({
+    loaded: input.loaded,
+    sourceNodes: prefix.snapshot!.nodes,
+    effectiveAnalystTaskIds: base.members
+      .filter(member => member.templateId === "analyst" && member.kind !== "historical")
+      .map(member => member.taskId),
+    summary: base.summary,
+  })
+  return { ...base, objectiveTailorFinalOutcome: { ...read.projection, reportedScoreFloor } }
 }
 
 /** Selects only the exact V2 marker; malformed or mixed markers never become V1 absence. */
@@ -59,35 +67,13 @@ export async function readObjectiveTailorFinalSummary(input: Readonly<{
     if (!hasObjectiveTailorWaveMarker(input.loaded)) return { status: "unmarked" }
     const root = await readOwnedRoot(input.client, input.lease, input.rootTaskId)
     if (!root) return { status: "invalid" }
-    const verified = await verifyCanonicalObjectiveTailorWaveCompletion({ client: input.client, lease: input.lease,
-      root, loaded: input.loaded, allowAbsent: false })
+    const verified = await verifyCanonicalObjectiveTailorWaveCompletion({
+      client: input.client, lease: input.lease, root, loaded: input.loaded, allowAbsent: false,
+    })
     if (verified.status !== "ready") return { status: "invalid" }
     const projection = projectOutcome(input.loaded, verified.witness, root.attemptCount)
     return projection ? { status: "ready", root, projection } : { status: "invalid" }
   } catch { return { status: "invalid" } }
-}
-
-export function parseObjectiveTailorFinalOutcome(value: unknown): ObjectiveTailorFinalOutcomeProjection | null {
-  try { return parseFinalOutcome(value) } catch { return null }
-}
-
-function parseFinalOutcome(value: unknown): ObjectiveTailorFinalOutcomeProjection | null {
-  const row = record(value)
-  if (!row || !exactKeys(row, "graphDigest,graphRevision,rootAttemptCount,schemaVersion,slots,sourceGraphDigest,sourceNodeCount,sourceStatusDigest")
-    || row.schemaVersion !== OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA || !integer(row.graphRevision, 1, 2_147_483_646) || !integer(row.rootAttemptCount, 1, 2_147_483_646)
-    || !digest(row.graphDigest) || !integer(row.sourceNodeCount, 2, 8) || !digest(row.sourceGraphDigest)
-    || !digest(row.sourceStatusDigest) || !dense(row.slots, 8) || row.slots.length < 1) return null
-  const slots: ObjectiveTailorFinalOutcomeProjection["slots"][number][] = []
-  for (let index = 0; index < row.slots.length; index += 1) {
-    const slot = record(row.slots[index])
-    if (!slot || !exactKeys(slot, "evidenceDigest,ordinal,status") || slot.ordinal !== index + 1
-      || typeof slot.status !== "string" || !SLOT_STATUSES.includes(slot.status as SettledStatus)
-      || !digest(slot.evidenceDigest)) return null
-    slots.push({ ordinal: index + 1, status: slot.status as Exclude<ObjectiveTailorWaveSlotStatus, "pending">, evidenceDigest: slot.evidenceDigest })
-  }
-  return { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA, graphRevision: row.graphRevision as number,
-    rootAttemptCount: row.rootAttemptCount as number, graphDigest: row.graphDigest, sourceNodeCount: row.sourceNodeCount as number, sourceGraphDigest: row.sourceGraphDigest,
-    sourceStatusDigest: row.sourceStatusDigest, slots }
 }
 
 export function hasObjectiveTailorFinalOutcome(value: unknown): boolean {
