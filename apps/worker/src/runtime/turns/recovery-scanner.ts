@@ -28,6 +28,7 @@ import {
   reclaimExpiredTurns,
   repairLegacyTurnDispatchAggregates,
 } from "./recovery-scanner-storage.js"
+import { recoverObjectiveFillPrestartFailures } from "./recovery-scanner-objective-fill-failure.js"
 export { TURN_DISPATCH_TOPIC, TURN_DISPATCH_MAX_BATCH, turnDispatchKey, turnJobId } from "./recovery-scanner-common.js"
 export type { TurnDispatchQueue } from "./recovery-scanner-common.js"
 export { dispatchPendingTurnOutbox } from "./recovery-scanner-delivery.js"
@@ -59,7 +60,8 @@ export async function recoverTurnQueue(
     await persistTurnDispatch(pool, { turnId: turn.turnId, sessionId: turn.sessionId, ownerId }, true)
   }
   const objectiveQueued = await recoverObjectiveSubmitFinalizations(pool, TURN_DISPATCH_MAX_BATCH, now)
-  const repaired = legacyRepaired + objectiveQueued + await ensureQueuedTurnDispatches(pool, queue, ownerId, TURN_DISPATCH_MAX_BATCH)
+  const objectiveFillFailures = await recoverObjectiveFillPrestartFailures(pool, TURN_DISPATCH_MAX_BATCH, now).catch(() => 0)
+  const repaired = legacyRepaired + objectiveQueued + objectiveFillFailures + await ensureQueuedTurnDispatches(pool, queue, ownerId, TURN_DISPATCH_MAX_BATCH)
   const dispatched = await dispatchPendingTurnOutbox(pool, queue)
   return { reclaimed: reclaimed.length, repaired, dispatched }
 }
@@ -107,7 +109,6 @@ async function readObjectiveCandidates(pool: LeasePool, limit: number): Promise<
   else if (last) objectiveCursor = null
   return rows
 }
-
 async function queueObjectiveCandidate(pool: LeasePool, candidate: ObjectiveCandidate, now: Date): Promise<boolean> {
   return withTransaction(pool, async client => {
     await client.query("SELECT set_config($1,$2,true)", ["app.user_id", candidate.userId])
@@ -200,7 +201,6 @@ async function settledExecution(client: Pick<pg.PoolClient, "query">, candidate:
     fillTurnId: candidate.turnId, approvalId: data.approvalId as string, constraintHash: data.constraintHash,
     workerTaskId: task.workerTaskId as string, executionId: data.executionId }
 }
-
 async function hasOpenSessionPause(client: Pick<pg.PoolClient, "query">, sessionId: string): Promise<boolean> {
   const result = await client.query(`SELECT pause."id" FROM "agent_events" AS pause WHERE pause."sessionId"=$1
     AND pause."actor"='user' AND pause."type"='session.pause_requested' AND NOT EXISTS (

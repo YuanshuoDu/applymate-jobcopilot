@@ -4,6 +4,7 @@ import { OBJECTIVE_REVIEWED_FILL_SOURCE_SCHEMA } from "@jobcopilot/shared"
 const sessionControlRecovery = vi.hoisted(() => ({ run: vi.fn() }))
 const objectiveRecovery = vi.hoisted(() => ({ settlement: vi.fn(), inspectWake: vi.fn(), hasEvidence: vi.fn(), eventId: vi.fn(), receipt: vi.fn(),
   hasPublishedWake: vi.fn(), rootMatches: vi.fn(), parseRootWait: vi.fn(), parkedWait: vi.fn(), persistWakeupDispatch: vi.fn() }))
+const objectiveFillFailureRecovery = vi.hoisted(() => ({ run: vi.fn() }))
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 vi.mock("../session-control/pause-recovery.js", () => ({ reconcilePendingSessionControls: sessionControlRecovery.run }))
@@ -22,6 +23,7 @@ vi.mock("./recovery-scanner-objective-submit.js", async importOriginal => ({
   parseObjectiveSubmitRootWait: objectiveRecovery.parseRootWait,
   hasParkedObjectiveRootWaitWithClient: objectiveRecovery.parkedWait,
 }))
+vi.mock("./recovery-scanner-objective-fill-failure.js", () => ({ recoverObjectiveFillPrestartFailures: objectiveFillFailureRecovery.run }))
 vi.mock("./recovery-scanner-storage.js", async importOriginal => ({
   ...(await importOriginal<typeof import("./recovery-scanner-storage.js")>()),
   persistWakeupTurnDispatchInTransaction: objectiveRecovery.persistWakeupDispatch,
@@ -94,6 +96,7 @@ describe("Turn recovery scanner", () => {
     objectiveRecovery.parseRootWait.mockReset().mockReturnValue({ kind: "explicit_approval", waitId: "approval-1" })
     objectiveRecovery.parkedWait.mockReset().mockResolvedValue(true)
     objectiveRecovery.persistWakeupDispatch.mockReset().mockResolvedValue(true)
+    objectiveFillFailureRecovery.run.mockReset().mockResolvedValue(0)
   })
 
   it("includes pause and resume reconciliation in each root recovery pass", async () => {
@@ -114,6 +117,32 @@ describe("Turn recovery scanner", () => {
 
     expect(log).toHaveBeenCalledWith("[turn-recovery] session control scan failed:", error)
     log.mockRestore()
+  })
+
+  it("keeps normal recovery and dispatch running when Objective prestart discovery rejects", async () => {
+    const fake = pool(
+      [{ id: "dispatch_normal", aggregateId: "session_1", payload: { turnId: "turn_2", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 0 }],
+      "running", [{ id: "turn_2", sessionId: "session_1" }], [], [{ id: "turn_1" }, { id: "turn_2" }],
+    )
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    objectiveFillFailureRecovery.run.mockRejectedValueOnce(new Error("private database detail"))
+
+    await expect(recoverTurnQueue(fake.pool, queue, "owner_1")).resolves.toMatchObject({ reclaimed: 1, dispatched: 1 })
+
+    expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_2", sessionId: "session_1", ownerId: "owner_1" },
+      { jobId: turnJobId("turn_2", 0), attempts: 5 })
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining("private database detail"))
+    log.mockRestore()
+  })
+
+  it("counts a rootless Objective failure settlement without changing the ordinary scanner path", async () => {
+    const fake = pool(), tick = new Date("2026-11-25T10:00:00.000Z")
+    objectiveFillFailureRecovery.run.mockResolvedValueOnce(2)
+
+    await expect(recoverTurnQueue(fake.pool, { add: vi.fn() }, "owner_1", tick)).resolves.toMatchObject({ reclaimed: 1, repaired: 2 })
+
+    expect(objectiveFillFailureRecovery.run).toHaveBeenCalledWith(fake.pool, expect.any(Number), tick)
   })
 
   it("timestamps a recovered finalization receipt at insert time, after the settled result", async () => {
