@@ -258,7 +258,7 @@ describe('projectFinalTaskGraphSourceDetail', () => {
     const projected = projectFinalTaskGraphSourceDetail(objectiveInput(analystKey) as never)
     expect(projected).toMatchObject({ role: 'analyst', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' })
     expect(projected).not.toBeNull()
-    expect(projected?.verification.status).toBe('unavailable')
+    expect(projected?.verification?.status).toBe('unavailable')
     const scoutKey = canonicalTaskGraphSourceKey(finalItemId, 4, 0)
     expect(projectFinalTaskGraphSourceDetail(objectiveInput(scoutKey) as never)).toMatchObject({ role: 'scout', resultState: 'valid' })
 
