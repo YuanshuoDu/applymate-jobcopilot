@@ -1,5 +1,6 @@
 export const OBJECTIVE_JOURNEY_REPORT_SCHEMA = "agent-harness.v2.objective-journey-report.v1" as const
 export const OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2 = "agent-harness.v2.objective-journey-report.v2" as const
+export const OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3 = "agent-harness.v2.objective-journey-report.v3" as const
 
 export const OBJECTIVE_JOURNEY_TAILORING_STATUSES = ["ready", "needs_revision", "rejected", "stale", "failed"] as const
 export const OBJECTIVE_JOURNEY_REVIEW_STATUSES = ["not_requested", "pending", "approved", "rejected", "expired", "unknown"] as const
@@ -20,12 +21,21 @@ export type ObjectiveJourneyReportedScoreFloor = Readonly<
   | { status: "unavailable" }
   | { status: "complete"; minimumScore: number; qualifyingJobCount: number }
 >
+export type ObjectiveJourneyRequirementEvidenceCoverage = Readonly<
+  | { status: "unavailable" }
+  | { status: "complete" | "partial"; checkedReadyJobs: number; verifiedReadyJobs: number }
+>
 export type ObjectiveJourneyReportV1 = ReportFields & Readonly<{ schemaVersion: typeof OBJECTIVE_JOURNEY_REPORT_SCHEMA }>
 export type ObjectiveJourneyReportV2 = ReportFields & Readonly<{
   schemaVersion: typeof OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2
   reportedScoreFloor: ObjectiveJourneyReportedScoreFloor
 }>
-export type ObjectiveJourneyReport = ObjectiveJourneyReportV1 | ObjectiveJourneyReportV2
+export type ObjectiveJourneyReportV3 = ReportFields & Readonly<{
+  schemaVersion: typeof OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3
+  reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor
+  requirementEvidenceCoverage: ObjectiveJourneyRequirementEvidenceCoverage
+}>
+export type ObjectiveJourneyReport = ObjectiveJourneyReportV1 | ObjectiveJourneyReportV2 | ObjectiveJourneyReportV3
 type Coverage = typeof COVERAGES[number]
 type Count = Readonly<{ knownCount: number | null; coverage: Coverage }>
 type Slot = Readonly<{
@@ -44,9 +54,13 @@ export function parseObjectiveJourneyReport(value: unknown): ObjectiveJourneyRep
   const row = record(value)
   const v1 = row?.schemaVersion === OBJECTIVE_JOURNEY_REPORT_SCHEMA
   const v2 = row?.schemaVersion === OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2
-  if (!row || !v1 && !v2 || !exact(row, v1
+  const v3 = row?.schemaVersion === OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3
+  const hasFloor = !!row && Object.hasOwn(row, "reportedScoreFloor")
+  if (!row || !v1 && !v2 && !v3 || !exact(row, v1
     ? "finalItemId,graphRevision,reviewCoverage,schemaVersion,slots,sourceCounts"
-    : "finalItemId,graphRevision,reportedScoreFloor,reviewCoverage,schemaVersion,slots,sourceCounts")
+    : v2 || hasFloor
+      ? "finalItemId,graphRevision,reportedScoreFloor,reviewCoverage,schemaVersion,slots,sourceCounts" + (v3 ? ",requirementEvidenceCoverage" : "")
+      : "finalItemId,graphRevision,requirementEvidenceCoverage,reviewCoverage,schemaVersion,slots,sourceCounts")
     || !id(row.finalItemId) || !positive(row.graphRevision)
     || !oneOf(row.reviewCoverage, ["complete", "partial", "unavailable"])) return undefined
   const counts = record(row.sourceCounts), slots = dense(row.slots)
@@ -69,8 +83,30 @@ export function parseObjectiveJourneyReport(value: unknown): ObjectiveJourneyRep
     graphRevision: Number(row.graphRevision), sourceCounts: { discoveredJobs, analyzedJobs },
     reviewCoverage: row.reviewCoverage, slots: parsed }
   if (v1) return { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA, ...common }
-  const reportedScoreFloor = parseReportedScoreFloor(row.reportedScoreFloor, analyzedJobs)
-  return reportedScoreFloor ? { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, ...common, reportedScoreFloor } : undefined
+  if (v2) {
+    const reportedScoreFloor = parseReportedScoreFloor(row.reportedScoreFloor, analyzedJobs)
+    return reportedScoreFloor ? { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, ...common, reportedScoreFloor } : undefined
+  }
+  const requirementEvidenceCoverage = parseRequirementEvidenceCoverage(row.requirementEvidenceCoverage, parsed)
+  if (!requirementEvidenceCoverage) return undefined
+  const reportedScoreFloor = hasFloor ? parseReportedScoreFloor(row.reportedScoreFloor, analyzedJobs) : undefined
+  if (hasFloor && !reportedScoreFloor) return undefined
+  return { schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3, ...common, requirementEvidenceCoverage,
+    ...(reportedScoreFloor ? { reportedScoreFloor } : {}) }
+}
+
+function parseRequirementEvidenceCoverage(value: unknown, slots: readonly Slot[]): ObjectiveJourneyRequirementEvidenceCoverage | undefined {
+  const row = record(value)
+  if (!row || !oneOf(row.status, ["unavailable", "complete", "partial"])) return undefined
+  const readyJobs = slots.filter(slot => slot.tailoringStatus === "ready").length
+  if (readyJobs === 0) return undefined
+  if (row.status === "unavailable") return exact(row, "status") ? { status: "unavailable" } : undefined
+  const checked = row.checkedReadyJobs
+  const complete = row.status === "complete" && checked === readyJobs
+  const partial = row.status === "partial" && positive(checked) && checked < readyJobs
+  return exact(row, "checkedReadyJobs,status,verifiedReadyJobs") && (complete || partial)
+    && nonnegative(row.verifiedReadyJobs) && row.verifiedReadyJobs <= checked
+    ? { status: row.status, checkedReadyJobs: checked, verifiedReadyJobs: row.verifiedReadyJobs } : undefined
 }
 
 function parseReportedScoreFloor(value: unknown, analyzed: Count): ObjectiveJourneyReportedScoreFloor | undefined {

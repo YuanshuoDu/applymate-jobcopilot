@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { OBJECTIVE_JOURNEY_REPORT_SCHEMA, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, parseObjectiveJourneyReport } from "./objective-journey-report-contract"
+import { OBJECTIVE_JOURNEY_REPORT_SCHEMA, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3,
+  parseObjectiveJourneyReport } from "./objective-journey-report-contract"
 
 const count = { knownCount: 3, coverage: "complete" }
 const baseSlot = {
@@ -32,6 +33,38 @@ describe("parseObjectiveJourneyReport", () => {
       .toMatchObject({ reportedScoreFloor: { status: "not_requested" } })
     expect(parseObjectiveJourneyReport({ ...base, reportedScoreFloor: { status: "unavailable" } }))
       .toMatchObject({ reportedScoreFloor: { status: "unavailable" } })
+  })
+
+  it("accepts closed requirement coverage with zero verified Jobs and an optional score floor", () => {
+    const base = { ...report, schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3 }
+    const coverage = { status: "complete", checkedReadyJobs: 1, verifiedReadyJobs: 0 }
+    expect(parseObjectiveJourneyReport({ ...base, requirementEvidenceCoverage: coverage }))
+      .toMatchObject({ requirementEvidenceCoverage: coverage })
+    expect(parseObjectiveJourneyReport({ ...base, requirementEvidenceCoverage: { status: "unavailable" } }))
+      .toMatchObject({ requirementEvidenceCoverage: { status: "unavailable" } })
+    const twoReady = { ...base, slots: [baseSlot, { ...baseSlot, ordinal: 2 }] }
+    expect(parseObjectiveJourneyReport({ ...twoReady, reportedScoreFloor: { status: "not_requested" },
+      requirementEvidenceCoverage: { status: "partial", checkedReadyJobs: 1, verifiedReadyJobs: 1 } }))
+      .toMatchObject({ schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3, reportedScoreFloor: { status: "not_requested" } })
+  })
+
+  it("rejects unbounded, contradictory, or open requirement coverage", () => {
+    const base = { ...report, schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3 }
+    for (const requirementEvidenceCoverage of [
+      undefined,
+      { status: "unavailable", checkedReadyJobs: 0, verifiedReadyJobs: 0 },
+      { status: "complete", checkedReadyJobs: 0, verifiedReadyJobs: 0 },
+      { status: "partial", checkedReadyJobs: 2, verifiedReadyJobs: 1 },
+      { status: "partial", checkedReadyJobs: 1, verifiedReadyJobs: 2 },
+      { status: "partial", checkedReadyJobs: 1, verifiedReadyJobs: 0 },
+      { status: "unknown" },
+      { status: "complete", checkedReadyJobs: 1, verifiedReadyJobs: 0, privateProof: "secret" },
+    ]) expect(parseObjectiveJourneyReport({ ...base, requirementEvidenceCoverage })).toBeUndefined()
+    const twoReady = { ...base, slots: [baseSlot, { ...baseSlot, ordinal: 2 }] }
+    expect(parseObjectiveJourneyReport({ ...twoReady,
+      requirementEvidenceCoverage: { status: "complete", checkedReadyJobs: 1, verifiedReadyJobs: 1 } })).toBeUndefined()
+    const noReady = { ...base, slots: [{ ...baseSlot, tailoringStatus: "stale" }] }
+    expect(parseObjectiveJourneyReport({ ...noReady, requirementEvidenceCoverage: { status: "unavailable" } })).toBeUndefined()
   })
 
   it("rejects score floors without exact closed evidence or a complete denominator", () => {

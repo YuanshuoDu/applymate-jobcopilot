@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
+import { validateTaskGraphVerificationItems as validateSharedTaskGraphVerificationItems } from "@jobcopilot/shared/task-graph-tool-receipt-verification"
 import { createObservedEvidenceIndex, hydrateObservedEvidence } from "./child-evidence.js"
 import { canonicalTaskGraphReadObservations, taskGraphEvidenceDigest, validateTaskGraphVerificationItems, type TaskGraphVerificationScope } from "./task-graph-pg-verification-receipt-validation.js"
 
@@ -49,6 +50,7 @@ describe("TaskGraph canonical verification receipt validation", () => {
 
   it("binds paired observations to the exact owner, task, step and attempt", () => {
     expect(validateTaskGraphVerificationItems(pair(), scope)).toHaveLength(2)
+    expect(validateTaskGraphVerificationItems(pair(), scope)).toEqual(validateSharedTaskGraphVerificationItems(pair(), scope))
     expect(() => validateTaskGraphVerificationItems(pair().map(item => ({ ...item, taskId: "other" })), scope)).toThrow("task_graph_verification_item_invalid")
     expect(() => validateTaskGraphVerificationItems(pair().map(item => ({ ...item, attempt: 1 })), scope)).toThrow("task_graph_verification_item_invalid")
     expect(() => validateTaskGraphVerificationItems([pair()[0]!], scope)).toThrow("task_graph_verification_pair_invalid")

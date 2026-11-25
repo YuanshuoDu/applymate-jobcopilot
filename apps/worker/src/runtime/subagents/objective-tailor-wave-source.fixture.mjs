@@ -1,14 +1,14 @@
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.ts"
+import { objectiveWaveFinding } from "./objective-tailor-wave-requirement.fixture.mjs"
 
 const SOURCES = ["greenhouse", "greenhouse", "greenhouse", "lever", "lever", "lever", "workday", "workday"]
-
 export async function seedObjectiveTailorWaveSource(pool, owner, jobIdForSlot) {
   const jobs = SOURCES.map((source, index) => ({ id: jobIdForSlot(owner.suffix, index), source, index }))
   for (const job of jobs) await pool.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
     VALUES ($1, $2, $3, 'Software Engineer', 'Dublin', 'saved', $4, $5, $6, CURRENT_TIMESTAMP)
     ON CONFLICT ("id") DO NOTHING`, [job.id, owner.userId, `Synthetic Employer ${job.index + 1}`,
     `https://jobs.example.invalid/objective-tailor/${job.index + 1}`,
-    `Synthetic role description ${job.index + 1}: build reliable software systems.`, job.source])
+    `Synthetic role description ${job.index + 1}: build reliable software systems.${owner.requirementQuote ? ` ${owner.requirementQuote}` : ""}`, job.source])
   const resumeId = `p3-1336-tailor-resume-${owner.suffix}`
   await pool.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
     VALUES ($1, $2, 'Synthetic objective-tailor base', $3::jsonb, 'base', 'manual', TRUE, CURRENT_TIMESTAMP)`,
@@ -68,7 +68,7 @@ async function* analystStream(request, { task, source, roleResultSchema }) {
   }
   const evidence = selected.map((job, index) => ({ id: `analysis-${task.id}-${index}`, kind: "job", ref: job.jobId, source }))
   const value = { schemaVersion: roleResultSchema, role: "analyst", status: "completed",
-    findings: selected.map((job, index) => ({ jobId: job.jobId, score: 8, evidenceIds: [evidence[index].id] })),
+    findings: selected.map((job, index) => objectiveWaveFinding(job, evidence[index], fixtureToolResult(request, reads.find(call => call.input?.jobId === job.jobId)))),
     evidence, summary: "Assessed two observed synthetic roles from the required Scout source." }
   yield { type: "text_delta", text: JSON.stringify(value) }; yield { type: "completed", finishReason: "stop" }
 }

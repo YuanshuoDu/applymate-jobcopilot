@@ -14,7 +14,7 @@ vi.mock('@/lib/hooks', () => ({
   },
 }))
 
-import { OBJECTIVE_JOURNEY_REPORT_SCHEMA, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2,
+import { OBJECTIVE_JOURNEY_REPORT_SCHEMA, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3,
   type ObjectiveJourneyReport as JourneyReport } from '@/lib/agent/session/objective-journey-report-contract'
 import {
   buildObjectiveJourneyReportUrl,
@@ -43,6 +43,8 @@ const journey = {
 }
 const floor = { status: 'complete' as const, minimumScore: 7.5, qualifyingJobCount: 0 }
 const journeyWithFloor = { ...journey, schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V2, sourceCounts: completeSourceCounts, reportedScoreFloor: floor }
+const journeyWithRequirements = { ...journey, schemaVersion: OBJECTIVE_JOURNEY_REPORT_SCHEMA_V3,
+  requirementEvidenceCoverage: { status: 'complete' as const, checkedReadyJobs: 1, verifiedReadyJobs: 0 } }
 
 function view(reportedScoreFloor?: typeof floor | { status: 'not_requested' | 'unavailable' }, counts: JourneyReport['sourceCounts'] = sourceCounts) {
   return <ObjectiveJourneyReport {...identity} sourceCounts={counts} reportedScoreFloor={reportedScoreFloor} slots={slots} lang="en" />
@@ -106,6 +108,32 @@ describe('ObjectiveJourneyReport', () => {
       expect(html).toContain(value.status === 'not_requested' ? 'Not requested' : 'Unavailable')
       expect(html).not.toContain('qualifying jobs')
     }
+  })
+
+  it('shows only the bounded ready-Job requirement coverage summary', () => {
+    api.state = { data: { report: journeyWithRequirements }, loading: false, error: null, refetch: vi.fn() }
+    const html = renderToStaticMarkup(view())
+    expect(html).toContain('Verified Job requirement evidence')
+    expect(html).toContain('0 verified of 1 checked ready Jobs (complete coverage)')
+    expect(html).not.toContain('proofDigest')
+    expect(html).not.toContain('requirementId')
+    expect(html).not.toContain('quote')
+  })
+
+  it('localizes the complete ready-Job requirement count in Chinese', () => {
+    api.state = { data: { report: journeyWithRequirements }, loading: false, error: null, refetch: vi.fn() }
+    const html = renderToStaticMarkup(<ObjectiveJourneyReport {...identity} sourceCounts={sourceCounts} slots={slots} lang="zh" />)
+    expect(html).toContain('1 个已检查的就绪职位中，0 个职位的要求证据已验证（完整覆盖）')
+    expect(html).not.toContain('verified of')
+  })
+
+  it('renders unavailable requirement coverage without numeric claims', () => {
+    api.state = { data: { report: { ...journeyWithRequirements,
+      requirementEvidenceCoverage: { status: 'unavailable' } } }, loading: false, error: null, refetch: vi.fn() }
+    const html = renderToStaticMarkup(view())
+    expect(html).toContain('Verified Job requirement evidence')
+    expect(html).toContain('<dd>Unavailable</dd>')
+    expect(html).not.toContain('checked ready Jobs')
   })
 
   it('hides a report when the expected V3 floor differs from its server report', () => {

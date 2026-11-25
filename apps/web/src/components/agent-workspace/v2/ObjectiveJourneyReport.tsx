@@ -4,6 +4,7 @@ import React, { useState } from 'react'
 import { useApi } from '@/lib/hooks'
 import {
   parseObjectiveJourneyReport,
+  type ObjectiveJourneyRequirementEvidenceCoverage,
   type ObjectiveJourneyReportedScoreFloor,
   type ObjectiveJourneyReport as Report,
 } from '@/lib/agent/session/objective-journey-report-contract'
@@ -52,7 +53,9 @@ export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, 
         <div><dt>{copy.shortlisted}</dt><dd>{report.slots.length}</dd></div>
         <div><dt>{copy.ready}</dt><dd>{report.slots.filter(slot => slot.tailoringStatus === 'ready').length}</dd></div>
         <div><dt>{copy.submitted}</dt><dd>{submittedSummary(report, copy)}</dd></div>
-        {'reportedScoreFloor' in report && <div><dt>{copy.scoreFloor}</dt><dd>{scoreFloorSummary(report.reportedScoreFloor, copy)}</dd></div>}
+        {'reportedScoreFloor' in report && report.reportedScoreFloor && <div><dt>{copy.scoreFloor}</dt><dd>{scoreFloorSummary(report.reportedScoreFloor, copy)}</dd></div>}
+        {'requirementEvidenceCoverage' in report && <div><dt>{copy.requirements}</dt>
+          <dd>{requirementEvidenceSummary(report.requirementEvidenceCoverage, copy)}</dd></div>}
         <div><dt>{copy.unresolved}</dt><dd>{report.slots.filter(isUnresolved).length}</dd></div>
         <div><dt>{copy.materialChanged}</dt><dd>{report.slots.filter(slot => slot.retirementReason === 'resume_material_changed'
           || slot.retirementReason === 'completed_source_changed').length}</dd></div>
@@ -123,6 +126,11 @@ function scoreFloorSummary(floor: ObjectiveJourneyReportedScoreFloor, copy: type
   return `≥ ${floor.minimumScore}: ${floor.qualifyingJobCount} ${copy.qualifyingJobs}`
 }
 
+function requirementEvidenceSummary(coverage: ObjectiveJourneyRequirementEvidenceCoverage, copy: typeof en): string {
+  if (coverage.status === 'unavailable') return copy.requirementUnavailable
+  return copy.requirementSummary(coverage.verifiedReadyJobs, coverage.checkedReadyJobs, coverage.status)
+}
+
 function sameCounts(left: ExpectedCounts, right: ExpectedCounts): boolean {
   return left.discoveredJobs.knownCount === right.discoveredJobs.knownCount
     && left.discoveredJobs.coverage === right.discoveredJobs.coverage
@@ -170,6 +178,9 @@ const en = {
   evidenceNotVisible: 'The submission is confirmed, but its fill record is not visible in the current transcript.',
   overview: 'Journey totals', shortlisted: 'Shortlisted', ready: 'Ready', submitted: 'Site-confirmed', unresolved: 'Unresolved',
   scoreFloor: 'Analyst-reported score floor', floorNotRequested: 'Not requested', floorUnavailable: 'Unavailable', qualifyingJobs: 'qualifying jobs',
+  requirements: 'Verified Job requirement evidence', requirementUnavailable: 'Unavailable',
+  requirementSummary: (verified: number, checked: number, coverage: 'complete' | 'partial') =>
+    `${verified} verified of ${checked} checked ready Jobs (${coverage} coverage)`,
   materialChanged: 'Material changed',
   outcomeUnavailableSuffix: ' observed; some outcomes unavailable',
   nextFormReview: 'Review the filled form before deciding.', checkEmployer: 'Check the employer site before any retry.',
@@ -191,6 +202,9 @@ const zh = {
   evidenceNotVisible: '已确认提交，但当前对话记录中没有显示填写记录。',
   overview: '申请进度', shortlisted: '已列入清单', ready: '已就绪', submitted: '网站已确认', unresolved: '待确认',
   scoreFloor: '分析师报告的评分下限', floorNotRequested: '未请求', floorUnavailable: '不可用', qualifyingJobs: '个符合条件的职位',
+  requirements: '已验证的职位要求证据', requirementUnavailable: '不可用',
+  requirementSummary: (verified: number, checked: number, coverage: 'complete' | 'partial') =>
+    `${checked} 个已检查的就绪职位中，${verified} 个职位的要求证据已验证（${coverage === 'complete' ? '完整覆盖' : '部分覆盖'}）`,
   materialChanged: '材料已变更',
   outcomeUnavailableSuffix: ' 条已确认；部分结果不可用',
   nextFormReview: '请先检查已填写的表单。', checkEmployer: '重试前请先查看雇主网站。',
