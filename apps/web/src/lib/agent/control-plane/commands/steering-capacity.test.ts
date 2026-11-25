@@ -1,12 +1,23 @@
 import { createHash } from "node:crypto"
 import { resolve } from "node:path"
-import { describe, expect, it, vi } from "vitest"
+import { beforeAll, describe, expect, it, vi } from "vitest"
 import { redactSensitiveText } from "@jobcopilot/shared"
 
 import { assertSteeringCapacity, MAX_UNRESOLVED_STEERING_INPUTS, readUnresolvedSteeringCount } from "./steering-capacity"
 import { lockOpenSession, type CommandTransaction } from "./transaction"
 
 type Row = Record<string, unknown>
+type WorkerReader = {
+  readSteeringReconciliationState(client: { query(sql: string, values?: readonly unknown[]): Promise<{ rows: Row[] }> }, scope: {
+    userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string;
+    turnLeaseOwner: string; turnLeaseVersion: number; parentLeaseOwner: string; parentAttemptCount: number;
+  }): Promise<{ unresolvedInputs: readonly unknown[] }>
+}
+const workerRoot = resolve(process.cwd(), "../../apps/worker/src/runtime/subagents")
+const workerReaderPath = resolve(workerRoot, "steering-reconciliation-read.ts")
+const graphStatePath = resolve(workerRoot, "task-graph-pg-state.ts")
+let workerReader: WorkerReader | undefined
+
 const scope = {
   userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_1", parentTaskId: "root_1", stepId: "decision-step",
   turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "root-owner", parentAttemptCount: 1,
@@ -256,19 +267,9 @@ function largeFacts(receiptCount: number, unresolvedCount = 2) {
 }
 
 async function invokeWorkerReader(fixture: ReturnType<typeof facts>): Promise<number> {
-  type WorkerReader = {
-    readSteeringReconciliationState(client: { query(sql: string, values?: readonly unknown[]): Promise<{ rows: Row[] }> }, scope: {
-      userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string;
-      turnLeaseOwner: string; turnLeaseVersion: number; parentLeaseOwner: string; parentAttemptCount: number;
-    }): Promise<{ unresolvedInputs: readonly unknown[] }>
-  }
-  const workerRoot = resolve(process.cwd(), "../../apps/worker/src/runtime/subagents")
-  const readerPath = resolve(workerRoot, "steering-reconciliation-read.ts")
-  const graphStatePath = resolve(workerRoot, "task-graph-pg-state.ts")
-  vi.doMock(graphStatePath, () => ({ lockTaskGraphScope: async () => ({}) }))
-  try {
-    // Load the real Worker reader only at test runtime, outside Web's static TypeScript module graph.
-    const reader = await vi.importActual<WorkerReader>(readerPath)
+  if (!workerReader) throw new Error("worker_steering_reader_not_loaded")
+  {
+    const reader = workerReader
     const client = {
       async query(sql: string, values?: readonly unknown[]): Promise<{ rows: Row[] }> {
         if (sql.includes('SELECT turn."input" FROM "agent_turns"')) return { rows: [{ input: { clientMessageId: "root-client" } }] }
@@ -327,9 +328,6 @@ async function invokeWorkerReader(fixture: ReturnType<typeof facts>): Promise<nu
       turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "root-owner", parentAttemptCount: 1,
     })
     return state.unresolvedInputs.length
-  } finally {
-    vi.doUnmock(graphStatePath)
-    vi.resetModules()
   }
 }
 
@@ -381,6 +379,17 @@ function sharedSessionLock(key: { sessionId: string; userId: string }) {
 }
 
 describe("steer acceptance capacity", () => {
+  beforeAll(async () => {
+    // Keep the cold cross-workspace Worker import out of the 5s behavior tests.
+    vi.doMock(graphStatePath, () => ({ lockTaskGraphScope: async () => ({}) }))
+    try {
+      workerReader = await vi.importActual<WorkerReader>(workerReaderPath)
+    } finally {
+      vi.doUnmock(graphStatePath)
+      vi.resetModules()
+    }
+  }, 30_000)
+
   it("counts accepted and queued user steers, and rejects the next one at 128 before writes", async () => {
     const full = facts(MAX_UNRESOLVED_STEERING_INPUTS)
     const count = await readUnresolvedSteeringCount(full.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })
