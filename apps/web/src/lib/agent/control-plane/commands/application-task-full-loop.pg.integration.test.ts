@@ -4556,6 +4556,76 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         return receipt
       }
       const waveFillerAttempts = new Map<string, Readonly<{ fillRootTaskId: string; fillerTaskId: string; attemptCount: number }>>()
+      const waveFillerTimeoutSnapshot = async (slot: ObjectiveWaveSubmissionSlot, fillTurnId: string) => {
+        const workerAlive = Boolean(worker && !exited(worker))
+        try {
+          return await beforeDeadline(async () => {
+            const [task, turn, job] = await Promise.all([
+              testDb.applicationTask.findFirst({ where: { id: slot.applicationTaskId, userId, sessionId, jobId: slot.jobId },
+                select: { status: true, checkpoint: true, fillTurnId: true } }),
+              testDb.agentTurn.findFirst({ where: { id: fillTurnId, userId, sessionId },
+                select: { status: true, rootTaskId: true, leaseOwnerId: true, leaseExpiresAt: true } }),
+              testDb.job.findFirst({ where: { id: slot.jobId, userId }, select: { status: true, workflowState: true, appliedAt: true } }),
+            ])
+            const rootTaskId = typeof turn?.rootTaskId === "string" ? turn.rootTaskId : null
+            const [root, fillers] = await Promise.all([
+              rootTaskId ? testDb.subAgentTask.findFirst({ where: { id: rootTaskId, rootTaskId, sessionId, turnId: fillTurnId,
+                parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId } },
+                select: { id: true, status: true, leaseOwner: true, leaseExpiresAt: true } }) : Promise.resolve(null),
+              rootTaskId ? testDb.subAgentTask.findMany({ where: { sessionId, turnId: fillTurnId, rootTaskId,
+                role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 3,
+                select: { status: true, attemptCount: true, completedAt: true, leaseOwner: true,
+                  leaseExpiresAt: true, interruptRequestedAt: true } }) : Promise.resolve([]),
+            ])
+            const filler = fillers[0]
+            const fillerLeaseFree = Boolean(filler && filler.leaseOwner === null && filler.leaseExpiresAt === null)
+            const turnLeaseFree = Boolean(turn && turn.leaseOwnerId === null && turn.leaseExpiresAt === null)
+            const rootLeaseFree = Boolean(root && root.leaseOwner === null && root.leaseExpiresAt === null)
+            return {
+              available: true, workerAlive,
+              task: task ? { status: reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+                checkpoint: reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+                fillTurnMatches: task.fillTurnId === fillTurnId,
+                formFilled: task.status === "waiting_for_authorization" && task.checkpoint === "form_filled"
+                  && task.fillTurnId === fillTurnId } : { status: "missing", checkpoint: "missing", fillTurnMatches: false, formFilled: false },
+              job: job ? { status: reviewedFillDiagnosticValue(job.status, OBJECTIVE_JOB_DIAGNOSTIC_STATUSES),
+                workflowState: reviewedFillDiagnosticValue(job.workflowState, OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES),
+                appliedAtPresent: job.appliedAt !== null,
+                preSubmitReady: job.status === "saved" && job.workflowState === "draft" && job.appliedAt === null }
+                : { status: "missing", workflowState: "missing", appliedAtPresent: false, preSubmitReady: false },
+              turn: turn ? { status: reviewedFillDiagnosticValue(turn.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+                rootPresent: rootTaskId !== null, leaseOwnerPresent: turn.leaseOwnerId !== null,
+                leaseExpiryPresent: turn.leaseExpiresAt !== null, leaseFree: turnLeaseFree,
+                waitingForApproval: turn.status === "waiting_for_approval" }
+                : { status: "missing", rootPresent: false, leaseOwnerPresent: false, leaseExpiryPresent: false,
+                  leaseFree: false, waitingForApproval: false },
+              root: root ? { present: true, status: reviewedFillDiagnosticValue(root.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+                leaseOwnerPresent: root.leaseOwner !== null, leaseExpiryPresent: root.leaseExpiresAt !== null,
+                leaseFree: rootLeaseFree, matchesTurn: root.id === rootTaskId }
+                : { present: false, status: "missing", leaseOwnerPresent: false, leaseExpiryPresent: false,
+                  leaseFree: false, matchesTurn: false },
+              fillerCount: Math.min(fillers.length, 3),
+              filler: filler ? { status: reviewedFillDiagnosticValue(filler.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+                attemptMatchesExpected: filler.attemptCount === 1, completedAtPresent: filler.completedAt instanceof Date,
+                leaseOwnerPresent: filler.leaseOwner !== null, leaseExpiryPresent: filler.leaseExpiresAt !== null,
+                leaseFree: fillerLeaseFree, interrupted: filler.interruptRequestedAt !== null,
+                completed: filler.status === "completed" } : { status: "missing", attemptMatchesExpected: false,
+                  completedAtPresent: false, leaseOwnerPresent: false, leaseExpiryPresent: false,
+                  leaseFree: false, interrupted: false, completed: false },
+              predicates: {
+                uniqueFiller: fillers.length === 1, fillerCompleted: filler?.status === "completed",
+                fillerAttemptMatchesExpected: filler?.attemptCount === 1,
+                fillerCompletedAtPresent: filler?.completedAt instanceof Date,
+                fillerLeaseFree, fillerNotInterrupted: filler?.interruptRequestedAt === null,
+                turnWaitingForApproval: turn?.status === "waiting_for_approval", turnLeaseFree,
+                rootPresent: root !== null, rootLeaseFree,
+              },
+            }
+          }, Date.now() + 1_200)
+        } catch {
+          return { available: false, workerAlive }
+        }
+      }
       const waitForWaveFillerCompletion = async (slot: ObjectiveWaveSubmissionSlot, fillTurnId: string) => {
         const deadline = Date.now() + 60_000
         while (Date.now() < deadline) {
@@ -4580,7 +4650,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           if (worker && exited(worker)) throw new Error("Worker exited before the Objective Filler released its lease")
           await delay(100)
         }
-        throw new Error("Objective Filler did not reach exact completed and lease-free state")
+        const snapshot = await waveFillerTimeoutSnapshot(slot, fillTurnId)
+        throw new Error(`Objective Filler did not reach exact completed and lease-free state ${JSON.stringify(snapshot)}`)
       }
       const readStaleProof = async (slot: typeof staleSlot) => {
         if (slot.reviewApprovalId !== staleApprovalId || slot.applicationTaskId !== staleApplicationTaskId) {
