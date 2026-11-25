@@ -385,7 +385,6 @@ describe("steer acceptance capacity", () => {
     const full = facts(MAX_UNRESOLVED_STEERING_INPUTS)
     const count = await readUnresolvedSteeringCount(full.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })
     expect(count).toBe(MAX_UNRESOLVED_STEERING_INPUTS)
-    expect(await invokeWorkerReader(full)).toBe(count)
     const error = await assertSteeringCapacity(full.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })
       .then(() => null, value => value as Error & { details?: Record<string, unknown> })
     expect(error).toMatchObject({ name: "AgentCommandError", code: "invalid_command", status: 409, details: { capacity: 128, unresolvedCount: 128 } })
@@ -430,6 +429,11 @@ describe("steer acceptance capacity", () => {
     const workerCount = await invokeWorkerReader(fixture)
     expect(workerCount).toBe(MAX_UNRESOLVED_STEERING_INPUTS - 1)
     expect(count).toBe(workerCount)
+  })
+
+  it("matches the Worker reader at the 128-entry boundary", async () => {
+    const fixture = facts(MAX_UNRESOLVED_STEERING_INPUTS)
+    await expect(invokeWorkerReader(fixture)).resolves.toBe(MAX_UNRESOLVED_STEERING_INPUTS)
   })
 
   it("accepts the exact R+2 supersession relation and replays it consistently", async () => {
