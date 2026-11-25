@@ -5,6 +5,7 @@ import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { taskGraphEvidenceDigest } from "./task-graph-pg-verification-receipt-validation.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { scheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
+import { objectiveJobRequirementMaterialDigest } from "@jobcopilot/shared/objective-job-requirement-evidence"
 import { readObjectiveJobRequirementEvidence, readObjectiveTailorJobRequirementEvidence } from "./objective-job-requirement-receipt.js"
 
 const mocks = vi.hoisted(() => ({ load: vi.fn(), getJob: vi.fn(), scheduledProof: vi.fn() }))
@@ -28,12 +29,12 @@ function result(quote = "Required: Rust."): AnalystResult {
 }
 function call(id = "call-1", requestJobId = jobId, attemptCount = 2) {
   return { id: `call-item-${id}`, type: "tool_call", taskId: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId,
-    stepId: `step-${id}`, attempt: attemptCount, revision: 1,
+    stepId: `step-${id}`, attempt: attemptCount, ordinal: 0, revision: 1,
     content: { toolCallId: id, toolName: "jobs.get", toolVersion: "1", input: { jobId: requestJobId }, status: "completed", errorCode: null } }
 }
 function toolResult(id = "call-1", outputJob = job(), attemptCount = 2) {
   return { id: `result-item-${id}`, type: "tool_result", taskId: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId,
-    stepId: `step-${id}`, attempt: attemptCount, revision: 1,
+    stepId: `step-${id}`, attempt: attemptCount, ordinal: 0, revision: 1,
     content: { toolCallId: id, status: "completed", output: { job: outputJob }, errorCode: null } }
 }
 function setup(options: { inputJobId?: string; outputJob?: ReturnType<typeof job>; attemptCount?: number;
@@ -66,6 +67,9 @@ describe("completed Objective Job requirement receipts", () => {
 
   it("binds a unique exact posting quote to the owned same-attempt jobs.get receipt and material digest", async () => {
     const value = setup()
+    expect(objectiveJobRequirementMaterialDigest(job())).toBe(scheduledDraftJobMaterialDigest(job()))
+    const privateTextJob = job({ description: "Email recruiter@example.com or call +1 (555) 123-4567" })
+    expect(objectiveJobRequirementMaterialDigest(privateTextJob)).toBe(scheduledDraftJobMaterialDigest(privateTextJob))
     const output = await readObjectiveJobRequirementEvidence(value.client, input(value.evidence, value.proof))
 
     expect(output).toMatchObject({ status: "verified", proposedCount: 1, receipts: [{ userId: scope.userId, sessionId: scope.sessionId,

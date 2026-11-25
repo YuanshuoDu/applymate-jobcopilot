@@ -1,3 +1,5 @@
+import { parseObjectiveJobRequirementCitations, type ObjectiveJobRequirementCitation } from "@jobcopilot/shared/objective-job-requirement-evidence"
+
 export const ROLE_RESULT_SCHEMA = "agent-harness.v2.subagent.result" as const
 const EVIDENCE_KEYS = ["id", "kind", "ref", "source"] as const
 const CANDIDATE_KEYS = ["jobId", "source", "url", "evidenceIds"] as const
@@ -12,7 +14,7 @@ export type RoleResultStatus = "completed" | "partial"
 export type EvidenceKind = "job" | "persona" | "resume" | "source"
 export type RoleEvidence = Readonly<{ id: string; kind: EvidenceKind; ref: string; source: string }>
 export type ScoutCandidate = Readonly<{ jobId: string; source: string; url: string | null; evidenceIds: readonly string[] }>
-export type AnalystRequirementCitation = Readonly<{ evidenceId: string; quote: string }>
+export type AnalystRequirementCitation = ObjectiveJobRequirementCitation
 export type AnalystFinding = Readonly<{ jobId: string; score: number; evidenceIds: readonly string[];
   requirementCitations?: readonly AnalystRequirementCitation[] }>
 export type ScoutResult = Readonly<{ schemaVersion: typeof ROLE_RESULT_SCHEMA; role: "scout"; status: RoleResultStatus;
@@ -48,13 +50,7 @@ required: [...FINDING_KEYS, "requirementCitations"], additionalProperties: false
 export const SCOUT_ROLE_RESULT_OUTPUT_SCHEMA = baseSchema(candidateSchema, "candidates")
 export const ANALYST_ROLE_RESULT_OUTPUT_SCHEMA = baseSchema(findingSchema, "findings")
 
-/** JavaScript string indices are UTF-16 offsets; only one literal occurrence is authoritative. */
-export function uniqueRequirementQuoteOffsets(description: unknown, quote: unknown): Readonly<{ startUtf16: number; endUtf16: number }> | undefined {
-  if (typeof description !== "string" || typeof quote !== "string" || quote.length < 1 || quote.length > MAX_QUOTE_LENGTH) return undefined
-  const startUtf16 = description.indexOf(quote)
-  if (startUtf16 < 0 || description.indexOf(quote, startUtf16 + 1) >= 0) return undefined
-  return { startUtf16, endUtf16: startUtf16 + quote.length }
-}
+export { uniqueObjectiveRequirementQuoteOffsets as uniqueRequirementQuoteOffsets } from "@jobcopilot/shared/objective-job-requirement-evidence"
 
 /** Keeps malformed optional citations from invalidating the Analyst's score and ordinary result. */
 export function parseScoutAnalystResult(row: Row): ScoutResult | AnalystResult {
@@ -122,24 +118,9 @@ function parseFindings(value: unknown, evidence: readonly RoleEvidence[]): Analy
     const finding = { jobId: row.jobId, score: row.score, evidenceIds: ids }
     if (!Object.hasOwn(row, "requirementCitations")) return finding
     if (row.requirementCitations === null) return finding
-    const citations = parseRequirementCitations(row.requirementCitations, row.jobId, ids, evidence)
+    const citations = parseObjectiveJobRequirementCitations(row.requirementCitations, row.jobId, ids, evidence)
     return citations ? { ...finding, requirementCitations: citations } : finding
   })
-}
-function parseRequirementCitations(value: unknown, jobId: string, ids: readonly string[], evidence: readonly RoleEvidence[]): AnalystRequirementCitation[] | undefined {
-  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_CITATIONS || Reflect.ownKeys(value).length !== value.length + 1) return undefined
-  const seen = new Set<string>(), parsed: AnalystRequirementCitation[] = []
-  for (const item of value) {
-    const row = record(item)
-    if (!row || !exactKeys(row, CITATION_KEYS) || !nonEmpty(row.evidenceId) || row.evidenceId.length > 512
-      || !nonEmpty(row.quote) || row.quote.length > MAX_QUOTE_LENGTH || !ids.includes(row.evidenceId)
-      || !evidence.some(entry => entry.id === row.evidenceId && entry.kind === "job" && entry.ref === jobId)) return undefined
-    const key = `${row.evidenceId}\u0000${row.quote}`
-    if (seen.has(key)) return undefined
-    seen.add(key)
-    parsed.push({ evidenceId: row.evidenceId, quote: row.quote })
-  }
-  return parsed
 }
 function record(value: unknown): Row | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
