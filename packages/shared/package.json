@@ -50,6 +50,10 @@
       "types": "./dist/task-graph-verification-digest.d.ts",
       "default": "./dist/task-graph-verification-digest.js"
     },
+    "./task-graph-tool-receipt-verification": {
+      "types": "./dist/task-graph-tool-receipt-verification.d.ts",
+      "default": "./dist/task-graph-tool-receipt-verification.js"
+    },
     "./pinned-outbound": {
       "types": "./dist/pinned-outbound.d.ts",
       "default": "./dist/pinned-outbound.js"

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
-import { parsePersistedTaskGraphReceipt } from "./task-graph-pg-event-validation.js"
+import { parsePersistedTaskGraphReceipt, validateTaskGraphToolEvents } from "./task-graph-pg-event-validation.js"
 import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 
@@ -191,5 +191,24 @@ describe("persisted TaskGraph event envelopes", () => {
       revision: 4, event: { type: "task.completed", idempotencyKey: "event-1", nodeKey: "child", expectedRevision: 3 },
       item: graphItem(4, { content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] } }),
     }), loaded, snapshot, scope)).toThrow("task_graph_receipt_invalid")
+  })
+})
+
+describe("Worker tool receipt validator re-export", () => {
+  it("keeps the existing Worker import path wired to the shared lifecycle validator", () => {
+    const callId = "tool-call-1"
+    const toolCall = { id: "item-1", type: "tool_call", content: {
+      toolCallId: callId, toolName: "agent.search", toolVersion: "v1", status: "completed", errorCode: null,
+    } }
+    const events = [
+      { itemId: toolCall.id, taskId: "task-1", correlationId: callId, type: "tool_call.started", sequence: 1,
+        payload: { taskId: "task-1", toolCallId: callId, toolName: "agent.search", status: "started" } },
+      { itemId: toolCall.id, taskId: "task-1", correlationId: callId, type: "tool_call.completed", sequence: 2,
+        payload: { taskId: "task-1", toolCallId: callId, toolName: "agent.search", status: "completed", errorCode: null } },
+    ]
+    expect(validateTaskGraphToolEvents(events, [toolCall], {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      parentTaskId: "root-1", taskId: "task-1", attemptCount: 1,
+    }).outcomes.get(callId)).toBe("completed")
   })
 })

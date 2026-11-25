@@ -15,6 +15,15 @@ const queuedEvent = {
   nodeKey: "node-1",
 } as const
 
+describe("canonical TaskGraph JSON", () => {
+  it("preserves JSON-object string parsing and stable key ordering", () => {
+    expect(canonicalTaskGraphJson('{"b":2,"a":{"y":1,"x":0}}'))
+      .toBe('{"a":{"x":0,"y":1},"b":2}')
+    expect(canonicalTaskGraphJson({ b: 2, a: { y: 1, x: 0 } }))
+      .toBe('{"a":{"x":0,"y":1},"b":2}')
+  })
+})
+
 describe("parseTaskGraphEvent", () => {
   it("parses task.queued lifecycle events from objects and JSON", () => {
     expect(parseTaskGraphEvent(queuedEvent)).toEqual(queuedEvent)
