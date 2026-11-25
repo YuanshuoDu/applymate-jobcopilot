@@ -7,6 +7,7 @@ import { parseFinalTaskGraphSourceManifest } from "./final-task-graph-source-man
 import { readFinalTaskGraphSourceSnapshot } from "./objective-tailor-final-source-graph"
 import { parseObjectiveTailorProgressSnapshot } from "./objective-tailor-progress-snapshot"
 import type { ObjectiveJourneyReport, ObjectiveJourneyReportedScoreFloor } from "./objective-journey-report-contract"
+import { objectiveJourneyAnalystGraphRequirements } from "./objective-journey-report-requirement-proof"
 
 type Tx = Prisma.TransactionClient
 type Row = Record<string, unknown>
@@ -15,7 +16,7 @@ type SourceGraphNodes = readonly Row[]
 type SlotSource = Readonly<{
   ordinal: number; tailoringStatus: Slot["tailoringStatus"]; sourceReady: boolean; jobId: string | null
   job: Slot["job"]; writerTaskId: string | null; reviewerTaskId: string | null
-  requirementAnalyst: Readonly<{ nodeKey: string; taskId: string; attemptCount: number; proofDigest: string;
+  requirementAnalyst?: Readonly<{ nodeKey: string; taskId: string; attemptCount: number; proofDigest: string;
     jobMaterialDigest: string; criteriaIds: readonly string[]; dependencyNodeKeys: readonly string[];
     dependencies: readonly Readonly<{ nodeKey: string; taskId: string }>[] }> | null
 }>
@@ -160,27 +161,22 @@ function requirementAnalystFor(nodeKey: string, candidate: NonNullable<ReturnTyp
   progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>,
   graphNodes: SourceGraphNodes): SlotSource["requirementAnalyst"] {
   const node = progress.nodes.find(value => value.key === nodeKey), task = node && tasks.get(node.taskId)
-  const typedNode = graphNodes.find(value => value.key === nodeKey), verification = typedNode?.verification
-  const criteriaIds = verification?.criteria.map(value => value.id) ?? []
-  const dependencyNodeKeys = verification ? [...new Set(verification.criteria.flatMap(({ check }) => {
-    if ("dependencyNodeKey" in check) return [check.dependencyNodeKey]
-    if ("dependencyNodeKeys" in check) return [...check.dependencyNodeKeys]
-    return []
-  }))].sort() : []
+  const typedNode = graphNodes.find(value => value.key === nodeKey), verification = objectiveJourneyAnalystGraphRequirements(typedNode?.verification)
+  const criteriaIds = verification?.criteriaIds ?? [], dependencyNodeKeys = verification?.dependencyNodeKeys ?? []
   const dependencies = dependencyNodeKeys.flatMap(key => {
     const dependency = progress.nodes.find(value => value.key === key)
     return dependency ? [{ nodeKey: key, taskId: dependency.taskId }] : []
   })
-  const hasScoutMembership = verification?.criteria.some(({ check }) =>
-    check.kind === "findings_from_scout_dependency" || check.kind === "findings_from_scout_union") ?? false
+  const hasScoutMembership = verification?.hasScoutMembership ?? false
   return candidate.sourceAnalystKeys.length === 1 && candidate.sourceAnalystKeys[0] === nodeKey && node?.templateId === "analyst"
-    && typedNode?.verificationDisposition === "typed" && verification?.role === "analyst" && hasScoutMembership
+    && typedNode?.verificationDisposition === "typed" && verification !== undefined && hasScoutMembership
     && criteriaIds.length > 0 && dependencyNodeKeys.length > 0 && dependencies.length === dependencyNodeKeys.length
     && task?.id === node.taskId && task.role === "analyst" && task.taskType === "job_analysis" && task.status === "completed"
     && Number.isSafeInteger(task.attemptCount) && Number(task.attemptCount) >= 1 && task.leaseOwner === null && task.leaseExpiresAt === null
     ? { nodeKey, taskId: node.taskId, attemptCount: Number(task.attemptCount), proofDigest: candidate.analystProofDigest,
       jobMaterialDigest: candidate.jobMaterialDigest, criteriaIds, dependencyNodeKeys, dependencies } : null
 }
+
 function readyPair(slot: ObjectiveTailorGraph["slots"][number], ordinal: number, revision: number,
   jobId: string, progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>) {
   const correction = slot.correction, writerNode = progress.nodes.find(node => node.key === (correction?.writerNodeKey ?? slot.writerNodeKey))

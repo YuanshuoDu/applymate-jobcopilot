@@ -46,7 +46,8 @@ function slot(ordinal: number, sourceReady: boolean) {
   return { ordinal, tailoringStatus: "ready" as const, sourceReady, jobId: sourceReady ? `job-${ordinal}` : null,
     job: sourceReady ? { company: "Example", role: "Engineer" } : null, writerTaskId: null, reviewerTaskId: null,
     requirementAnalyst: sourceReady ? { nodeKey: `analyst-${ordinal}`, taskId: `task-${ordinal}`, attemptCount: 1,
-      proofDigest: "a".repeat(64), jobMaterialDigest: `sha256:${"b".repeat(64)}`, criteriaIds: ["finding-count"], dependencyNodeKeys: ["scout"] } : null }
+      proofDigest: "a".repeat(64), jobMaterialDigest: `sha256:${"b".repeat(64)}`, criteriaIds: ["finding-count"], dependencyNodeKeys: ["scout"],
+      dependencies: [{ nodeKey: "scout", taskId: `scout-task-${ordinal}` }] } : null }
 }
 function sourceFixture(slots: ReturnType<typeof slot>[]): ObjectiveJourneySource {
   return { userId: "owner", sessionId: "session", sourceTurnId: "turn", rootTaskId: "root", finalItemId: "final", graphRevision: 2,

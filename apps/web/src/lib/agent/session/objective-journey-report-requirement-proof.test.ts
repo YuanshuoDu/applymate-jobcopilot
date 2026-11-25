@@ -6,13 +6,26 @@ import { canonicalTaskGraphReceiptJson, type TaskGraphReplayReceipt } from "@job
 import { taskGraphEvidenceDigest, taskGraphResultDigest } from "@jobcopilot/shared/task-graph-verification-digest"
 import type { ObjectiveJourneySource } from "./objective-journey-report-source"
 import type { ObjectiveJourneyRequirementRead } from "./objective-journey-report-requirement-receipts"
-import { verifyObjectiveJourneyRequirementProof } from "./objective-journey-report-requirement-proof"
+import { objectiveJourneyAnalystGraphRequirements, verifyObjectiveJourneyRequirementProof } from "./objective-journey-report-requirement-proof"
 
 const jobId = "123e4567-e89b-42d3-a456-426614174000", userId = "owner-1", sessionId = "session-1"
 const job = { id: jobId, company: "Example", description: "Must know Rust. Apply with care.", keywords: "Rust", location: "Dublin",
   role: "Engineer", salary: null, score: 8, source: "greenhouse", status: "saved", url: "https://jobs.example/1" }
 
 describe("verifyObjectiveJourneyRequirementProof", () => {
+  it("collects every Worker Scout selector in parser order", () => {
+    const proof = objectiveJourneyAnalystGraphRequirements({ role: "analyst", criteria: [
+      { id: "member-z", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-z" } },
+      { id: "cover-a", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout-a", minimumPercent: 90 } },
+      { id: "union", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-d", "scout-c"] } },
+      { id: "union-cover", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-f", "scout-e"], minimumPercent: 80 } },
+      { id: "each-cover", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-h", "scout-g"], minimumPercent: 70 } },
+    ] })
+    expect(proof).toEqual({ criteriaIds: ["member-z", "cover-a", "union", "union-cover", "each-cover"],
+      dependencyNodeKeys: ["scout-a", "scout-c", "scout-d", "scout-e", "scout-f", "scout-g", "scout-h", "scout-z"],
+      hasScoutMembership: true })
+  })
+
   it("counts a quote only when result, report, receipt, candidate and current Job bindings agree", () => {
     const value = fixture(true)
     expect(verifyObjectiveJourneyRequirementProof(value.source, value.slot, value.read)).toEqual({ checked: true, hasVerifiedRequirements: true })

@@ -53,7 +53,7 @@ export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, 
         <div><dt>{copy.shortlisted}</dt><dd>{report.slots.length}</dd></div>
         <div><dt>{copy.ready}</dt><dd>{report.slots.filter(slot => slot.tailoringStatus === 'ready').length}</dd></div>
         <div><dt>{copy.submitted}</dt><dd>{submittedSummary(report, copy)}</dd></div>
-        {'reportedScoreFloor' in report && <div><dt>{copy.scoreFloor}</dt><dd>{scoreFloorSummary(report.reportedScoreFloor, copy)}</dd></div>}
+        {'reportedScoreFloor' in report && report.reportedScoreFloor && <div><dt>{copy.scoreFloor}</dt><dd>{scoreFloorSummary(report.reportedScoreFloor, copy)}</dd></div>}
         {'requirementEvidenceCoverage' in report && <div><dt>{copy.requirements}</dt>
           <dd>{requirementEvidenceSummary(report.requirementEvidenceCoverage, copy)}</dd></div>}
         <div><dt>{copy.unresolved}</dt><dd>{report.slots.filter(isUnresolved).length}</dd></div>

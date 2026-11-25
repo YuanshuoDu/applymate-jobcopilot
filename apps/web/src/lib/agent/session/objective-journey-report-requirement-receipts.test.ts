@@ -16,7 +16,8 @@ vi.mock("@jobcopilot/shared/task-graph-read-observations", async importOriginal 
 const scope = { userId: "owner-1", sessionId: "session-1", sourceTurnId: "source-turn", rootTaskId: "source-root", graphRevision: 9,
   finalItemId: "final-item", sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" as const }, analyzedJobs: { knownCount: 1, coverage: "complete" as const } }, slots: [] }
 const analyst = { nodeKey: "analyst-1", taskId: "analyst-task", attemptCount: 2, proofDigest: "a".repeat(64),
-  jobMaterialDigest: `sha256:${"b".repeat(64)}`, criteriaIds: ["finding-count"], dependencyNodeKeys: ["scout-1"] }
+  jobMaterialDigest: `sha256:${"b".repeat(64)}`, criteriaIds: ["finding-count"], dependencyNodeKeys: ["scout-1"],
+  dependencies: [{ nodeKey: "scout-1", taskId: "scout-task" }] }
 const slot = { ordinal: 1, tailoringStatus: "ready" as const, sourceReady: true, jobId: "job-1", job: { company: "Example", role: "Engineer" },
   writerTaskId: "writer-1", reviewerTaskId: "reviewer-1", requirementAnalyst: analyst }
 const task = { id: analyst.taskId, sessionId: scope.sessionId, turnId: scope.sourceTurnId, rootTaskId: scope.rootTaskId,
@@ -26,6 +27,7 @@ const task = { id: analyst.taskId, sessionId: scope.sessionId, turnId: scope.sou
   allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"] }
 const job = { id: slot.jobId, userId: scope.userId, company: "Example", description: "Role description", keywords: null,
   location: null, role: "Engineer", salary: null, score: 8, source: "greenhouse", status: "saved", url: null }
+type TestRow = Record<string, unknown>
 
 describe("readObjectiveJourneyRequirementReceipts", () => {
   beforeEach(() => {
@@ -48,7 +50,7 @@ describe("readObjectiveJourneyRequirementReceipts", () => {
     }) }))
     expect(tx.job.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: slot.jobId, userId: scope.userId } }))
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
-    const values = (tx.$queryRaw.mock.calls[0]?.[0] as { values?: unknown[] }).values
+    const values = (tx.$queryRaw.mock.calls[0]?.[0] as unknown as { values?: unknown[] } | undefined)?.values
     expect(values).toEqual(expect.arrayContaining([analyst.taskId, scope.sessionId, scope.sourceTurnId, scope.rootTaskId, scope.userId]))
     expect(mocks.restore).toHaveBeenCalledWith(expect.any(Array), expect.any(Array))
   })
@@ -83,6 +85,6 @@ function fixtureTx() {
     stepId: "step-1", type: "tool_call", status: "completed", revision: 0, content: { toolCallId: "call-1", toolName: "jobs.get" },
     joinedStepId: "step-1", stepStatus: "completed", attempt: 2, ordinal: 0, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId }
   const result = { ...call, id: "result-item", type: "tool_result", content: { toolCallId: "call-1", output: { job } } }
-  const queryRaw = vi.fn(async () => [call, result])
-  return { $queryRaw: queryRaw, rows: [call, result], subAgentTask: { findMany: vi.fn(async () => [task]) }, job: { findMany: vi.fn(async () => [job]) } }
+  const queryRaw = vi.fn(async (..._args: unknown[]): Promise<TestRow[]> => [call, result])
+  return { $queryRaw: queryRaw, rows: [call, result] as TestRow[], subAgentTask: { findMany: vi.fn(async () => [task]) }, job: { findMany: vi.fn(async () => [job]) } }
 }

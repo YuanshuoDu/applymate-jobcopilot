@@ -15,6 +15,19 @@ const VERIFIER = "agent-harness.v2.task-graph-verifier.v1"
 const SHA = /^[a-f0-9]{64}$/
 const JOB_KEYS = ["company", "description", "id", "keywords", "location", "role", "salary", "score", "source", "status", "url"]
 
+export function objectiveJourneyAnalystGraphRequirements(value: unknown): Readonly<{
+  criteriaIds: readonly string[]; dependencyNodeKeys: readonly string[]; hasScoutMembership: boolean
+}> | undefined {
+  const verification = record(value), criteria = verification && dense(verification.criteria, 8)
+  if (verification?.role !== "analyst" || !criteria?.length) return undefined
+  const rows = criteria.map(record)
+  if (rows.some(item => !item || typeof item.id !== "string" || !record(item.check))) return undefined
+  const checks = rows.map(item => record(item!.check)!)
+  return { criteriaIds: rows.map(item => item!.id as string),
+    dependencyNodeKeys: [...new Set(checks.flatMap(checkDependencyKeys))].sort(),
+    hasScoutMembership: checks.some(check => check.kind === "findings_from_scout_dependency" || check.kind === "findings_from_scout_union") }
+}
+
 /** Verifies the private Analyst result, event receipts, candidate binding and current Job before counting coverage. */
 export function verifyObjectiveJourneyRequirementProof(source: ObjectiveJourneySource, slot: Slot,
   read: ObjectiveJourneyRequirementRead): ProofResult {
@@ -180,3 +193,10 @@ function integer(value: unknown, min: number): boolean { return Number.isSafeInt
 function text(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.trim() === value }
 function digest(value: unknown): string | undefined { try { return createHash("sha256").update(canonicalTaskGraphReceiptJson(value)).digest("hex") } catch { return undefined } }
 function unchecked(): ProofResult { return { checked: false, hasVerifiedRequirements: false } }
+function checkDependencyKeys(check: Row): readonly string[] {
+  if (check.kind === "findings_from_scout_dependency" || check.kind === "findings_cover_scout_candidates_gte")
+    return typeof check.dependencyNodeKey === "string" ? [check.dependencyNodeKey] : []
+  const multi = ["findings_from_scout_union", "findings_cover_scout_candidate_union_gte", "findings_cover_each_scout_candidates_gte"]
+  return multi.includes(String(check.kind)) && dense(check.dependencyNodeKeys, 8)?.every((key): key is string => typeof key === "string")
+    ? check.dependencyNodeKeys as string[] : []
+}
