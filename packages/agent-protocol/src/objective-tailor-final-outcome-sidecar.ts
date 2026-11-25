@@ -1,32 +1,77 @@
 export const OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA = "agent-harness.v2.objective-tailor-final-outcomes.v1" as const
+export const OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA = "agent-harness.v2.objective-tailor-final-outcomes.v2" as const
 export const OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_STATUSES = ["ready", "needs_revision", "rejected", "stale", "failed"] as const
+const OBJECTIVE_TAILOR_FINAL_OUTCOME_COVERAGES = ["complete", "partial", "unavailable", "not_requested"] as const
 
 export type ObjectiveTailorFinalOutcomeSidecarStatus = typeof OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_STATUSES[number]
-export type ObjectiveTailorFinalOutcomeSidecar = Readonly<{
+type ObjectiveTailorFinalOutcomeCoverage = typeof OBJECTIVE_TAILOR_FINAL_OUTCOME_COVERAGES[number]
+type ObjectiveTailorFinalOutcomeCount = Readonly<{ knownCount: number | null; coverage: ObjectiveTailorFinalOutcomeCoverage }>
+type Slot = Readonly<{ ordinal: number; status: ObjectiveTailorFinalOutcomeSidecarStatus }>
+type ObjectiveTailorFinalOutcomeSidecarV1 = Readonly<{
   schemaVersion: typeof OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA
-  slots: readonly Readonly<{ ordinal: number; status: ObjectiveTailorFinalOutcomeSidecarStatus }>[]
+  slots: readonly Slot[]
 }>
+export type ObjectiveTailorFinalOutcomeSidecarV2 = Readonly<{
+  schemaVersion: typeof OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA
+  graphRevision: number
+  slots: readonly Slot[]
+  sourceCounts: Readonly<{ discoveredJobs: ObjectiveTailorFinalOutcomeCount; analyzedJobs: ObjectiveTailorFinalOutcomeCount }>
+}>
+export type ObjectiveTailorFinalOutcomeSidecar = ObjectiveTailorFinalOutcomeSidecarV1 | ObjectiveTailorFinalOutcomeSidecarV2
 
-/** Parses only the small public final projection; private proof material is never accepted. */
+/** Reads the current closed projection while keeping historical V1 slot-only items valid. */
 export function parseObjectiveTailorFinalOutcomeSidecar(value: unknown): ObjectiveTailorFinalOutcomeSidecar | undefined {
   const row = record(value)
-  if (!row || !exactKeys(row, "schemaVersion,slots") || row.schemaVersion !== OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA
-    || !dense(row.slots)) return undefined
-  const slots: ObjectiveTailorFinalOutcomeSidecar["slots"][number][] = []
-  for (let index = 0; index < row.slots.length; index += 1) {
-    const slot = record(row.slots[index])
+  if (!row) return undefined
+  if (row.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA) return parseV1(row)
+  if (row.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA) return parseV2(row)
+  return undefined
+}
+
+function parseV1(row: Record<string, unknown>): ObjectiveTailorFinalOutcomeSidecarV1 | undefined {
+  if (!exactKeys(row, "schemaVersion,slots")) return undefined
+  const slots = parseSlots(row.slots)
+  return slots
+    ? { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, slots } : undefined
+}
+
+function parseV2(row: Record<string, unknown>): ObjectiveTailorFinalOutcomeSidecarV2 | undefined {
+  if (!exactKeys(row, "graphRevision,schemaVersion,slots,sourceCounts") || !positiveSafeInteger(row.graphRevision)) return undefined
+  const slots = parseSlots(row.slots), counts = record(row.sourceCounts)
+  if (!slots || !counts || !exactKeys(counts, "analyzedJobs,discoveredJobs")) return undefined
+  const discoveredJobs = parseCount(counts.discoveredJobs), analyzedJobs = parseCount(counts.analyzedJobs)
+  if (!discoveredJobs || !analyzedJobs) return undefined
+  return { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: row.graphRevision,
+    slots, sourceCounts: { discoveredJobs, analyzedJobs } }
+}
+
+function parseSlots(value: unknown): readonly Slot[] | undefined {
+  if (!dense(value)) return undefined
+  const slots: Slot[] = []
+  for (let index = 0; index < value.length; index += 1) {
+    const slot = record(value[index])
     if (!slot || !exactKeys(slot, "ordinal,status") || slot.ordinal !== index + 1
       || !oneOf(slot.status, OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_STATUSES)) return undefined
     slots.push({ ordinal: index + 1, status: slot.status })
   }
-  return { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, slots }
+  return slots
+}
+
+function parseCount(value: unknown): ObjectiveTailorFinalOutcomeCount | undefined {
+  const row = record(value)
+  if (!row || !exactKeys(row, "coverage,knownCount") || !oneOf(row.coverage, OBJECTIVE_TAILOR_FINAL_OUTCOME_COVERAGES)) return undefined
+  const count = row.knownCount
+  if (row.coverage === "complete" || row.coverage === "partial") {
+    return nonnegativeSafeInteger(count) ? { knownCount: count, coverage: row.coverage } : undefined
+  }
+  return count === null ? { knownCount: null, coverage: row.coverage } : undefined
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
   try {
-  const keys = Reflect.ownKeys(value), prototype = Object.getPrototypeOf(value)
-    if (keys.length > 2 || prototype !== Object.prototype && prototype !== null || keys.some(key => typeof key !== "string")) return undefined
+    const keys = Reflect.ownKeys(value), prototype = Object.getPrototypeOf(value)
+    if (keys.length > 4 || prototype !== Object.prototype && prototype !== null || keys.some(key => typeof key !== "string")) return undefined
     for (const key of keys) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key)
       if (!descriptor?.enumerable || !("value" in descriptor)) return undefined
@@ -56,3 +101,5 @@ function dense(value: unknown): value is unknown[] {
 function oneOf<T extends string>(value: unknown, values: readonly T[]): value is T {
   return typeof value === "string" && values.includes(value as T)
 }
+function positiveSafeInteger(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
+function nonnegativeSafeInteger(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }

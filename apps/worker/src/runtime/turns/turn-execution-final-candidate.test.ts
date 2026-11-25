@@ -8,7 +8,7 @@ import type { StepContext } from "../context/step-context-builder.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA } from "../subagents/objective-tailor-final-summary-binding.js"
-import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA } from "@jobcopilot/agent-protocol"
 import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 import { taskGraphItemId, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
@@ -23,11 +23,18 @@ function completeWithTestDefaults(input: CandidateTestInput) {
 
 function objectiveWaveBinding(): TaskGraphFinalSummaryBinding {
   const rootTaskId = "root-wave", graphRevision = 12
-  const taskRows: GraphTaskRow[] = ["source-a", "source-b"].map((id, index) => ({ id, role: "scout", taskType: "research",
-    status: "completed", failureReason: null, result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA,
-      role: "scout", status: "completed", candidates: [], evidence: [], summary: `Source ${index + 1}.` } } }))
+  const taskRows: GraphTaskRow[] = [
+    { id: "source-a", role: "scout", taskType: "job_discovery", status: "completed", failureReason: null,
+      result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+        candidates: [{ jobId: "job-wave", source: "fixture", url: null, evidenceIds: ["source-job"] }],
+        evidence: [{ id: "source-job", kind: "job", ref: "job-wave", source: "fixture" }], summary: "Scout source." } } },
+    { id: "source-b", role: "analyst", taskType: "job_analysis", status: "completed", failureReason: null,
+      result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+        findings: [{ jobId: "job-wave", score: 8, evidenceIds: ["analysis-job"] }],
+        evidence: [{ id: "analysis-job", kind: "job", ref: "job-wave", source: "fixture" }], summary: "Analyst source." } } },
+  ]
   const loaded = { rootTaskId, item: { id: taskGraphItemId(rootTaskId), revision: graphRevision, content: {}, createdAt: new Date(0) },
-    snapshot: { nodes: taskRows.map((row, nodeIndex) => ({ taskId: row.id, key: `source-${nodeIndex + 1}`, templateId: "scout" })) },
+    snapshot: { nodes: taskRows.map((row, nodeIndex) => ({ taskId: row.id, key: `source-${nodeIndex + 1}`, templateId: row.role })) },
     state: { revision: graphRevision }, tasks: new Map(taskRows.map(row => [row.id, row])) } as unknown as LoadedGraph
   const base = buildTaskGraphFinalSummaryBinding(loaded)
   if (!base) throw new Error("Expected a current wave TaskGraph binding")
@@ -71,8 +78,9 @@ describe("atomic TaskGraph finalization recovery", () => {
 
     expect(outcome.kind).toBe("completed")
     const recorded = saved[0] as { response: string; terminal: { finalContent: Record<string, unknown> } }
-    expect(recorded.terminal.finalContent.objectiveTailorFinalOutcomes).toEqual({ schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
-      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }] })
+    expect(recorded.terminal.finalContent.objectiveTailorFinalOutcomes).toEqual({ schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+      graphRevision: 12, slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }],
+      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } } })
     expect(recorded.terminal.finalContent.final).not.toHaveProperty("objectiveTailorFinalOutcomes")
     expect(JSON.parse(recorded.response)).not.toHaveProperty("objectiveTailorFinalOutcomes")
     expect(JSON.stringify(recorded.terminal.finalContent.objectiveTailorFinalOutcomes)).not.toMatch(/root-wave|source-a|source-b|graphDigest|evidenceDigest/)
