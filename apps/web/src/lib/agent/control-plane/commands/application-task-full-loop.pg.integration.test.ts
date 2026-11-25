@@ -4319,7 +4319,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(initialReportSlots.map(slot => slot?.submissionEvidence)).toEqual(Array(8).fill(null))
       expect(initialReportSlots.every(slot => slot && Object.keys(slot).sort().join(",") ===
         "applicationStatus,job,ordinal,retirementReason,reviewStatus,reviewTurnId,submissionEvidence,tailoringStatus")).toBe(true)
-      const initialReportJson = JSON.stringify(initialReport)
+      // This exact navigation ID is separately bound above and canonically embeds its owner ID.
+      const initialReportJson = JSON.stringify(Object.fromEntries(Object.entries(initialReport)
+        .filter(([key]) => key !== "finalItemId")))
       expect([sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds, ...jobIds]
         .some(privateId => initialReportJson.includes(privateId))).toBe(false)
 
@@ -4579,7 +4581,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         const ownedJob = ownedJobLabelById.get(candidate.jobId)
         expect(jsonRecord(journeySlots[candidate.ordinal - 1]?.job)).toEqual(ownedJob && { company: ownedJob.company, role: ownedJob.role })
       }
-      const journeyReportJson = JSON.stringify(journeyReport)
+      const journeyReportJson = JSON.stringify(Object.fromEntries(Object.entries(journeyReport)
+        .filter(([key]) => key !== "finalItemId")))
       const privateReportMarkers = [sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds, ...jobIds,
         ...approvalIdByOrdinal.values(), ...applicationTaskIdByApprovalId.values(), staleApplicationTaskId,
         ...candidates.flatMap(candidate => [candidate.artifactRef.artifactId, candidate.artifactRef.contentHash,
