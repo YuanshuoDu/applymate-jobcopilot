@@ -1,5 +1,5 @@
 import type { PrismaClient } from "@prisma/client"
-import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, validate } from "@jobcopilot/agent-protocol"
+import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, parseObjectiveReportScoreFloor, validate } from "@jobcopilot/agent-protocol"
 
 import { invalidCommand, isUniqueViolation, objectiveStartStateConflict, retryActiveConflict } from "./errors"
 import { lockOwnedSessionForObjectiveReplacement } from "./session-control"
@@ -129,6 +129,13 @@ export class ObjectiveStartCommandService {
         }
       }
     }
+    let reportScoreFloor: number | undefined
+    if (Object.hasOwn(command, "reportScoreFloor")) {
+      const descriptor = Object.getOwnPropertyDescriptor(command, "reportScoreFloor")
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) throw invalidCommand("Objective report score floor is invalid")
+      reportScoreFloor = parseObjectiveReportScoreFloor(descriptor.value) ?? undefined
+      if (reportScoreFloor === undefined) throw invalidCommand("Objective report score floor must be a number from 0 to 10")
+    }
     const normalized: ObjectiveStartCommand = {
       sessionId: command.sessionId,
       userId: command.userId,
@@ -137,6 +144,7 @@ export class ObjectiveStartCommandService {
       objective: normalizeObjective(command.objective),
       content: command.content,
       ...(hasRequirements ? { verificationRequirements: requirements ?? null } : {}),
+      ...(reportScoreFloor !== undefined ? { reportScoreFloor } : {}),
     }
     if (!hasBoundedContent(command.content)) throw invalidCommand("Objective context is invalid or exceeds the command limits")
     try {

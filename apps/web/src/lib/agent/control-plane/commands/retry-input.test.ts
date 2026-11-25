@@ -78,6 +78,24 @@ describe('persisted retry input', () => {
     })
   })
 
+  it('preserves an explicit Objective report floor, including zero, through retry parsing', () => {
+    const base = {
+      goal: 'Retry the objective',
+      content: [{ type: 'text', text: 'Retry the objective' }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+    }
+    expect(parsePersistedRetryContent('turn-report-floor', { ...base, reportScoreFloor: 0 }))
+      .toEqual({ ...base, reportScoreFloor: 0 })
+    expect(parsePersistedRetryContent('turn-report-floor', { ...base, reportScoreFloor: 8 }))
+      .toEqual({ ...base, reportScoreFloor: 8 })
+    for (const reportScoreFloor of [null, -1, 10.1, '8']) {
+      expect(() => parsePersistedRetryContent('turn-report-floor', { ...base, reportScoreFloor })).toThrow()
+    }
+    expect(() => parsePersistedRetryContent('turn-selected-floor', {
+      goal: base.goal, content: base.content, selectedJobPreparation: { jobId: 'job_1' }, reportScoreFloor: 4,
+    })).toThrow()
+  })
+
   it('does not replay an approval-producing reviewed application intent through generic Retry', () => {
     expect(() => parsePersistedRetryContent('turn-review', {
       goal: 'Review selected materials for application fill',

@@ -230,3 +230,5 @@ export type {
   ObjectiveTailorFinalOutcomeSidecarV3,
   ObjectiveTailorReportedScoreFloor,
 } from './objective-tailor-final-outcome-sidecar.js'
+
+export { parseObjectiveReportScoreFloor } from './objective-report-score-floor.js'

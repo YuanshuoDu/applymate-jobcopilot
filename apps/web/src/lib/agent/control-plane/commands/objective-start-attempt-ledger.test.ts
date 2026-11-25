@@ -137,6 +137,23 @@ describe("objective start attempt ledger", () => {
     expect(create).not.toHaveBeenCalled()
   })
 
+  it("reconstructs an accepted Objective request with its immutable report floor", async () => {
+    const base = legacyInput()
+    const input = {
+      ...base,
+      targetTurn: { ...base.targetTurn, input: { ...base.targetTurn.input, reportScoreFloor: 0 } },
+    }
+    const db = {
+      agentObjectiveStartAttempt: { findUnique: vi.fn().mockResolvedValue(null) },
+      $transaction: (work: (value: unknown) => Promise<unknown>) => work({
+        agentInput: { findMany: vi.fn().mockResolvedValue([input]) },
+        agentEvent: { findFirst: vi.fn().mockResolvedValue(legacyEvent()) },
+        agentSession: { findFirst: vi.fn().mockResolvedValue({ id: "session_1" }) },
+      }),
+    } as unknown as PrismaClient
+    await expect(getObjectiveStartAttempt(db, "user_1", "attempt_1")).resolves.toMatchObject({ state: "accepted" })
+  })
+
   it.each([
     ["consumed after execution", { status: "consumed", consumedByStepId: "step_1", consumedAt: new Date("2026-11-12T10:00:00Z") }],
     ["cancelled after stop", { status: "cancelled", cancelledAt: new Date("2026-11-12T10:00:00Z") }],

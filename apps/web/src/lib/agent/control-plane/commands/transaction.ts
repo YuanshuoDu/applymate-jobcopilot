@@ -6,7 +6,7 @@ import { OBJECTIVE_APPLICATION_REVIEW_TURN_INTENT, OBJECTIVE_TASK_GRAPH_EXECUTIO
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { selectObjectiveTailorExecutionBudgetSnapshot } from "./objective-tailor-execution-budget"
 import { activeTurnChanged, sessionNotFound } from "./errors"
-import type { CommandDisposition, CommandIdentity, InterruptDisposition, ObjectiveVerificationRequirements, SelectedJobPreparationScope, ServerAgentTurnIntent } from "./types"
+import { objectiveReportScoreFloorTurnInput, type CommandDisposition, type CommandIdentity, type InterruptDisposition, type ObjectiveVerificationRequirements, type SelectedJobPreparationScope, type ServerAgentTurnIntent } from "./types"
 
 export { fallbackDisposition, findExistingCommand } from "./existing-command"
 export type { ExistingCommand } from "./existing-command"
@@ -82,7 +82,7 @@ function actorFor(source: TurnSource): "user" | "system" { return source === "us
 
 export async function createRootTurn(
   tx: CommandTransaction,
-  command: CommandIdentity,
+  command: CommandIdentity & { reportScoreFloor?: unknown },
   content: InputContentPart[],
   explicitGoal?: string,
   selectedJobPreparation?: SelectedJobPreparationScope,
@@ -112,7 +112,7 @@ export async function createRootTurn(
         ...(selectedJobPreparation ? { selectedJobPreparation } : {}),
         ...(intent ? { intent } : {}),
         ...(selectedJobBatch ? { verifiedShortlistSelection } : {}),
-        ...(verificationRequirements !== undefined ? { verificationRequirements } : {}),
+        ...objectiveReportScoreFloorTurnInput(command, intent, verificationRequirements),
       }),
       modelProfileSnapshot: json({}),
       toolPolicySnapshot: json({}),
@@ -141,7 +141,7 @@ export async function createRootTurn(
 
 export async function acceptInputFacts(
   tx: CommandTransaction,
-  command: CommandIdentity,
+  command: CommandIdentity & { reportScoreFloor?: unknown },
   content: InputContentPart[],
   turn: ActiveTurn,
   delivery: "steer" | "follow_up",

@@ -209,6 +209,27 @@ describe("Agent command transaction helpers", () => {
     expect(agentTurn.create.mock.calls[0]?.[0]?.data).not.toHaveProperty("executionMode")
   })
 
+  it("persists report floors only on user Objective TaskGraph Turn input", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_report_floor" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const tx = { agentTurn, agentOutbox } as unknown as CommandTransaction
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_report_floor", source: "user" as const }
+    await createRootTurn(tx, { ...command, reportScoreFloor: 0 }, [{ type: "text", text: "Find roles" }], undefined, undefined,
+      OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data.input).toHaveProperty("reportScoreFloor", 0)
+    await createRootTurn(tx, command, [{ type: "text", text: "Find roles" }], undefined, undefined,
+      OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
+    expect(agentTurn.create.mock.calls[1]?.[0]?.data.input).not.toHaveProperty("reportScoreFloor")
+    await expect(createRootTurn(tx, { ...command, source: "automation", reportScoreFloor: 4 }, [{ type: "text", text: "Find roles" }],
+      undefined, undefined, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT))
+      .rejects.toThrow("objective_report_score_floor_binding_invalid")
+    await expect(createRootTurn(tx, { ...command, reportScoreFloor: 4 }, [{ type: "text", text: "Find roles" }],
+      undefined, undefined, undefined))
+      .rejects.toThrow("objective_report_score_floor_binding_invalid")
+    expect(agentTurn.create).toHaveBeenCalledTimes(2)
+    expect(agentOutbox.create).toHaveBeenCalledTimes(2)
+  })
+
   it("persists valid, invalid-sentinel, and absent objective requirements distinctly", async () => {
     const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_requirements" }) }
     const agentOutbox = { create: vi.fn().mockResolvedValue({}) }

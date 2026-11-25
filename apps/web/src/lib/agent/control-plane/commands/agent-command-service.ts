@@ -242,8 +242,8 @@ export class AgentCommandService {
       const active = await findActiveTurn(tx, command.sessionId, command.userId)
       if (active) throw retryActiveConflict(active.id)
       const persisted = parsePersistedRetryContent(target.id, target.input)
-
-      const created = await createRootTurn(tx, command, persisted.content, persisted.goal, persisted.selectedJobPreparation, persisted.intent, persisted.verificationRequirements)
+      const created = await createRootTurn(tx, { ...command, ...(persisted.reportScoreFloor === undefined ? {} : { reportScoreFloor: persisted.reportScoreFloor }) },
+        persisted.content, persisted.goal, persisted.selectedJobPreparation, persisted.intent, persisted.verificationRequirements)
       return acceptRetriedInput(tx, command, target, persisted, () => acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true))
     })
   }
