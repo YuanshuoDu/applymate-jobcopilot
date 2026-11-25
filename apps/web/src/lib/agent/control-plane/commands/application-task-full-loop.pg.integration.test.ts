@@ -23,6 +23,7 @@ import {
   OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE,
   OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_SCHEMA,
   buildObjectiveReviewedFillHandoffOutboxData,
+  parseObjectiveReviewedApplicationFillBrowserStartEvent,
   parseObjectiveApplicationSubmissionManifestEvent,
   parseObjectiveReviewedFillHandoffOutboxRow,
 } from "@jobcopilot/shared"
@@ -4568,19 +4569,23 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
               testDb.job.findFirst({ where: { id: slot.jobId, userId }, select: { status: true, workflowState: true, appliedAt: true } }),
             ])
             const rootTaskId = typeof turn?.rootTaskId === "string" ? turn.rootTaskId : null
-            const [root, fillers] = await Promise.all([
+            const [root, fillers, browserStarts] = await Promise.all([
               rootTaskId ? testDb.subAgentTask.findFirst({ where: { id: rootTaskId, rootTaskId, sessionId, turnId: fillTurnId,
                 parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId } },
                 select: { id: true, status: true, leaseOwner: true, leaseExpiresAt: true } }) : Promise.resolve(null),
               rootTaskId ? testDb.subAgentTask.findMany({ where: { sessionId, turnId: fillTurnId, rootTaskId,
                 role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 3,
-                select: { status: true, attemptCount: true, completedAt: true, leaseOwner: true,
+                select: { id: true, status: true, attemptCount: true, completedAt: true, leaseOwner: true,
                   leaseExpiresAt: true, interruptRequestedAt: true } }) : Promise.resolve([]),
+              testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
+                type: "reviewed_application_fill_browser_started", actor: "worker" }, take: 2, select: { data: true } }),
             ])
             const filler = fillers[0]
             const fillerLeaseFree = Boolean(filler && filler.leaseOwner === null && filler.leaseExpiresAt === null)
             const turnLeaseFree = Boolean(turn && turn.leaseOwnerId === null && turn.leaseExpiresAt === null)
             const rootLeaseFree = Boolean(root && root.leaseOwner === null && root.leaseExpiresAt === null)
+            const fillerAttemptMatchesReceipt = fillers.length === 1 && browserStarts.length === 1
+              && objectiveBrowserStartMatches(browserStarts[0]?.data, slot, fillTurnId, fillers[0]!.id, fillers[0]!.attemptCount)
             return {
               available: true, workerAlive,
               task: task ? { status: reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
@@ -4606,15 +4611,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                   leaseFree: false, matchesTurn: false },
               fillerCount: Math.min(fillers.length, 3),
               filler: filler ? { status: reviewedFillDiagnosticValue(filler.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
-                attemptMatchesExpected: filler.attemptCount === 1, completedAtPresent: filler.completedAt instanceof Date,
+                attemptMatchesReceipt: fillerAttemptMatchesReceipt, completedAtPresent: filler.completedAt instanceof Date,
                 leaseOwnerPresent: filler.leaseOwner !== null, leaseExpiryPresent: filler.leaseExpiresAt !== null,
                 leaseFree: fillerLeaseFree, interrupted: filler.interruptRequestedAt !== null,
-                completed: filler.status === "completed" } : { status: "missing", attemptMatchesExpected: false,
+                completed: filler.status === "completed" } : { status: "missing", attemptMatchesReceipt: false,
                   completedAtPresent: false, leaseOwnerPresent: false, leaseExpiryPresent: false,
                   leaseFree: false, interrupted: false, completed: false },
               predicates: {
                 uniqueFiller: fillers.length === 1, fillerCompleted: filler?.status === "completed",
-                fillerAttemptMatchesExpected: filler?.attemptCount === 1,
+                fillerAttemptMatchesReceipt,
                 fillerCompletedAtPresent: filler?.completedAt instanceof Date,
                 fillerLeaseFree, fillerNotInterrupted: filler?.interruptRequestedAt === null,
                 turnWaitingForApproval: turn?.status === "waiting_for_approval", turnLeaseFree,
@@ -4625,6 +4630,14 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         } catch {
           return { available: false, workerAlive }
         }
+      }
+      const objectiveBrowserStartMatches = (data: unknown, slot: ObjectiveWaveSubmissionSlot,
+        fillTurnId: string, fillerTaskId: string, attemptCount: number) => {
+        const binding = parseObjectiveReviewedApplicationFillBrowserStartEvent(data)
+        return Boolean(binding && binding.userId === userId && binding.sessionId === sessionId
+          && binding.jobId === slot.jobId && binding.applicationTaskId === slot.applicationTaskId
+          && binding.fillTurnId === fillTurnId && binding.fillerTaskId === fillerTaskId
+          && binding.attemptCount === attemptCount)
       }
       const waitForWaveFillerCompletion = async (slot: ObjectiveWaveSubmissionSlot, fillTurnId: string) => {
         const deadline = Date.now() + 60_000
@@ -4638,10 +4651,17 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                 completedAt: true, leaseOwner: true, leaseExpiresAt: true, interruptRequestedAt: true } })
             if (fillers.length > 1) throw new Error("Objective Fill Root has duplicate Filler children")
             const filler = fillers[0]
-            if (fillers.length === 1 && filler?.status === "completed" && filler.attemptCount === 1
+            if (fillers.length === 1 && filler?.status === "completed" && Number.isSafeInteger(filler.attemptCount)
+              && filler.attemptCount > 0
               && filler.completedAt instanceof Date && filler.leaseOwner === null && filler.leaseExpiresAt === null
               && filler.interruptRequestedAt === null && turn.status === "waiting_for_approval"
               && turn.leaseOwnerId === null && turn.leaseExpiresAt === null) {
+              const browserStarts = await testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
+                type: "reviewed_application_fill_browser_started", actor: "worker" }, take: 2, select: { data: true } })
+              if (browserStarts.length !== 1 || !objectiveBrowserStartMatches(browserStarts[0]?.data, slot,
+                fillTurnId, filler.id, filler.attemptCount)) {
+                throw new Error("Objective completed Filler has no exact browser-start receipt")
+              }
               const binding = { fillRootTaskId: turn.rootTaskId, fillerTaskId: filler.id, attemptCount: filler.attemptCount }
               waveFillerAttempts.set(slot.applicationTaskId, binding)
               return binding
@@ -4693,12 +4713,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         }
         const fillTurnId = task.fillTurnId
         if (!fillTurnId || fillTurnId !== handoff.fillTurnId) throw new Error("Objective Fill Turn binding changed")
-        const [turn, approval, job, filler] = await Promise.all([
+        const filler = await waitForWaveFillerCompletion(slot, fillTurnId)
+        const [turn, approval, job] = await Promise.all([
           testDb.agentTurn.findFirstOrThrow({ where: { id: fillTurnId, userId, sessionId },
             select: { status: true, rootTaskId: true, leaseOwnerId: true, leaseExpiresAt: true } }),
           waitForReviewedApproval(`application-fill:${slot.applicationTaskId}:${fillTurnId}`),
           testDb.job.findFirstOrThrow({ where: { id: slot.jobId, userId }, select: { status: true, workflowState: true, appliedAt: true } }),
-          waitForWaveFillerCompletion(slot, fillTurnId),
         ])
         if (turn.status !== "waiting_for_approval" || turn.rootTaskId !== filler.fillRootTaskId
           || turn.leaseOwnerId !== null || turn.leaseExpiresAt !== null
@@ -4712,10 +4732,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         const scopeHash = approval.scopeHash
         if (typeof scopeHash !== "string") throw new Error("Objective final approval has no stable receipt hash")
         const browserEvents = await testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
-          type: "reviewed_application_fill_browser_started", actor: "worker" }, select: { data: true } })
-        const browserBinding = jsonRecord(browserEvents[0]?.data)
-        if (browserEvents.length !== 1 || browserBinding?.fillerTaskId !== filler.fillerTaskId
-          || browserBinding.attemptCount !== filler.attemptCount) throw new Error("Objective browser-start Filler identity changed")
+          type: "reviewed_application_fill_browser_started", actor: "worker" }, take: 2, select: { data: true } })
+        if (browserEvents.length !== 1 || !objectiveBrowserStartMatches(browserEvents[0]?.data, slot,
+          fillTurnId, filler.fillerTaskId, filler.attemptCount)) throw new Error("Objective browser-start Filler identity changed")
         return { task, fillTurnId, approval, scopeHash, ...filler }
       }
       type ApprovedObjectiveSubmission = Awaited<ReturnType<typeof prepareFilledSlot>> & {
@@ -4768,7 +4787,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           select: { id: true, status: true, attemptCount: true, completedAt: true, leaseOwner: true,
             leaseExpiresAt: true, interruptRequestedAt: true } })
         if (completedFillers.length !== 1 || completedFillers[0]?.status !== "completed"
-          || completedFillers[0]?.attemptCount !== filler.attemptCount || completedFillers[0]?.attemptCount !== 1
+          || completedFillers[0]?.attemptCount !== filler.attemptCount
           || !(completedFillers[0]?.completedAt instanceof Date) || completedFillers[0]?.leaseOwner !== null
           || completedFillers[0]?.leaseExpiresAt !== null || completedFillers[0]?.interruptRequestedAt !== null) {
           throw new Error("Objective completed Filler attempt changed")
@@ -5141,7 +5160,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
             }
             const measured = await Promise.all(pair.map(async proof => {
               const recorded = waveFillerAttempts.get(proof.durable.task.id)
-              if (!recorded || recorded.attemptCount !== 1) throw new Error("Objective rate-window Filler attempt was not verified")
+              if (!recorded || !Number.isSafeInteger(recorded.attemptCount) || recorded.attemptCount < 1) {
+                throw new Error("Objective rate-window Filler attempt was not verified")
+              }
               const fillers = await testDb.subAgentTask.findMany({ where: { id: recorded.fillerTaskId,
                 sessionId, turnId: proof.durable.fillTurnId, rootTaskId: recorded.fillRootTaskId,
                 role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 2,
