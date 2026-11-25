@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { AGENT_STREAM_SCHEMA_VERSION, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { AGENT_STREAM_SCHEMA_VERSION, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION,
+  OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { makeObjectiveTailorWaveCandidateSelection, bindObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphState } from "./task-graph-snapshot.js"
@@ -51,15 +52,28 @@ function candidate(index: number) {
     candidate: { jobId: `f47ac10b-58cc-4372-a567-0e02b2c3d47${index}`, score: 8, materialDigest: digest }, sourceAnalystKey: "analyst-a" })!
 }
 function dbClient(events: Record<string, unknown>[] = []) {
+  return dbClientWithInput(events, turnInput)
+}
+function dbClientWithInput(events: Record<string, unknown>[], input: unknown) {
   const calls: Array<{ sql: string; values?: unknown[] }> = []
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
     calls.push({ sql, values })
-    if (sql.includes('SELECT turn."input"')) return { rows: [{ input: turnInput, source: "user", executionMode: "canonical_task_graph" }], rowCount: 1 }
+    if (sql.includes('SELECT turn."input"')) return { rows: [{ input, source: "user", executionMode: "canonical_task_graph" }], rowCount: 1 }
     if (sql.includes('FROM "Job"')) return { rows: [{ id: values?.[0] }], rowCount: 1 }
     if (sql.includes('FROM "agent_events" AS event')) return { rows: events, rowCount: events.length }
     return { rows: [], rowCount: 1 }
   })
   return { client: { query } as never, calls, query }
+}
+function loadedWithOneSlot(marker: Record<string, unknown>): LoadedGraph {
+  const slot = { slotId: "tailor-1", sourceAnalystNodeKey: "analyst-a", writerNodeKey: "writer-a", reviewerNodeKey: "reviewer-a" }
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, objectiveTailor: { ...marker, slots: [slot] },
+    nodes: [...source.nodes, { key: "writer-a", templateId: "cover_letter_writer", goal: "Draft", successCriteria: ["Save"],
+      dependsOn: ["analyst-a"], depth: 3, taskId: "writer-task" }, { key: "reviewer-a", templateId: "cover_letter_reviewer",
+      goal: "Review", successCriteria: ["Review"], dependsOn: ["writer-a"], depth: 4, taskId: "reviewer-task" }] })!
+  const state = taskGraphState(snapshot, 3, new Map(snapshot.nodes.map(node => [node.taskId, { status: "completed" as const, failureReason: null }])), [])
+  return { ...baseLoaded(), item: { id: taskGraphItemId(scope.rootTaskId), revision: 3, content: snapshot, createdAt: "2026-11-24T10:00:00.000Z" },
+    snapshot, state }
 }
 function accepted(nodes: readonly { key: string; taskId: string; status: "queued" | "waiting" }[]) {
   return { state: { revision: 2, nodes: nodes.map(node => ({ ...node })), appliedEvents: [] },
@@ -103,6 +117,8 @@ describe("Objective Tailor wave PostgreSQL command", () => {
     expect(fake.calls.filter(call => call.sql.includes('FROM "Job"') && call.sql.includes("FOR SHARE")).map(call => call.values?.[0]))
       .toEqual(selected.map(value => value.candidate.jobId).sort())
     const createArgs = mocks.create.mock.calls[0]!
+    expect(createArgs[10].marker.schemaVersion).toBe(OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION)
+    expect(Object.hasOwn(createArgs[10].marker, "reportScoreFloor")).toBe(false)
     expect(createArgs[1].proposal.nodes).toHaveLength(8)
     expect(createArgs[1].proposal.nodes[0].dependsOn).toEqual(["analyst-a"])
     expect(createArgs[1].proposal.nodes[1].dependsOn).toEqual([createArgs[1].proposal.nodes[0].key])
@@ -112,6 +128,64 @@ describe("Objective Tailor wave PostgreSQL command", () => {
     expect(mocks.write).toHaveBeenCalledWith(fake.client, expect.objectContaining({ expectedRevision: 1,
       idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 1), fingerprint: taskGraphFingerprint({ kind: "objective_tailor_candidate_wave",
         scope: graphScope, expectedRevision: 1, candidateRefs: selected.map(value => value.candidateRef) }) }))
+  })
+
+  it("copies the persisted explicit floor into the first V2 wave marker", async () => {
+    const selected = candidate(1)
+    mocks.resolve.mockResolvedValue({ inventory: baseInventory(), selections: [selected] })
+    const nodes = [
+      { key: "objective-tailor-wave-writer-tailor-1", taskId: "writer-1", status: "queued" as const },
+      { key: "objective-tailor-wave-reviewer-tailor-1", taskId: "reviewer-1", status: "waiting" as const },
+    ]
+    mocks.create.mockResolvedValue(accepted(nodes))
+    const fake = dbClientWithInput([], { ...turnInput, reportScoreFloor: 8 })
+    await appendWaveWithClient(fake.client, { scope, expectedRevision: 1, candidateRefs: [selected.candidateRef] })
+    expect(mocks.create.mock.calls[0]?.[10]?.marker).toMatchObject({
+      schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION, reportScoreFloor: 8,
+    })
+  })
+
+  it("preserves the same V2 floor when appending another wave", async () => {
+    const marker = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION, sourceNodeCount: 2, reportScoreFloor: 8 }
+    const loaded = loadedWithOneSlot(marker), currentMarker = loaded.snapshot!.objectiveTailor!
+    mocks.load.mockResolvedValue(loaded)
+    const selected = candidate(2), witness = bindObjectiveTailorWaveCandidateWitness(selected, { slotId: "tailor-2", admittedRevision: 4 })!
+    const nextMarker = { ...currentMarker, slots: [...currentMarker.slots,
+      { slotId: witness.slotId, sourceAnalystNodeKey: "analyst-a", writerNodeKey: witness.writerNodeKey, reviewerNodeKey: witness.reviewerNodeKey }] }
+    const nodes = [
+      { key: witness.writerNodeKey, taskId: "writer-2", status: "queued" as const },
+      { key: witness.reviewerNodeKey, taskId: "reviewer-2", status: "waiting" as const },
+    ]
+    const addedSnapshotNodes = nodes.map(node => ({ ...node, templateId: node.key.includes("writer") ? "cover_letter_writer" : "cover_letter_reviewer",
+      goal: "Wave node", successCriteria: ["Complete"], dependsOn: [node.key.includes("writer") ? "analyst-a" : witness.writerNodeKey], depth: 5 }))
+    const inventory = { ...baseInventory(), marker: currentMarker, occupiedSlots: [{}], occupiedJobIds: ["job-1"] }
+    mocks.inventory.mockResolvedValue(inventory)
+    mocks.resolve.mockResolvedValue({ inventory, selections: [selected] })
+    mocks.create.mockResolvedValue({ state: { revision: 4, objectiveTailor: nextMarker,
+      nodes: [...loaded.state!.nodes, ...nodes] }, snapshot: { ...loaded.snapshot!, objectiveTailor: nextMarker,
+      nodes: [...loaded.snapshot!.nodes, ...addedSnapshotNodes] }, taskIds: new Map(nodes.map(node => [node.key, node.taskId])),
+      created: nodes, readyTaskIds: ["writer-2"] })
+    const fake = dbClientWithInput([], { ...turnInput, reportScoreFloor: 8 })
+    await appendWaveWithClient(fake.client, { scope, expectedRevision: 3, candidateRefs: [selected.candidateRef] })
+    expect(mocks.create.mock.calls[0]?.[10]?.marker).toMatchObject({
+      schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION, reportScoreFloor: 8,
+    })
+    expect(mocks.create.mock.calls[0]?.[10]?.marker.slots).toHaveLength(2)
+  })
+
+  it("rejects Turn/marker drift before catalog construction or replay lookup", async () => {
+    const v1 = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: 2 }
+    mocks.load.mockResolvedValue(loadedWithOneSlot(v1))
+    const explicitTurn = { ...turnInput, reportScoreFloor: 8 }
+    const catalogDb = dbClientWithInput([], explicitTurn)
+    await expect(readCatalogWithClient(catalogDb.client, readScope)).resolves.toBeUndefined()
+    expect(mocks.build).not.toHaveBeenCalled()
+
+    const appendDb = dbClientWithInput([], explicitTurn)
+    await expect(appendWaveWithClient(appendDb.client, { scope, expectedRevision: 3, candidateRefs: [candidate(1).candidateRef] }))
+      .rejects.toMatchObject({ code: "objective_tailor_wave_not_eligible" })
+    expect(appendDb.calls.some(call => call.sql.includes('FROM "agent_events" AS event'))).toBe(false)
+    expect(mocks.resolve).not.toHaveBeenCalled()
   })
 
   it("does not persist a receipt if the create adapter cannot realize queued Writer and waiting Reviewer pairs", async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   OBJECTIVE_TAILOR_GRAPH_MAX_NODES,
+  OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION,
   OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION,
   parseObjectiveTailorGraph,
 } from "./objective-tailor-graph.js"
@@ -62,6 +63,19 @@ describe("Objective Tailor graph codec", () => {
     const value = fixture(8, 8, [1, 2, 3, 4, 5, 6, 7, 8])
     expect(value.nodes).toHaveLength(OBJECTIVE_TAILOR_GRAPH_MAX_NODES)
     expect(parseObjectiveTailorGraph(value.marker, value.nodes)?.slots).toHaveLength(8)
+  })
+
+  it("accepts a versioned report-only score floor, including zero, while preserving V1", () => {
+    const value = fixture()
+    const marker = { ...value.marker, schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION,
+      reportScoreFloor: 0 }
+    expect(parseObjectiveTailorGraph(marker, value.nodes)).toEqual(marker)
+    expect(parseObjectiveTailorGraph(value.marker, value.nodes)).toEqual(value.marker)
+    for (const floor of [-1, 10.1, Number.NaN, Number.POSITIVE_INFINITY, "8"]) {
+      expect(parseObjectiveTailorGraph({ ...marker, reportScoreFloor: floor }, value.nodes)).toBeNull()
+    }
+    expect(parseObjectiveTailorGraph({ ...marker, extra: true }, value.nodes)).toBeNull()
+    expect(parseObjectiveTailorGraph({ ...value.marker, reportScoreFloor: 8 }, value.nodes)).toBeNull()
   })
 
   it("accepts cross-wave node ordering when every exact successor follows its predecessor", () => {

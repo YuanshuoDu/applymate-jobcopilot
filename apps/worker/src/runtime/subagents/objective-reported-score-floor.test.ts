@@ -40,7 +40,7 @@ describe("deriveObjectiveReportedScoreFloor", () => {
       { jobId: "job-c", findings: [{ taskId: "task-2", score: 6.9 }] },
     ] })
     expect(deriveObjectiveReportedScoreFloor(input)).toEqual({ status: "complete", minimumScore: 7,
-      minimumFindings: 1, aggregation: "any", qualifyingJobCount: 2 })
+      source: "analyst_verification", minimumFindings: 1, aggregation: "any", qualifyingJobCount: 2 })
   })
 
   it("uses the inclusive floor and rejects a stale passed report", () => {
@@ -97,6 +97,27 @@ describe("deriveObjectiveReportedScoreFloor", () => {
     expect(deriveObjectiveReportedScoreFloor(fixture({ jobs: [{ jobId: "job-a", findings: [
       { taskId: "task-1", score: 11 }, { taskId: "task-2", score: 9 },
     ] }] }))).toEqual({ status: "unavailable" })
+  })
+
+  it("counts eight distinct Jobs inclusively for an explicit report-only floor and accepts zero", () => {
+    const jobs = Array.from({ length: 8 }, (_, index) => ({ jobId: `job-${index + 1}`, findings: [
+      { taskId: "task-1", score: 8 }, { taskId: "task-2", score: 8 },
+    ] }))
+    const evidence = fixture({ floors: [null, null], jobs })
+    expect(deriveObjectiveReportedScoreFloor({ ...evidence, requestedFloor: 8 })).toEqual({ status: "complete",
+      source: "turn_input", minimumScore: 8, qualifyingJobCount: 8 })
+    expect(deriveObjectiveReportedScoreFloor({ ...evidence, requestedFloor: 9 })).toEqual({ status: "complete",
+      source: "turn_input", minimumScore: 9, qualifyingJobCount: 0 })
+    expect(deriveObjectiveReportedScoreFloor({ ...evidence, requestedFloor: 8, summary: {
+      ...evidence.summary, counts: { analyzedJobs: { knownCount: 8, coverage: "partial" } },
+    } as unknown as TaskGraphFinalSummary })).toEqual({ status: "unavailable" })
+  })
+
+  it("withholds an explicit count when overlapping Analyst reports disagree", () => {
+    const evidence = fixture({ floors: [null, null], jobs: [{ jobId: "job-a", findings: [
+      { taskId: "task-1", score: 8 }, { taskId: "task-2", score: 7.9 },
+    ] }] })
+    expect(deriveObjectiveReportedScoreFloor({ ...evidence, requestedFloor: 8 })).toEqual({ status: "unavailable" })
   })
 
   it("withholds the count when the current graph no longer has the exact source prefix", () => {

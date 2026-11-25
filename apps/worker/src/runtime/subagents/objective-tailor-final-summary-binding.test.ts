@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { createHash } from "node:crypto"
-import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION,
+  OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphState, parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { buildTaskGraphFinalSummaryBinding, sameTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
@@ -79,7 +80,8 @@ function fixture() {
   const waveMarker = snapshot.objectiveTailor!
   const witness: ObjectiveTailorWaveCompletionWitness = { graphRevision, graphDigest: taskDigest(snapshot), marker: waveMarker,
     sourceGraphRevision: 10, sourceGraphDigest, sourceStatusDigest, outcomes }
-  const client = { query: vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [{ id: scope.rootTaskId, attemptCount: 2 }], rowCount: 1 })) }
+  const client = { query: vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [{ id: scope.rootTaskId, attemptCount: 2,
+    turnInput: { intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } }], rowCount: 1 })) }
   return { loaded, client, witness, outcomes }
 }
 
@@ -103,7 +105,8 @@ describe("Objective Tailor final summary binding", () => {
     ])
     expect(binding?.objectiveTailorFinalOutcome?.reportedScoreFloor).toEqual({ status: "not_requested" })
     const changedFloor = { ...binding!, objectiveTailorFinalOutcome: { ...binding!.objectiveTailorFinalOutcome!,
-      reportedScoreFloor: { status: "complete" as const, minimumScore: 7, minimumFindings: 1, aggregation: "any" as const, qualifyingJobCount: 0 } } }
+      reportedScoreFloor: { status: "complete" as const, source: "analyst_verification" as const,
+        minimumScore: 7, minimumFindings: 1, aggregation: "any" as const, qualifyingJobCount: 0 } } }
     expect(sameTaskGraphFinalSummaryBinding(binding, changedFloor)).toBe(false)
     expect(client.query).toHaveBeenCalledTimes(1)
     const sql = client.query.mock.calls[0]?.[0] as string
@@ -123,6 +126,23 @@ describe("Objective Tailor final summary binding", () => {
       loaded, buildOrdinary: ordinary })).resolves.toBeNull()
     expect(ordinary).toHaveBeenCalledWith(loaded, undefined, undefined)
     expect(client.query).not.toHaveBeenCalled()
+  })
+
+  it("withholds a requested count when the leased Turn input no longer matches the V2 marker", async () => {
+    const value = fixture(), prior = value.loaded.snapshot!.objectiveTailor!
+    const marker = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION,
+      sourceNodeCount: 8, reportScoreFloor: 8, slots: prior.slots }
+    const snapshot = { ...value.loaded.snapshot!, objectiveTailor: marker }
+    const loaded = { ...value.loaded, snapshot, item: { ...value.loaded.item!, content: snapshot },
+      state: { ...value.loaded.state!, objectiveTailor: marker } }
+    const witness = { ...value.witness, graphDigest: taskDigest(snapshot), marker }
+    mocks.verify.mockResolvedValue({ status: "ready", outcomes: value.outcomes, witness })
+    value.client.query.mockResolvedValue({ rows: [{ id: scope.rootTaskId, attemptCount: 2,
+      turnInput: { intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, reportScoreFloor: 9 } }], rowCount: 1 } as never)
+
+    const binding = await buildCurrentTaskGraphFinalSummaryBinding({ client: value.client as never, lease,
+      rootTaskId: scope.rootTaskId, loaded, buildOrdinary: buildTaskGraphFinalSummaryBinding })
+    expect(binding?.objectiveTailorFinalOutcome?.reportedScoreFloor).toEqual({ status: "unavailable" })
   })
 
   it("fails closed for a blocked V2 verification without falling back to the ordinary reducer", async () => {

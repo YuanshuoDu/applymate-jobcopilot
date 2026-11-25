@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphState } from "./task-graph-snapshot.js"
@@ -122,5 +122,16 @@ describe("Objective Tailor correction plan", () => {
     expect(prepareObjectiveTailorCorrectionPlan({ current: occupied.current, proof: occupied.makeProof() })).toBeUndefined()
     const deep = fixture({ sourceDepth: 6, slots: 1 })
     expect(prepareObjectiveTailorCorrectionPlan({ current: deep.current, proof: deep.makeProof() })).toBeUndefined()
+  })
+
+  it("preserves the explicit V2 score floor when appending a correction", () => {
+    const { current, makeProof } = fixture()
+    const previous = current.objectiveTailor!
+    const marker = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION,
+      sourceNodeCount: previous.sourceNodeCount, reportScoreFloor: 0, slots: previous.slots }
+    const plan = prepareObjectiveTailorCorrectionPlan({ current: { ...current, objectiveTailor: marker }, proof: makeProof() })
+    expect(plan?.marker).toEqual({ ...marker, slots: marker.slots.map((slot, index) => index === 7
+      ? { ...slot, correction: { writerNodeKey: "objective-tailor-wave-correction-writer-tailor-8",
+        reviewerNodeKey: "objective-tailor-wave-correction-reviewer-tailor-8" } } : slot) })
   })
 })

@@ -62,6 +62,7 @@ function prepare(input: Readonly<{ current: CurrentState; proof: unknown }>): Ob
   ]
   const proposal: TaskGraphProposal = { expectedRevision: current.revision, nodes }
   const nextMarker = { schemaVersion: previous.schemaVersion, sourceNodeCount: previous.sourceNodeCount,
+    ...(previous.schemaVersion === "agent-harness.v2.objective-tailor-graph.v2" ? { reportScoreFloor: previous.reportScoreFloor } : {}),
     slots: previous.slots.map(value => value.slotId === slot.slotId ? { ...value, correction: keys } : value) }
   const appended = appendObjectiveTailorTaskGraphProposal(current, proposal, {
     registeredTemplateIds: new Set(["cover_letter_writer", "cover_letter_reviewer"]),

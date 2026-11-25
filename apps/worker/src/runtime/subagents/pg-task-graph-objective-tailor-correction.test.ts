@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
-import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { appendCorrectionWithClient } from "./pg-task-graph-objective-tailor-correction.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
@@ -51,16 +51,29 @@ const created = { state: { revision: 5, objectiveTailor: newMarker, nodes: nodes
   taskIds: new Map(nodes.map(value => [value.key, value.taskId])), created: nodes, readyTaskIds: ["correction-writer"] }
 
 function loaded(revision = 4) {
-  const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, objectiveTailor: oldMarker, nodes: [] }
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, objectiveTailor: oldMarker, nodes: [
+    { key: "scout-a", taskId: "scout-task", templateId: "scout", goal: "Find", successCriteria: ["Find"], dependsOn: [], depth: 1,
+      verificationDisposition: "typed", verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+        criteria: [{ id: "count", check: { kind: "candidate_count_gte", minimum: 1 } }] } },
+    { key: "analyst-a", taskId: "analyst-task", templateId: "analyst", goal: "Analyze", successCriteria: ["Analyze"], dependsOn: ["scout-a"], depth: 2,
+      verificationDisposition: "typed", verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+        criteria: [{ id: "count", check: { kind: "finding_count_gte", minimum: 1 } }] } },
+    { key: oldMarker.slots[0]!.writerNodeKey, taskId: "initial-writer", templateId: "cover_letter_writer", goal: "Draft",
+      successCriteria: ["Save"], dependsOn: ["analyst-a"], depth: 3 },
+    { key: oldMarker.slots[0]!.reviewerNodeKey, taskId: "initial-reviewer", templateId: "cover_letter_reviewer", goal: "Review",
+      successCriteria: ["Review"], dependsOn: [oldMarker.slots[0]!.writerNodeKey], depth: 4 },
+  ] })!
+  const state = taskGraphState(snapshot, revision, new Map(snapshot.nodes.map(node => [node.taskId,
+    { status: "completed" as const, failureReason: null }])), [])
   return { rootTaskId: scope.rootTaskId, item: { id: taskGraphItemId(scope.rootTaskId), revision, content: snapshot, createdAt: "2026-11-24T10:00:00.000Z" },
-    snapshot, state: { revision, objectiveTailor: oldMarker, nodes: [], appliedEvents: [] }, tasks: new Map(), discoveryTurnEligibility: "ordinary" }
+    snapshot, state, tasks: new Map(), discoveryTurnEligibility: "ordinary" }
 }
 
-function dbClient(events: Record<string, unknown>[] = []) {
+function dbClient(events: Record<string, unknown>[] = [], input: unknown = turnInput) {
   const calls: Array<{ sql: string; values?: unknown[] }> = []
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
     calls.push({ sql, values })
-    if (sql.includes('SELECT turn."input"')) return { rows: [{ input: turnInput, source: "user", executionMode: "canonical_task_graph",
+    if (sql.includes('SELECT turn."input"')) return { rows: [{ input, source: "user", executionMode: "canonical_task_graph",
       leaseStartedAt: "2026-11-24T10:00:00.000Z", leaseExpiresAt: "2026-11-24T10:01:00.000Z" }], rowCount: 1 }
     if (sql.includes('FROM "Job"')) return { rows: [{ id: values?.[0] }], rowCount: 1 }
     if (sql.includes('FROM "agent_artifact" AS artifact')) return { rows: [{ artifactId: ref.artifactId, userId: scope.userId, jobId: "job-1",
@@ -107,6 +120,14 @@ describe("Objective Tailor correction PostgreSQL command", () => {
       idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4), fingerprint: taskGraphFingerprint({
         kind: "objective_tailor_same_slot_correction", scope: { userId: scope.userId, sessionId: scope.sessionId,
           turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId }, expectedRevision: 4, correctionSlotId: "tailor-1" }) }))
+  })
+
+  it("rejects persisted Turn/marker drift before correction replay lookup", async () => {
+    const fake = dbClient([], { ...turnInput, reportScoreFloor: 8 })
+    await expect(appendCorrectionWithClient(fake.client, { scope, expectedRevision: 4, correctionSlotId: "tailor-1" }))
+      .rejects.toMatchObject({ code: "objective_tailor_wave_not_eligible" })
+    expect(fake.calls.some(call => call.sql.includes('FROM "agent_events" AS event'))).toBe(false)
+    expect(mocks.proof).not.toHaveBeenCalled()
   })
 
   it("replays the writePlanReceipt item.delta envelope through the persisted proposal parser", async () => {

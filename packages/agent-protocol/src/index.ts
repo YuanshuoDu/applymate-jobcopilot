@@ -212,6 +212,7 @@ export type {
 } from './scheduled-pipeline-continuation-key-material.js'
 export {
   OBJECTIVE_TAILOR_GRAPH_MAX_NODES,
+  OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION,
   OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION,
   parseObjectiveTailorGraph,
 } from './objective-tailor-graph.js'
