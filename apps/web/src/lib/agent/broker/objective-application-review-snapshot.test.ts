@@ -71,6 +71,17 @@ describe("readObjectiveApplicationReviewSnapshot", () => {
     expect(snapshot?.members[0]).toMatchObject({ status: "pending", decisionAvailable: false })
   })
 
+  it("reads a completed set from its exact completed review Root without reopening decisions", async () => {
+    const { database } = makeDatabase({ completed: true })
+    const snapshot = await readObjectiveApplicationReviewSnapshot(database, { userId: "user-1", sessionId: "session-1", turnId: "review-turn" })
+    expect(snapshot).toMatchObject({ setStatus: "resolved", members: [{ status: "approved", decisionAvailable: false }] })
+  })
+
+  it.each(["failed", "missing", "foreign"] as const)("rejects a completed set with a %s review Root", async reviewRoot => {
+    const { database } = makeDatabase({ completed: true, reviewRoot })
+    expect(await readObjectiveApplicationReviewSnapshot(database, { userId: "user-1", sessionId: "session-1", turnId: "review-turn" })).toBeNull()
+  })
+
   it("fails closed when the source Turn Root differs from the bound proof", async () => {
     fixture.sourceRoot = "different-source-root"
     const { database } = makeDatabase()
@@ -78,7 +89,8 @@ describe("readObjectiveApplicationReviewSnapshot", () => {
   })
 })
 
-function makeDatabase(options: { headVersion?: number; correction?: boolean; correctionDrift?: boolean } = {}) {
+function makeDatabase(options: { headVersion?: number; correction?: boolean; correctionDrift?: boolean; completed?: boolean;
+  reviewRoot?: "failed" | "missing" | "foreign" } = {}) {
   const expiresAt = new Date("2099-01-01T00:00:00.000Z"), id = `objective-review:${setId("session-1", "review-turn")}:1`
   const writerTaskId = options.correction ? "writer-corrected-1" : "writer-1"
   const reviewerTaskId = options.correction ? "reviewer-corrected-1" : "reviewer-1"
@@ -88,8 +100,9 @@ function makeDatabase(options: { headVersion?: number; correction?: boolean; cor
   const intent = { clientMessageId: "review-command", goal: "Review the selected completed Objective materials for application preparation.",
     content: [{ type: "text", text: "Review the selected verified materials. This does not authorize an application or submission." }],
     intent: { kind: "objective_application_review", version: 1, selection } }
-  const receipt = { id, userId: "user-1", sessionId: "session-1", turnId: "review-turn", type: "review_application", status: "pending",
-    taskId: "application-task-1", jobId: "job-1", toolCallId: "review-call", revision: 0, expiresAt, decidedAt: null, consumedAt: null,
+  const receipt = { id, userId: "user-1", sessionId: "session-1", turnId: "review-turn", type: "review_application",
+    status: options.completed ? "approved" : "pending", taskId: "application-task-1", jobId: "job-1", toolCallId: "review-call",
+    revision: options.completed ? 1 : 0, expiresAt, decidedAt: options.completed ? new Date() : null, consumedAt: null,
     resourceHash: hash, answersHash: hash, materialHash: hash, scopeHash: hash, nonceHash: hash, payload: { fixture: true } }
   fixture.envelope = { schema: "objective-application-approval-set-member.v1", setId: setId("session-1", "review-turn"),
     sourceTurnId: "source-turn", slotOrdinal: 1, proof: selectedProof }
@@ -99,13 +112,18 @@ function makeDatabase(options: { headVersion?: number; correction?: boolean; cor
   const tx = {
     agentTurn: { findMany: vi.fn(async ({ where }: { where: { id: string } }) => where.id === "review-turn"
       ? [{ id: "review-turn", userId: "user-1", sessionId: "session-1", source: "user", executionMode: "canonical_task_graph",
-        status: "waiting_for_approval", revision: 3, rootTaskId: "review-root", input: intent }]
+        status: options.completed ? "completed" : "waiting_for_approval", revision: options.completed ? 6 : 3, rootTaskId: "review-root", input: intent }]
       : fixture.sourceRoot === selection.rootTaskId ? [{ id: "source-turn" }] : []) },
     subAgentTask: { findMany: vi.fn(async ({ where }: { where: { id: string } }) => where.id === "review-root"
-      ? [{ id: "review-root" }] : [{ result: { status: "completed", finalItemId: "source-final" } }]) },
+      ? options.completed && options.reviewRoot === "missing" ? [] : [{ id: options.reviewRoot === "foreign" ? "foreign-root" : "review-root",
+        status: options.completed ? options.reviewRoot === "failed" ? "failed" : "completed" : "running",
+        failureReason: options.reviewRoot === "failed" ? "failed" : null, leaseOwner: options.completed ? null : "lease",
+        leaseExpiresAt: options.completed ? null : new Date(), completedAt: options.completed ? new Date() : null }]
+      : [{ result: { status: "completed", finalItemId: "source-final" } }]) },
     agentItem: { findMany: vi.fn(async ({ where }: { where: { id: string; type: string } }) => where.type === "approval_request"
       ? [{ id: `item:${setId("session-1", "review-turn")}`, sessionId: "session-1", turnId: "review-turn", stepId: null,
-        taskId: null, type: "approval_request", status: "started", phase: "commentary", revision: 0, content: {}, startedAt: new Date(), completedAt: null }]
+        taskId: null, type: "approval_request", status: options.completed ? "completed" : "started", phase: "commentary",
+        revision: options.completed ? 1 : 0, content: {}, startedAt: new Date(), completedAt: options.completed ? new Date() : null }]
       : where.type === "task_graph" ? [{ id: graphId, revision: 7, content: { objectiveTailor: {}, nodes: [
         { key: "writer-node", taskId: "writer-1" }, { key: "reviewer-node", taskId: "reviewer-1" },
         { key: "corrected-writer-node", taskId: options.correctionDrift ? "wrong-writer" : writerTaskId },

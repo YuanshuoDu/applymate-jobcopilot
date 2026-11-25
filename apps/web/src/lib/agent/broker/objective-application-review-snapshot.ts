@@ -52,12 +52,14 @@ async function readSnapshot(tx: Tx, input: { userId: string; sessionId: string; 
     || turn.executionMode !== "canonical_task_graph" || !Number.isSafeInteger(turn.revision) || turn.revision < 0) return null
   const [reviewRoots, sourceTurns] = await Promise.all([
     tx.subAgentTask.findMany({ where: { id: turn.rootTaskId, sessionId: input.sessionId, turnId: input.turnId,
-      rootTaskId: turn.rootTaskId, parentTaskId: null, role: "orchestrator", taskType: "root", depth: 0 }, take: 2, select: { id: true } }),
+      rootTaskId: turn.rootTaskId, parentTaskId: null, role: "orchestrator", taskType: "root", depth: 0 }, take: 2,
+      select: { id: true, status: true, failureReason: true, leaseOwner: true, leaseExpiresAt: true, completedAt: true } }),
     tx.agentTurn.findMany({ where: { id: selection.sourceTurnId, userId: input.userId, sessionId: input.sessionId,
       status: "completed", source: "user", executionMode: "canonical_task_graph", rootTaskId: selection.rootTaskId }, take: 2,
       select: { id: true } }),
   ])
-  if (reviewRoots.length !== 1 || sourceTurns.length !== 1) return null
+  const reviewRoot = reviewRoots[0]
+  if (reviewRoots.length !== 1 || reviewRoot?.id !== turn.rootTaskId || sourceTurns.length !== 1) return null
 
   const setId = reviewSetId(input.sessionId, input.turnId), itemId = objectiveApplicationApprovalSetItemId(setId)
   const items = await tx.agentItem.findMany({ where: { id: itemId, sessionId: input.sessionId, turnId: input.turnId, type: "approval_request" }, take: 2,
@@ -69,8 +71,11 @@ async function readSnapshot(tx: Tx, input: { userId: string; sessionId: string; 
     || set.members.length !== selection.slotOrdinals.length || set.members.some((entry, index) =>
       entry.slotOrdinal !== selection.slotOrdinals[index] || entry.approvalId !== approvalId(setId, entry.slotOrdinal))) return null
   const pending = item.status === "started" && item.revision === 0 && item.completedAt === null && turn.status === "waiting_for_approval"
-  const resolved = item.status === "completed" && item.revision === 1 && item.completedAt instanceof Date && turn.status === "waiting_for_approval"
+  const resolved = item.status === "completed" && item.revision === 1 && item.completedAt instanceof Date
+    && (turn.status === "waiting_for_approval" || turn.status === "completed")
   if (!pending && !resolved) return null
+  if (turn.status === "completed" && (reviewRoot.status !== "completed" || reviewRoot.failureReason !== null
+    || reviewRoot.leaseOwner !== null || reviewRoot.leaseExpiresAt !== null || !(reviewRoot.completedAt instanceof Date))) return null
   const rawApprovals = await tx.agentApproval.findMany({
     where: { userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, type: "review_application",
       OR: [{ id: { in: set.members.map(member => member.approvalId) } }, { payload: { path: ["setId"], equals: setId } }] },
