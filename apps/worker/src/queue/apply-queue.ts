@@ -51,6 +51,7 @@ import {
 import { redisConnection } from "../redis.js";
 import { createPgApplicationSubmitTool, type ApplicationSubmitOutput } from "../runtime/tools/application-submit-tool.js";
 import { recordSubmissionExecutionSettled, type ApplicationSubmitIdentity } from "./application-submit-fence.js";
+import { hasExactObjectiveSubmitResult } from "./objective-application-submit-terminal-recovery.js";
 import { reconcileTerminalSubmitJob } from "./application-submit-outbox-terminal-recovery.js";
 import { createBrowserApplicationSubmitProvider } from "../runtime/tools/browser-submit-provider.js";
 import { objectiveApplicationSubmitTargetSupported, runObjectiveGreenhouseApplicationSubmit } from "./objective-application-submit-material.js";
@@ -211,6 +212,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         : "ordinary";
       if (materialMode === "blocked") throw new Error("Application material source is invalid or unavailable.");
       const objectiveMode = materialMode === "objective";
+      if (objectiveMode && submissionIdentity && await hasExactObjectiveSubmitResult(getPool(), { ...submissionIdentity, workerTaskId })) return;
       if (operation === "fill" && !await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
         console.warn(`[apply-worker] Skipping stale or revoked application task for job=${jobId}`);
         return;

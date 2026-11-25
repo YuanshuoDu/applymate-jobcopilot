@@ -37,6 +37,37 @@ export async function hasObjectiveSubmitResultCandidate(pool: Pool, intent: Inte
   } finally { client.release() }
 }
 
+/** Exact replay short-circuit for a prior browser-confirmed result; never used as submission authority. */
+export async function hasExactObjectiveSubmitResult(pool: Pool, intent: Intent): Promise<boolean> {
+  if (!validIntent(intent)) return false
+  const client = await pool.connect(); let open = false
+  try {
+    await client.query("BEGIN"); open = true
+    await client.query("SELECT set_config($1, $2, true)", ["app.user_id", intent.userId])
+    const found = await hasExactObjectiveSubmitResultWithClient(client, intent)
+    await client.query("COMMIT"); open = false
+    return found
+  } catch (error: unknown) {
+    if (open) await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
+async function hasExactObjectiveSubmitResultWithClient(client: Client, intent: Intent): Promise<boolean> {
+  const eventId = objectiveApplicationSubmitResultEventId(intent)
+  const rows = await client.query<Row>(`SELECT "id","taskId","type","actor","body","data" FROM "application_task_events"
+    WHERE "taskId"=$1 AND ("id"=$2 OR ("type"=$3 AND "data"->>'fillTurnId'=$4)) LIMIT 2`,
+  [intent.applicationTaskId, eventId, OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE, intent.fillTurnId])
+  const event = rows.rows[0], stored = parseObjectiveApplicationSubmitResultReceipt(event?.data)
+  if (rows.rows.length !== 1 || !event || event.id !== eventId || event.taskId !== intent.applicationTaskId
+    || event.type !== OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE || event.actor !== "worker"
+    || event.body !== OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_BODY || !stored || !sameIntent(stored, intent)) return false
+  const receipt = await readObjectiveApplicationSubmitResultWithClient(client, executionFor(stored))
+  return !!receipt && receipt.eventId === eventId && sameIntent(receipt, intent)
+    && receipt.executionId === stored.executionId && receipt.attemptId === stored.attemptId
+    && receipt.applyResultId === stored.applyResultId
+}
+
 /** Rechecks the candidate hint inside an already source-fenced transaction. */
 export async function hasObjectiveSubmitResultCandidateWithClient(client: Client, intent: Intent): Promise<boolean> {
   if (!validIntent(intent)) return false

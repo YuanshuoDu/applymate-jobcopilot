@@ -14,6 +14,7 @@ vi.mock("./application-submit-fence.js", async importOriginal => {
 })
 
 import { OBJECTIVE_SUBMIT_RECOVERY_EVENT_SCHEMA, OBJECTIVE_SUBMIT_RECOVERY_EVENT_TYPE, hasObjectiveSubmitResultCandidate,
+  hasExactObjectiveSubmitResult,
   recoverObjectiveSubmitAfterTerminal } from "./objective-application-submit-terminal-recovery.js"
 
 const intent = { applicationTaskId: "task-1", userId: "user-1", jobId: "job-1", sessionId: "session-1",
@@ -26,7 +27,7 @@ const resultEventId = objectiveApplicationSubmitResultEventId({ applicationTaskI
 const resultReceipt = { ...stored, eventId: resultEventId, eventCreatedAt: new Date("2026-11-20T12:00:00Z") }
 
 function setup(options: { candidate?: boolean; task?: Record<string, unknown>; job?: Record<string, unknown>; settled?: unknown[];
-  audit?: "valid" | "invalid" } = {}) {
+  audit?: "valid" | "invalid"; candidateEvent?: Record<string, unknown>; candidateDuplicate?: boolean } = {}) {
   const resultEvent = { id: resultEventId, taskId: intent.applicationTaskId, type: OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE,
     actor: "worker", body: OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_BODY, data: stored, createdAt: new Date() }
   const sourceClient = { query: vi.fn(async (sql: string, values?: unknown[]) => {
@@ -58,7 +59,14 @@ function setup(options: { candidate?: boolean; task?: Record<string, unknown>; j
   }))
   mocks.readResult.mockResolvedValue(resultReceipt)
   mocks.settle.mockResolvedValue(true)
-  const probeClient = { query: vi.fn(async () => ({ rows: options.candidate === false ? [] : [{ id: resultEventId }] })), release: vi.fn() }
+  const probeClient = { query: vi.fn(async (sql: string, values?: unknown[]) => {
+    if (sql.includes('FROM "application_task_events"') && values?.[2] === OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE) {
+      if (options.candidate === false) return { rows: [] }
+      const event = options.candidateEvent ?? resultEvent
+      return { rows: options.candidateDuplicate ? [event, event] : [event] }
+    }
+    return { rows: [] }
+  }), release: vi.fn() }
   const pool = { connect: vi.fn(async () => probeClient) }
   return { pool, probeClient, sourceClient }
 }
@@ -102,6 +110,45 @@ describe("Objective submit terminal recovery", () => {
     const test = setup({ candidate: false })
     expect(await hasObjectiveSubmitResultCandidate(test.pool as never, intent)).toBe(false)
     expect(mocks.sourceWrite).not.toHaveBeenCalled()
+  })
+
+  it("short-circuits only for the exact owner-scoped result and canonical linked receipt", async () => {
+    const test = setup()
+    await expect(hasExactObjectiveSubmitResult(test.pool as never, intent)).resolves.toBe(true)
+    expect(test.probeClient.query).toHaveBeenCalledWith("BEGIN")
+    expect(test.probeClient.query).toHaveBeenCalledWith("SELECT set_config($1, $2, true)", ["app.user_id", intent.userId])
+    expect(test.probeClient.query).toHaveBeenCalledWith(expect.stringContaining("\"data\"->>'fillTurnId'=$4"),
+      [intent.applicationTaskId, resultEventId, OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE, intent.fillTurnId])
+    expect(mocks.readResult).toHaveBeenCalledWith(test.probeClient, execution)
+    expect(test.probeClient.query).toHaveBeenCalledWith("COMMIT")
+  })
+
+  it("does not short-circuit malformed, mismatched, duplicate, or unreadable result evidence", async () => {
+    const malformed = setup({ candidateEvent: { id: resultEventId, taskId: intent.applicationTaskId,
+      type: OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE, actor: "worker", body: OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_BODY,
+      data: { ...stored, extra: true } } })
+    await expect(hasExactObjectiveSubmitResult(malformed.pool as never, intent)).resolves.toBe(false)
+    expect(mocks.readResult).not.toHaveBeenCalled()
+
+    const mismatched = setup({ candidateEvent: { id: resultEventId, taskId: intent.applicationTaskId,
+      type: OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_TYPE, actor: "worker", body: OBJECTIVE_APPLICATION_SUBMIT_RESULT_EVENT_BODY,
+      data: { ...stored, workerTaskId: "superseded-worker" } } })
+    await expect(hasExactObjectiveSubmitResult(mismatched.pool as never, intent)).resolves.toBe(false)
+    expect(mocks.readResult).not.toHaveBeenCalled()
+
+    const duplicate = setup({ candidateDuplicate: true })
+    await expect(hasExactObjectiveSubmitResult(duplicate.pool as never, intent)).resolves.toBe(false)
+    expect(mocks.readResult).not.toHaveBeenCalled()
+
+    const unreadable = setup()
+    mocks.readResult.mockResolvedValueOnce(null)
+    await expect(hasExactObjectiveSubmitResult(unreadable.pool as never, intent)).resolves.toBe(false)
+  })
+
+  it("propagates database errors so replay cannot proceed to browser work", async () => {
+    const test = setup()
+    test.pool.connect.mockRejectedValueOnce(new Error("database unavailable"))
+    await expect(hasExactObjectiveSubmitResult(test.pool as never, intent)).rejects.toThrow("database unavailable")
   })
 
   it("requires terminal evidence again inside the fenced transaction", async () => {

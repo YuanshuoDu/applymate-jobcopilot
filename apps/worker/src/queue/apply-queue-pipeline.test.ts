@@ -68,6 +68,7 @@ const mocks = vi.hoisted(() => {
     outcomeClient,
     loadTaskContext: vi.fn(),
     readApplyQueueMaterialMode: vi.fn().mockResolvedValue("ordinary"),
+    hasExactObjectiveSubmitResult: vi.fn().mockResolvedValue(false),
     objectiveSubmit: vi.fn().mockResolvedValue({ status: "submitted", durationMs: 7 }),
     objectiveTargetSupported: vi.fn((url: unknown) => url === "https://boards.greenhouse.io/acme/jobs/123"),
     objectiveMaterial: undefined as unknown,
@@ -174,6 +175,10 @@ vi.mock("../db/form-patterns.js", () => ({
 vi.mock("../db/load-task-context.js", () => ({
   loadTaskContext: mocks.loadTaskContext,
   readApplyQueueMaterialMode: mocks.readApplyQueueMaterialMode,
+}));
+vi.mock("./objective-application-submit-terminal-recovery.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./objective-application-submit-terminal-recovery.js")>(),
+  hasExactObjectiveSubmitResult: mocks.hasExactObjectiveSubmitResult,
 }));
 vi.mock("../harness/agent-harness.js", () => ({ AgentHarness: mocks.AgentHarness }));
 vi.mock("../flows/index.js", () => ({ detectFlow: mocks.detectFlow }));
@@ -288,6 +293,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.outcomeTransaction.nextId = 1000;
     mocks.outcomeTransaction.currentId = null;
     mocks.readApplyQueueMaterialMode.mockReset().mockResolvedValue("ordinary");
+    mocks.hasExactObjectiveSubmitResult.mockReset().mockResolvedValue(false);
     mocks.objectiveSubmit.mockReset().mockResolvedValue({ status: "submitted", durationMs: 7 });
     mocks.objectiveTargetSupported.mockReset().mockImplementation((url: unknown) => url === "https://boards.greenhouse.io/acme/jobs/123");
     mocks.objectiveMaterial = undefined;
@@ -525,6 +531,35 @@ describe("apply-queue Phase 5 pipeline", () => {
     expect(mocks.claimUnattendedSubmission).not.toHaveBeenCalled();
     expect(mocks.fakePage.goto).not.toHaveBeenCalled();
     expect(submitToolMocks.create).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("returns an exact Objective result replay before rate limiting, context loading, or browser work", async () => {
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.hasExactObjectiveSubmitResult.mockResolvedValueOnce(true);
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.hasExactObjectiveSubmitResult).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      applicationTaskId: "application-task-1", userId: "user-1", jobId: "job-1", sessionId: "agent-session-1",
+      fillTurnId: "agent-turn-1", approvalId: "approval-1", workerTaskId: "worker-task-pipeline-1",
+    }));
+    expect(mocks.checkRateLimit).not.toHaveBeenCalled();
+    expect(mocks.loadTaskContext).not.toHaveBeenCalled();
+    expect(mocks.claimUnattendedSubmission).not.toHaveBeenCalled();
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("does not open a browser when exact Objective result verification is unavailable", async () => {
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.hasExactObjectiveSubmitResult.mockRejectedValueOnce(new Error("result read unavailable"));
+
+    await expect(runApplyJob()).rejects.toThrow("result read unavailable");
+
+    expect(mocks.checkRateLimit).not.toHaveBeenCalled();
+    expect(mocks.loadTaskContext).not.toHaveBeenCalled();
+    expect(mocks.claimUnattendedSubmission).not.toHaveBeenCalled();
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
   }, 15_000);
 
   it("blocks unsupported Objective ATS targets before consuming approval or opening a browser", async () => {
