@@ -4,7 +4,7 @@ import type { PoolClient } from "pg"
 
 import { InMemoryArtifactToolStore } from "./artifact-tools.js"
 import { BrowserApplicationSubmitError } from "./browser-submit-provider.js"
-import { createApplicationSubmitTool, type SubmissionApprovalStore, type SubmissionAttemptStore } from "./application-submit-tool.js"
+import { createApplicationSubmitTool, ObjectiveSubmissionUncertainError, type SubmissionApprovalStore, type SubmissionAttemptStore } from "./application-submit-tool.js"
 import type { ApplicationTarget, SubmissionAttempt, SubmissionClaimAuthorizer, SubmissionSourceSelection } from "../../db/application-submit-repo.js"
 import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
 import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
@@ -303,6 +303,22 @@ describe("application.submit typed tool", () => {
     expect(JSON.stringify(replay)).not.toContain(privateReason)
     expect(tested.submit).toHaveBeenCalledOnce()
     expect(objectiveRead).toHaveBeenCalledOnce()
+  })
+
+  it("does not fail a reserved Objective attempt when the durable request marker may have committed", async () => {
+    const tested = harness({ source: objectiveSelection })
+    objectiveRead.mockResolvedValue({ artifactHash: tested.base.hash.slice("sha256:".length), packet: objectiveMaterial, objectiveSource })
+    Object.assign(tested.submit, { acceptsObjectiveReviewedApplicationMaterial: true as const,
+      supportsObjectiveApplicationSubmitTarget: () => true })
+    const markFailed = vi.spyOn(tested.attempts, "markFailed")
+    tested.submit.mockRejectedValueOnce(new ObjectiveSubmissionUncertainError())
+
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({
+      status: "failed", errorCode: "submission_in_flight", output: null,
+    })
+
+    expect(markFailed).not.toHaveBeenCalled()
+    expect(tested.attempts.rows.get(identity.approvalId)).toMatchObject({ state: "reserved", errorCode: null })
   })
 
   it("preserves legacy browser_manual codes and ignores untrusted Objective subtypes", async () => {
