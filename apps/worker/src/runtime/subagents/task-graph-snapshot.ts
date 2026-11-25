@@ -8,6 +8,7 @@ import { APPLICATION_FILLER_TEMPLATE_ID } from "./role-policy.js"
 import { OBJECTIVE_TAILOR_GRAPH_MAX_NODES, parseObjectiveTailorGraph, SELECTED_JOB_BATCH_TEMPLATE_CATALOG,
   type ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import { readPinnedRootCriteria } from "./root-plan-criteria.js"
+import { canonicalTaskGraphReceiptJson } from "@jobcopilot/shared/task-graph-tool-receipt-verification"
 import { parseTaskGraphSnapshotPackageRefs, taskGraphSnapshotCapacityValid, taskGraphSnapshotExactKeys as exactKeys,
   taskGraphSnapshotObject as object, taskGraphSnapshotOwnData, taskGraphSnapshotRepairOf as parsedRepairOf,
   taskGraphSnapshotStringList as stringList, taskGraphSnapshotText as text } from "./task-graph-snapshot-capacity.js"
@@ -219,12 +220,7 @@ export function taskGraphState(
 }
 
 export function canonicalTaskGraphJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalTaskGraphJson).join(",")}]`
-  const row = object(value)
-  if (row) return `{${Object.keys(row).sort().map(key => `${JSON.stringify(key)}:${canonicalTaskGraphJson(row[key])}`).join(",")}}`
-  const encoded = JSON.stringify(value)
-  if (encoded === undefined) throw new TypeError("task_graph_json_invalid")
-  return encoded
+  return canonicalTaskGraphReceiptJson(value)
 }
 
 export function taskGraphFingerprint(value: unknown): string {
