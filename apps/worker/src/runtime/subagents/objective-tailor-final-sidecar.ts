@@ -1,7 +1,7 @@
 import {
-  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
+  OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
   parseObjectiveTailorFinalOutcomeSidecar,
-  type ObjectiveTailorFinalOutcomeSidecar,
+  type ObjectiveTailorFinalOutcomeSidecarV2,
 } from "@jobcopilot/agent-protocol"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import { buildTaskGraphFinalSourceManifest } from "./task-graph-final-source-manifest.js"
@@ -10,22 +10,27 @@ import { hasObjectiveTailorFinalOutcome, readBoundObjectiveTailorFinalOutcome } 
 export type ObjectiveTailorFinalOutcomeSidecarRead =
   | Readonly<{ status: "absent" }>
   | Readonly<{ status: "invalid" }>
-  | Readonly<{ status: "ready"; sidecar: ObjectiveTailorFinalOutcomeSidecar }>
+  | Readonly<{ status: "ready"; sidecar: ObjectiveTailorFinalOutcomeSidecarV2 }>
 
 export type TaskGraphFinalSidecars = Readonly<{
   taskGraphSources?: Exclude<ReturnType<typeof buildTaskGraphFinalSourceManifest>, null>
-  objectiveTailorFinalOutcomes?: ObjectiveTailorFinalOutcomeSidecar
+  objectiveTailorFinalOutcomes?: ObjectiveTailorFinalOutcomeSidecarV2
 }>
 
 export function readObjectiveTailorFinalOutcomeSidecar(value: unknown): ObjectiveTailorFinalOutcomeSidecarRead {
   if (!hasObjectiveTailorFinalOutcome(value)) return { status: "absent" }
   const outcome = readBoundObjectiveTailorFinalOutcome(value)
   if (!outcome) return { status: "invalid" }
+  const sourceCounts = readSourceCounts(value, outcome.graphRevision)
+  if (!sourceCounts) return { status: "invalid" }
   const sidecar = parseObjectiveTailorFinalOutcomeSidecar({
-    schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA,
+    schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
+    graphRevision: outcome.graphRevision,
     slots: outcome.slots.map(slot => ({ ordinal: slot.ordinal, status: slot.status })),
+    sourceCounts,
   })
-  return sidecar ? { status: "ready", sidecar } : { status: "invalid" }
+  return sidecar?.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA
+    ? { status: "ready", sidecar } : { status: "invalid" }
 }
 
 export function objectiveTailorFinalOutcomeSidecarMatches(binding: unknown, value: unknown): boolean {
@@ -33,7 +38,7 @@ export function objectiveTailorFinalOutcomeSidecarMatches(binding: unknown, valu
   if (read.status === "invalid") return false
   if (read.status === "absent") return value === undefined
   const parsed = parseObjectiveTailorFinalOutcomeSidecar(value)
-  return Boolean(parsed && sameSidecar(read.sidecar, parsed))
+  return Boolean(parsed?.schemaVersion === OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA && sameSidecar(read.sidecar, parsed))
 }
 
 export function buildTaskGraphFinalSidecars(binding: TaskGraphFinalSummaryBinding, finalItemId: string): TaskGraphFinalSidecars | null {
@@ -47,7 +52,27 @@ export function buildTaskGraphFinalSidecars(binding: TaskGraphFinalSummaryBindin
   }
 }
 
-function sameSidecar(left: ObjectiveTailorFinalOutcomeSidecar, right: ObjectiveTailorFinalOutcomeSidecar): boolean {
-  return left.schemaVersion === right.schemaVersion && left.slots.length === right.slots.length
+function sameSidecar(left: ObjectiveTailorFinalOutcomeSidecarV2, right: ObjectiveTailorFinalOutcomeSidecarV2): boolean {
+  return left.graphRevision === right.graphRevision && left.slots.length === right.slots.length
     && left.slots.every((slot, index) => slot.ordinal === right.slots[index]?.ordinal && slot.status === right.slots[index]?.status)
+    && sameCount(left.sourceCounts.discoveredJobs, right.sourceCounts.discoveredJobs)
+    && sameCount(left.sourceCounts.analyzedJobs, right.sourceCounts.analyzedJobs)
+}
+
+function readSourceCounts(value: unknown, graphRevision: number): Readonly<{ discoveredJobs: unknown; analyzedJobs: unknown }> | null {
+  const binding = record(value), summary = record(binding?.summary), counts = record(summary?.counts)
+  if (!summary || summary.graphRevision !== graphRevision || !counts) return null
+  return { discoveredJobs: counts.discoveredJobs, analyzedJobs: counts.analyzedJobs }
+}
+
+function sameCount(left: ObjectiveTailorFinalOutcomeSidecarV2["sourceCounts"]["discoveredJobs"], right: ObjectiveTailorFinalOutcomeSidecarV2["sourceCounts"]["discoveredJobs"]): boolean {
+  return left.knownCount === right.knownCount && left.coverage === right.coverage
+}
+function record(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return (prototype === Object.prototype || prototype === null) && Object.getOwnPropertySymbols(value).length === 0
+      ? value as Record<string, unknown> : null
+  } catch { return null }
 }
