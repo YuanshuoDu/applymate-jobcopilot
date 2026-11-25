@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js"
 import type { Page } from "playwright-core"
+import type { ObjectiveGreenhouseSubmissionObservation } from "../flows/objective-greenhouse-submission-observation.js"
 
 const mocks = vi.hoisted(() => ({ generate: vi.fn(), greenhouse: vi.fn() }))
 vi.mock("../db/resume-pdf.js", () => ({ generateResumePdf: mocks.generate }))
@@ -14,6 +15,11 @@ const directUrl = "https://boards.greenhouse.io/acme/jobs/123"
 const resume = { basics: { name: "Approved candidate" }, experience: [{ company: "Example" }] }
 const material = { reviewedResumeContent: resume, reviewedCoverLetter: "Approved letter", confirmedAnswers: { salary: "€80,000" }, approvedApplyUrl: directUrl }
 const page = { url: () => `${directUrl}/application` } as Page
+const observation = {
+  arm: vi.fn().mockReturnValue(true), accept: vi.fn().mockReturnValue(true), reject: vi.fn(),
+  forward: vi.fn().mockReturnValue(true), waitForConfirmation: vi.fn().mockResolvedValue("confirmed"),
+  outcome: vi.fn().mockReturnValue("confirmed"), dispose: vi.fn(),
+} as unknown as ObjectiveGreenhouseSubmissionObservation
 const task: ApplyTask = { jobId: "job-1", applyUrl: directUrl, persona: { fullName: "Candidate", coverLetter: "Old letter" },
   jobTitle: "Engineer", jobCompany: "Example", resumePath: "/old/resume.pdf", coverLetterPath: "/old/letter.pdf",
   confirmedAnswers: { old: "stale" }, allowSubmit: true, beforeSubmit: vi.fn().mockResolvedValue(true) }
@@ -45,7 +51,7 @@ describe("Objective approved Greenhouse submit material", () => {
   })
 
   it("renders and submits only the exact approved Resume, letter, answers, and URL", async () => {
-    const result = await runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material, page })
+    const result = await runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material, page, observation })
     const [actualPage, actualTask, options] = mocks.greenhouse.mock.calls[0] ?? []
 
     expect(result.status).toBe("submitted")
@@ -55,14 +61,14 @@ describe("Objective approved Greenhouse submit material", () => {
       confirmedAnswers: { salary: "€80,000" }, persona: { coverLetter: "Approved letter" } })
     expect(actualTask.coverLetterPath).toBeUndefined()
     expect(actualTask.beforeSubmit).toBe(task.beforeSubmit)
-    expect(options).toEqual({ reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true })
+    expect(options).toEqual({ reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true, submissionObservation: observation })
     expect(existsSync(generatedPath)).toBe(false)
   })
 
   it("preserves special confirmed-answer keys as data", async () => {
     const answers = Object.create(null) as Record<string, string>
     answers["__proto__"] = "confirmed value"
-    await runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material: { ...material, confirmedAnswers: answers }, page })
+    await runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material: { ...material, confirmedAnswers: answers }, page, observation })
     const submittedTask = mocks.greenhouse.mock.calls[0]?.[1] as ApplyTask
     expect(Object.hasOwn(submittedTask.confirmedAnswers ?? {}, "__proto__")).toBe(true)
     expect(submittedTask.confirmedAnswers?.["__proto__"]).toBe("confirmed value")
@@ -93,9 +99,17 @@ describe("Objective approved Greenhouse submit material", () => {
     expect(mocks.greenhouse).not.toHaveBeenCalled()
   })
 
+  it("requires an observation before rendering approved material for a real submit", async () => {
+    const result = await runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material, page })
+
+    expect(result.status).toBe("submission_blocked")
+    expect(mocks.generate).not.toHaveBeenCalled()
+    expect(mocks.greenhouse).not.toHaveBeenCalled()
+  })
+
   it("deletes the generated approved Resume when the dedicated flow throws", async () => {
     mocks.greenhouse.mockRejectedValueOnce(new Error("private browser detail"))
-    await expect(runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material, page }))
+    await expect(runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material, page, observation }))
       .rejects.toThrow("private browser detail")
     expect(existsSync(generatedPath)).toBe(false)
   })
@@ -106,7 +120,7 @@ describe("Objective approved Greenhouse submit material", () => {
       writeFileSync(generatedPath, "partial pdf")
       throw new Error("renderer failed")
     })
-    await expect(runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material, page }))
+    await expect(runObjectiveGreenhouseApplicationSubmit({ userId: "user-1", task, material, page, observation }))
       .resolves.toMatchObject({ status: "submission_blocked" })
     expect(existsSync(generatedPath)).toBe(false)
     expect(mocks.greenhouse).not.toHaveBeenCalled()

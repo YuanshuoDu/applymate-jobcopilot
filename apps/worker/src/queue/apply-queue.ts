@@ -59,6 +59,10 @@ import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import { linkAbortSignals } from "../runtime/interrupt/bridge.js";
 import { createObjectiveSubmissionRouteLifecycle } from "./objective-submission-route-lifecycle.js";
 import {
+  createObjectiveGreenhouseSubmissionObservation,
+  OBJECTIVE_SUBMISSION_START_TIMEOUT_MS,
+} from "../flows/objective-greenhouse-submission-observation.js";
+import {
   acquireApplicationSubmissionStartFence,
   isApplicationSubmissionStopped,
   startApplicationSubmissionStopProbe,
@@ -69,7 +73,7 @@ export const connection = redisConnection;
 
 const APPLY_TIMEOUT_MS = Number(process.env.APPLY_TIMEOUT_MS ?? '300000');
 const TURN_STOPPED_MESSAGE = "Agent turn was stopped before the application submission request started.";
-const SUBMISSION_START_OBSERVATION_TIMEOUT_MS = 8_000;
+const SUBMISSION_START_OBSERVATION_TIMEOUT_MS = OBJECTIVE_SUBMISSION_START_TIMEOUT_MS;
 const BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS = 1_000;
 
 export const QUEUE_NAME = "apply-tasks";
@@ -135,6 +139,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       work: Promise<void> | null;
     } = { cleanup: null, work: null };
     let objectiveSubmissionRouteLifecycle: ReturnType<typeof createObjectiveSubmissionRouteLifecycle> | null = null;
+    const objectiveSubmissionObservation: { current: ReturnType<typeof createObjectiveGreenhouseSubmissionObservation> | null } = { current: null };
     const cancelObjectiveSubmissionRoute = (): void => {
       const lifecycle = objectiveSubmissionRouteLifecycle;
       lifecycle?.cancel();
@@ -525,6 +530,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                         // the exact action URL, which only the source page may
                         // submit regardless of HTTP method.
                         await route.abort("aborted").catch(() => undefined);
+                        if (objectiveMode) objectiveSubmissionObservation.current?.reject("wrong_provenance");
                       } else {
                         await route.fallback().catch(() => undefined);
                       }
@@ -536,6 +542,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                       await route.fallback().catch(() => undefined);
                     } else {
                       await route.abort("aborted").catch(() => undefined);
+                      if (objectiveMode && requestTargetsArmedAction) {
+                        objectiveSubmissionObservation.current?.reject("wrong_provenance");
+                      }
                     }
                     return;
                   }
@@ -546,6 +555,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     // continue, and iframe traffic never starts the fence.
                     if (requestTargetsArmedAction || !isSafeRead || isNavigationRequest) {
                       await route.abort("aborted").catch(() => undefined);
+                      if (objectiveMode && requestTargetsArmedAction) objectiveSubmissionObservation.current?.reject("wrong_provenance");
                     } else {
                       await route.fallback().catch(() => undefined);
                     }
@@ -566,6 +576,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                       // A rewritten action URL or a write/navigation that
                       // differs from the declared intent is undeclared.
                       await route.abort("aborted").catch(() => undefined);
+                      if (objectiveMode) objectiveSubmissionObservation.current?.reject("intent_mismatch");
                     } else {
                       await route.fallback().catch(() => undefined);
                     }
@@ -576,9 +587,16 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     // candidate. A method-changed request at this action URL
                     // must never escape via fallback.
                     await route.abort("aborted").catch(() => undefined);
+                    if (objectiveMode) objectiveSubmissionObservation.current?.reject("intent_mismatch");
                     return;
                   }
                   if (submissionCandidateSeen || submissionRequestStarted) {
+                    await route.abort("aborted").catch(() => undefined);
+                    return;
+                  }
+
+                  if (objectiveMode && !objectiveSubmissionObservation.current?.accept(request)) {
+                    submissionFenceUnavailable = true;
                     await route.abort("aborted").catch(() => undefined);
                     return;
                   }
@@ -606,6 +624,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                         pendingSubmissionFence = fence;
                         submissionRequestStarted = true;
                         submissionFenceUnavailable = true;
+                        if (objectiveMode) objectiveSubmissionObservation.current?.reject("not_forwarded");
                         await route.abort("failed").catch(() => undefined);
                         await releaseSubmissionFence(false).catch((releaseError: unknown) => {
                           console.warn(
@@ -621,6 +640,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                         if (fence.state === "stopped") await interruptStoppedTurn();
                         else if (fence.state === "inactive") submissionTaskInactive = true;
                         else if (fence.state === "unavailable") submissionFenceUnavailable = true;
+                        if (objectiveMode) objectiveSubmissionObservation.current?.reject("not_forwarded");
                         await route.abort("aborted").catch(() => undefined);
                         return;
                       }
@@ -630,11 +650,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                         // Cancellation before forwarding must retain uncertainty.
                         submissionRequestStarted = true;
                         submissionFenceUnavailable = true;
+                        if (objectiveMode) objectiveSubmissionObservation.current?.reject("not_forwarded");
                         await route.abort("failed").catch(() => undefined);
                         await releaseSubmissionFence(false);
                         return;
                       }
                       if (stopController.signal.aborted || turnStopped || queueCatchStarted) {
+                        if (objectiveMode) objectiveSubmissionObservation.current?.reject("not_forwarded");
                         await route.abort("aborted").catch(() => undefined);
                         await releaseSubmissionFence(false);
                         return;
@@ -658,6 +680,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                       await continuation;
                       if (continuationFailed) throw continuationFailure;
                       submissionRequestForwarded = true;
+                      if (objectiveMode && !objectiveSubmissionObservation.current?.forward(request)) {
+                        submissionFenceUnavailable = true;
+                      }
                     } catch (error: unknown) {
                       submissionFenceUnavailable = true;
                       console.warn(
@@ -667,6 +692,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                         error instanceof Error ? error.message : String(error),
                       );
                       if (!continuationAttempted) await route.abort("failed").catch(() => undefined);
+                      if (objectiveMode && !continuationAttempted) objectiveSubmissionObservation.current?.reject("not_forwarded");
+                      else if (objectiveMode) objectiveSubmissionObservation.current?.reject("forward_uncertain");
                       if (pendingSubmissionFence) {
                         await releaseSubmissionFence(continuationAttempted).catch((releaseError: unknown) => {
                           submissionFenceUnavailable = true;
@@ -888,6 +915,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     return applyTask.beforeSubmit ? applyTask.beforeSubmit(intent) : true;
                   },
                 };
+                const observation = createObjectiveGreenhouseSubmissionObservation(
+                  page, () => objectiveSubmissionRouteLifecycle?.signal ?? null,
+                );
+                objectiveSubmissionObservation.current = observation;
                 const cancelAndJoin = async (): Promise<void> => {
                   armedSubmissionIntent = null;
                   if (submissionFenceTimer) clearTimeout(submissionFenceTimer);
@@ -898,13 +929,14 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                 };
                 let result: HarnessResult;
                 try {
-                  result = await runObjectiveGreenhouseApplicationSubmit({ userId, task: objectiveTask, material, page });
+                  result = await runObjectiveGreenhouseApplicationSubmit({ userId, task: objectiveTask, material, page, observation });
                 } catch (error: unknown) {
                   await cancelAndJoin();
                   if (submissionRequestStarted) throw new ObjectiveSubmissionUncertainError();
                   throw error;
                 }
                 if (result.status !== "submitted") {
+                  console.log(`OBJECTIVE_SUBMIT_OBSERVATION ${observation.outcome() ?? "not_armed"}`);
                   await cancelAndJoin();
                   if (submissionRequestStarted) throw new ObjectiveSubmissionUncertainError();
                   return result;
@@ -1261,6 +1293,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       stopProbe?.stop();
       cancelObjectiveSubmissionRoute();
       const objectiveRouteSettled = objectiveMode ? await settleObjectiveSubmissionRoute(false) : true;
+      objectiveSubmissionObservation.current?.dispose();
       if (submissionRequestStarted && (queueCatchStarted || submissionSuperseded || activeSubmissionContextClosePromise)) {
         if (objectiveMode) await closeActiveSubmissionContextBounded();
         else await closeActiveSubmissionContext();
