@@ -11,16 +11,19 @@ import type { ObjectiveJourneyReport, ObjectiveJourneyReportedScoreFloor } from 
 type Tx = Prisma.TransactionClient
 type Row = Record<string, unknown>
 type Slot = ObjectiveJourneyReport["slots"][number]
+type SourceGraphNodes = readonly Row[]
 type SlotSource = Readonly<{
   ordinal: number; tailoringStatus: Slot["tailoringStatus"]; sourceReady: boolean; jobId: string | null
   job: Slot["job"]; writerTaskId: string | null; reviewerTaskId: string | null
+  requirementAnalyst: Readonly<{ nodeKey: string; taskId: string; attemptCount: number; proofDigest: string;
+    jobMaterialDigest: string; criteriaIds: readonly string[]; dependencyNodeKeys: readonly string[];
+    dependencies: readonly Readonly<{ nodeKey: string; taskId: string }>[] }> | null
 }>
 export type ObjectiveJourneySource = Readonly<{
   userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
   sourceCounts: ObjectiveJourneyReport["sourceCounts"]; slots: readonly SlotSource[]; reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor
 }>
 
-/** Reads a completed Objective source from one owner-scoped transaction; no current graph means no report. */
 export async function readObjectiveJourneySource(tx: Tx, input: Readonly<{ userId: string; sessionId: string; finalItemId: string }>): Promise<ObjectiveJourneySource | null> {
   if (![input.userId, input.sessionId, input.finalItemId].every(id)) return null
   const sessions = await tx.agentSession.findMany({ where: { id: input.sessionId, userId: input.userId }, take: 2, select: { id: true, userId: true } })
@@ -65,11 +68,14 @@ async function readGraph(tx: Tx, input: { userId: string; sessionId: string; fin
     || graphRow.revision !== manifest.graphRevision || "graphRevision" in sidecar && sidecar.graphRevision !== graphRow.revision) return null
   const projected = readFinalTaskGraphSourceSnapshot(graphRow.content, final.content)
   if (!projected || projected.kind !== "objective-tailor") return null
+  const graphNodes = sourceGraphNodes(projected.graph)
+  if (!graphNodes) return null
   const allTaskIds = [rootTaskId, ...progress.nodes.map(node => node.taskId)]
   if (new Set(allTaskIds).size !== allTaskIds.length) return null
   const rows = await tx.subAgentTask.findMany({ where: { sessionId: input.sessionId, turnId: sourceTurnId, rootTaskId, id: { in: allTaskIds } },
     take: allTaskIds.length + 1, select: { id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true,
-      role: true, taskType: true, status: true, result: true, context: true } }) as unknown[]
+      role: true, taskType: true, status: true, attemptCount: true, leaseOwner: true, leaseExpiresAt: true, result: true, context: true,
+    } }) as unknown[]
   const tasks = new Map<string, Row>()
   for (const value of rows) {
     const task = record(value)
@@ -79,12 +85,22 @@ async function readGraph(tx: Tx, input: { userId: string; sessionId: string; fin
   }
   if (rows.length !== allTaskIds.length || allTaskIds.some(taskId => !tasks.has(taskId))
     || !validObjectiveApplicationSourceManifest(manifest, input.finalItemId, progress, tasks)) return null
-  return readSlots(tx, input, sourceTurnId, rootTaskId, Number(graphRow.revision), progress, sidecar, tasks)
+  return readSlots(tx, input, sourceTurnId, rootTaskId, Number(graphRow.revision), progress, sidecar, tasks, graphNodes)
+}
+
+function sourceGraphNodes(value: unknown): SourceGraphNodes | undefined {
+  try {
+    const nodes = record(value)?.nodes
+    if (!Array.isArray(nodes) || Object.getPrototypeOf(nodes) !== Array.prototype || nodes.length > 8
+      || Reflect.ownKeys(nodes).length !== nodes.length + 1) return undefined
+    const rows = nodes.map(record)
+    return rows.every((row): row is Row => !!row) ? rows : undefined
+  } catch { return undefined }
 }
 
 async function readSlots(tx: Tx, input: { userId: string; sessionId: string; finalItemId: string }, sourceTurnId: string, rootTaskId: string, graphRevision: number,
   progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, sidecar: NonNullable<ReturnType<typeof parseObjectiveTailorFinalOutcomeSidecar>>,
-  tasks: Map<string, Row>): Promise<ObjectiveJourneySource | null> {
+  tasks: Map<string, Row>, graphNodes: SourceGraphNodes): Promise<ObjectiveJourneySource | null> {
   const candidates = progress.marker.slots.map((slot, index) => candidateForSlot(slot, index + 1, graphRevision, progress, tasks))
   const jobIds = candidates.flatMap(candidate => candidate ? [candidate.jobId] : [])
   const frequencies = new Map<string, number>()
@@ -106,8 +122,10 @@ async function readSlots(tx: Tx, input: { userId: string; sessionId: string; fin
     const jobRow = candidate && frequencies.get(candidate.jobId) === 1 ? jobById.get(candidate.jobId) : undefined
     const job = jobRow ? jobLabel(jobRow) : undefined
     const pair = status === "ready" && candidate && job ? readyPair(marker, ordinal, graphRevision, candidate.jobId, progress, tasks) : undefined
+    const requirementAnalyst = status === "ready" && pair && candidate && job
+      ? requirementAnalystFor(marker.sourceAnalystNodeKey, candidate, progress, tasks, graphNodes) : null
     slots.push({ ordinal, tailoringStatus: status, sourceReady: !!pair && !!job, jobId: job ? candidate?.jobId ?? null : null,
-      job: job ?? null, writerTaskId: pair?.writerTaskId ?? null, reviewerTaskId: pair?.reviewerTaskId ?? null })
+      job: job ?? null, writerTaskId: pair?.writerTaskId ?? null, reviewerTaskId: pair?.reviewerTaskId ?? null, requirementAnalyst })
   }
   const sourceCounts = "sourceCounts" in sidecar ? sidecar.sourceCounts : {
     discoveredJobs: { knownCount: null, coverage: "unavailable" as const }, analyzedJobs: { knownCount: null, coverage: "unavailable" as const },
@@ -120,7 +138,8 @@ async function readSlots(tx: Tx, input: { userId: string; sessionId: string; fin
 }
 
 function candidateForSlot(slot: ObjectiveTailorGraph["slots"][number], ordinal: number, revision: number,
-  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>): { jobId: string } | undefined {
+  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>):
+  { jobId: string; sourceAnalystKeys: readonly string[]; analystProofDigest: string; jobMaterialDigest: string } | undefined {
   const writerNode = progress.nodes.find(node => node.key === slot.writerNodeKey), writer = writerNode && tasks.get(writerNode.taskId)
   const context = writer && record(writer.context), selected = context && exactRecord(context.selectedJobPreparation, "jobId")
   const witness = context && candidateWitness(context.objectiveTailorCandidateWitness)
@@ -133,9 +152,35 @@ function candidateForSlot(slot: ObjectiveTailorGraph["slots"][number], ordinal: 
     && witness.writerNodeKey === slot.writerNodeKey && witness.reviewerNodeKey === slot.reviewerNodeKey
     && witness.sourceAnalystKeys.includes(slot.sourceAnalystNodeKey)
     && witness.sourceAnalystKeys.every(key => sourceNodes.get(key)?.templateId === "analyst")
-    && witness.admittedRevision <= revision ? { jobId: witness.jobId } : undefined
+    && witness.admittedRevision <= revision ? { jobId: witness.jobId, sourceAnalystKeys: witness.sourceAnalystKeys,
+      analystProofDigest: witness.analystProofDigest, jobMaterialDigest: witness.materialDigest } : undefined
 }
 
+function requirementAnalystFor(nodeKey: string, candidate: NonNullable<ReturnType<typeof candidateForSlot>>,
+  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>,
+  graphNodes: SourceGraphNodes): SlotSource["requirementAnalyst"] {
+  const node = progress.nodes.find(value => value.key === nodeKey), task = node && tasks.get(node.taskId)
+  const typedNode = graphNodes.find(value => value.key === nodeKey), verification = typedNode?.verification
+  const criteriaIds = verification?.criteria.map(value => value.id) ?? []
+  const dependencyNodeKeys = verification ? [...new Set(verification.criteria.flatMap(({ check }) => {
+    if ("dependencyNodeKey" in check) return [check.dependencyNodeKey]
+    if ("dependencyNodeKeys" in check) return [...check.dependencyNodeKeys]
+    return []
+  }))].sort() : []
+  const dependencies = dependencyNodeKeys.flatMap(key => {
+    const dependency = progress.nodes.find(value => value.key === key)
+    return dependency ? [{ nodeKey: key, taskId: dependency.taskId }] : []
+  })
+  const hasScoutMembership = verification?.criteria.some(({ check }) =>
+    check.kind === "findings_from_scout_dependency" || check.kind === "findings_from_scout_union") ?? false
+  return candidate.sourceAnalystKeys.length === 1 && candidate.sourceAnalystKeys[0] === nodeKey && node?.templateId === "analyst"
+    && typedNode?.verificationDisposition === "typed" && verification?.role === "analyst" && hasScoutMembership
+    && criteriaIds.length > 0 && dependencyNodeKeys.length > 0 && dependencies.length === dependencyNodeKeys.length
+    && task?.id === node.taskId && task.role === "analyst" && task.taskType === "job_analysis" && task.status === "completed"
+    && Number.isSafeInteger(task.attemptCount) && Number(task.attemptCount) >= 1 && task.leaseOwner === null && task.leaseExpiresAt === null
+    ? { nodeKey, taskId: node.taskId, attemptCount: Number(task.attemptCount), proofDigest: candidate.analystProofDigest,
+      jobMaterialDigest: candidate.jobMaterialDigest, criteriaIds, dependencyNodeKeys, dependencies } : null
+}
 function readyPair(slot: ObjectiveTailorGraph["slots"][number], ordinal: number, revision: number,
   jobId: string, progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>) {
   const correction = slot.correction, writerNode = progress.nodes.find(node => node.key === (correction?.writerNodeKey ?? slot.writerNodeKey))
@@ -160,7 +205,8 @@ function pairSource(slotOrdinal: number, writerTaskId: string | undefined, revie
     contentHash: ref.contentHash, sourceDigest: ref.sourceDigest, reviewHash: reviewer.reviewHash }
 }
 
-function candidateWitness(value: unknown): { jobId: string; slotId: string; writerNodeKey: string; reviewerNodeKey: string; sourceAnalystKeys: readonly string[]; admittedRevision: number } | undefined {
+function candidateWitness(value: unknown): { jobId: string; slotId: string; writerNodeKey: string; reviewerNodeKey: string;
+  sourceAnalystKeys: readonly string[]; analystProofDigest: string; materialDigest: string; admittedRevision: number } | undefined {
   const row = record(value), candidate = row && record(row.candidate), sources = row?.sourceAnalystKeys
   if (!row || !candidate || Object.keys(row).sort().join(",") !== "admittedRevision,analystProofDigest,candidate,candidateRef,reviewerNodeKey,schemaVersion,slotId,sourceAnalystKeys,sourceGraphDigest,sourceGraphRevision,sourceStatusDigest,writerNodeKey"
     || Object.keys(candidate).sort().join(",") !== "jobId,materialDigest,score" || !id(candidate.jobId)
@@ -173,9 +219,9 @@ function candidateWitness(value: unknown): { jobId: string; slotId: string; writ
     || typeof row.candidateRef !== "string" || !/^otc2_[a-f0-9]{64}$/.test(row.candidateRef)
     || ![row.analystProofDigest, row.sourceGraphDigest, row.sourceStatusDigest].every(value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value))) return undefined
   return { jobId: candidate.jobId, slotId: row.slotId, writerNodeKey: row.writerNodeKey, reviewerNodeKey: row.reviewerNodeKey,
-    sourceAnalystKeys: sources, admittedRevision: Number(row.admittedRevision) }
+    sourceAnalystKeys: sources, analystProofDigest: row.analystProofDigest as string, materialDigest: candidate.materialDigest,
+    admittedRevision: Number(row.admittedRevision) }
 }
-
 function denseStrings(value: unknown): value is string[] {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length < 1 || value.length > 8) return false
   try {
@@ -189,7 +235,6 @@ function denseStrings(value: unknown): value is string[] {
     return new Set(items).size === items.length
   } catch { return false }
 }
-
 function jobLabel(row: Row): Slot["job"] | undefined {
   return typeof row.company === "string" && row.company.trim() === row.company && row.company.length > 0 && row.company.length <= 160
     && typeof row.role === "string" && row.role.trim() === row.role && row.role.length > 0 && row.role.length <= 160

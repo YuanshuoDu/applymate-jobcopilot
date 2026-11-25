@@ -524,6 +524,7 @@ const workerCwd = resolve(process.cwd(), "../worker")
 const fixturePath = resolve(workerCwd, "src/queue/application-task-full-loop.fixture.mjs")
 const objectiveTailorWaveFixturePath = resolve(workerCwd, "src/runtime/subagents/objective-tailor-wave-process.fixture.mjs")
 const objectiveTailorWaveSourceFixturePath = resolve(workerCwd, "src/runtime/subagents/objective-tailor-wave-source.fixture.mjs")
+const objectiveTailorWaveRequirementFixturePath = resolve(workerCwd, "src/runtime/subagents/objective-tailor-wave-requirement.fixture.mjs")
 const socketPath = join(tmpdir(), `applymate-${runId}.sock`)
 const reviewedFillRouteSocketPath = join(tmpdir(), `am-${runId.slice(0, 16)}-rf.sock`)
 const tlsPaths = ["AGENT_TEST_TLS_CERT_PATH", "AGENT_TEST_TLS_KEY_PATH", "AGENT_TEST_TLS_CA_PATH"] as const
@@ -3256,14 +3257,18 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       await testDb.agentSession.create({ data: { id: sessionId, userId, goal: "Assess synthetic roles at the requested reporting floor",
         status: "running", source: "application_full_loop_objective_score_floor" } })
       const { Pool } = workerRequire("pg") as { Pool: new (options: { connectionString: string }) => { end(): Promise<void> } }
+      const requirementFixture = await import(objectiveTailorWaveRequirementFixturePath) as unknown as {
+        OBJECTIVE_WAVE_REQUIREMENT_QUOTE: string
+      }
       const sourceFixture = await import(objectiveTailorWaveSourceFixturePath) as unknown as {
-        seedObjectiveTailorWaveSource(pool: unknown, owner: { userId: string; suffix: string },
+        seedObjectiveTailorWaveSource(pool: unknown, owner: { userId: string; suffix: string; requirementQuote?: string },
           jobIdForSlot: (suffix: string, slot: number) => string): Promise<{ jobs: readonly Readonly<{ id: string }>[] }>
       }
       const sourcePool = new Pool({ connectionString: databaseUrl! }), jobIds = Array.from({ length: 8 }, () => randomUUID())
       let seeded: Awaited<ReturnType<typeof sourceFixture.seedObjectiveTailorWaveSource>>
       try {
-        seeded = await sourceFixture.seedObjectiveTailorWaveSource(sourcePool, { userId, suffix }, (ownerSuffix, slot) => {
+        seeded = await sourceFixture.seedObjectiveTailorWaveSource(sourcePool, { userId, suffix,
+          requirementQuote: requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE }, (ownerSuffix, slot) => {
           if (ownerSuffix !== suffix || !jobIds[slot]) throw new Error("Score floor source scope changed")
           return jobIds[slot]!
         })
@@ -3328,10 +3333,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(reportResponse.status).toBe(200)
       const report = jsonRecord((await jsonResponse(reportResponse)).report)
       expect(report?.reportedScoreFloor).toEqual({ status: "complete", minimumScore: 9, qualifyingJobCount: 0 })
+      expect(report?.schemaVersion).toBe("agent-harness.v2.objective-journey-report.v3")
+      expect(report?.requirementEvidenceCoverage).toEqual({ status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 6 })
+      expect(JSON.stringify(report)).not.toContain(requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE)
       expect(Array.isArray(report?.slots) ? report.slots.map(slot => jsonRecord(slot)?.reviewStatus) : []).toEqual(Array(8).fill("not_requested"))
       expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(1)
       expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(0)
       expect(await testDb.agentOutbox.count({ where: { aggregateId: sessionId, topic: "application.submit.dispatch" } })).toBe(0)
+      const foreignReport = await getObjectiveJourneyReport(sessionId, finalItemId, await signedBearer(ids.foreignUser))
+      expect(foreignReport.status).toBe(404)
       selectedJobFullLoopPhase("objective_score_floor_nine_verified")
     } finally {
       if (sourceWorker && worker === sourceWorker && !exited(sourceWorker)) {
@@ -4413,11 +4423,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const initialReport = jsonRecord(initialReportEnvelope.report)
       if (!initialReport) throw new Error("Objective journey source report is unavailable")
       expect(Object.keys(initialReport).sort()).toEqual([
-        "finalItemId", "graphRevision", "reportedScoreFloor", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
+        "finalItemId", "graphRevision", "reportedScoreFloor", "requirementEvidenceCoverage", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
       ])
-      expect(initialReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v2",
+      expect(initialReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v3",
         finalItemId, graphRevision: graphRow.revision, reviewCoverage: "complete" })
       expect(initialReport.reportedScoreFloor).toEqual({ status: "complete", minimumScore: 8, qualifyingJobCount: 8 })
+      expect(initialReport.requirementEvidenceCoverage).toEqual({ status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 0 })
       selectedJobFullLoopPhase("objective_wave_score_floor_eight_verified")
       const expectedSourceCounts = jsonRecord(jsonRecord(finalContent?.objectiveTailorFinalOutcomes)?.sourceCounts)
         ?? { discoveredJobs: { knownCount: null, coverage: "unavailable" }, analyzedJobs: { knownCount: null, coverage: "unavailable" } }
@@ -4666,11 +4677,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const journeyReport = jsonRecord(journeyReportEnvelope.report)
       if (!journeyReport) throw new Error("Objective journey review report is unavailable")
       expect(Object.keys(journeyReport).sort()).toEqual([
-        "finalItemId", "graphRevision", "reportedScoreFloor", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
+        "finalItemId", "graphRevision", "reportedScoreFloor", "requirementEvidenceCoverage", "reviewCoverage", "schemaVersion", "slots", "sourceCounts",
       ])
-      expect(journeyReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v2",
+      expect(journeyReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v3",
         finalItemId, graphRevision: graphRow.revision, sourceCounts: expectedSourceCounts, reviewCoverage: "complete" })
       expect(journeyReport.reportedScoreFloor).toEqual({ status: "complete", minimumScore: 8, qualifyingJobCount: 8 })
+      expect(journeyReport.requirementEvidenceCoverage).toEqual({ status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 0 })
       const journeySlots = Array.isArray(journeyReport.slots) ? journeyReport.slots.map(jsonRecord) : []
       expect(journeySlots).toHaveLength(8)
       expect(journeySlots.map(slot => [slot?.ordinal, slot?.tailoringStatus, slot?.reviewStatus,

@@ -48,17 +48,40 @@ describe("readObjectiveJourneySource", () => {
     const result = await readObjectiveJourneySource(fixture.client as never, { userId, sessionId, finalItemId: finalId })
     expect(result?.reportedScoreFloor).toEqual(floor)
   })
+
+  it("retains only a single exact completed and lease-free Analyst binding for requirement reads", async () => {
+    mocks.pairProof.mockReturnValue({})
+    const fixture = sourceFixture({ schemaVersion: "agent-harness.v2.objective-tailor-final-outcomes.v1",
+      slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "ready" }] })
+    const result = await readObjectiveJourneySource(fixture.client as never, { userId, sessionId, finalItemId: finalId })
+    expect(result?.slots.map(slot => slot.requirementAnalyst)).toEqual([
+      null,
+      { nodeKey: "analyst-2", taskId: "task-analyst-2", attemptCount: 2, proofDigest: "c".repeat(64),
+        jobMaterialDigest: `sha256:${"d".repeat(64)}`, criteriaIds: ["finding-count", "scout-membership-0", "scout-membership-1"],
+        dependencyNodeKeys: ["scout-a", "scout-z"], dependencies: [
+          { nodeKey: "scout-a", taskId: "task-scout-a" }, { nodeKey: "scout-z", taskId: "task-scout-z" },
+        ] },
+    ])
+    expect(fixture.client.subAgentTask.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      select: expect.objectContaining({ attemptCount: true, leaseOwner: true, leaseExpiresAt: true }),
+    }))
+  })
 })
 
 function sourceFixture(sidecar: unknown = { schemaVersion: "agent-harness.v2.objective-tailor-final-outcomes.v1",
   slots: [{ ordinal: 1, status: "ready" }, { ordinal: 2, status: "needs_revision" }] }) {
-  const verify = (role: "scout" | "analyst") => ({ schemaVersion: "agent-harness.v2.task-graph-verification.v1", role,
-    criteria: [{ id: role === "scout" ? "candidate-count" : "finding-count",
-      check: { kind: role === "scout" ? "candidate_count_gte" : "finding_count_gte", minimum: 1 } }] })
+  const scoutZ = "scout-z", scoutA = "scout-a"
+  const verify = (role: "scout" | "analyst", dependencyNodeKeys: readonly string[] = [scoutZ]) => ({
+    schemaVersion: "agent-harness.v2.task-graph-verification.v1", role,
+    criteria: role === "scout" ? [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }]
+      : [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+        ...dependencyNodeKeys.map((dependencyNodeKey, index) => ({ id: `scout-membership-${index}`,
+          check: { kind: "findings_from_scout_dependency", dependencyNodeKey } }))] })
   const sources = [
-    node("scout-1", "task-scout-1", "scout", [], 1, verify("scout")),
-    node("analyst-1", "task-analyst-1", "analyst", ["scout-1"], 2, verify("analyst")),
-    node("analyst-2", "task-analyst-2", "analyst", ["scout-1"], 2, verify("analyst")),
+    node(scoutZ, "task-scout-z", "scout", [], 1, verify("scout")),
+    node(scoutA, "task-scout-a", "scout", [], 1, verify("scout")),
+    node("analyst-1", "task-analyst-1", "analyst", [scoutZ], 2, verify("analyst", [scoutZ])),
+    node("analyst-2", "task-analyst-2", "analyst", [scoutZ, scoutA], 2, verify("analyst", [scoutZ, scoutA])),
   ]
   const slots = [1, 2].map(ordinal => ({ slotId: `tailor-${ordinal}`, sourceAnalystNodeKey: `analyst-${ordinal}`,
     writerNodeKey: `writer-${ordinal}`, reviewerNodeKey: `reviewer-${ordinal}` }))
@@ -77,11 +100,17 @@ function sourceFixture(sidecar: unknown = { schemaVersion: "agent-harness.v2.obj
   const taskRows = [
     { id: rootId, sessionId, turnId, rootTaskId: rootId, parentTaskId: null, role: "orchestrator", taskType: "root", status: "completed",
       result: { status: "completed", finalItemId: finalId }, context: {} },
-    ...sources.map((source, index) => ({ id: source.taskId, sessionId, turnId, rootTaskId: rootId, parentTaskId: rootId,
-      role: source.templateId, taskType: source.templateId, status: "completed", result: {}, context: {} })),
+    ...sources.map(source => ({ id: source.taskId, sessionId, turnId, rootTaskId: rootId, parentTaskId: rootId,
+      role: source.templateId, taskType: source.templateId === "scout" ? "job_discovery" : "job_analysis", status: "completed",
+      attemptCount: 2, leaseOwner: null, leaseExpiresAt: null, result: {}, context: {},
+      ...(source.templateId === "analyst" ? { expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "analyst" },
+        allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"] } : {}) })),
     ...suffix.map((task, index) => ({ id: task.taskId, sessionId, turnId, rootTaskId: rootId, parentTaskId: rootId,
       role: task.templateId === "cover_letter_writer" ? "writer" : "reviewer", taskType: task.templateId,
-      status: "completed", result: {}, context: contexts[Math.floor(index / 2)] })),
+      status: "completed", result: task.templateId === "cover_letter_writer"
+        ? { structuredResult: { artifactRef: { artifactId: `artifact-${index}`, version: 1, contentHash: `sha256:${"a".repeat(64)}`,
+          sourceDigest: `sha256:${"b".repeat(64)}` } } }
+        : { structuredResult: { reviewHash: `sha256:${"c".repeat(64)}` } }, context: contexts[Math.floor(index / 2)] })),
   ]
   const content = { text: "Final answer", final: { schemaVersion: "agent-harness.v2.final", response: "Final answer" },
     taskGraphSources: { schemaVersion: "agent-harness.v2.task-graph-sources.v1", graphRevision: 9,
