@@ -1977,51 +1977,71 @@ function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string
 }
 
 async function reviewedFillTimeoutSnapshot(input: {
-  sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; traceOffset: number; reviewedGetBaseline: number
+  sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; traceOffset?: number;
+  reviewedGetBaseline?: number; ownerUserId?: string; includeFixture?: boolean;
+  traceSource?: { child: Child | undefined; offset: number } | null
 }) {
-  const stats = await requestFixtureStats(300).catch(() => null)
-  const fixture = stats ? {
+  const ownerUserId = input.ownerUserId ?? ids.user
+  const stats = input.includeFixture === false ? null : await requestFixtureStats(300).catch(() => null)
+  const fixture = input.includeFixture === false ? undefined : stats ? {
     available: true,
-    reviewedPageGetObserved: stats.reviewedGetCount > input.reviewedGetBaseline,
+    reviewedPageGetObserved: stats.reviewedGetCount > (input.reviewedGetBaseline ?? 0),
     exactReviewedCoverLetterObserved: stats.reviewedMaterialExactCount > 0,
     noReviewedSubmitRequest: stats.reviewedSubmitCount === 0 && !stats.requests.includes("POST /example-reviewed/jobs/1"),
   } : { available: false }
+  const traceChild = input.traceSource === undefined ? worker : input.traceSource?.child
+  const traceOffset = input.traceSource === undefined ? input.traceOffset : input.traceSource?.offset
   const runtime = {
-    executor: applicationFillExecutorTraces(worker, input.traceOffset).slice(-4),
-    stages: applicationFillStageTraces(worker, input.traceOffset).slice(-6),
-    phases: applicationFillAcquisitionPhases(worker, input.traceOffset).slice(-16),
-    workerExited: worker ? exited(worker) : null,
+    traceScoped: traceChild !== undefined && traceOffset !== undefined,
+    executor: traceChild && traceOffset !== undefined ? applicationFillExecutorTraces(traceChild, traceOffset).slice(-4) : [],
+    stages: traceChild && traceOffset !== undefined ? applicationFillStageTraces(traceChild, traceOffset).slice(-6) : [],
+    phases: traceChild && traceOffset !== undefined ? applicationFillAcquisitionPhases(traceChild, traceOffset).slice(-16) : [],
+    workerExited: traceChild ? exited(traceChild) : null,
   }
   try {
     return await beforeDeadline(async () => {
-      const task = await testDb.applicationTask.findUnique({ where: { userId_jobId: { userId: ids.user, jobId: input.jobId } } }) as ApplicationTaskRow | null
-      const taskBound = Boolean(task && task.id === input.applicationTaskId && task.userId === ids.user
-        && task.sessionId === input.sessionId && task.jobId === input.jobId && task.fillTurnId === input.fillTurnId)
-      if (!task || !taskBound) return { databaseSnapshotAvailable: true, applicationTaskBound: taskBound, fixture, runtime }
+      const task = await testDb.applicationTask.findUnique({ where: { userId_jobId: { userId: ownerUserId, jobId: input.jobId } } }) as ApplicationTaskRow | null
+      const taskIdentityBound = Boolean(task && task.id === input.applicationTaskId && task.userId === ownerUserId
+        && task.sessionId === input.sessionId && task.jobId === input.jobId)
+      if (!task || !taskIdentityBound) return { databaseSnapshotAvailable: true, applicationTaskBound: false, fixture, runtime }
+      if (task.fillTurnId !== input.fillTurnId) return { databaseSnapshotAvailable: true, applicationTaskBound: false,
+        fillTurnBound: false, fillTurnPresent: Boolean(task.fillTurnId), fixture, runtime }
       const turn = await testDb.agentTurn.findFirst({ where: {
-        id: input.fillTurnId, userId: ids.user, sessionId: input.sessionId, session: { userId: ids.user },
-      }, select: { status: true, rootTaskId: true, error: true } })
-      const [root, fillers, events] = await Promise.all([
+        id: input.fillTurnId, userId: ownerUserId, sessionId: input.sessionId, session: { userId: ownerUserId },
+      }, select: { status: true, rootTaskId: true, error: true, leaseOwnerId: true, leaseExpiresAt: true } })
+      const [root, fillers, events, job] = await Promise.all([
         turn?.rootTaskId ? testDb.subAgentTask.findFirst({ where: {
           id: turn.rootTaskId, rootTaskId: turn.rootTaskId, sessionId: input.sessionId, turnId: input.fillTurnId,
-          parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ids.user },
-        }, select: { status: true, failureReason: true } }) : Promise.resolve(null),
+          parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: ownerUserId },
+        }, select: { status: true, failureReason: true, leaseOwner: true, leaseExpiresAt: true } }) : Promise.resolve(null),
         turn?.rootTaskId ? testDb.subAgentTask.findMany({ where: {
           sessionId: input.sessionId, turnId: input.fillTurnId, rootTaskId: turn.rootTaskId,
-          role: "application_filler", taskType: "application_fill_for_review", session: { userId: ids.user },
-        }, orderBy: { createdAt: "asc" }, take: 4, select: { status: true, failureReason: true } }) : Promise.resolve([]),
+          role: "application_filler", taskType: "application_fill_for_review", session: { userId: ownerUserId },
+        }, orderBy: { createdAt: "asc" }, take: 4, select: { status: true, failureReason: true, leaseOwner: true, leaseExpiresAt: true } }) : Promise.resolve([]),
         testDb.applicationTaskEvent.findMany({ where: { taskId: task.id, actor: "worker",
           type: { in: ["reviewed_application_fill_browser_started", "form_filled"] } }, take: 4, select: { type: true } }),
+        testDb.job.findFirst({ where: { id: input.jobId, userId: ownerUserId }, select: { status: true, workflowState: true, appliedAt: true } }),
       ])
       return {
         databaseSnapshotAvailable: true, applicationTaskBound: true,
         applicationTask: { status: reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
-          checkpoint: reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS), errorPresent: Boolean(task.error) },
-        turn: { status: reviewedFillDiagnosticValue(turn?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES), errorCategory: diagnosticMachineErrorCode(turn?.error) },
+          checkpoint: reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS), errorPresent: Boolean(task.error),
+          fillTurnBound: true, fillTurnPresent: true },
+        turn: { status: reviewedFillDiagnosticValue(turn?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES), errorCategory: diagnosticMachineErrorCode(turn?.error),
+          leaseActive: Boolean(turn?.leaseOwnerId && turn.leaseExpiresAt && turn.leaseExpiresAt > new Date()),
+          leaseFree: Boolean(turn && turn.leaseOwnerId === null && turn.leaseExpiresAt === null) },
         root: { present: root !== null, status: reviewedFillDiagnosticValue(root?.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
-          failureCategory: diagnosticMachineErrorCode(root?.failureReason) },
+          failureCategory: diagnosticMachineErrorCode(root?.failureReason),
+          leaseActive: Boolean(root?.leaseOwner && root.leaseExpiresAt && root.leaseExpiresAt > new Date()),
+          leaseFree: Boolean(root && root.leaseOwner === null && root.leaseExpiresAt === null) },
         fillers: fillers.map(filler => ({ status: reviewedFillDiagnosticValue(filler.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
-          failureCategory: diagnosticMachineErrorCode(filler.failureReason) })),
+          failureCategory: diagnosticMachineErrorCode(filler.failureReason),
+          leaseActive: Boolean(filler.leaseOwner && filler.leaseExpiresAt && filler.leaseExpiresAt > new Date()),
+          leaseFree: filler.leaseOwner === null && filler.leaseExpiresAt === null })),
+        fillerRows: fillers.length,
+        job: job ? { status: reviewedFillDiagnosticValue(job.status, OBJECTIVE_JOB_DIAGNOSTIC_STATUSES),
+          workflowState: reviewedFillDiagnosticValue(job.workflowState, OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES),
+          appliedAtPresent: job.appliedAt !== null } : { present: false },
         events: { browserStarted: events.some(event => event.type === "reviewed_application_fill_browser_started"),
           formFilled: events.some(event => event.type === "form_filled") },
         fixture, runtime,
@@ -4341,10 +4361,19 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           checkpoint: "materials_ready" as const, fillTurnId: null, workerTaskId: null, outboxCount: 0 as const,
           browserStartCount: 0 as const, routeGets: 0 as const, routePostAttempts: 0 as const }
       }
+      const waveFillTraceSources = new Map<string, { child: Child | undefined; offset: number } | null>()
       const prepareFilledSlot = async (slot: typeof submissionSlots[number], handoff: { fillTurnId: string }) => {
-        const task = await waitForReviewedApplicationTask(slot.jobId, value => value.id === slot.applicationTaskId
-          && value.status === "waiting_for_authorization" && value.checkpoint === "form_filled"
-          && typeof value.fillTurnId === "string", 180_000, userId)
+        let task: ApplicationTaskRow
+        try {
+          task = await waitForReviewedApplicationTask(slot.jobId, value => value.id === slot.applicationTaskId
+            && value.status === "waiting_for_authorization" && value.checkpoint === "form_filled"
+            && typeof value.fillTurnId === "string", 180_000, userId)
+        } catch {
+          const snapshot = await reviewedFillTimeoutSnapshot({ sessionId, jobId: slot.jobId,
+            applicationTaskId: slot.applicationTaskId, fillTurnId: handoff.fillTurnId,
+            traceSource: waveFillTraceSources.get(slot.applicationTaskId) ?? null, ownerUserId: userId, includeFixture: false })
+          throw new Error(`Objective first Fill preparation poll failed ${JSON.stringify(snapshot)}`)
+        }
         const fillTurnId = task.fillTurnId
         if (!fillTurnId || fillTurnId !== handoff.fillTurnId) throw new Error("Objective Fill Turn binding changed")
         const [turn, approval, job, filler] = await Promise.all([
@@ -4555,6 +4584,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
             const before = await requestFixtureStats(), beforeReceipt = routeReceipt(before, slot)
             const outboxId = outboxIdByApprovalId.get(slot.reviewApprovalId)
             if (!outboxId || !gate) throw new Error("Objective handoff release is not armed")
+            waveFillTraceSources.set(slot.applicationTaskId, worker && !exited(worker)
+              ? { child: worker, offset: worker.lines.length } : null)
             releaseObjectiveFillWaveApproval(gate, slot.reviewApprovalId, slot.applicationTaskId)
             await waitForObjectiveFillWavePublished(gate, slot.reviewApprovalId)
             const [outbox, task] = await Promise.all([
