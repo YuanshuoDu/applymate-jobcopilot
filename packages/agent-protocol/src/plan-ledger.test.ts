@@ -387,6 +387,23 @@ describe('versioned Plan Ledger contract', () => {
     expect(JSON.stringify(preview)).not.toMatch(/verification|repairReceipt|candidate-count|evidenceDigest/)
   })
 
+  it('keeps Analyst previews while strictly dropping private requirement citations', () => {
+    const jobId = 'private-job-77', evidenceId = 'private-job-evidence'
+    const structuredResult = { schemaVersion: 'agent-harness.v2.subagent.result', role: 'analyst', status: 'completed', summary: 'PRIVATE_REQUIREMENT_QUOTE',
+      findings: [{ jobId, score: 8, evidenceIds: [evidenceId], requirementCitations: [{ evidenceId, quote: 'PRIVATE_REQUIREMENT_QUOTE' }] }],
+      evidence: [{ id: evidenceId, kind: 'job', ref: jobId, source: 'greenhouse' }] }
+    const envelope = { ...result, structuredResult }
+    const preview = projectTaskEvidencePreview({ status: 'completed', role: 'analyst', result: envelope })
+    expect(preview).toMatchObject({ role: 'analyst', itemCount: 1, evidence: [{ kind: 'job', source: 'greenhouse', reference: null }] })
+    expect(JSON.stringify(preview)).not.toContain('PRIVATE_REQUIREMENT_QUOTE')
+    expect(projectTaskEvidencePreview({ status: 'completed', role: 'analyst', result: { ...envelope, structuredResult: {
+      ...structuredResult, findings: [{ ...structuredResult.findings[0]!, requirementCitations: [{ evidenceId, quote: 'quote', extra: true }] }],
+    } } })).toBeNull()
+    expect(projectTaskEvidencePreview({ status: 'completed', role: 'analyst', result: { ...envelope, structuredResult: {
+      ...structuredResult, findings: [{ ...structuredResult.findings[0]!, requirementCitations: [{ evidenceId: 'foreign', quote: 'quote' }] }],
+    } } })).toBeNull()
+  })
+
   it('accepts Worker-generated final item IDs up to 256 without widening graph IDs', () => {
     const taskId = `subagent-${'0'.repeat(36)}`
     const jobId = 'private-job-77'

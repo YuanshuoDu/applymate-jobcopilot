@@ -126,7 +126,9 @@ export function projectTaskEvidencePreview(row: unknown): PlanLedgerEvidencePrev
     const linked = new Set<string>()
     for (const item of result[listKey]) {
       const expected = role === 'scout' ? ['jobId', 'source', 'url', 'evidenceIds'] : ['jobId', 'score', 'evidenceIds']
-      if (!record(item) || !exact(item, expected) || !identifier(item.jobId) || !dense(item.evidenceIds, 50) || item.evidenceIds.length === 0) return null
+      if (!record(item) || !(exact(item, expected) || role === 'analyst' && exact(item, [...expected, 'requirementCitations']))
+        || !identifier(item.jobId) || !dense(item.evidenceIds, 50) || item.evidenceIds.length === 0
+        || Object.hasOwn(item, 'requirementCitations') && !safeRequirementCitations(item.requirementCitations, item.jobId, item.evidenceIds, evidenceById)) return null
       if (role === 'scout' && (!identifier(item.source) || (item.url !== null && (typeof item.url !== 'string' || !item.url.trim() || item.url.length > 2_048)))) return null
       if (role === 'analyst' && (typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 10)) return null
       let linkedJob = false
@@ -148,7 +150,20 @@ export function projectTaskEvidencePreview(row: unknown): PlanLedgerEvidencePrev
     return { role, summary, itemCount, evidence }
   } catch { return null }
 }
-
+function safeRequirementCitations(value: unknown, jobId: string, evidenceIds: readonly unknown[], evidence: ReadonlyMap<string, { kind: typeof KINDS[number]; ref: string }>): boolean {
+  if (value === null) return true
+  if (!dense(value, 8)) return false
+  const seen = new Set<string>()
+  for (const raw of value) {
+    if (!record(raw) || !exact(raw, ['evidenceId', 'quote']) || !identifier(raw.evidenceId) || !evidenceIds.includes(raw.evidenceId)
+      || evidence.get(raw.evidenceId)?.kind !== 'job' || evidence.get(raw.evidenceId)?.ref !== jobId
+      || typeof raw.quote !== 'string' || !raw.quote.trim() || raw.quote.length > 512) return false
+    const key = `${raw.evidenceId}\u0000${raw.quote}`
+    if (seen.has(key)) return false
+    seen.add(key)
+  }
+  return true
+}
 function parseEvidencePreview(value: unknown, role: unknown): PlanLedgerEvidencePreview | null {
   if (!record(value) || !exact(value, ['role', 'summary', 'itemCount', 'evidence']) || value.role !== role
     || (role !== 'scout' && role !== 'analyst') || !smallInteger(value.itemCount, 50) || !dense(value.evidence, 5)
@@ -165,7 +180,6 @@ function parseEvidencePreview(value: unknown, role: unknown): PlanLedgerEvidence
   }
   return { role, summary: value.summary, itemCount: value.itemCount, evidence }
 }
-
 function safePreview(value: unknown): value is PlanLedgerEvidencePreview | null { return value === null || (record(value) && parseEvidencePreview(value, value.role) !== null) }
 export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot | null {
   try {
@@ -176,7 +190,6 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot | null
     return nodes ? { nodes } : null
   } catch { return null }
 }
-
 function readiness(node: { key: string; dependsOn: readonly string[] }, status: PlanLedgerStatus | null,
   statuses: ReadonlyMap<string, PlanLedgerStatus | null>, nodes: readonly { key: string; dependsOn: readonly string[] }[]): PlanLedgerReadiness {
   if (!status) return 'unavailable'

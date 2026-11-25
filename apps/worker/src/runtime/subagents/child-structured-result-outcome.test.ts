@@ -76,6 +76,19 @@ describe("single-pass structured result outcomes", () => {
       .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
   })
 
+  it("rebinds an optional Analyst citation to the canonical same-Job evidence ID", () => {
+    const index = createObservedEvidenceIndex()
+    recordReadToolOutput(index, "jobs.get", { job: { id: "job-1", source: "greenhouse", description: "Build APIs" } })
+    const result = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+      findings: [{ jobId: "job-1", score: 8, evidenceIds: ["model-job"],
+        requirementCitations: [{ evidenceId: "model-job", quote: "Build APIs" }] }],
+      evidence: [{ id: "model-job", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "one finding" }
+
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(result), "analyst", index)).toMatchObject({
+      kind: "valid", result: { findings: [{ requirementCitations: [{ evidenceId: "read:job:job-1", quote: "Build APIs" }] }] },
+    })
+  })
+
   it.each([undefined, null, "", "   "])("uses the generic jobs.read source fallback when the read has no bounded source (%s)", source => {
     const index = createObservedEvidenceIndex()
     const job: Record<string, unknown> = { id: "job-1" }

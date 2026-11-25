@@ -1,14 +1,12 @@
-export const ROLE_RESULT_SCHEMA = "agent-harness.v2.subagent.result" as const
+import { ROLE_RESULT_SCHEMA, SCOUT_ROLE_RESULT_OUTPUT_SCHEMA, ANALYST_ROLE_RESULT_OUTPUT_SCHEMA,
+  RoleResultValidationError, parseScoutAnalystResult } from "./role-result-job-evidence.js"
+import type { AnalystFinding, AnalystResult, EvidenceKind, RoleEvidence, RoleResultStatus, ScoutCandidate, ScoutResult } from "./role-result-job-evidence.js"
+
+export { ROLE_RESULT_SCHEMA, SCOUT_ROLE_RESULT_OUTPUT_SCHEMA, ANALYST_ROLE_RESULT_OUTPUT_SCHEMA, RoleResultValidationError }
+export type { AnalystFinding, AnalystResult, EvidenceKind, RoleEvidence, RoleResultStatus, ScoutCandidate, ScoutResult }
 export const ARTIFACT_REFERENCE_SCHEMA = "agent-harness.v2.subagent.artifact-reference" as const
 export const REVIEW_STATUSES = ["passed", "needs_revision", "rejected", "stale"] as const
 type JsonSchema = Record<string, unknown>
-const evidenceSchema: JsonSchema = { type: "object", properties: { id: { type: "string", minLength: 1 }, kind: { type: "string", enum: ["job", "persona", "resume", "source"] }, ref: { type: "string", minLength: 1 }, source: { type: "string", minLength: 1 } }, required: ["id", "kind", "ref", "source"], additionalProperties: false }
-const evidenceIdsSchema: JsonSchema = { type: "array", items: { type: "string", minLength: 1 }, minItems: 1 }
-const baseSchema = (items: JsonSchema, itemName: "candidates" | "findings"): JsonSchema => ({ type: "object", properties: { schemaVersion: { const: ROLE_RESULT_SCHEMA }, role: { const: itemName === "candidates" ? "scout" : "analyst" }, status: { type: "string", enum: ["completed", "partial"] }, [itemName]: { type: "array", items, }, evidence: { type: "array", items: evidenceSchema }, summary: { type: "string" } }, required: ["schemaVersion", "role", "status", itemName, "evidence", "summary"], additionalProperties: false })
-const candidateSchema: JsonSchema = { type: "object", properties: { jobId: { type: "string", minLength: 1 }, source: { type: "string", minLength: 1 }, url: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] }, evidenceIds: evidenceIdsSchema }, required: ["jobId", "source", "url", "evidenceIds"], additionalProperties: false }
-const findingSchema: JsonSchema = { type: "object", properties: { jobId: { type: "string", minLength: 1 }, score: { type: "number", minimum: 0, maximum: 10 }, evidenceIds: evidenceIdsSchema }, required: ["jobId", "score", "evidenceIds"], additionalProperties: false }
-export const SCOUT_ROLE_RESULT_OUTPUT_SCHEMA: JsonSchema = baseSchema(candidateSchema, "candidates")
-export const ANALYST_ROLE_RESULT_OUTPUT_SCHEMA: JsonSchema = baseSchema(findingSchema, "findings")
 const artifactRefSchema: JsonSchema = { type: "object", properties: { artifactId: { type: "string", minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?![\\s\\S])" }, version: { type: "integer", minimum: 1 }, contentHash: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" }, sourceDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" } }, required: ["artifactId", "version", "contentHash", "sourceDigest"], additionalProperties: false }
 export const WRITER_ROLE_RESULT_OUTPUT_SCHEMA: JsonSchema = { type: "object", properties: { schemaVersion: { const: ROLE_RESULT_SCHEMA }, role: { const: "writer" }, status: { const: "completed" }, artifactRef: artifactRefSchema }, required: ["schemaVersion", "role", "status", "artifactRef"], additionalProperties: false }
 export const REVIEWER_ROLE_RESULT_OUTPUT_SCHEMA: JsonSchema = { type: "object", properties: { schemaVersion: { const: ROLE_RESULT_SCHEMA }, role: { const: "reviewer" }, status: { const: "completed" }, artifactRef: artifactRefSchema, reviewStatus: { type: "string", enum: REVIEW_STATUSES }, reviewHash: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" } }, required: ["schemaVersion", "role", "status", "artifactRef", "reviewStatus", "reviewHash"], additionalProperties: false }
@@ -29,47 +27,6 @@ export function roleResultOutputSchema(role: StructuredRole): JsonSchema {
   if (role === "prepare") return PREPARE_ROLE_RESULT_OUTPUT_SCHEMA
   return role === "writer" ? WRITER_ROLE_RESULT_OUTPUT_SCHEMA : REVIEWER_ROLE_RESULT_OUTPUT_SCHEMA
 }
-export type RoleResultStatus = "completed" | "partial"
-export type EvidenceKind = "job" | "persona" | "resume" | "source"
-
-export type RoleEvidence = {
-  readonly id: string
-  readonly kind: EvidenceKind
-  readonly ref: string
-  readonly source: string
-}
-
-export type ScoutCandidate = {
-  readonly jobId: string
-  readonly source: string
-  readonly url: string | null
-  readonly evidenceIds: readonly string[]
-}
-
-export type ScoutResult = {
-  readonly schemaVersion: typeof ROLE_RESULT_SCHEMA
-  readonly role: "scout"
-  readonly status: RoleResultStatus
-  readonly candidates: readonly ScoutCandidate[]
-  readonly evidence: readonly RoleEvidence[]
-  readonly summary: string
-}
-
-export type AnalystFinding = {
-  readonly jobId: string
-  readonly score: number
-  readonly evidenceIds: readonly string[]
-}
-
-export type AnalystResult = {
-  readonly schemaVersion: typeof ROLE_RESULT_SCHEMA
-  readonly role: "analyst"
-  readonly status: RoleResultStatus
-  readonly findings: readonly AnalystFinding[]
-  readonly evidence: readonly RoleEvidence[]
-  readonly summary: string
-}
-
 export type ArtifactVersionReference = Readonly<{
   artifactId: string
   version: number
@@ -111,16 +68,10 @@ export function structuredRoleOutputGuidance(role: string, marker: unknown): str
     if (role === "writer") return "SERVER STRUCTURED RESULT CONTRACT: Final output must be one JSON object with exactly schemaVersion, role, status, and artifactRef. status must be completed. artifactRef must contain only artifactId, version, contentHash, and sourceDigest from the successful cover_letter.draft tool result. Read the base artifact ID and hash from runtimeContext.coverLetterBase. Never include cover-letter content, findings, identity, lease, capability, permission, or authorization data."
     if (role === "reviewer") return "SERVER STRUCTURED RESULT CONTRACT: Final output must be one JSON object with exactly schemaVersion, role, status, artifactRef, reviewStatus, and reviewHash. status must be completed. Copy artifactRef and the review receipt only from the successful artifact.review tool result. Never include draft content, findings, identity, lease, capability, permission, or authorization data."
     if (role === "prepare") return "SERVER STRUCTURED RESULT CONTRACT: Final output must be one JSON object with exactly schemaVersion, role, status, taskId, attemptCount, snapshotDigest, checkpointDigest, jobs, and materials. Copy taskId, attemptCount, job status, authoritative job bindings, immutable artifact references, and digests only from the successful scheduled.application.prepare tool result. Each job has only jobId and status (prepared, skipped, or failed); each material has only jobId, kind (resume or cover_letter), and artifactRef. Keep status partial exactly when a job failed. The server independently rebinds task, attempt, job IDs, checkpoint digest, snapshot digest, owner, and artifact refs to persisted evidence. Never include scores, resume or letter content, user identity, schedule configuration, or authorization data."
-    return "SERVER STRUCTURED RESULT CONTRACT: Final output must be one JSON object with exactly schemaVersion, role, status, candidates (scout) or findings (analyst), evidence, and summary. evidenceIds must reference evidence in this same result. status must be completed or partial. Do not include extra fields or identity, lease, capability, permission, or authorization data."
+    if (role === "analyst") return "SERVER STRUCTURED RESULT CONTRACT: Final output must be one JSON object with exactly schemaVersion, role, status, findings, evidence, and summary. Each finding includes requirementCitations as null or an array of at most 8 closed objects containing evidenceId and quote. Cite only an exact continuous quote from the same finding Job's saved description returned by jobs.get; use the finding's job evidence ID. If no exact requirement quote is available, use null. Do not cite generated keywords, add rationale, or include identity, lease, capability, permission, or authorization data."
+    return "SERVER STRUCTURED RESULT CONTRACT: Final output must be one JSON object with exactly schemaVersion, role, status, candidates, evidence, and summary. evidenceIds must reference evidence in this same result. status must be completed or partial. Do not include extra fields or identity, lease, capability, permission, or authorization data."
   } catch {
     return null
-  }
-}
-
-export class RoleResultValidationError extends Error {
-  constructor(readonly code: "invalid_shape" | "missing_id" | "missing_evidence" | "invalid_score", message: string) {
-    super(message)
-    this.name = "RoleResultValidationError"
   }
 }
 
@@ -128,11 +79,6 @@ const FORBIDDEN_RESULT_KEYS = new Set([
   "userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease",
   "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget",
 ])
-const SCOUT_RESULT_KEYS = ["schemaVersion", "role", "status", "candidates", "evidence", "summary"] as const
-const ANALYST_RESULT_KEYS = ["schemaVersion", "role", "status", "findings", "evidence", "summary"] as const
-const EVIDENCE_KEYS = ["id", "kind", "ref", "source"] as const
-const CANDIDATE_KEYS = ["jobId", "source", "url", "evidenceIds"] as const
-const FINDING_KEYS = ["jobId", "score", "evidenceIds"] as const
 const ARTIFACT_REF_KEYS = ["artifactId", "version", "contentHash", "sourceDigest"] as const
 const SAFE_ARTIFACT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const WRITER_RESULT_KEYS = ["schemaVersion", "role", "status", "artifactRef"] as const
@@ -149,12 +95,7 @@ export function validateRoleResult(value: unknown, expectedRole?: StructuredRole
   }
   if (row.role === "writer" || row.role === "reviewer") return parseArtifactRoleResult(row)
   if (row.role === "prepare") return parsePrepareRoleResult(row)
-  if (!exactKeys(row, row.role === "scout" ? SCOUT_RESULT_KEYS : ANALYST_RESULT_KEYS)) throw new RoleResultValidationError("invalid_shape", "Structured subagent result has an invalid field set")
-  if (!isStatus(row.status) || typeof row.summary !== "string") throw new RoleResultValidationError("invalid_shape", "Structured subagent result has invalid status or summary")
-  const evidence = parseEvidence(row.evidence)
-  return row.role === "scout"
-    ? { schemaVersion: ROLE_RESULT_SCHEMA, role: row.role, status: row.status, candidates: parseCandidates(row.candidates, evidence), evidence, summary: row.summary }
-    : { schemaVersion: ROLE_RESULT_SCHEMA, role: row.role, status: row.status, findings: parseFindings(row.findings, evidence), evidence, summary: row.summary }
+  return parseScoutAnalystResult(row)
 }
 
 function parseArtifactRoleResult(row: Record<string, unknown>): WriterResult | ReviewerResult {
@@ -232,39 +173,6 @@ function isStatus(value: unknown): value is RoleResultStatus { return value === 
 function isReviewStatus(value: unknown): value is typeof REVIEW_STATUSES[number] { return typeof value === "string" && (REVIEW_STATUSES as readonly string[]).includes(value) }
 function isDigest(value: unknown): value is string { return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value) }
 function nonEmpty(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
-function parseEvidence(value: unknown): RoleEvidence[] {
-  if (!Array.isArray(value)) throw new RoleResultValidationError("invalid_shape", "Evidence must be an array")
-  const ids = new Set<string>()
-  return value.map(item => {
-    const row = record(item)
-    if (!exactKeys(row, EVIDENCE_KEYS)) throw new RoleResultValidationError("invalid_shape", "Evidence has an invalid field set")
-    if (!nonEmpty(row.id) || !nonEmpty(row.ref) || !nonEmpty(row.source) || !isEvidenceKind(row.kind)) throw new RoleResultValidationError("missing_id", "Evidence requires id, kind, ref and source")
-    if (ids.has(row.id)) throw new RoleResultValidationError("invalid_shape", `Duplicate evidence id: ${row.id}`)
-    ids.add(row.id)
-    return { id: row.id, kind: row.kind, ref: row.ref, source: row.source }
-  })
-}
-function evidenceIds(value: unknown, evidence: readonly RoleEvidence[]): string[] {
-  if (!Array.isArray(value) || value.length === 0 || !value.every(nonEmpty)) throw new RoleResultValidationError("missing_evidence", "Every result item needs evidence ids")
-  const available = new Set(evidence.map(item => item.id))
-  if (!value.every(id => available.has(id))) throw new RoleResultValidationError("missing_evidence", "Result references unknown evidence")
-  return [...new Set(value)]
-}
-function evidenceForJob(value: unknown, jobId: string, evidence: readonly RoleEvidence[]): string[] {
-  const ids = evidenceIds(value, evidence)
-  if (!ids.some(id => evidence.some(item => item.id === id && item.kind === "job" && item.ref === jobId))) {
-    throw new RoleResultValidationError("missing_evidence", `Job ${jobId} needs job evidence with the same real id`)
-  }
-  return ids
-}
-function parseCandidates(value: unknown, evidence: readonly RoleEvidence[]): ScoutCandidate[] {
-  if (!Array.isArray(value)) throw new RoleResultValidationError("invalid_shape", "Scout candidates must be an array")
-  return value.map(item => { const row = record(item); if (!exactKeys(row, CANDIDATE_KEYS)) throw new RoleResultValidationError("invalid_shape", "Scout candidate has an invalid field set"); if (!nonEmpty(row.jobId) || !nonEmpty(row.source) || (row.url !== null && !nonEmpty(row.url))) throw new RoleResultValidationError("missing_id", "Scout candidate requires a job id and source"); return { jobId: row.jobId, source: row.source, url: row.url as string | null, evidenceIds: evidenceForJob(row.evidenceIds, row.jobId, evidence) } })
-}
-function parseFindings(value: unknown, evidence: readonly RoleEvidence[]): AnalystFinding[] {
-  if (!Array.isArray(value)) throw new RoleResultValidationError("invalid_shape", "Analyst findings must be an array")
-  return value.map(item => { const row = record(item); if (!exactKeys(row, FINDING_KEYS)) throw new RoleResultValidationError("invalid_shape", "Analyst finding has an invalid field set"); if (!nonEmpty(row.jobId) || typeof row.score !== "number" || !Number.isFinite(row.score) || row.score < 0 || row.score > 10) throw new RoleResultValidationError(row.jobId ? "invalid_score" : "missing_id", "Analyst finding requires a job id and a score from 0 to 10"); return { jobId: row.jobId, score: row.score, evidenceIds: evidenceForJob(row.evidenceIds, row.jobId, evidence) } })
-}
 function parsePrepareJobs(value: unknown): PrepareJobResult[] {
   if (!densePrepareArray(value, 50)) throw new RoleResultValidationError("invalid_shape", "Prepare jobs must be a bounded array")
   const seen = new Set<string>()

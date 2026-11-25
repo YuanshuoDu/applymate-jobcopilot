@@ -5,15 +5,17 @@ import { verifyCompletedObjectiveTailorWaveSlots, type ObjectiveTailorWaveComple
 import { readObjectiveTailorWaveInventory, type ObjectiveTailorWaveInventory } from "./objective-tailor-wave-inventory.js"
 import { loadTaskGraph, type GraphIdentityScope, type LoadedGraph } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, taskGraphItemId } from "./task-graph-snapshot.js"
+import { readObjectiveTailorJobRequirementEvidence, type ObjectiveJobRequirementEvidence } from "./objective-job-requirement-receipt.js"
 
 type Row = Record<string, unknown>
 type Queryable = Pick<PoolClient, "query">
 export type CompletedObjectiveTailorSourceEvidence = Readonly<{
   sourceTurnId: string; reviewTurnId: string; sourceRootTaskId: string; graphItemId: string; graphRevision: number; finalItemId: string
-  witness: ObjectiveTailorWaveCompletionWitness; outcomes: readonly ObjectiveTailorWaveSlotOutcome[]
+  witness: ObjectiveTailorWaveCompletionWitness; outcomes: readonly ObjectiveTailorWaveSlotOutcome[]; requirementEvidence?: ObjectiveJobRequirementEvidence
 }>
 type Input = Readonly<{ userId: string; sessionId: string; reviewTurnId: string; sourceTurnId: string; rootTaskId: string;
-  graphItemId: string; graphRevision: number; selectedSlotIds: readonly string[]; reviewTurnMode?: "active" | "completed"; evidenceSlotId?: string }>
+  graphItemId: string; graphRevision: number; selectedSlotIds: readonly string[]; reviewTurnMode?: "active" | "completed"; evidenceSlotId?: string;
+  includeRequirementEvidence?: boolean }>
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 const MANIFEST_V1 = "agent-harness.v2.task-graph-sources.v1"
 const MANIFEST_V2 = "agent-harness.v2.task-graph-sources.v2"
@@ -69,7 +71,7 @@ async function readSource(client: Queryable, input: Input): Promise<CompletedObj
     [ids, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
   if (!sameLockedTasks(locked.rows, loaded)) return undefined
   const reread = await loadTaskGraph(client, scope, true)
-  if (!sameLoadedGraph(loaded, reread)) return undefined
+  if (!sameLoadedGraph(loaded, reread) || !reread.item || !reread.snapshot) return undefined
   const inventory = await readObjectiveTailorWaveInventory(client, scope, reread)
   if (!inventory?.marker || inventory.graphRevision !== input.graphRevision || inventory.graphRevision !== reread.item?.revision) return undefined
   const terminal = await readTerminalItem(client, input, scope, inventory.graphRevision, inventory, reread)
@@ -84,9 +86,15 @@ async function readSource(client: Queryable, input: Input): Promise<CompletedObj
     selectedSlotIds: evidenceSlotIds })
   if (completed.status !== "ready" || completed.outcomes.length !== evidenceSlotIds.length
     || completed.outcomes.some(value => value.status !== "ready" || !evidenceSlotIds.includes(value.slotId))) return undefined
+  let requirementEvidence: ObjectiveJobRequirementEvidence | undefined
+  if (input.includeRequirementEvidence === true) {
+    try { requirementEvidence = await readObjectiveTailorJobRequirementEvidence(client, { scope, graphItemId: reread.item.id,
+      graphRevision: reread.item.revision, snapshot: reread.snapshot, outcomes: completed.outcomes }) }
+    catch { requirementEvidence = { status: "unavailable", proposedCount: 0, receipts: [] } }
+  }
   return { sourceTurnId: input.sourceTurnId, reviewTurnId: input.reviewTurnId, sourceRootTaskId: scope.rootTaskId,
     graphItemId: reread.item.id, graphRevision: reread.item.revision, finalItemId: terminal.finalItemId,
-    witness: completed.witness, outcomes: completed.outcomes }
+    witness: completed.witness, outcomes: completed.outcomes, ...(requirementEvidence ? { requirementEvidence } : {}) }
 }
 
 async function readTerminalItem(client: Queryable, input: Input, scope: GraphIdentityScope, revision: number,

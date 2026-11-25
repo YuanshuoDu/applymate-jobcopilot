@@ -46,6 +46,15 @@ describe("structured Scout and Analyst results", () => {
     expect(validateRoleResult({ schemaVersion: "agent-harness.v2.subagent.result", role: "analyst", status: "partial", findings: [{ jobId: "job-1", score: 8.5, evidenceIds: ["ev-job-1"] }], evidence, summary: "one finding" }, "analyst").status).toBe("partial")
   })
 
+  it("accepts absent legacy citations and keeps malformed optional citations from invalidating a score", () => {
+    const legacy = validateRoleResult(validAnalystResult(), "analyst")
+    expect(legacy.findings[0]).not.toHaveProperty("requirementCitations")
+    const malformed = validateRoleResult({ ...validAnalystResult(), findings: [{ ...validAnalystResult().findings[0],
+      requirementCitations: [{ evidenceId: "foreign", quote: "unsupported" }] }] }, "analyst")
+    expect(malformed).toMatchObject({ findings: [{ jobId: "job-1", score: 8.5 }] })
+    expect(malformed.findings[0]).not.toHaveProperty("requirementCitations")
+  })
+
   it("rejects missing ids, dangling evidence, and non-job evidence", () => {
     expect(() => validateRoleResult({ schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed", candidates: [{ jobId: "", source: "greenhouse", url: null, evidenceIds: ["ev-job-1"] }], evidence, summary: "bad" })).toThrow(RoleResultValidationError)
     expect(() => validateRoleResult({ schemaVersion: "agent-harness.v2.subagent.result", role: "analyst", status: "completed", findings: [{ jobId: "job-1", score: 4, evidenceIds: ["missing"] }], evidence, summary: "bad" })).toThrow(/unknown evidence/)
