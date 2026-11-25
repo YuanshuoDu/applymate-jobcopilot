@@ -4890,7 +4890,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
               if (!boundaryApproval) return { available: false, waiterCount, workerAlive }
               try {
                 const [task, turn, job, approval, attempts, resultEvents, executionEvents, browserStarts,
-                  submitDispatches, stats] = await Promise.all([
+                  submitDispatch, stats] = await Promise.all([
                   testDb.applicationTask.findFirst({ where: { id: slot.applicationTaskId, userId, sessionId,
                     jobId: slot.jobId, fillTurnId: prepared.fillTurnId }, select: {
                     status: true, checkpoint: true, workerTaskId: true, fillTurnId: true,
@@ -4911,13 +4911,15 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                     select: { id: true, type: true, body: true, data: true } }),
                   testDb.applicationTaskEvent.count({ where: { taskId: slot.applicationTaskId,
                     type: "reviewed_application_fill_browser_started", actor: "worker" } }),
-                  testDb.agentOutbox.findMany({ where: { aggregateId: sessionId, topic: "application.submit.dispatch" },
-                    take: 12, select: { id: true, payload: true, publishedAt: true, attemptCount: true } }),
+                  testDb.agentOutbox.findUnique({ where: { id: boundaryApproval.dispatchId }, select: {
+                    id: true, aggregateId: true, topic: true, payload: true, publishedAt: true, attemptCount: true,
+                  } }),
                   requestFixtureStats(500).catch(() => null),
                 ])
-                const exactDispatches = submitDispatches.filter(row => jsonString(row.payload, "applicationTaskId") === slot.applicationTaskId
-                  && jsonString(row.payload, "constraintHash") === boundaryApproval.scopeHash
-                  && row.id === boundaryApproval.dispatchId)
+                const exactDispatch = Boolean(submitDispatch?.id === boundaryApproval.dispatchId
+                  && submitDispatch.aggregateId === sessionId && submitDispatch.topic === "application.submit.dispatch"
+                  && jsonString(submitDispatch.payload, "applicationTaskId") === slot.applicationTaskId
+                  && jsonString(submitDispatch.payload, "constraintHash") === boundaryApproval.scopeHash)
                 const exactAttemptState = attempts.length === 1
                   ? diagnosticSubmissionAttemptState(attempts[0]?.state) ?? "missing"
                   : attempts.length === 0 ? "missing" : "other"
@@ -4971,9 +4973,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                   fillTurnStatus: turn ? reviewedFillDiagnosticValue(turn.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES) : "missing",
                   jobStatus: job ? jobStatus : "missing", jobWorkflowState: job ? jobWorkflowState : "missing",
                   jobProjectionStillPreSubmit: Boolean(job && job.status === "saved" && job.workflowState === "submitting" && job.appliedAt === null),
-                  submitOutboxCount: Math.min(2, exactDispatches.length),
-                  submitOutboxPublished: exactDispatches.length === 1 && exactDispatches[0]?.publishedAt instanceof Date
-                    && exactDispatches[0]?.attemptCount === 1,
+                  submitOutboxPresent: submitDispatch !== null,
+                  submitOutboxExact: exactDispatch,
+                  submitOutboxPublished: exactDispatch && submitDispatch?.publishedAt instanceof Date
+                    && submitDispatch?.attemptCount === 1,
                   approvalConsumed: Boolean(approval?.status === "consumed" && approval.consumedAt instanceof Date
                     && approval.scopeHash === boundaryApproval.scopeHash),
                   attemptCount: Math.min(2, attempts.length), attemptState: exactAttemptState,
