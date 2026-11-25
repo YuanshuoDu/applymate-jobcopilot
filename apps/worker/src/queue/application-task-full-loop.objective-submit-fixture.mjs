@@ -28,6 +28,18 @@ export function objectiveApplicationPage(slot) {
       const traces = new Map();
       window.addEventListener('pagehide', () => { if (traces.size) fetch('/__trace?batch=' + encodeURIComponent(JSON.stringify([...traces.values()])), { method: 'POST', keepalive: true }).catch(() => {}); });
       document.addEventListener('DOMContentLoaded', () => fetch('/__trace?event=dom_ready&elapsedMs=' + Math.round(performance.now()), { method: 'POST', keepalive: true }).catch(() => {}));
+      const recordFormEvent = (eventName, field) => {
+        const query = new URLSearchParams({ slot: String(${slot}), event: eventName });
+        if (field) query.set('field', field);
+        fetch('/__trace?' + query, { method: 'GET', cache: 'no-store', keepalive: true }).catch(() => {});
+      };
+      const form = document.querySelector('form');
+      document.querySelector('#submit-app').addEventListener('click', () => recordFormEvent('button_click'));
+      form.addEventListener('submit', () => recordFormEvent('form_submit'), true);
+      form.addEventListener('invalid', event => {
+        const name = event.target?.name;
+        recordFormEvent('invalid', name === 'resume' ? 'resume' : name === 'cover_letter' ? 'cover_letter' : 'other');
+      }, true);
       document.querySelectorAll('input,textarea').forEach(field => field.addEventListener('input', async () => {
         const trace = { event: 'input', field: field.name, elapsedMs: Math.round(performance.now()), length: field.value.length };
         if (field.name === 'cover_letter') {

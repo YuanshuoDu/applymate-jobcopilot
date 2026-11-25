@@ -86,6 +86,8 @@ async function startSite() {
   await unlink(SOCKET).catch(() => undefined)
   let submitCount = 0, reviewedSubmitCount = 0, reviewedMaterialExactCount = 0, objectiveMaterialExactCount = 0, reviewedGetCount = 0
   const objectiveGetCounts = Array(8).fill(0)
+  const objectiveBrowserEvents = Array.from({ length: 8 }, () => ({ buttonClicks: 0, formSubmits: 0,
+    invalidResume: 0, invalidCoverLetter: 0, invalidOther: 0 }))
   const objectiveSubmitReceipts = Array.from({ length: 8 }, (_, index) => ({ slot: index + 1,
     attempts: 0, validAttempts: 0, malformedAttempts: 0, last: null }))
   const requests = []
@@ -97,6 +99,21 @@ async function startSite() {
   const proxySockets = new Set()
   const site = createHttpsServer(await tls(), async (request, response) => {
     const requestUrl = new URL(request.url ?? "/", "https://boards.greenhouse.io")
+    if (request.method === "GET" && requestUrl.pathname === "/__trace") {
+      const query = requestUrl.searchParams, slots = query.getAll("slot"), events = query.getAll("event"), fields = query.getAll("field")
+      const slotText = slots[0], slot = Number(slotText), event = events[0], field = fields[0]
+      const keys = [...query.keys()].sort().join(","), exactKeys = event === "invalid" ? keys === "event,field,slot" : keys === "event,slot"
+      if (slots.length === 1 && /^[1-8]$/.test(slotText ?? "") && events.length === 1 && exactKeys) {
+        const stats = objectiveBrowserEvents[slot - 1]
+        if (event === "button_click") stats.buttonClicks = Math.min(8, stats.buttonClicks + 1)
+        else if (event === "form_submit") stats.formSubmits = Math.min(8, stats.formSubmits + 1)
+        else if (fields.length === 1 && field === "resume") stats.invalidResume = Math.min(8, stats.invalidResume + 1)
+        else if (fields.length === 1 && field === "cover_letter") stats.invalidCoverLetter = Math.min(8, stats.invalidCoverLetter + 1)
+        else if (fields.length === 1 && field === "other") stats.invalidOther = Math.min(8, stats.invalidOther + 1)
+      }
+      response.writeHead(204, { "cache-control": "no-store" }).end()
+      return
+    }
     requests.push(`${request.method ?? "GET"} ${requestUrl.pathname}`)
     if (requests.length > 20) requests.shift()
     if (request.method === "POST" && requestUrl.pathname === "/__trace") {
@@ -276,7 +293,7 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, objectiveMaterialExactCount, reviewedGetCount, objectiveGetCounts, objectiveSubmitReceipts, blocked, requests, browserTrace, browserProgress })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, reviewedSubmitCount, reviewedMaterialExactCount, objectiveMaterialExactCount, reviewedGetCount, objectiveGetCounts, objectiveBrowserEvents, objectiveSubmitReceipts, blocked, requests, browserTrace, browserProgress })}`)
       if (line === "shutdown") {
         process.stdin.pause()
         for (const response of held) response.destroy()
