@@ -1,4 +1,3 @@
-import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
 import { resolveRootTaskVerificationRequirements } from "../context/root-task-objective.js"
 import { readCurrentScheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
@@ -11,8 +10,11 @@ import { isExactObjectiveTaskGraphIntent } from "./objective-task-graph-child-au
 import { buildObjectiveTailorWaveCandidateCatalog, resolveObjectiveTailorWaveCandidates,
   type ObjectiveTailorWaveCandidateCatalog } from "./objective-tailor-candidate-v2.js"
 import { readObjectiveTailorWaveInventory, type ObjectiveTailorWaveInventory } from "./objective-tailor-wave-inventory.js"
+import { buildObjectiveTailorGraphMarker, objectiveTailorGraphFloorMatchesTurn,
+  readObjectiveTailorScoreFloorRequest } from "./objective-tailor-score-floor-marker.js"
 import { bindObjectiveTailorWaveCandidateWitness, parseObjectiveTailorWaveCandidateRefs,
   type ObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
+import type { ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import { objectiveTailorWaveChildExecutionAllowed, prepareObjectiveTailorWaveCreatePlan,
   type ObjectiveTailorWaveCreatePlan } from "./task-graph-pg-create-objective-tailor-wave.js"
 import { TaskGraphCommandError, type TaskGraphExecutionScope, type TaskGraphReadScope, type TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
@@ -40,7 +42,10 @@ export async function readCatalogWithClient(client: Queryable, scope: TaskGraphR
   if (!validRoot(parent, scope) || !turn || !eligibleObjective(parent, turn.input, turn.executionMode)) return undefined
   await assertPlanningRootHasNoUnresolvedSteering(client, parent.allowedActions, scope)
   const loaded = await loadTaskGraph(client, scope, true)
-  if (!loaded.item || loaded.discoveryTurnEligibility !== "ordinary") return undefined
+  if (!loaded.item || !loaded.snapshot || !loaded.state || loaded.discoveryTurnEligibility !== "ordinary"
+    || !objectiveTailorGraphFloorMatchesTurn(loaded.snapshot.objectiveTailor, loaded.snapshot.nodes, turn.input)
+    || !objectiveTailorGraphFloorMatchesTurn(loaded.state.objectiveTailor, loaded.state.nodes, turn.input)
+    || canonicalTaskGraphJson(loaded.snapshot.objectiveTailor ?? null) !== canonicalTaskGraphJson(loaded.state.objectiveTailor ?? null)) return undefined
   return buildObjectiveTailorWaveCandidateCatalog(client, scope, loaded)
 }
 
@@ -59,6 +64,11 @@ export async function appendWaveWithClient(client: Queryable, raw: WaveInput): P
     if (await hasPersistedPlanReceipt(client, scope)) throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
     throw stale()
   }
+  const scoreFloorRequest = readObjectiveTailorScoreFloorRequest(turn.input)
+  if (scoreFloorRequest.status === "invalid"
+    || !objectiveTailorGraphFloorMatchesTurn(loaded.snapshot.objectiveTailor, loaded.snapshot.nodes, turn.input)
+    || !objectiveTailorGraphFloorMatchesTurn(loaded.state.objectiveTailor, loaded.state.nodes, turn.input)
+    || canonicalTaskGraphJson(loaded.snapshot.objectiveTailor ?? null) !== canonicalTaskGraphJson(loaded.state.objectiveTailor ?? null)) throw denied()
   const key = taskGraphProposalKey(scope.rootTaskId, expectedRevision), fingerprint = requestFingerprint(scope, expectedRevision, candidateRefs)
   const replay = await findExactReplay(client, input, loaded, key, fingerprint)
   if (replay) return replay
@@ -81,9 +91,11 @@ export async function appendWaveWithClient(client: Queryable, raw: WaveInput): P
       throw new TaskGraphCommandError("objective_tailor_wave_source_stale", "A candidate source material changed")
     }
   }
-  const nextMarker = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: inventory.sourceNodeCount,
-    slots: [...(inventory.marker?.slots ?? []), ...completeWitnesses.map(value => ({ slotId: value.slotId,
-      sourceAnalystNodeKey: value.sourceAnalystKeys[0], writerNodeKey: value.writerNodeKey, reviewerNodeKey: value.reviewerNodeKey }))] }
+  const nextMarker = buildObjectiveTailorGraphMarker(inventory.sourceNodeCount,
+    [...(inventory.marker?.slots ?? []), ...completeWitnesses.map(value => ({ slotId: value.slotId,
+      sourceAnalystNodeKey: value.sourceAnalystKeys[0]!, writerNodeKey: value.writerNodeKey, reviewerNodeKey: value.reviewerNodeKey
+    } as ObjectiveTailorGraph["slots"][number]))], scoreFloorRequest)
+  if (!nextMarker) throw denied()
   const plan = prepareObjectiveTailorWaveCreatePlan({ current: loaded.state, witnesses: completeWitnesses, nextMarker })
   if (!plan) throw stale()
   const pinned = loaded.snapshot.rootSuccessCriteria === undefined ? undefined

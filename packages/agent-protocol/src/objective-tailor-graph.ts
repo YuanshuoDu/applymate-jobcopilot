@@ -1,6 +1,7 @@
 import { TASK_GRAPH_MAX_IDENTIFIER_LENGTH } from "./plan-ledger.js"
 
 export const OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION = "agent-harness.v2.objective-tailor-graph.v1" as const
+export const OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION = "agent-harness.v2.objective-tailor-graph.v2" as const
 export const OBJECTIVE_TAILOR_GRAPH_MAX_NODES = 40 as const
 
 type SlotNumber = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
@@ -14,9 +15,15 @@ type Slot = Readonly<{
   correction?: Correction
 }>
 
-export type ObjectiveTailorGraph = Readonly<{
+type ObjectiveTailorGraphBase = Readonly<{
   schemaVersion: typeof OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION
   sourceNodeCount: number
+  slots: readonly Slot[]
+}>
+export type ObjectiveTailorGraph = ObjectiveTailorGraphBase | Readonly<{
+  schemaVersion: typeof OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION
+  sourceNodeCount: number
+  reportScoreFloor: number
   slots: readonly Slot[]
 }>
 
@@ -70,8 +77,15 @@ export function parseObjectiveTailorGraph(marker: unknown, nodes: unknown): Obje
 
 function parseObjectiveTailorGraphInner(marker: unknown, nodes: unknown): ObjectiveTailorGraph | null {
   const envelope = record(marker), nodeRows = denseValues(nodes, OBJECTIVE_TAILOR_GRAPH_MAX_NODES)
-  if (!envelope || !exactKeys(envelope, ["schemaVersion", "sourceNodeCount", "slots"])
-    || envelope.schemaVersion !== OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION || !nodeRows) return null
+  const version = envelope?.schemaVersion
+  const hasFloor = version === OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION
+  if (!envelope || !exactKeys(envelope, hasFloor
+    ? ["schemaVersion", "sourceNodeCount", "reportScoreFloor", "slots"]
+    : ["schemaVersion", "sourceNodeCount", "slots"])
+    || version !== OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION && !hasFloor || !nodeRows) return null
+  const reportScoreFloor = envelope.reportScoreFloor
+  if (hasFloor && (typeof reportScoreFloor !== "number" || !Number.isFinite(reportScoreFloor)
+    || reportScoreFloor < 0 || reportScoreFloor > 10)) return null
   const sourceNodeCount = envelope.sourceNodeCount
   if (typeof sourceNodeCount !== "number" || !Number.isSafeInteger(sourceNodeCount) || sourceNodeCount < 2 || sourceNodeCount > 8) return null
   const sourceCount = sourceNodeCount
@@ -128,5 +142,8 @@ function parseObjectiveTailorGraphInner(marker: unknown, nodes: unknown): Object
       ...(correction ? { correction } : {}) })
   }
   if (claimed.size !== suffixKeys.size) return null
-  return { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: sourceCount, slots }
+  return hasFloor
+    ? { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION, sourceNodeCount: sourceCount,
+      reportScoreFloor: reportScoreFloor as number, slots }
+    : { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: sourceCount, slots }
 }

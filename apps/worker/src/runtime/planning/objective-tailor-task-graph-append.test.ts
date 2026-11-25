@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import {
   appendObjectiveTailorTaskGraphProposal,
   appendTaskGraphProposal,
@@ -184,6 +184,26 @@ describe("Objective Tailor TaskGraph append", () => {
     const immediateCorrection = append(state, [...initialPairs([newSlotWithCorrection]), ...correctionPairs([newSlotWithCorrection])],
       [...graphSlots(state), newSlotWithCorrection])
     expect(immediateCorrection).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+  })
+
+  it("keeps the admitted marker version and report floor immutable across every append", () => {
+    const slots = newSlots(1, 1)
+    const floorMarker = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION,
+      sourceNodeCount: 7, reportScoreFloor: 8, slots }
+    const first = appendObjectiveTailorTaskGraphProposal(sourceState(),
+      { expectedRevision: 7, nodes: initialPairs(slots) }, options, floorMarker)
+    expect(first.ok).toBe(true)
+    if (!first.ok) return
+    const changedFloor = { ...first.state.objectiveTailor!, reportScoreFloor: 9,
+      slots: [...first.state.objectiveTailor!.slots, ...newSlots(2, 1)] }
+    expect(appendObjectiveTailorTaskGraphProposal(first.state,
+      { expectedRevision: first.state.revision, nodes: initialPairs(newSlots(2, 1)) }, options, changedFloor))
+      .toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+    const changedVersion = { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: 7,
+      slots: [...first.state.objectiveTailor!.slots, ...newSlots(2, 1)] }
+    expect(appendObjectiveTailorTaskGraphProposal(first.state,
+      { expectedRevision: first.state.revision, nodes: initialPairs(newSlots(2, 1)) }, options, changedVersion))
+      .toMatchObject({ ok: false, error: { code: "invalid_shape" } })
   })
 
   it("enforces four-pair append waves, the 40-node ceiling, and one correction per slot", () => {

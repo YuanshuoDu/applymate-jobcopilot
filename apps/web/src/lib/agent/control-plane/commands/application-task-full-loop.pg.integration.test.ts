@@ -1741,7 +1741,8 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "objective_single_source_completed" | "objective_single_worker_ready" | "objective_single_review_started"
   | "objective_single_approval_pending" | "objective_single_approval_accepted" | "objective_single_handoff_published"
   | "objective_single_fill_ready" | "objective_single_submit_approved" | "objective_single_completed"
-  | "objective_wave_source_ready" | "objective_wave_set_issued" | "objective_wave_stale_retired"
+  | "objective_score_floor_nine_verified" | "objective_wave_source_ready" | "objective_wave_score_floor_eight_verified"
+  | "objective_wave_set_issued" | "objective_wave_stale_retired"
   | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
 
@@ -3240,6 +3241,110 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     selectedJobFullLoopPhase("final_checks_completed")
   }, 300_000)
 
+  it("reports zero qualifying jobs at a score floor of nine without starting review or fill", async () => {
+    const userId = `${ids.user}-score-floor-nine`
+    const sessionId = `full-loop-score-floor-nine-session-${runId}`
+    const suffix = `full-loop-score-floor-nine-${runId}`
+    reviewedSessionIds.push(sessionId)
+    reviewedSessionOwners.set(sessionId, userId)
+    let sourceWorker: Child | undefined
+    try {
+      const user = await testDb.user.create({ data: { id: userId, email: `${userId}@example.test`,
+        name: "Synthetic Score Floor Candidate", plan: "pro", phone: "+353000000000", location: "Dublin",
+        personaFields: [{ key: "firstName", value: "A" }, { key: "lastName", value: "B" }] } })
+      createdUsers.push(user.id)
+      await testDb.agentSession.create({ data: { id: sessionId, userId, goal: "Assess synthetic roles at the requested reporting floor",
+        status: "running", source: "application_full_loop_objective_score_floor" } })
+      const { Pool } = workerRequire("pg") as { Pool: new (options: { connectionString: string }) => { end(): Promise<void> } }
+      const sourceFixture = await import(objectiveTailorWaveSourceFixturePath) as unknown as {
+        seedObjectiveTailorWaveSource(pool: unknown, owner: { userId: string; suffix: string },
+          jobIdForSlot: (suffix: string, slot: number) => string): Promise<{ jobs: readonly Readonly<{ id: string }>[] }>
+      }
+      const sourcePool = new Pool({ connectionString: databaseUrl! }), jobIds = Array.from({ length: 8 }, () => randomUUID())
+      let seeded: Awaited<ReturnType<typeof sourceFixture.seedObjectiveTailorWaveSource>>
+      try {
+        seeded = await sourceFixture.seedObjectiveTailorWaveSource(sourcePool, { userId, suffix }, (ownerSuffix, slot) => {
+          if (ownerSuffix !== suffix || !jobIds[slot]) throw new Error("Score floor source scope changed")
+          return jobIds[slot]!
+        })
+      } finally { await sourcePool.end() }
+      reviewedJobIds.push(...seeded.jobs.map(job => job.id))
+      for (const jobId of seeded.jobs.map(job => job.id)) reviewedJobOwners.set(jobId, userId)
+
+      const token = await signedBearer(userId), objective = "Assess synthetic roles for a reporting-only score floor"
+      const startKey = `objective-score-floor-nine-${runId}`
+      const requirements = { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+      ] }
+      await stopFixture(worker)
+      worker = undefined
+      const { POST: startObjective } = await import("@/app/api/agent/sessions/[id]/start-objective/route")
+      const response = await startObjective(apiRequest(`/api/agent/sessions/${sessionId}/start-objective`, token, "POST", {
+        schemaVersion, clientMessageId: startKey, objective, content: [{ type: "text", text: objective }],
+        verificationRequirements: requirements, reportScoreFloor: 9,
+      }, { "idempotency-key": startKey }), { params: Promise.resolve({ id: sessionId }) })
+      expect(response.status).toBe(202)
+      const started = await jsonResponse(response), turnId = typeof started.turnId === "string" ? started.turnId : ""
+      if (!turnId) throw new Error("Score floor source returned no Turn")
+      sourceWorker = spawnObjectiveTailorWaveFixture({ userId, sessionId, turnId })
+      worker = sourceWorker
+      await waitLine(sourceWorker, "TAILOR_WAVE_WORKER_READY resume", 90_000)
+      const terminal = await waitForAgentTurnTerminal(turnId, 240_000)
+      if (terminal.status !== "completed") {
+        const diagnostic = await objectiveSourceFailureSnapshot({ sessionId, turnId,
+          lines: sourceWorker.lines, errors: sourceWorker.errors })
+        throw new Error(`Score floor source failed ${JSON.stringify(diagnostic)}`)
+      }
+      const turn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: turnId } })
+      expect(turn).toMatchObject({ userId, sessionId, source: "user", status: "completed", executionMode: "canonical_task_graph" })
+      expect(turn.input).toMatchObject({ reportScoreFloor: 9 })
+      const rootTaskId = turn.rootTaskId
+      if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("Score floor source Root is missing")
+      const graph = await testDb.agentItem.findFirstOrThrow({ where: { sessionId, turnId, taskId: rootTaskId, type: "task_graph" },
+        select: { content: true } })
+      const graphContent = jsonRecord(graph.content)
+      expect(parseObjectiveTailorGraph(graphContent?.objectiveTailor, graphContent?.nodes)).toMatchObject({
+        schemaVersion: "agent-harness.v2.objective-tailor-graph.v2", reportScoreFloor: 9,
+      })
+      const completion = await testDb.agentEvent.findFirstOrThrow({ where: {
+        id: `turn:${turnId}:event:turn-completed`, sessionId, turnId,
+      }, select: { payload: true } })
+      const finalItemId = jsonString(completion.payload, "finalItemId")
+      if (!finalItemId) throw new Error("Score floor source final item is missing")
+      const finalItem = await testDb.agentItem.findFirstOrThrow({ where: { id: finalItemId, sessionId, turnId,
+        taskId: rootTaskId, type: "agent_message", status: "completed", phase: "final_answer" }, select: { content: true } })
+      const outcome = parseObjectiveTailorFinalOutcomeSidecar(jsonRecord(finalItem.content)?.objectiveTailorFinalOutcomes)
+      expect(outcome).toMatchObject({
+        schemaVersion: "agent-harness.v2.objective-tailor-final-outcomes.v3",
+        reportedScoreFloor: { status: "complete", minimumScore: 9, qualifyingJobCount: 0 },
+        sourceCounts: { analyzedJobs: { knownCount: 8, coverage: "complete" } },
+      })
+      expect(outcome?.slots.map(slot => [slot.ordinal, slot.status])).toEqual([
+        [1, "ready"], [2, "ready"], [3, "rejected"], [4, "ready"],
+        [5, "ready"], [6, "ready"], [7, "ready"], [8, "rejected"],
+      ])
+      const reportResponse = await getObjectiveJourneyReport(sessionId, finalItemId, token)
+      expect(reportResponse.status).toBe(200)
+      const report = jsonRecord((await jsonResponse(reportResponse)).report)
+      expect(report?.reportedScoreFloor).toEqual({ status: "complete", minimumScore: 9, qualifyingJobCount: 0 })
+      expect(Array.isArray(report?.slots) ? report.slots.map(slot => jsonRecord(slot)?.reviewStatus) : []).toEqual(Array(8).fill("not_requested"))
+      expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(1)
+      expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(0)
+      expect(await testDb.agentOutbox.count({ where: { aggregateId: sessionId, topic: "application.submit.dispatch" } })).toBe(0)
+      selectedJobFullLoopPhase("objective_score_floor_nine_verified")
+    } finally {
+      if (sourceWorker && worker === sourceWorker && !exited(sourceWorker)) {
+        await stopFixture(sourceWorker)
+        worker = undefined
+      }
+      if (!worker || exited(worker)) {
+        worker = spawnFixture("worker")
+        await waitLine(worker, "WORKER_READY", 90_000)
+      }
+    }
+  }, 360_000)
+
   it("fills the corrected Objective slot without submission, then separately approves and verifies synthetic submission on the same Turn", () => {
     const completeStandaloneScenario = beginObjectiveStandaloneScenario()
     return (async () => {
@@ -4202,7 +4307,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       worker = undefined
       const startResponse = await startObjective(apiRequest(`/api/agent/sessions/${sessionId}/start-objective`, token, "POST", {
         schemaVersion, clientMessageId: startKey, objective, content: [{ type: "text", text: objective }],
-        verificationRequirements: requirements,
+        verificationRequirements: requirements, reportScoreFloor: 8,
       }, { "idempotency-key": startKey }), { params: Promise.resolve({ id: sessionId }) })
       expect(startResponse.status).toBe(202)
       const started = await jsonResponse(startResponse), sourceTurnId = typeof started.turnId === "string" ? started.turnId : ""
@@ -4218,6 +4323,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       }
       const sourceTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: sourceTurnId } })
       expect(sourceTurn).toMatchObject({ userId, sessionId, source: "user", status: "completed", executionMode: "canonical_task_graph" })
+      expect(sourceTurn.input).toMatchObject({ reportScoreFloor: 8 })
       const sourceRootTaskId = sourceTurn.rootTaskId
       if (typeof sourceRootTaskId !== "string" || !sourceRootTaskId) throw new Error("Objective wave Root is missing")
       const graphRow = await testDb.agentItem.findFirstOrThrow({ where: {
@@ -4225,6 +4331,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       }, select: { id: true, revision: true, content: true } })
       const graphContent = jsonRecord(graphRow.content), marker = parseObjectiveTailorGraph(graphContent?.objectiveTailor, graphContent?.nodes)
       if (!marker || marker.slots.length !== 8) throw new Error("Objective wave graph has no exact eight-slot marker")
+      expect(marker).toMatchObject({ schemaVersion: "agent-harness.v2.objective-tailor-graph.v2", reportScoreFloor: 8 })
       const sourceCompletedEvent = await testDb.agentEvent.findFirstOrThrow({ where: {
         id: `turn:${sourceTurnId}:event:turn-completed`, sessionId, turnId: sourceTurnId,
       }, select: { payload: true } })
@@ -4238,6 +4345,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         [1, "ready"], [2, "ready"], [3, "rejected"], [4, "ready"],
         [5, "ready"], [6, "ready"], [7, "ready"], [8, "rejected"],
       ])
+      expect(sidecar).toMatchObject({ schemaVersion: "agent-harness.v2.objective-tailor-final-outcomes.v3",
+        reportedScoreFloor: { status: "complete", minimumScore: 8, qualifyingJobCount: 8 },
+        sourceCounts: { analyzedJobs: { knownCount: 8, coverage: "complete" } },
+      })
       selectedJobFullLoopPhase("objective_wave_source_ready")
 
       const graphNodes = Array.isArray(graphContent?.nodes) ? graphContent.nodes : []
@@ -4306,7 +4417,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       ])
       expect(initialReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v2",
         finalItemId, graphRevision: graphRow.revision, reviewCoverage: "complete" })
-      expect(initialReport.reportedScoreFloor).toEqual({ status: "not_requested" })
+      expect(initialReport.reportedScoreFloor).toEqual({ status: "complete", minimumScore: 8, qualifyingJobCount: 8 })
+      selectedJobFullLoopPhase("objective_wave_score_floor_eight_verified")
       const expectedSourceCounts = jsonRecord(jsonRecord(finalContent?.objectiveTailorFinalOutcomes)?.sourceCounts)
         ?? { discoveredJobs: { knownCount: null, coverage: "unavailable" }, analyzedJobs: { knownCount: null, coverage: "unavailable" } }
       expect(initialReport.sourceCounts).toEqual(expectedSourceCounts)

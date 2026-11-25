@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import type { PoolClient } from "pg"
-import { parseObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION, parseObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import { isTaskGraphTerminal } from "../planning/task-graph-transition-rules.js"
 import type { TurnLease } from "../turns/lease.js"
 import {
@@ -9,6 +9,7 @@ import {
   type ObjectiveTailorWaveSlotStatus,
 } from "../canonical-objective-tailor-wave-completion.js"
 import { parseObjectiveTailorCorrectionProof } from "./objective-tailor-correction-witness.js"
+import { objectiveTailorGraphFloorMatchesTurn } from "./objective-tailor-score-floor-marker.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { LoadedGraph } from "./task-graph-pg-state.js"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
@@ -27,7 +28,7 @@ const DIGEST = /^[a-f0-9]{64}$/
 type SettledStatus = Exclude<ObjectiveTailorWaveSlotStatus, "pending">
 const SLOT_STATUSES: readonly SettledStatus[] = ["ready", "needs_revision", "rejected", "stale", "failed"]
 export type ObjectiveTailorFinalSummaryRead = Readonly<{ status: "unmarked" | "invalid" }>
-  | Readonly<{ status: "ready"; root: Readonly<{ id: string; attemptCount: number }>; projection: ObjectiveTailorFinalOutcomeProjection }>
+  | Readonly<{ status: "ready"; root: Readonly<{ id: string; attemptCount: number; turnInput: unknown }>; projection: ObjectiveTailorFinalOutcomeProjection }>
 
 export async function buildCurrentTaskGraphFinalSummaryBinding(input: Readonly<{
   client: PoolClient; lease: TurnLease; rootTaskId: string; loaded: LoadedGraph
@@ -43,14 +44,15 @@ export async function buildCurrentTaskGraphFinalSummaryBinding(input: Readonly<{
   if (!base || base.graphRevision !== read.projection.graphRevision
     || base.rootTaskId !== input.loaded.rootTaskId || base.graphItemId !== input.loaded.item?.id) return null
   if (!base.members) return null
-  const reportedScoreFloor = deriveObjectiveReportedScoreFloorFromLoaded({
-    loaded: input.loaded,
-    sourceNodes: prefix.snapshot!.nodes,
-    effectiveAnalystTaskIds: base.members
-      .filter(member => member.templateId === "analyst" && member.kind !== "historical")
-      .map(member => member.taskId),
-    summary: base.summary,
-  })
+  const marker = parseObjectiveTailorGraph(input.loaded.snapshot?.objectiveTailor, input.loaded.snapshot?.nodes)
+  if (!marker) return null
+  const floorMatchesTurn = objectiveTailorGraphFloorMatchesTurn(marker, input.loaded.snapshot!.nodes, read.root.turnInput)
+  const reportedScoreFloor = floorMatchesTurn ? deriveObjectiveReportedScoreFloorFromLoaded({
+    loaded: input.loaded, sourceNodes: prefix.snapshot!.nodes,
+    effectiveAnalystTaskIds: base.members.filter(member => member.templateId === "analyst" && member.kind !== "historical")
+      .map(member => member.taskId), summary: base.summary,
+    ...(marker.schemaVersion === OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION ? { requestedFloor: marker.reportScoreFloor } : {}),
+  }) : { status: "unavailable" as const }
   return { ...base, objectiveTailorFinalOutcome: { ...read.projection, reportedScoreFloor } }
 }
 
@@ -172,9 +174,9 @@ function projectOutcome(loaded: LoadedGraph, witness: ObjectiveTailorWaveComplet
     sourceGraphDigest, sourceStatusDigest, slots })
 }
 
-async function readOwnedRoot(client: PoolClient, lease: TurnLease, rootTaskId: string): Promise<{ id: string; attemptCount: number } | undefined> {
-  const result = await client.query<{ id: string; attemptCount: number }>(`WITH observed AS (SELECT clock_timestamp() AS now)
-    SELECT task."id", task."attemptCount"
+async function readOwnedRoot(client: PoolClient, lease: TurnLease, rootTaskId: string): Promise<{ id: string; attemptCount: number; turnInput: unknown } | undefined> {
+  const result = await client.query<{ id: string; attemptCount: number; turnInput: unknown }>(`WITH observed AS (SELECT clock_timestamp() AS now)
+    SELECT task."id", task."attemptCount", turn."input" AS "turnInput"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
     CROSS JOIN observed

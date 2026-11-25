@@ -11,7 +11,8 @@ const FINAL_SLOT_STATUSES = ["ready", "needs_revision", "rejected", "stale", "fa
 type FinalSlotStatus = Exclude<ObjectiveTailorWaveSlotStatus, "pending">
 
 export type ObjectiveReportedScoreFloor = Readonly<{ status: "not_requested" | "unavailable" }>
-  | Readonly<{ status: "complete"; minimumScore: number; minimumFindings: number; aggregation: "any" | "all"; qualifyingJobCount: number }>
+  | Readonly<{ status: "complete"; source: "turn_input"; minimumScore: number; qualifyingJobCount: number }>
+  | Readonly<{ status: "complete"; source: "analyst_verification"; minimumScore: number; minimumFindings: number; aggregation: "any" | "all"; qualifyingJobCount: number }>
 export type ObjectiveTailorFinalOutcomeProjection = Readonly<{
   schemaVersion: typeof OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA
   graphRevision: number
@@ -32,6 +33,7 @@ export function deriveObjectiveReportedScoreFloor(input: Readonly<{
   currentGraph?: TaskGraphCurrentState
   effectiveAnalystTaskIds: readonly string[]
   summary: TaskGraphFinalSummary
+  requestedFloor?: number
 }>): ObjectiveReportedScoreFloor {
   try { return derive(input) } catch { return UNAVAILABLE }
 }
@@ -39,24 +41,32 @@ export function deriveObjectiveReportedScoreFloor(input: Readonly<{
 export function deriveObjectiveReportedScoreFloorFromLoaded(input: Readonly<{
   loaded: LoadedGraph; sourceNodes: readonly StoredTaskGraphNode[]
   effectiveAnalystTaskIds: readonly string[]; summary: TaskGraphFinalSummary
+  requestedFloor?: number
 }>): ObjectiveReportedScoreFloor {
   let currentGraph: TaskGraphCurrentState | undefined
   try { currentGraph = currentTaskGraph(input.loaded) } catch { /* Invalid verification projection means unavailable. */ }
   return deriveObjectiveReportedScoreFloor({ sourceNodes: input.sourceNodes,
-    effectiveAnalystTaskIds: input.effectiveAnalystTaskIds, summary: input.summary, currentGraph })
+    effectiveAnalystTaskIds: input.effectiveAnalystTaskIds, summary: input.summary, currentGraph, requestedFloor: input.requestedFloor })
 }
 
 export function parseObjectiveReportedScoreFloor(value: unknown): ObjectiveReportedScoreFloor | null {
   const row = exactRecord(value)
   if (!row) return null
   if (row.status === "not_requested" || row.status === "unavailable") return exactKeys(row, "status") ? { status: row.status } : null
-  return exactKeys(row, "aggregation,minimumFindings,minimumScore,qualifyingJobCount,status") && row.status === "complete"
-    && typeof row.minimumScore === "number" && Number.isFinite(row.minimumScore) && row.minimumScore >= 0 && row.minimumScore <= 10
+  const old = exactKeys(row, "aggregation,minimumFindings,minimumScore,qualifyingJobCount,status") && row.status === "complete"
+  const derived = exactKeys(row, "aggregation,minimumFindings,minimumScore,qualifyingJobCount,source,status")
+    && row.status === "complete" && row.source === "analyst_verification"
+  if (derived || old) return typeof row.minimumScore === "number" && Number.isFinite(row.minimumScore) && row.minimumScore >= 0 && row.minimumScore <= 10
     && Number.isSafeInteger(row.minimumFindings) && Number(row.minimumFindings) > 0
     && (row.aggregation === "any" || row.aggregation === "all")
     && Number.isSafeInteger(row.qualifyingJobCount) && Number(row.qualifyingJobCount) >= 0
-    ? { status: "complete", minimumScore: row.minimumScore, minimumFindings: Number(row.minimumFindings),
+    ? { status: "complete", source: "analyst_verification", minimumScore: row.minimumScore, minimumFindings: Number(row.minimumFindings),
       aggregation: row.aggregation, qualifyingJobCount: Number(row.qualifyingJobCount) } : null
+  return exactKeys(row, "minimumScore,qualifyingJobCount,source,status") && row.status === "complete" && row.source === "turn_input"
+    && typeof row.minimumScore === "number" && Number.isFinite(row.minimumScore) && row.minimumScore >= 0 && row.minimumScore <= 10
+    && Number.isSafeInteger(row.qualifyingJobCount) && Number(row.qualifyingJobCount) >= 0
+    ? { status: "complete", source: "turn_input", minimumScore: row.minimumScore,
+      qualifyingJobCount: Number(row.qualifyingJobCount) } : null
 }
 
 /** Accepts the exact historical private projection without a floor as unavailable. */
@@ -103,6 +113,7 @@ function parseFinalOutcome(value: unknown): ObjectiveTailorFinalOutcomeProjectio
 
 function derive(input: Parameters<typeof deriveObjectiveReportedScoreFloor>[0]): ObjectiveReportedScoreFloor {
   const { sourceNodes, currentGraph, effectiveAnalystTaskIds, summary } = input
+  const explicit = input.requestedFloor !== undefined
   if (sourceNodes.length < 2 || sourceNodes.length > 8
     || new Set(effectiveAnalystTaskIds).size !== effectiveAnalystTaskIds.length
     || summary.graphRevision < 1 || !Number.isSafeInteger(summary.graphRevision)) return UNAVAILABLE
@@ -110,11 +121,18 @@ function derive(input: Parameters<typeof deriveObjectiveReportedScoreFloor>[0]):
   if (analysts.length !== effectiveAnalystTaskIds.length || analysts.some(node => node.verificationDisposition !== "typed"
     || node.verification?.role !== "analyst")) return UNAVAILABLE
   const criteriaByAnalyst = analysts.map(node => node.verification!.criteria.filter(item => item.check.kind === "reported_score_gte"))
-  if (!criteriaByAnalyst.some(criteria => criteria.length > 0)) return { status: "not_requested" }
-  if (!analysts.length || criteriaByAnalyst.some(criteria => criteria.length === 0)) return UNAVAILABLE
-  const checks = criteriaByAnalyst.flatMap(criteria => criteria.map(item => item.check as ScoreCheck))
-  const floor = checks[0]!
-  if (!validFloor(floor) || checks.some(check => !validFloor(check) || !sameFloor(floor, check))) return UNAVAILABLE
+  let floor: Pick<ScoreCheck, "minimumScore" | "minimumFindings" | "aggregation">
+  if (explicit) {
+    if (typeof input.requestedFloor !== "number" || !Number.isFinite(input.requestedFloor) || input.requestedFloor < 0 || input.requestedFloor > 10) return UNAVAILABLE
+    floor = { minimumScore: input.requestedFloor, minimumFindings: 1, aggregation: "any" }
+  } else {
+    if (!criteriaByAnalyst.some(criteria => criteria.length > 0)) return { status: "not_requested" }
+    if (!analysts.length || criteriaByAnalyst.some(criteria => criteria.length === 0)) return UNAVAILABLE
+    const checks = criteriaByAnalyst.flatMap(criteria => criteria.map(item => item.check as ScoreCheck))
+    const requested = checks[0]!
+    if (!validFloor(requested) || checks.some(check => !validFloor(check) || !sameFloor(requested, check))) return UNAVAILABLE
+    floor = requested
+  }
   if (!currentGraph || currentGraph.revision !== summary.graphRevision || currentGraph.nodes.length < sourceNodes.length) return UNAVAILABLE
   const currentNodes = currentGraph.nodes.slice(0, sourceNodes.length)
   if (currentNodes.some((node, index) => node.key !== sourceNodes[index]?.key
@@ -152,8 +170,8 @@ function derive(input: Parameters<typeof deriveObjectiveReportedScoreFloor>[0]):
   for (const analyst of analysts) {
     const scores = scoresByTask.get(analyst.taskId) ?? []
     const meets = (score: number) => score >= floor.minimumScore
-    if (scores.length < floor.minimumFindings
-      || !(floor.aggregation === "any" ? scores.some(meets) : scores.every(meets))) return UNAVAILABLE
+    if (!explicit && (scores.length < floor.minimumFindings
+      || !(floor.aggregation === "any" ? scores.some(meets) : scores.every(meets)))) return UNAVAILABLE
   }
   let qualifyingJobCount = 0
   for (const job of analyzed) {
@@ -161,8 +179,9 @@ function derive(input: Parameters<typeof deriveObjectiveReportedScoreFloor>[0]):
     if (sides.size !== 1) return UNAVAILABLE
     if (sides.has(true)) qualifyingJobCount += 1
   }
-  return { status: "complete", minimumScore: floor.minimumScore, minimumFindings: floor.minimumFindings,
-    aggregation: floor.aggregation, qualifyingJobCount }
+  return explicit ? { status: "complete", source: "turn_input", minimumScore: floor.minimumScore, qualifyingJobCount }
+    : { status: "complete", source: "analyst_verification", minimumScore: floor.minimumScore,
+      minimumFindings: floor.minimumFindings, aggregation: floor.aggregation, qualifyingJobCount }
 }
 
 function validFloor(value: ScoreCheck): boolean {

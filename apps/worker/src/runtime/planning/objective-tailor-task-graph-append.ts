@@ -1,5 +1,6 @@
 import {
   OBJECTIVE_TAILOR_GRAPH_MAX_NODES,
+  OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION,
   parseObjectiveTailorGraph,
   type ObjectiveTailorGraph,
 } from "@jobcopilot/agent-protocol"
@@ -57,6 +58,9 @@ function validTransition(
     return sameKeys(introduced, addedNodes)
   }
   if (next.sourceNodeCount !== previous.sourceNodeCount || next.slots.length < previous.slots.length) return false
+  if (next.schemaVersion !== previous.schemaVersion || previous.schemaVersion === OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION
+    && next.schemaVersion === OBJECTIVE_TAILOR_GRAPH_SCORE_FLOOR_SCHEMA_VERSION
+    && next.reportScoreFloor !== previous.reportScoreFloor) return false
   for (let index = 0; index < previous.slots.length; index++) {
     const old = previous.slots[index]!, current = next.slots[index]!
     if (old.slotId !== current.slotId || old.sourceAnalystNodeKey !== current.sourceAnalystNodeKey

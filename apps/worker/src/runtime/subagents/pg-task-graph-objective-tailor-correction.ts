@@ -12,6 +12,7 @@ import { readObjectiveTailorWaveInventory } from "./objective-tailor-wave-invent
 import { objectiveTailorCorrectionNodeKeys, parseObjectiveTailorCorrectionProof,
   verifyAndBindObjectiveTailorCorrectionProof, type ObjectiveTailorCorrectionProof } from "./objective-tailor-correction-proof.js"
 import { prepareObjectiveTailorCorrectionPlan } from "./objective-tailor-correction-plan.js"
+import { objectiveTailorGraphFloorMatchesTurn } from "./objective-tailor-score-floor-marker.js"
 import { objectiveTailorWaveChildExecutionAllowed } from "./task-graph-pg-create-objective-tailor-wave.js"
 import { TaskGraphCommandError, type TaskGraphExecutionScope, type TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 import { requireOwnedRootPlanCriteria } from "./root-plan-criteria.js"
@@ -45,6 +46,9 @@ export async function appendCorrectionWithClient(client: pg.PoolClient, raw: unk
     if (await hasPersistedPlanReceipt(client, scope)) throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
     throw stale()
   }
+  if (!objectiveTailorGraphFloorMatchesTurn(loaded.snapshot.objectiveTailor, loaded.snapshot.nodes, turn.input)
+    || !objectiveTailorGraphFloorMatchesTurn(loaded.state.objectiveTailor, loaded.state.nodes, turn.input)
+    || canonicalTaskGraphJson(loaded.snapshot.objectiveTailor ?? null) !== canonicalTaskGraphJson(loaded.state.objectiveTailor ?? null)) throw denied()
   const key = taskGraphProposalKey(scope.rootTaskId, expectedRevision), fingerprint = correctionFingerprint(scope, expectedRevision, correctionSlotId)
   const replay = await findExactReplay(client, input, loaded, key, fingerprint)
   if (replay) return replay
