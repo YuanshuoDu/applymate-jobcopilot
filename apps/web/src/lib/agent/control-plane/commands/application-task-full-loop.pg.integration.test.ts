@@ -562,6 +562,33 @@ let agentWorkerSecretOverridden = false
 let databaseUrlOverridden = false
 let dbConnected = false
 let priorApplicationFillTaskGraph: string | undefined
+let priorObjectiveTailorWaves: string | undefined
+let objectiveStandaloneScenarioCompletion: Promise<void> = Promise.resolve()
+
+type FixtureWorkerProfile = "standard" | "objective_wave"
+
+function objectiveTailorWorkerFlags(profile: FixtureWorkerProfile): Record<string, string> {
+  return profile === "objective_wave"
+    ? { ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      ENABLE_AGENT_OBJECTIVE_TAILOR: "0", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1" }
+    : { ENABLE_AGENT_OBJECTIVE_TAILOR: "0", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "0" }
+}
+
+function beginObjectiveStandaloneScenario(): () => void {
+  let complete!: () => void
+  let completed = false
+  objectiveStandaloneScenarioCompletion = new Promise(resolve => { complete = resolve })
+  return () => { if (!completed) { completed = true; complete() } }
+}
+
+async function requireObjectiveStandaloneScenarioCompletion(completion: Promise<void>, timeoutMs = 10_000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const settled = await Promise.race([completion.then(() => true), new Promise<boolean>(resolve => {
+    timer = setTimeout(() => resolve(false), timeoutMs)
+  })])
+  if (timer) clearTimeout(timer)
+  if (!settled) throw new Error("objective_standalone_scenario_not_quiescent")
+}
 
 function checkTlsAndIsolation(): void {
   if (!enabled) return
@@ -587,12 +614,13 @@ async function assertEgressBlocked(): Promise<void> {
   }
 }
 
-function spawnFixture(mode: "site" | "worker", workerUserId = ids.user): Child {
-  const objectiveTailorWorker = mode === "worker" && process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES === "1"
+function spawnFixture(mode: "site" | "worker", workerUserId = ids.user,
+  workerProfile: FixtureWorkerProfile = "standard"): Child {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode], {
     cwd: workerCwd,
     env: {
       ...process.env,
+      ...(mode === "worker" ? objectiveTailorWorkerFlags(workerProfile) : {}),
       DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!,
       REDIS_URL: redisUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!,
       AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true", AGENT_RUNTIME_PG_TEST_REQUIRED: "true",
@@ -603,8 +631,7 @@ function spawnFixture(mode: "site" | "worker", workerUserId = ids.user): Child {
       ...(mode === "worker" ? { AGENT_WEB_URL: "", WEB_APP_URL: "", APPLYMATE_WEB_URL: "", AGENT_WORKER_SECRET: "",
         APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_ENDPOINT_URL: reviewedFillEndpointUrl,
         APPLICATION_TASK_FULL_LOOP_REVIEWED_FILL_SECRET: reviewedFillBridgeSecret,
-        ...(objectiveTailorWorker ? { ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1",
-          ENABLE_AGENT_WAIT_RESOLVER: "1" } : {}) } : {}),
+      } : {}),
       BULLMQ_STALLED_INTERVAL_MS: "30000",
       ...(mode === "worker" ? { APPLICATION_TASK_FULL_LOOP_USER_ID: workerUserId } : {}),
     },
@@ -627,10 +654,11 @@ function spawnFixture(mode: "site" | "worker", workerUserId = ids.user): Child {
 function spawnObjectiveTailorWaveFixture(scope: { userId: string; sessionId: string; turnId: string }): Child {
   const child = spawn(process.execPath, ["--import", "tsx", objectiveTailorWaveFixturePath, "resume", JSON.stringify(scope)], {
     cwd: workerCwd,
-    env: { ...process.env, DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!,
+    env: { ...process.env, ...objectiveTailorWorkerFlags("objective_wave"),
+      DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!,
       REDIS_URL: redisUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_REQUIRED: "true",
       AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true", AGENT_TURN_REDIS_TEST_DISPOSABLE: "true",
-      RUN_AGENT_TURN_REDIS_INTEGRATION: "1", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1" },
+      RUN_AGENT_TURN_REDIS_INTEGRATION: "1" },
     stdio: ["pipe", "pipe", "pipe"],
   }) as Child
   Object.defineProperties(child, { lines: { value: [] }, errors: { value: [] } })
@@ -1703,6 +1731,9 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "source_completed" | "review_start_started" | "review_turn_created" | "approval_wait_started" | "approval_observed"
   | "approval_decision_started" | "approval_decision_accepted" | "review_terminal_wait_started" | "review_turn_completed"
   | "handoff_retry_wait_started" | "handoff_published" | "fill_turn_wait_started" | "fill_turn_created"
+  | "objective_single_source_completed" | "objective_single_worker_ready" | "objective_single_review_started"
+  | "objective_single_approval_pending" | "objective_single_approval_accepted" | "objective_single_handoff_published"
+  | "objective_single_fill_ready" | "objective_single_submit_approved" | "objective_single_completed"
   | "objective_wave_source_ready" | "objective_wave_set_issued" | "objective_wave_stale_retired"
   | "objective_wave_five_decided" | "objective_wave_first_handoff" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
@@ -1710,6 +1741,24 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
 function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
   process.stdout.write(`SELECTED_JOB_FULL_LOOP_PHASE ${phase}\n`)
 }
+
+describe("Objective fixture worker isolation", () => {
+  it("pins Objective and TaskGraph gates for each spawned worker profile", () => {
+    const inherited = { ENABLE_AGENT_OBJECTIVE_TAILOR: "1", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1" }
+    expect({ ...inherited, ...objectiveTailorWorkerFlags("standard") }).toMatchObject({
+      ENABLE_AGENT_OBJECTIVE_TAILOR: "0", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "0",
+    })
+    expect({ ...inherited, ...objectiveTailorWorkerFlags("objective_wave") }).toEqual({
+      ENABLE_AGENT_OBJECTIVE_TAILOR: "0", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1",
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+  })
+
+  it("fails closed when the prior standalone scenario has not quiesced", async () => {
+    await expect(requireObjectiveStandaloneScenarioCompletion(new Promise<void>(() => undefined), 1))
+      .rejects.toThrow("objective_standalone_scenario_not_quiescent")
+  })
+})
 
 async function withObjectiveResumeAmbientAuth<T>(token: string, operation: () => Promise<T>): Promise<T> {
   const previous = objectiveResumeAmbientAuth.authorization
@@ -2433,6 +2482,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     // This fixture creates a TaskGraph-bound fill; exercise the matching production PATCH route.
     priorApplicationFillTaskGraph = process.env.ENABLE_APPLICATION_FILL_TASKGRAPH
     process.env.ENABLE_APPLICATION_FILL_TASKGRAPH = "1"
+    priorObjectiveTailorWaves = process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
+    process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = "1"
     checkTlsAndIsolation()
     if (!enabled) return
     await Promise.all(tlsPaths.map(name => access(process.env[name]!)))
@@ -2481,6 +2532,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }
     if (priorApplicationFillTaskGraph === undefined) delete process.env.ENABLE_APPLICATION_FILL_TASKGRAPH
     else process.env.ENABLE_APPLICATION_FILL_TASKGRAPH = priorApplicationFillTaskGraph
+    if (priorObjectiveTailorWaves === undefined) delete process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
+    else process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = priorObjectiveTailorWaves
     selectedJobFullLoopPhase("cleanup_completed")
     if (cleanupError) throw cleanupError
   }, 60_000)
@@ -3180,7 +3233,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     selectedJobFullLoopPhase("final_checks_completed")
   }, 300_000)
 
-  it("fills the corrected Objective slot without submission, then separately approves and verifies synthetic submission on the same Turn", async () => {
+  it("fills the corrected Objective slot without submission, then separately approves and verifies synthetic submission on the same Turn", () => {
+    const completeStandaloneScenario = beginObjectiveStandaloneScenario()
+    return (async () => {
     const sessionId = `full-loop-objective-session-${runId}`
     const suffix = `full-loop-objective-${runId}`
     const redis = await applyQueue!.client
@@ -3237,12 +3292,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
     ] }
     const { POST: startObjective } = await import("@/app/api/agent/sessions/[id]/start-objective/route")
-    const priorWaveFlag = process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
     let sourceWorker: Child | undefined
     try {
       await stopFixture(worker)
       worker = undefined
-      process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = "1"
       const startResponse = await startObjective(apiRequest(`/api/agent/sessions/${sessionId}/start-objective`, token, "POST", {
         schemaVersion, clientMessageId: startKey, objective, content: [{ type: "text", text: objective }],
         verificationRequirements: requirements,
@@ -3260,6 +3313,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           lines: sourceWorker.lines, errors: sourceWorker.errors })
         throw new Error(`Objective source Turn failed ${JSON.stringify(diagnostic)}`)
       }
+      selectedJobFullLoopPhase("objective_single_source_completed")
       const sourceTurn = await testDb.agentTurn.findUniqueOrThrow({ where: { id: sourceTurnId } })
       expect(sourceTurn).toMatchObject({ userId: ids.user, sessionId, source: "user", status: "completed", executionMode: "canonical_task_graph" })
       const sourceRootTaskId = sourceTurn.rootTaskId
@@ -3355,8 +3409,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(staleFixtureOrdinal).not.toBe(selectedFixtureOrdinal)
       await stopFixture(sourceWorker)
       worker = undefined
-      worker = spawnFixture("worker")
+      worker = spawnFixture("worker", ids.user, "objective_wave")
       await waitLine(worker, "WORKER_READY", 90_000)
+      selectedJobFullLoopPhase("objective_single_worker_ready")
 
       const staleSelection = { schema: "agent-harness.v2.objective-application-review-intent.v1", sourceTurnId,
         rootTaskId: sourceRootTaskId, graphItemId: graphRow.id, graphRevision: graphRow.revision, slotOrdinals: [6] }
@@ -3486,6 +3541,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(startedReview.response.status).toBe(202)
       const reviewTurnId = typeof startedReview.body.turnId === "string" ? startedReview.body.turnId : ""
       if (!reviewTurnId) throw new Error("Objective review route returned no review Turn")
+      selectedJobFullLoopPhase("objective_single_review_started")
       const pendingSnapshot = await waitForObjectiveApplicationReviewSnapshot({ sessionId, turnId: reviewTurnId, token }, snapshot => {
         const members = Array.isArray(snapshot.members) ? snapshot.members : []
         return snapshot.setStatus === "pending" && members.length === 1 && jsonRecord(members[0])?.status === "pending"
@@ -3494,6 +3550,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const pendingMember = jsonRecord(members[0])
       const approvalId = typeof pendingMember?.approvalId === "string" ? pendingMember.approvalId : ""
       if (!pendingMember || !approvalId) throw new Error("Objective slot 2 has no durable approval receipt")
+      selectedJobFullLoopPhase("objective_single_approval_pending")
       const pendingArtifactRef = jsonRecord(pendingMember?.artifactRef)
       expect(pendingMember).toMatchObject({ slotOrdinal: 2, status: "pending", decisionAvailable: true,
         resumeId: selectedResumeId, artifactRef: { artifactId: correctedRef.artifactId, version: correctedRef.version,
@@ -3529,6 +3586,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         snapshotReceiptRevision: pendingMember.receiptRevision, expectedTurnRevision: turnFence.revision,
         expectedReceiptRevision: pendingMember.receiptRevision,
       })
+      selectedJobFullLoopPhase("objective_single_approval_accepted")
       expect((await waitForAgentTurnTerminal(reviewTurnId)).status).toBe("completed")
       const approvedReceipt = await testDb.agentApproval.findUniqueOrThrow({ where: { id: approvalId } })
       expect(approvedReceipt).toMatchObject({ id: approvalId, userId: ids.user, sessionId, turnId: reviewTurnId,
@@ -3579,6 +3637,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       ])
       const published = await waitForOutboxPublished(handoff.id)
       expect(published.attemptCount).toBe(1)
+      selectedJobFullLoopPhase("objective_single_handoff_published")
       const firstFill = await waitForReviewedApplicationTask(selectedJobId, task => Boolean(task.fillTurnId))
       const fillTurnId = firstFill.fillTurnId!
       expect(firstFill).toMatchObject({ id: applicationTaskId, resumeId: selectedResumeId })
@@ -3604,6 +3663,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         taskId: applicationTaskId!, type: "reviewed_application_fill_browser_started", actor: "worker",
       }, select: { type: true, data: true } })
       expect(browserEvents).toHaveLength(1)
+      selectedJobFullLoopPhase("objective_single_fill_ready")
       const browserBinding = jsonRecord(browserEvents[0]?.data)
       expect(browserBinding).toMatchObject({ schemaVersion: "agent-harness.v2.objective-reviewed-fill-browser-start.v1",
         userId: ids.user, sessionId, fillTurnId, applicationTaskId, jobId: selectedJobId, sourceTurnId,
@@ -3851,6 +3911,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         throw new Error(`Objective final approval rejected: ${JSON.stringify({ status: approvalResponse.status, errorCategory, snapshot })}`)
       }
       expect(approvalResponse.status).toBe(200)
+      selectedJobFullLoopPhase("objective_single_submit_approved")
       const submitDispatches = await testDb.agentOutbox.findMany({ where: {
         aggregateId: sessionId, topic: "application.submit.dispatch",
       }, select: { id: true, idempotencyKey: true, publishedAt: true, payload: true } })
@@ -4051,9 +4112,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(closureStats.objectiveSubmitReceipts).toEqual(submittedStats.objectiveSubmitReceipts)
       expect(closureStats.submitCount).toBe(submittedStats.submitCount)
       expect(closureStats.reviewedSubmitCount).toBe(submittedStats.reviewedSubmitCount)
+      selectedJobFullLoopPhase("objective_single_completed")
     } finally {
-      if (priorWaveFlag === undefined) delete process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
-      else process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = priorWaveFlag
       if (sourceWorker && worker === sourceWorker && !exited(sourceWorker)) {
         await stopFixture(sourceWorker)
         worker = undefined
@@ -4063,9 +4123,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         await waitLine(worker, "WORKER_READY", 90_000)
       }
     }
+    })().finally(completeStandaloneScenario)
   }, 360_000)
 
   it("submits five approved Objective slots with one stale Resume, guarded restart, and bounded rate windows", async () => {
+    await requireObjectiveStandaloneScenarioCompletion(objectiveStandaloneScenarioCompletion)
     const userId = `${ids.user}-objective-wave`
     const sessionId = `full-loop-objective-wave-session-${runId}`
     const suffix = `full-loop-objective-wave-${runId}`
@@ -4077,7 +4139,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await redis.get(objectiveDomainQuotaKey)).toBeNull()
     reviewedSessionIds.push(sessionId)
     reviewedSessionOwners.set(sessionId, userId)
-    const priorWaveFlag = process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
     let sourceWorker: Child | undefined
     let gate: ObjectiveFillWaveGate | undefined
     try {
@@ -4132,7 +4193,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const { POST: startObjective } = await import("@/app/api/agent/sessions/[id]/start-objective/route")
       await stopFixture(worker)
       worker = undefined
-      process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = "1"
       const startResponse = await startObjective(apiRequest(`/api/agent/sessions/${sessionId}/start-objective`, token, "POST", {
         schemaVersion, clientMessageId: startKey, objective, content: [{ type: "text", text: objective }],
         verificationRequirements: requirements,
@@ -4228,7 +4288,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(new Set(candidates.map(candidate => candidate.jobId)).size).toBe(6)
 
       if (sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
-      worker = spawnFixture("worker", userId)
+      worker = spawnFixture("worker", userId, "objective_wave")
       await waitLine(worker, "WORKER_READY", 90_000)
       const selection = { schema: "agent-harness.v2.objective-application-review-intent.v1", sourceTurnId,
         rootTaskId: sourceRootTaskId, graphItemId: graphRow.id, graphRevision: graphRow.revision,
@@ -4816,7 +4876,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                   if (phase === "blocked") committed = next
                 },
                 startExactlyOneWorker: () => {
-                  const next = spawnFixture("worker", userId)
+                  const next = spawnFixture("worker", userId, "objective_wave")
                   worker = next
                   return next
                 },
@@ -4922,8 +4982,6 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       if (worker && !exited(worker)) await stopFixture(worker)
       worker = undefined
       gate?.releasedApprovalIds.clear()
-      if (priorWaveFlag === undefined) delete process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES
-      else process.env.ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES = priorWaveFlag
       worker = spawnFixture("worker")
       await waitLine(worker, "WORKER_READY", 90_000)
     }
