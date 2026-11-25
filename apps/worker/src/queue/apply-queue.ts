@@ -49,7 +49,7 @@ import {
   UNATTENDED_APPLY_UNAVAILABLE_MESSAGE,
 } from "./unattended-apply-control.js";
 import { redisConnection } from "../redis.js";
-import { createPgApplicationSubmitTool, type ApplicationSubmitOutput } from "../runtime/tools/application-submit-tool.js";
+import { createPgApplicationSubmitTool, ObjectiveSubmissionUncertainError, type ApplicationSubmitOutput } from "../runtime/tools/application-submit-tool.js";
 import { recordSubmissionExecutionSettled, type ApplicationSubmitIdentity } from "./application-submit-fence.js";
 import { hasExactObjectiveSubmitResult } from "./objective-application-submit-terminal-recovery.js";
 import { reconcileTerminalSubmitJob } from "./application-submit-outbox-terminal-recovery.js";
@@ -57,6 +57,7 @@ import { createBrowserApplicationSubmitProvider } from "../runtime/tools/browser
 import { objectiveApplicationSubmitTargetSupported, runObjectiveGreenhouseApplicationSubmit } from "./objective-application-submit-material.js";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import { linkAbortSignals } from "../runtime/interrupt/bridge.js";
+import { createObjectiveSubmissionRouteLifecycle } from "./objective-submission-route-lifecycle.js";
 import {
   acquireApplicationSubmissionStartFence,
   isApplicationSubmissionStopped,
@@ -95,6 +96,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     const validSubmitPayload = operation !== "submit" ||
       (workerTaskId.length > 0 && matchesApplyTaskSubmitPayload(payload, payload) && /^[a-f0-9]{64}$/.test(constraintHash));
     let submissionSuperseded = false;
+    let objectiveMode = false;
 
     // Extract domain from applyUrl for per-domain rate limiting
     let domain: string | null = null;
@@ -108,6 +110,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     const startedAt = Date.now();
     let resultWritten = false;
     let resultWriteStarted = false;
+    let objectiveResultLinkCommitted = false;
     let browserAttemptStarted = false;
     let submissionClaimed = false;
     let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
@@ -131,7 +134,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       cleanup: (() => Promise<void>) | null;
       work: Promise<void> | null;
     } = { cleanup: null, work: null };
+    let objectiveSubmissionRouteLifecycle: ReturnType<typeof createObjectiveSubmissionRouteLifecycle> | null = null;
+    const cancelObjectiveSubmissionRoute = (): void => {
+      const lifecycle = objectiveSubmissionRouteLifecycle;
+      lifecycle?.cancel();
+    };
     let activeBrowserExecution: Promise<void> | null = null;
+    let browserExecutionFinished = false;
     let submissionFenceRelease: Promise<void> | null = null;
     const activePageCloseRef: { current: (() => Promise<void>) | null } = { current: null };
     let activeSubmissionContextClose: (() => Promise<void>) | null = null;
@@ -140,20 +149,21 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     let queueCatchStarted = false;
     const stopController = new AbortController();
     let stopProbe: ReturnType<typeof startApplicationSubmissionStopProbe> | null = null;
-    const closeActivePage = async (): Promise<void> => {
-      if (!activePageCloseRef.current) return;
+    const closeActivePageBounded = async (): Promise<boolean> => {
+      if (!activePageCloseRef.current) return false;
       let closeTimeout: ReturnType<typeof setTimeout> | null = null;
       try {
-        await Promise.race([
-          Promise.resolve().then(() => activePageCloseRef.current?.()).then(() => undefined).catch(() => undefined),
-          new Promise<void>((resolve) => {
-            closeTimeout = setTimeout(resolve, BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS);
+        return await Promise.race([
+          Promise.resolve().then(() => activePageCloseRef.current?.()).then(() => true).catch(() => false),
+          new Promise<boolean>((resolve) => {
+            closeTimeout = setTimeout(() => resolve(false), BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS);
           }),
         ]);
       } finally {
         if (closeTimeout) clearTimeout(closeTimeout);
       }
     };
+    const closeActivePage = async (): Promise<void> => { await closeActivePageBounded(); };
     const closeActiveSubmissionContext = (): Promise<void> => {
       if (!activeSubmissionContextClosePromise) {
         if (!activeSubmissionContextClose) {
@@ -171,9 +181,32 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       }
       return activeSubmissionContextClosePromise;
     };
+    const closeActiveSubmissionContextBounded = async (): Promise<boolean> => {
+      let closeTimeout: ReturnType<typeof setTimeout> | null = null;
+      try {
+        return await Promise.race([
+          closeActiveSubmissionContext().then(() => true, () => false),
+          new Promise<boolean>(resolve => {
+            closeTimeout = setTimeout(() => resolve(false), BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS);
+          }),
+        ]);
+      } finally { if (closeTimeout) clearTimeout(closeTimeout); }
+    };
+    const waitForObjectiveCleanup = async (work: Promise<unknown>): Promise<boolean> => {
+      let cleanupTimeout: ReturnType<typeof setTimeout> | null = null;
+      try {
+        return await Promise.race([
+          work.then(() => true, () => false),
+          new Promise<boolean>(resolve => {
+            cleanupTimeout = setTimeout(() => resolve(false), BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS);
+          }),
+        ]);
+      } finally { if (cleanupTimeout) clearTimeout(cleanupTimeout); }
+    };
     const interruptStoppedTurn = async (): Promise<void> => {
       turnStopped = true;
       if (!stopController.signal.aborted) stopController.abort(new Error(TURN_STOPPED_MESSAGE));
+      cancelObjectiveSubmissionRoute();
       await closeActivePage();
     };
     const releaseSubmissionFence = (commit: boolean): Promise<void> => {
@@ -185,6 +218,30 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       submissionFenceTimer = null;
       submissionFenceRelease = fence.release(commit);
       return submissionFenceRelease;
+    };
+    const settleObjectiveSubmissionRoute = async (cancel: boolean): Promise<boolean> => {
+      const lifecycle = objectiveSubmissionRouteLifecycle;
+      if (!lifecycle) return true;
+      if (cancel) lifecycle.cancel();
+      const settled = await lifecycle.settle();
+      if (!settled) {
+        submissionFenceUnavailable = true;
+        if (submissionExecutionStartAttempted && !submissionRequestStarted) submissionRequestStarted = true;
+        await closeActivePage();
+      }
+      return settled;
+    };
+    const persistSubmissionUncertain = async (): Promise<void> => {
+      if (!applicationTaskId || !submissionIdentity || applicationTaskFinalized) return;
+      try {
+        if (await finishApplicationTask(
+          getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain",
+          UNCONFIRMED_SUBMISSION_MESSAGE, "submit", submissionIdentity,
+        ) === "superseded") submissionSuperseded = true;
+        applicationTaskFinalized = true;
+      } catch (stateError: unknown) {
+        console.warn("[apply-worker] Could not persist uncertain submission state:", stateError instanceof Error ? stateError.message : String(stateError));
+      }
     };
 
     try {
@@ -211,7 +268,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         ? await readApplyQueueMaterialMode(getPool(), submissionIdentity)
         : "ordinary";
       if (materialMode === "blocked") throw new Error("Application material source is invalid or unavailable.");
-      const objectiveMode = materialMode === "objective";
+      objectiveMode = materialMode === "objective";
       if (objectiveMode && submissionIdentity && await hasExactObjectiveSubmitResult(getPool(), { ...submissionIdentity, workerTaskId })) return;
       if (operation === "fill" && !await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
         console.warn(`[apply-worker] Skipping stale or revoked application task for job=${jobId}`);
@@ -405,6 +462,11 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                 }
 
                 const submissionContext = page.context();
+                const routeLifecycle = objectiveMode ? createObjectiveSubmissionRouteLifecycle() : null;
+                if (routeLifecycle) {
+                  objectiveSubmissionRouteLifecycle = routeLifecycle;
+                  stopController.signal.addEventListener("abort", routeLifecycle.cancel, { once: true });
+                }
                 const submissionFrame = page.mainFrame();
                 const pagesPresentWhenArmed = new Set(submissionContext.pages());
                 // A context route is required to see a popup's first request.
@@ -412,7 +474,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                 // immediately fall through every known unrelated request.
                 const routeMatcher = (): boolean => true;
                 const routeHandler = async (route: import("playwright-core").Route): Promise<void> => {
-                  if (queueCatchStarted) {
+                  if (queueCatchStarted || routeLifecycle?.signal.aborted) {
                     await route.abort("aborted").catch(() => undefined);
                     return;
                   }
@@ -530,13 +592,17 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                   const work = (async () => {
                     let continuationAttempted = false;
                     try {
-                      if (queueCatchStarted || stopController.signal.aborted || turnStopped || submissionFenceUnavailable) {
+                      if (queueCatchStarted || routeLifecycle?.signal.aborted || stopController.signal.aborted || turnStopped || submissionFenceUnavailable) {
                         await route.abort("aborted").catch(() => undefined);
                         return;
                       }
                       submissionExecutionStartAttempted = true;
-                      const fence = await acquireApplicationSubmissionStartFence(getPool(), approvedTurnScope!);
-                      if (fence.state === "uncertain") {
+                      const fence = routeLifecycle
+                        ? await acquireApplicationSubmissionStartFence(getPool(), approvedTurnScope!, {
+                            signal: routeLifecycle.signal, timeoutMs: SUBMISSION_START_OBSERVATION_TIMEOUT_MS,
+                          })
+                        : await acquireApplicationSubmissionStartFence(getPool(), approvedTurnScope!);
+                      if (fence.state === "uncertain" || (objectiveMode && fence.markerCommitted === true)) {
                         pendingSubmissionFence = fence;
                         submissionRequestStarted = true;
                         submissionFenceUnavailable = true;
@@ -547,30 +613,27 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                             releaseError instanceof Error ? releaseError.message : String(releaseError),
                           );
                         });
-                        try {
-                          if (await finishApplicationTask(
-                            getPool(),
-                            applicationTaskId,
-                            "waiting_for_user",
-                            "submission_uncertain",
-                            UNCONFIRMED_SUBMISSION_MESSAGE, "submit", submissionIdentity!,
-                          ) === "superseded") submissionSuperseded = true;
-                          applicationTaskFinalized = true;
-                        } catch (stateError: unknown) {
-                          console.warn(
-                            "[apply-worker] Could not persist ambiguous submission start state:",
-                            stateError instanceof Error ? stateError.message : String(stateError),
-                          );
-                        }
+                        if (fence.state === "stopped") await interruptStoppedTurn();
+                        if (!objectiveMode) await persistSubmissionUncertain();
                         return;
                       }
                       if (fence.state !== "ready") {
                         if (fence.state === "stopped") await interruptStoppedTurn();
-                        else submissionTaskInactive = true;
+                        else if (fence.state === "inactive") submissionTaskInactive = true;
+                        else if (fence.state === "unavailable") submissionFenceUnavailable = true;
                         await route.abort("aborted").catch(() => undefined);
                         return;
                       }
                       pendingSubmissionFence = fence;
+                      if (routeLifecycle?.signal.aborted) {
+                        // The ready result means the durable start marker committed.
+                        // Cancellation before forwarding must retain uncertainty.
+                        submissionRequestStarted = true;
+                        submissionFenceUnavailable = true;
+                        await route.abort("failed").catch(() => undefined);
+                        await releaseSubmissionFence(false);
+                        return;
+                      }
                       if (stopController.signal.aborted || turnStopped || queueCatchStarted) {
                         await route.abort("aborted").catch(() => undefined);
                         await releaseSubmissionFence(false);
@@ -610,25 +673,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                           console.warn("[apply-worker] Could not release submission request fence:", releaseError instanceof Error ? releaseError.message : String(releaseError));
                         });
                       }
-                      if (continuationAttempted && applicationTaskId && !applicationTaskFinalized) {
-                        try {
-                          if (await finishApplicationTask(
-                            getPool(),
-                            applicationTaskId,
-                            "waiting_for_user",
-                            "submission_uncertain",
-                            UNCONFIRMED_SUBMISSION_MESSAGE, "submit", submissionIdentity!,
-                          ) === "superseded") submissionSuperseded = true;
-                          applicationTaskFinalized = true;
-                        } catch (stateError: unknown) {
-                          console.warn(
-                            "[apply-worker] Could not promptly persist uncertain submission state:",
-                            stateError instanceof Error ? stateError.message : String(stateError),
-                          );
-                        }
-                      }
+                      if (continuationAttempted && !objectiveMode) await persistSubmissionUncertain();
                       if (continuationAttempted) {
-                        void closeActiveSubmissionContext();
+                        if (objectiveMode) void closeActiveSubmissionContextBounded();
+                        else void closeActiveSubmissionContext();
                       } else {
                         void closeActivePage().catch(() => undefined);
                       }
@@ -642,6 +690,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     }
                   })();
                   submissionRouteState.work = work;
+                  routeLifecycle?.track(work);
                   try {
                     await work;
                   } finally {
@@ -655,6 +704,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                 submissionFenceTimer = setTimeout(() => {
                   if (!armedSubmissionIntent || submissionCandidateSeen || submissionRequestStarted) return;
                   submissionFenceUnavailable = true;
+                  routeLifecycle?.cancel();
                   if (!stopController.signal.aborted) {
                     stopController.abort(new Error("The approved submission request did not start after the final approval gate."));
                   }
@@ -838,7 +888,39 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     return applyTask.beforeSubmit ? applyTask.beforeSubmit(intent) : true;
                   },
                 };
-                return runObjectiveGreenhouseApplicationSubmit({ userId, task: objectiveTask, material, page });
+                const cancelAndJoin = async (): Promise<void> => {
+                  armedSubmissionIntent = null;
+                  if (submissionFenceTimer) clearTimeout(submissionFenceTimer);
+                  submissionFenceTimer = null;
+                  await settleObjectiveSubmissionRoute(true);
+                  if (submissionRequestStarted) await closeActiveSubmissionContextBounded();
+                  await closeActivePage();
+                };
+                let result: HarnessResult;
+                try {
+                  result = await runObjectiveGreenhouseApplicationSubmit({ userId, task: objectiveTask, material, page });
+                } catch (error: unknown) {
+                  await cancelAndJoin();
+                  if (submissionRequestStarted) throw new ObjectiveSubmissionUncertainError();
+                  throw error;
+                }
+                if (result.status !== "submitted") {
+                  await cancelAndJoin();
+                  if (submissionRequestStarted) throw new ObjectiveSubmissionUncertainError();
+                  return result;
+                }
+                const routeSettled = await settleObjectiveSubmissionRoute(false);
+                if (!routeSettled || !submissionRequestForwarded || submissionFenceUnavailable) {
+                  await cancelAndJoin();
+                  if (submissionRequestStarted) throw new ObjectiveSubmissionUncertainError();
+                  return {
+                    status: "manual",
+                    error: submissionRequestStarted ? UNCONFIRMED_SUBMISSION_MESSAGE
+                      : "The approved application request was not forwarded through the verified boundary.",
+                    durationMs: result.durationMs,
+                  };
+                }
+                return result;
               },
             } : {}),
             confirmationId: `application:${applicationTaskId}`,
@@ -942,7 +1024,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE, "submit", submissionIdentity!,
           ) === "superseded") { submissionSuperseded = true; return; }
           applicationTaskFinalized = true;
-          await closeActiveSubmissionContext();
+          if (objectiveMode) await closeActiveSubmissionContextBounded();
+          else await closeActiveSubmissionContext();
         }
         if (queueCatchStarted || submissionSuperseded) return;
 
@@ -982,6 +1065,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                 submissionIdentity: submissionIdentity!,
               });
           if (resultId === null) { submissionSuperseded = true; return; }
+          if (recordObjectiveSuccess) objectiveResultLinkCommitted = true;
           resultWritten = true;
         } catch (error: unknown) {
           resultWriteStarted = false;
@@ -1059,9 +1143,11 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           setTimeout(() => reject(new Error('Apply timeout: exceeded 5 minutes')), APPLY_TIMEOUT_MS)
         ),
       ]);
+      browserExecutionFinished = true;
       if (submissionSuperseded) return;
     } catch (err: unknown) {
       queueCatchStarted = true;
+      cancelObjectiveSubmissionRoute();
       if (!stopController.signal.aborted) stopController.abort(new Error(err instanceof Error ? err.message : String(err)));
       const durationMs = Date.now() - startedAt;
       const message = err instanceof Error ? err.message : String(err);
@@ -1074,7 +1160,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         console.warn(`[apply-worker] Submit claim is not confirmed; retrying the queue task without state writes for job=${jobId}`);
         throw err;
       }
-      if (submissionRequestStarted) void closeActiveSubmissionContext();
+      if (submissionRequestStarted) {
+        if (objectiveMode) void closeActiveSubmissionContextBounded();
+        else void closeActiveSubmissionContext();
+      }
       if (operation === "fill") {
         if (!applicationTaskId || stoppedBeforeRequest) return;
         const outcome = await legacyFillOutcomes.persistLegacyFillErrorOutcome({
@@ -1098,7 +1187,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         } catch (stateError: unknown) {
           console.warn("[apply-worker] Could not persist uncertain task state:", stateError instanceof Error ? stateError.message : String(stateError));
         }
-        if (activeSubmissionContextClose) await closeActiveSubmissionContext();
+        if (activeSubmissionContextClose) {
+          if (objectiveMode) await closeActiveSubmissionContextBounded();
+          else await closeActiveSubmissionContext();
+        }
         else await closeActivePage();
       }
       if (submissionSuperseded) return;
@@ -1167,13 +1259,16 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       return;
     } finally {
       stopProbe?.stop();
+      cancelObjectiveSubmissionRoute();
+      const objectiveRouteSettled = objectiveMode ? await settleObjectiveSubmissionRoute(false) : true;
       if (submissionRequestStarted && (queueCatchStarted || submissionSuperseded || activeSubmissionContextClosePromise)) {
-        await closeActiveSubmissionContext();
+        if (objectiveMode) await closeActiveSubmissionContextBounded();
+        else await closeActiveSubmissionContext();
       } else if (submissionCandidateSeen || submissionRequestStarted) {
         const closePage = activePageCloseRef.current;
         if (submissionExecutionStartAttempted && closePage) {
-          await closePage();
-          submissionPageCloseConfirmed = true;
+          if (objectiveMode) submissionPageCloseConfirmed = await closeActivePageBounded();
+          else { await closePage(); submissionPageCloseConfirmed = true; }
         } else {
           await closeActivePage().catch(() => undefined);
         }
@@ -1183,19 +1278,29 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         const observedRouteWork = activeSubmissionRouteWork.catch((error: unknown) => {
           console.warn("[apply-worker] Submission route failed:", error instanceof Error ? error.message : String(error));
         });
-        await observedRouteWork;
+        if (!objectiveMode || objectiveRouteSettled) await observedRouteWork;
+        else void observedRouteWork;
       }
       if ((submissionCandidateSeen || submissionRequestStarted) && activeBrowserExecution) {
-        await activeBrowserExecution.catch((error: unknown) => {
+        const observedBrowserExecution = activeBrowserExecution.catch((error: unknown) => {
           console.warn("[apply-worker] Browser submit execution failed after timeout:", error instanceof Error ? error.message : String(error));
         });
+        if (!objectiveMode) await observedBrowserExecution;
+        else if (objectiveRouteSettled) await waitForObjectiveCleanup(observedBrowserExecution);
+        else void observedBrowserExecution;
+      }
+      if (objectiveMode && browserExecutionFinished && objectiveRunnerReportedSuccess
+        && objectiveResultLinkCommitted && submissionRequestForwarded && !submissionContextCloseConfirmed) {
+        await closeActiveSubmissionContextBounded();
       }
       const removeSubmissionRoute = submissionRouteState.cleanup;
-      if (removeSubmissionRoute) {
+      const objectiveRouteClosureProven = submissionContextCloseConfirmed;
+      if (removeSubmissionRoute && (!objectiveMode || objectiveRouteClosureProven)) {
         const routeCleanup = removeSubmissionRoute().catch((error: unknown) =>
           console.warn("[apply-worker] Could not remove exact submission request route:", error instanceof Error ? error.message : String(error))
         );
-        await routeCleanup;
+        if (!objectiveMode) await routeCleanup;
+        else await waitForObjectiveCleanup(routeCleanup);
       }
       if (armedSubmissionIntent && !submissionCandidateSeen && !submissionRequestStarted) await closeActivePage();
       if (pendingSubmissionFence && !submissionRequestStarted) await closeActivePage();
@@ -1206,10 +1311,20 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         if (!submissionContextCloseConfirmed && !submissionPageCloseConfirmed) {
           const closePage = activePageCloseRef.current;
           if (!closePage) throw new Error("Cannot confirm submission page closure for Worker execution evidence.");
-          await closePage();
-          submissionPageCloseConfirmed = true;
+          if (objectiveMode) submissionPageCloseConfirmed = await closeActivePageBounded();
+          else { await closePage(); submissionPageCloseConfirmed = true; }
         }
-        await recordSubmissionExecutionSettled(getPool(), approvedTurnScope);
+        const objectiveExecutionSafe = submissionContextCloseConfirmed || (
+          browserExecutionFinished && objectiveRunnerReportedSuccess && objectiveResultLinkCommitted
+            && submissionRequestForwarded
+        );
+        if (objectiveMode ? objectiveExecutionSafe : submissionContextCloseConfirmed || submissionPageCloseConfirmed) {
+          await recordSubmissionExecutionSettled(getPool(), approvedTurnScope);
+        } else if (objectiveMode) {
+          console.warn("[apply-worker] Objective browser closure is unconfirmed; submission remains uncertain.");
+        } else {
+          throw new Error("Cannot confirm submission page closure for Worker execution evidence.");
+        }
       }
       if (submissionFenceTimer) clearTimeout(submissionFenceTimer);
       activePageCloseRef.current = null;
