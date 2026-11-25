@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { hashApprovalScope, parseObjectiveApplicationApprovalSet, objectiveApplicationApprovalSetItemId } from "@jobcopilot/agent-protocol"
 import { buildObjectiveApplicationResumeWitness, buildObjectiveApplicationReviewMemberProof, redactAgentEvent } from "@jobcopilot/shared"
-import { protocolScope } from "../approval/types"
+import { ApprovalStoreError, protocolScope } from "../approval/types"
 import { decideObjectiveApplicationApprovalSetMemberInTransaction } from "./objective-application-approval-set-decision"
 
 const mocks = vi.hoisted(() => ({
@@ -52,7 +52,7 @@ type Row = Record<string, any> // Fixture rows mirror mutable Prisma JSON record
 type Event = Record<string, any>
 type FixtureTx = {
   events: Event[]; outbox: Event[]; $queryRaw: ReturnType<typeof vi.fn>
-  agentSession: Row; agentTurn: Row; agentItem: Row; agentApproval: Row; agentEvent: Row
+  agentSession: Row; agentTurn: Row; agentItem: Row; agentApproval: Row; agentEvent: Row; applicationTask: Row; applicationTaskEvent: Row
 }
 function resumeWitness(jobId: string, materialRevision = 3) {
   return buildObjectiveApplicationResumeWitness({
@@ -75,7 +75,7 @@ async function makeRows(statuses: readonly string[]) {
       resourceHash: "sha256:" + "b".repeat(64), materialHash: proof.materialProofHash,
       answersHash: "sha256:" + "d".repeat(64), revision: 4, expiresAt }
     const scopeHash = await hashApprovalScope(protocolScope(scope, nonceHash))
-    return { id: member.approvalId, userId, sessionId, turnId, taskId: null, jobId, toolCallId,
+    return { id: member.approvalId, userId, sessionId, turnId, taskId: `application-task-${index + 1}`, jobId, toolCallId,
       type: "review_application", status: statuses[index] ?? "pending", revision: 4, scopeHash, nonceHash,
       resourceHash: scope.resourceHash, materialHash: scope.materialHash, answersHash: scope.answersHash,
       expiresAt, createdAt: now, updatedAt: now, decidedAt: statuses[index] === "approved" ? now : null, consumedAt: null,
@@ -96,7 +96,7 @@ function seededEvents(rows: Row[]) {
   })
 }
 function fixture(rows: Row[]) {
-  const events: Event[] = [], outbox: Event[] = []
+  const events: Event[] = [], outbox: Event[] = [], taskEvents: Event[] = []
   const session = { id: sessionId, status: "running" }, turn = { id: turnId, status: "waiting_for_approval", revision: 5 }
   const item = { id: itemId, sessionId, turnId, type: "approval_request", status: "started", revision: 0, content: setContent }
   const tx: FixtureTx = {
@@ -131,8 +131,16 @@ function fixture(rows: Row[]) {
     agentEvent: {
       findFirst: vi.fn(async ({ where }: { where: Row }) => events.find(event => event.idempotencyKey === where.idempotencyKey) ?? null),
     },
+    applicationTask: { findMany: vi.fn(async ({ where }: { where: Row }) => [{ id: where.id, userId: where.userId,
+      sessionId: where.sessionId, jobId: where.jobId }]) },
+    applicationTaskEvent: {
+      findMany: vi.fn(async ({ where }: { where: Row }) => taskEvents.filter(event => event.taskId === where.taskId
+        && event.type === where.type && (event.data as Row)?.approvalId === (where.data as Row).equals)),
+      findUnique: vi.fn(async ({ where }: { where: Row }) => taskEvents.find(event => event.id === where.id) ?? null),
+      create: vi.fn(async ({ data }: { data: Row }) => { taskEvents.push(data); return data }),
+    },
   }
-  return { tx, rows, events, outbox, turn, item }
+  return { tx, rows, events, outbox, taskEvents, turn, item }
 }
 const request = (row: Row, decision: "approved" | "rejected" = "approved") => ({
   approvalId: row.id, userId, sessionId, expectedTurnId: turnId, expectedRevision: 5,
@@ -188,11 +196,19 @@ describe("Objective application approval-set member decision", () => {
     expect(fake.tx.agentApproval.updateMany).toHaveBeenCalledTimes(6)
 
     const writes = { approval: fake.tx.agentApproval.updateMany.mock.calls.length, item: fake.tx.agentItem.updateMany.mock.calls.length,
-      turn: fake.tx.agentTurn.updateMany.mock.calls.length, append: mocks.append.mock.calls.length }
+      turn: fake.tx.agentTurn.updateMany.mock.calls.length, append: mocks.append.mock.calls.length,
+      retirement: fake.tx.applicationTaskEvent.create.mock.calls.length }
     const duplicate = await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, request(selected), callbacks)
     expect(duplicate).toMatchObject({ disposition: "duplicate", status: "expired", setCompleted: true, nextTurnRevision: 6 })
     expect({ approval: fake.tx.agentApproval.updateMany.mock.calls.length, item: fake.tx.agentItem.updateMany.mock.calls.length,
-      turn: fake.tx.agentTurn.updateMany.mock.calls.length, append: mocks.append.mock.calls.length }).toEqual(writes)
+      turn: fake.tx.agentTurn.updateMany.mock.calls.length, append: mocks.append.mock.calls.length,
+      retirement: fake.tx.applicationTaskEvent.create.mock.calls.length }).toEqual(writes)
+    expect(fake.taskEvents).toHaveLength(1)
+    expect(fake.taskEvents[0]).toMatchObject({ id: `objective-application-review-retired:${setId}:6`,
+      taskId: selected.taskId, type: "objective_application_review_retired", actor: "system",
+      body: "Objective application review member was retired.", data: { schemaVersion: "objective-application-review-retirement.v1",
+        userId, sessionId, reviewTurnId: turnId, sourceTurnId, setId, slotOrdinal: 6, jobId: selected.jobId,
+        applicationTaskId: selected.taskId, approvalId: selected.id, receiptRevision: 4, reason: "resume_material_changed" } })
 
     const outboxApproval = fake.outbox.find(row => row.topic === "agent.session.event" && row.payload.type === "approval.expired")
     expect(outboxApproval?.payload.payload).toEqual(expired?.payload)
@@ -210,7 +226,66 @@ describe("Objective application approval-set member decision", () => {
     expect(fake.tx.agentItem.updateMany).not.toHaveBeenCalled()
     expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
     expect(mocks.append).not.toHaveBeenCalled()
+    expect(fake.tx.applicationTaskEvent.create).not.toHaveBeenCalled()
     expect(callbacks.recordApprovedHandoff).not.toHaveBeenCalled()
+  })
+
+  it("records TTL before other stale observations", async () => {
+    const rows = await makeRows(Array(6).fill("pending")), fake = fixture(rows), selected = rows[0]!
+    mocks.resume.mockImplementation(async (_tx: unknown, scope: { jobId: string }) => resumeWitness(scope.jobId))
+    mocks.freshness.mockRejectedValue(new ApprovalStoreError("approval_revision_mismatch", "stale"))
+    const expiredAt = new Date(expiresAt.getTime() + 1)
+    await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, { ...request(selected), now: expiredAt }, hooks())
+    expect(fake.taskEvents).toHaveLength(6)
+    expect((fake.taskEvents[0]?.data as Row).reason).toBe("approval_ttl_reached")
+    expect(mocks.freshness).not.toHaveBeenCalled()
+    expect(mocks.resume).not.toHaveBeenCalled()
+  })
+
+  it("still closes an expired set when a deleted member task cannot hold private retirement evidence", async () => {
+    const rows = await makeRows(Array(6).fill("pending")), fake = fixture(rows), selected = rows[2]!
+    fake.tx.applicationTask.findMany.mockImplementation(async ({ where }: { where: Row }) =>
+      where.id === selected.taskId ? [] : [{ id: where.id, userId: where.userId, sessionId: where.sessionId, jobId: where.jobId }])
+    mocks.freshness.mockRejectedValue(new ApprovalStoreError("approval_revision_mismatch", "stale"))
+    const result = await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never,
+      { ...request(selected), now: new Date(expiresAt.getTime() + 1) }, hooks())
+    expect(result).toMatchObject({ status: "expired", setCompleted: true })
+    expect(fake.events.filter(event => event.type === "approval.expired")).toHaveLength(6)
+    expect(fake.events.filter(event => event.type === "turn.wakeup")).toHaveLength(1)
+    expect(fake.taskEvents).toHaveLength(5)
+    expect(fake.taskEvents.some(event => event.taskId === selected.taskId)).toBe(false)
+  })
+
+  it("records receipt revision before Resume drift and isolates the affected member", async () => {
+    const rows = await makeRows(Array(6).fill("pending")), fake = fixture(rows), selected = rows[2]!
+    mocks.freshness.mockImplementation(async (...args: unknown[]) => {
+      const scope = args[1] as { id: string }
+      if (scope.id === selected.id) throw new ApprovalStoreError("approval_revision_mismatch", "stale")
+    })
+    mocks.resume.mockImplementation(async (_tx: unknown, scope: { jobId: string }) => scope.jobId === selected.jobId
+      ? null : resumeWitness(scope.jobId))
+    await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, request(selected), hooks())
+    expect(fake.taskEvents).toHaveLength(1)
+    expect((fake.taskEvents[0]?.data as Row).reason).toBe("approval_revision_changed")
+    expect(mocks.resume).not.toHaveBeenCalledWith(expect.anything(), { userId, jobId: selected.jobId })
+  })
+
+  it("records a missing Resume witness separately from changed material", async () => {
+    const rows = await makeRows(Array(6).fill("pending")), fake = fixture(rows), selected = rows[0]!
+    mocks.resume.mockImplementation(async (_tx: unknown, scope: { jobId: string }) => scope.jobId === selected.jobId
+      ? null : resumeWitness(scope.jobId))
+    await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, request(selected), hooks())
+    expect(fake.taskEvents).toHaveLength(1)
+    expect((fake.taskEvents[0]?.data as Row).reason).toBe("resume_witness_unavailable")
+  })
+
+  it("records exact completed-source drift only after current receipt and Resume proofs", async () => {
+    const rows = await makeRows(Array(6).fill("pending")), fake = fixture(rows), selected = rows[0]!
+    mocks.resume.mockImplementation(async (_tx: unknown, scope: { jobId: string }) => resumeWitness(scope.jobId))
+    const callbacks = hooks({ verifySource: vi.fn(async () => "stale" as const) })
+    await decideObjectiveApplicationApprovalSetMemberInTransaction(fake.tx as never, request(selected), callbacks)
+    expect(fake.taskEvents).toHaveLength(1)
+    expect((fake.taskEvents[0]?.data as Row).reason).toBe("completed_source_changed")
   })
 
   it("approves only the selected member while keeping the aggregate open for the other five", async () => {
