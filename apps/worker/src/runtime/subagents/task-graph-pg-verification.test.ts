@@ -7,7 +7,7 @@ import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automa
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { parseTaskGraphSnapshot, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
-import { TASK_GRAPH_VERIFIER_VERSION, reverifyFailedTaskGraphNodeEvidence, verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence, type TaskGraphVerificationScope } from "./task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION, reverifyFailedTaskGraphNodeEvidence, taskGraphResultDigest, verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence, type TaskGraphVerificationScope } from "./task-graph-pg-verification.js"
 
 const scope: TaskGraphVerificationScope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
@@ -197,6 +197,16 @@ function replayData(options: { sourceResultItemId?: string; sourceSessionId?: st
 }
 
 describe("TaskGraph PostgreSQL verification evidence", () => {
+  it("keeps the Worker result-digest export byte-compatible", () => {
+    expect(taskGraphResultDigest({
+      status: "completed",
+      structuredResult: {
+        findings: [{ jobId: "job-1", score: 8, evidenceIds: ["ev-b", "ev-a"] }],
+        evidence: [{ id: "ev-a", kind: "job" }],
+      },
+    })).toBe("c0de43b19aee1d9f9c33c485f1bdaeb0f3f932b4ca5efdca3565df4aca53d2d5")
+  })
+
   it("reports a verified empty objective search as a failed candidate-count criterion", async () => {
     const emptyTurn = { source: "user", executionMode: "canonical_task_graph", input: {
       goal: "Find roles", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
@@ -628,6 +638,27 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(result.projection?.schemaVersion).toBe(TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION)
     expect(JSON.stringify(result.report)).not.toContain("job-1")
     expect(data.query.mock.calls[0]?.[1]).toEqual([scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
+  })
+
+  it("binds an additional successful read even when the Scout result does not cite it", async () => {
+    const data = durableRows()
+    const extraCall = { ...data.items[0]!, id: "extra-call-item", stepId: "extra-step", joinedStepId: "extra-step", ordinal: 1,
+      content: { ...(data.items[0]!.content as Record<string, unknown>), toolCallId: "extra-call", toolName: "jobs.get", input: { jobId: "job-extra" } } }
+    const extraResult = { ...data.items[1]!, id: "extra-result-item", stepId: "extra-step", joinedStepId: "extra-step", ordinal: 1,
+      content: { toolCallId: "extra-call", output: { job: { id: "job-extra", source: "lever" } }, errorCode: null } }
+    data.items.push(extraCall, extraResult)
+    data.events.push(
+      { id: "extra-started", itemId: "extra-call-item", taskId: scope.taskId, correlationId: "extra-call", type: "tool_call.started", sequence: 3,
+        payload: { taskId: scope.taskId, toolCallId: "extra-call", toolName: "jobs.get", toolVersion: "1" } },
+      { id: "extra-completed", itemId: "extra-call-item", taskId: scope.taskId, correlationId: "extra-call", type: "tool_call.completed", sequence: 4,
+        payload: { taskId: scope.taskId, toolCallId: "extra-call", toolName: "jobs.get", toolVersion: "1", status: "completed", errorCode: null } },
+    )
+
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult })
+    expect(result).toMatchObject({ verified: true, projection: {
+      evidenceIds: ["read:job:job-1", "read:job:job-extra"],
+      candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }],
+    } })
   })
 
   it("verifies a Scout candidate from only a fresh current-attempt jobs.get receipt", async () => {

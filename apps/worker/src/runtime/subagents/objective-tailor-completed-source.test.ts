@@ -8,10 +8,11 @@ import type { LoadedGraph } from "./task-graph-pg-state.js"
 
 const ids = { userId: "owner-1", sessionId: "session-1", reviewTurnId: "review-turn", sourceTurnId: "source-turn", rootTaskId: "root-1",
   graphItemId: "task-graph-" + createHash("sha256").update("root-1").digest("hex"), graphRevision: 6 }
-const mocks = vi.hoisted(() => ({ load: vi.fn(), inventory: vi.fn(), verify: vi.fn() }))
+const mocks = vi.hoisted(() => ({ load: vi.fn(), inventory: vi.fn(), verify: vi.fn(), requirementEvidence: vi.fn() }))
 vi.mock("./task-graph-pg-state.js", () => ({ loadTaskGraph: mocks.load }))
 vi.mock("./objective-tailor-wave-inventory.js", () => ({ readObjectiveTailorWaveInventory: mocks.inventory }))
 vi.mock("../canonical-objective-tailor-wave-completion.js", () => ({ verifyCompletedObjectiveTailorWaveSlots: mocks.verify }))
+vi.mock("./objective-job-requirement-receipt.js", () => ({ readObjectiveTailorJobRequirementEvidence: mocks.requirementEvidence }))
 import { readCompletedObjectiveTailorSourceEvidence } from "./objective-tailor-completed-source.js"
 
 const nodes = [
@@ -73,8 +74,8 @@ function makeClient(overrides: { reviewStatus?: string; sourceStatus?: string; s
   })
   return { client: { query } as unknown as PoolClient, query }
 }
-function input(selectedSlotIds: string[] = ["tailor-1"], evidenceSlotId?: string) {
-  return { ...ids, selectedSlotIds, ...(evidenceSlotId ? { evidenceSlotId } : {}) }
+function input(selectedSlotIds: string[] = ["tailor-1"], evidenceSlotId?: string, includeRequirementEvidence = false) {
+  return { ...ids, selectedSlotIds, ...(evidenceSlotId ? { evidenceSlotId } : {}), ...(includeRequirementEvidence ? { includeRequirementEvidence } : {}) }
 }
 
 beforeEach(() => {
@@ -95,6 +96,26 @@ describe("completed Objective Tailor source reader", () => {
       rootTaskId: ids.rootTaskId, parentTaskId: ids.rootTaskId }, loaded, selectedSlotIds: ["tailor-1"] })
     expect(query.mock.calls[0]?.[0]).toContain('FROM "User"')
     expect(query.mock.calls.map(([sql]) => sql).some(sql => String(sql).includes("FOR SHARE OF task NOWAIT"))).toBe(true)
+  })
+
+  it("only reads optional private requirement citations after explicit opt-in", async () => {
+    const { client } = makeClient()
+    const privateEvidence = { status: "verified", proposedCount: 1, receipts: [{ quote: "private quote" }] }
+    mocks.requirementEvidence.mockResolvedValue(privateEvidence)
+
+    const ordinary = await readCompletedObjectiveTailorSourceEvidence(client, input())
+    expect(ordinary).not.toHaveProperty("requirementEvidence")
+    expect(mocks.requirementEvidence).not.toHaveBeenCalled()
+
+    const optedIn = await readCompletedObjectiveTailorSourceEvidence(client, input(["tailor-1"], undefined, true))
+    expect(optedIn?.requirementEvidence).toEqual(privateEvidence)
+    expect(mocks.requirementEvidence).toHaveBeenCalledWith(client, expect.objectContaining({ graphRevision: ids.graphRevision,
+      graphItemId: ids.graphItemId, outcomes: [expect.objectContaining({ slotId: "tailor-1", status: "ready" })] }))
+
+    mocks.requirementEvidence.mockRejectedValueOnce(new Error("private lookup failure"))
+    await expect(readCompletedObjectiveTailorSourceEvidence(client, input(["tailor-1"], undefined, true)))
+      .resolves.toMatchObject({ outcomes: [{ slotId: "tailor-1", status: "ready" }],
+        requirementEvidence: { status: "unavailable", proposedCount: 0, receipts: [] } })
   })
 
   it("keeps unselected stale outcomes from blocking a selected ready slot", async () => {

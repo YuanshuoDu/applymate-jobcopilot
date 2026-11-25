@@ -146,7 +146,12 @@ function normalizeStructuredResult(value: StructuredRoleResult, index: ObservedE
   for (const finding of value.findings) {
     const evidenceIds = rewriteEvidenceIds(finding.evidenceIds)
     if (!evidenceIds) return undefined
-    findings.push({ ...finding, evidenceIds })
+    const jobEvidenceId = index.entries.get(evidenceKey("job", finding.jobId))?.id
+    const requirementCitations = finding.requirementCitations?.flatMap(citation => {
+      const evidenceId = canonicalByModelId.get(citation.evidenceId)
+      return evidenceId && evidenceId === jobEvidenceId ? [{ ...citation, evidenceId }] : []
+    })
+    findings.push({ ...finding, evidenceIds, ...(requirementCitations?.length ? { requirementCitations } : {}) })
   }
   return { ...value, findings, evidence }
 }
