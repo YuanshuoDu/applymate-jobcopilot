@@ -575,6 +575,12 @@ function objectiveTailorWorkerFlags(profile: FixtureWorkerProfile): Record<strin
     : { ENABLE_AGENT_OBJECTIVE_TAILOR: "0", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "0" }
 }
 
+function objectiveTailorWorkerConnectionOptions(mode: "site" | "worker", profile: FixtureWorkerProfile): Record<string, string> {
+  // Detect the killed fixture client while it waits inside the projection trigger.
+  return mode === "worker" && profile === "objective_wave"
+    ? { PGOPTIONS: "-c client_connection_check_interval=200ms" } : {}
+}
+
 function beginObjectiveStandaloneScenario(): () => void {
   let complete!: () => void
   let completed = false
@@ -622,6 +628,7 @@ function spawnFixture(mode: "site" | "worker", workerUserId = ids.user,
     env: {
       ...process.env,
       ...(mode === "worker" ? objectiveTailorWorkerFlags(workerProfile) : {}),
+      ...objectiveTailorWorkerConnectionOptions(mode, workerProfile),
       DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!,
       REDIS_URL: redisUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!,
       AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true", AGENT_RUNTIME_PG_TEST_REQUIRED: "true",
@@ -1767,6 +1774,14 @@ describe("Objective fixture worker isolation", () => {
       ENABLE_AGENT_OBJECTIVE_TAILOR: "0", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1",
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
+  })
+
+  it("enables PostgreSQL client checks only for the disposable Objective-wave worker", () => {
+    expect(objectiveTailorWorkerConnectionOptions("worker", "objective_wave")).toEqual({
+      PGOPTIONS: "-c client_connection_check_interval=200ms",
+    })
+    expect(objectiveTailorWorkerConnectionOptions("worker", "standard")).toEqual({})
+    expect(objectiveTailorWorkerConnectionOptions("site", "objective_wave")).toEqual({})
   })
 
   it("fails closed when the prior standalone scenario has not quiesced", async () => {
