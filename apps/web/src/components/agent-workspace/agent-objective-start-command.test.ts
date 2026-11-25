@@ -77,6 +77,32 @@ describe('objective start command', () => {
     })
   })
 
+  it('sends only an explicitly selected report score floor, including zero and decimals', async () => {
+    for (const value of [0, 0.25, 4.5, 10]) {
+      const bodies: unknown[] = []
+      let calls = 0
+      const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        calls += 1
+        if (calls === 2) bodies.push(JSON.parse(String(init?.body)))
+        return calls === 1 ? jsonResponse({ session: { id: 'session_1' } }, 201) : jsonResponse(successBody(), 202)
+      }) as typeof fetch
+      await new AgentObjectiveStartCoordinator(fetcher, () => `floor-${value}`)
+        .start('Find roles', '', '', undefined, undefined, value)
+      expect(bodies[0]).toMatchObject({ reportScoreFloor: value })
+    }
+  })
+
+  it('rejects invalid explicit score floors before creating a Session', async () => {
+    let calls = 0
+    const fetcher = (async () => { calls += 1; return jsonResponse({ session: { id: 'session_1' } }, 201) }) as typeof fetch
+    const coordinator = new AgentObjectiveStartCoordinator(fetcher, () => 'invalid-floor')
+    for (const value of [-0.01, 10.01, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(coordinator.start('Find roles', '', '', undefined, undefined, value))
+        .rejects.toMatchObject({ status: 422, code: 'invalid_command' })
+    }
+    expect(calls).toBe(0)
+  })
+
   it('preserves existing count requirements when appending the location criterion', async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
     const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -178,11 +204,12 @@ describe('objective start command', () => {
       return jsonResponse({ ...successBody(), disposition: 'duplicate' }, 202)
     }) as typeof fetch
     const coordinator = new AgentObjectiveStartCoordinator(fetcher, () => 'key_retry')
-    await expect(coordinator.start('Objective', 'Background')).rejects.toThrow('Network outcome unknown')
-    await expect(coordinator.start('Objective', 'Background')).resolves.toMatchObject({ disposition: 'duplicate' })
+    await expect(coordinator.start('Objective', 'Background', '', undefined, undefined, 4.25)).rejects.toThrow('Network outcome unknown')
+    await expect(coordinator.start('Objective', 'Background', '', undefined, undefined, 4.25)).resolves.toMatchObject({ disposition: 'duplicate' })
     expect(calls).toHaveLength(3)
     expect(calls[1]?.input).toBe(calls[2]?.input)
     expect(calls[1]?.init?.body).toBe(calls[2]?.init?.body)
+    expect(JSON.parse(String(calls[1]?.init?.body))).toMatchObject({ reportScoreFloor: 4.25 })
     expect((calls[1]?.init?.headers as Record<string, string>)['Idempotency-Key']).toBe('key_retry')
     expect((calls[2]?.init?.headers as Record<string, string>)['Idempotency-Key']).toBe('key_retry')
   })
@@ -243,7 +270,7 @@ describe('objective start command', () => {
     let identity = 0
     const coordinator = new AgentObjectiveStartCoordinator(fetcher, () => `selected_${++identity}`)
 
-    await expect(coordinator.start('Objective', 'Background', '', undefined, 'session_a')).rejects.toMatchObject({ status: 409 })
+    await expect(coordinator.start('Objective', 'Background', '', undefined, 'session_a', 0)).rejects.toMatchObject({ status: 409 })
     await expect(coordinator.start('Objective', 'Background', '', undefined, 'session_b')).resolves.toMatchObject({
       sessionId: 'session_b', disposition: 'started',
     })
@@ -255,6 +282,27 @@ describe('objective start command', () => {
     ])
     expect(calls.map(call => (call.init?.headers as Record<string, string>)['Idempotency-Key']))
       .toEqual(['selected_1', 'selected_2'])
+    expect(JSON.parse(String(calls[0]?.init?.body))).toMatchObject({ reportScoreFloor: 0 })
+    expect(JSON.parse(String(calls[1]?.init?.body))).not.toHaveProperty('reportScoreFloor')
+  })
+
+  it('rotates the idempotency key when the explicit report floor changes', async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input, init })
+      if (calls.length === 1) return jsonResponse({ session: { id: 'session_1' } }, 201)
+      return calls.length === 2
+        ? jsonResponse({ error: { code: 'objective_start_state_conflict', message: 'Retry explicitly' } }, 409)
+        : jsonResponse(successBody(), 202)
+    }) as typeof fetch
+    let identity = 0
+    const coordinator = new AgentObjectiveStartCoordinator(fetcher, () => `floor-change-${++identity}`)
+    await expect(coordinator.start('Objective', 'Background', '', undefined, undefined, 2.5)).rejects.toMatchObject({ status: 409 })
+    await coordinator.start('Objective', 'Background', '', undefined, undefined, 3.5)
+    expect(calls.map(call => (call.init?.headers as Record<string, string>)['Idempotency-Key']))
+      .toEqual(['floor-change-1', 'floor-change-1', 'floor-change-2'])
+    expect(JSON.parse(String(calls[1]?.init?.body))).toMatchObject({ reportScoreFloor: 2.5 })
+    expect(JSON.parse(String(calls[2]?.init?.body))).toMatchObject({ reportScoreFloor: 3.5 })
   })
 
   it('does not share a pending request or result with a different selected Session', async () => {
