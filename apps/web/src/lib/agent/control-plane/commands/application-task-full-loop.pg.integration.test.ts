@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer"
 import { createHash, randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
 import { isDeepStrictEqual } from "node:util"
@@ -11,7 +12,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope, objectiveApplicationApprovalSetItemId, parseObjectiveApplicationApprovalSet,
-  parseObjectiveTailorGraph, parseObjectiveTailorFinalOutcomeSidecar, schemaVersion } from "@jobcopilot/agent-protocol"
+  parseObjectiveTailorGraph, parseObjectiveTailorFinalOutcomeSidecar, parseObjectiveTailorSourceGroups, schemaVersion } from "@jobcopilot/agent-protocol"
 import {
   hashAgentReceiptValue,
   hashContent,
@@ -33,6 +34,8 @@ import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from "vit
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
 import { protocolScope, type ApprovalScopeInput } from "@/lib/agent/approval/types"
+import { parseFinalTaskGraphSourceManifest } from "@/lib/agent/session/final-task-graph-source-manifest"
+import { parseObjectiveJobEvidence } from "@/lib/agent/session/objective-job-evidence-contract"
 import type { ApplicationPackage, PipelineCtx } from "@/lib/agent/types"
 import type { ObjectiveWaveHandoffProof, ObjectiveWaveSubmissionSlot } from "./application-task-full-loop.objective-wave-submission"
 
@@ -1532,6 +1535,66 @@ async function reviewedSourceStructuredResult(taskStatus: string, value: unknown
   return result
 }
 
+type ObjectiveScoutProofStage = "task_lookup" | "result_envelope" | "structured_result" | "candidate_set" | "source_assignment"
+type ObjectiveScoutProofCode = "missing_task_id" | "row_count" | "invalid_shape" | "unknown_key" | "missing_field"
+  | "invalid_status" | "oversized" | "invalid_role_result" | "candidate_count" | "duplicate_candidate"
+  | "expected_job_set" | "evidence_source_mismatch"
+
+function objectiveScoutProofFailure(stage: ObjectiveScoutProofStage, code: ObjectiveScoutProofCode): Error {
+  return new Error(`objective_greenhouse_scout_proof:${stage}:${code}`)
+}
+
+async function persistedObjectiveScoutCandidateIds(taskStatus: string, value: unknown): Promise<string[]> {
+  let parsed: unknown = value
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed) as unknown } catch { throw objectiveScoutProofFailure("result_envelope", "invalid_shape") }
+  }
+  const envelope = jsonRecord(parsed)
+  if (!envelope) throw objectiveScoutProofFailure("result_envelope", "invalid_shape")
+  const requiredKeys = ["finalItemId", "finalText", "status", "stepCount", "structuredResult", "toolCallCount"]
+  // These sidecars are written alongside successful child results by Worker runtime paths.
+  const allowedKeys = new Set([...requiredKeys, "discoveryAttempt", "discoveryRecovery", "taskGraphVerificationReport", "taskGraphRepairReceipt"])
+  const ownKeys = Reflect.ownKeys(envelope)
+  if (ownKeys.length !== Object.keys(envelope).length || ownKeys.some(key => typeof key !== "string" || !allowedKeys.has(key))) {
+    throw objectiveScoutProofFailure("result_envelope", "unknown_key")
+  }
+  if (!requiredKeys.every(key => Object.hasOwn(envelope, key))) {
+    throw objectiveScoutProofFailure("result_envelope", "missing_field")
+  }
+
+  let encodedEnvelope: string, encodedStructured: string
+  try {
+    encodedEnvelope = JSON.stringify(envelope) as string
+    encodedStructured = JSON.stringify(envelope.structuredResult) as string
+  } catch { throw objectiveScoutProofFailure("result_envelope", "invalid_shape") }
+  const { TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT, isCanonicalTaskGraphJobId } = await import("../../../../../../worker/src/runtime/subagents/task-graph-result-page-contract")
+  if (typeof encodedEnvelope !== "string" || typeof encodedStructured !== "string"
+    || Buffer.byteLength(encodedEnvelope, "utf8") > TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT
+    || Buffer.byteLength(encodedStructured, "utf8") > TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT) {
+    throw objectiveScoutProofFailure("result_envelope", "oversized")
+  }
+  if (taskStatus !== "completed" || envelope.status !== "completed"
+    || !Number.isSafeInteger(envelope.stepCount) || Number(envelope.stepCount) < 0
+    || !Number.isSafeInteger(envelope.toolCallCount) || Number(envelope.toolCallCount) < 0
+    || (envelope.finalItemId !== null && typeof envelope.finalItemId !== "string")
+    || typeof envelope.finalText !== "string") {
+    throw objectiveScoutProofFailure("result_envelope", "invalid_status")
+  }
+
+  const { validateRoleResult } = await import("../../../../../../worker/src/runtime/subagents/role-results")
+  let candidateIds: string[]
+  try {
+    const result = validateRoleResult(envelope.structuredResult, "scout")
+    if (result.role !== "scout") throw new Error("unexpected_role")
+    candidateIds = result.candidates.map(candidate => candidate.jobId)
+  }
+  catch { throw objectiveScoutProofFailure("structured_result", "invalid_role_result") }
+  if (candidateIds.some(jobId => !isCanonicalTaskGraphJobId(jobId))) {
+    throw objectiveScoutProofFailure("structured_result", "invalid_role_result")
+  }
+  return candidateIds
+}
+
 async function startReviewedFillRouteBridge(): Promise<void> {
   const { db } = await import("@/lib/db")
   reviewedFillRouteDb = db
@@ -1767,7 +1830,7 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "objective_score_floor_nine_verified" | "objective_wave_source_ready" | "objective_wave_score_floor_eight_verified"
   | "objective_wave_set_issued" | "objective_wave_stale_retired"
   | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff"
-  | "objective_wave_skill_comparison_verified" | "objective_wave_completed"
+  | "objective_wave_skill_comparison_verified" | "objective_wave_job_evidence_verified" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
 
 function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
@@ -5629,22 +5692,32 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
               if (!recorded || !Number.isSafeInteger(recorded.attemptCount) || recorded.attemptCount < 1) {
                 throw new Error("Objective rate-window Filler attempt was not verified")
               }
-              const fillers = await testDb.subAgentTask.findMany({ where: { id: recorded.fillerTaskId,
-                sessionId, turnId: proof.durable.fillTurnId, rootTaskId: recorded.fillRootTaskId,
-                role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 2,
-                select: { id: true, status: true, attemptCount: true, completedAt: true, leaseOwner: true,
-                  leaseExpiresAt: true, interruptRequestedAt: true } })
+              const slot = submissionSlots.find(value => value.applicationTaskId === proof.durable.task.id
+                && value.ordinal === proof.durable.slot.ordinal)
+              if (!slot) throw new Error("Objective rate-window slot binding was not verified")
+              const [fillers, browserStarts] = await Promise.all([
+                testDb.subAgentTask.findMany({ where: { id: recorded.fillerTaskId,
+                  sessionId, turnId: proof.durable.fillTurnId, rootTaskId: recorded.fillRootTaskId,
+                  role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 2,
+                  select: { id: true, status: true, attemptCount: true, completedAt: true, leaseOwner: true,
+                    leaseExpiresAt: true, interruptRequestedAt: true } }),
+                testDb.applicationTaskEvent.findMany({ where: { taskId: proof.durable.task.id,
+                  type: "reviewed_application_fill_browser_started", actor: "worker" }, take: 2, select: { data: true } }),
+              ])
               const submitAttemptCount = submitAttempts.filter(attempt => attempt.receiptId === proof.durable.approval.id
                 && attempt.jobId === proof.durable.job.id).length
               if (fillers.length !== 1 || fillers[0]?.status !== "completed" || fillers[0]?.attemptCount !== recorded.attemptCount
                 || !(fillers[0]?.completedAt instanceof Date) || fillers[0]?.leaseOwner !== null || fillers[0]?.leaseExpiresAt !== null
-                || fillers[0]?.interruptRequestedAt !== null || submitAttemptCount !== 1) {
+                || fillers[0]?.interruptRequestedAt !== null || browserStarts.length !== 1
+                || !objectiveBrowserStartMatches(browserStarts[0]?.data, slot, proof.durable.fillTurnId,
+                  recorded.fillerTaskId, recorded.attemptCount) || submitAttemptCount !== 1) {
                 throw new Error("Objective rate-window attempt evidence changed")
               }
               return { applicationTaskId: proof.durable.task.id, fillTurnId: proof.durable.fillTurnId,
                 applicationStatus: proof.durable.task.status, checkpoint: proof.durable.task.checkpoint,
                 fillTurnStatus: proof.durable.turn.status, jobStatus: proof.durable.job.status,
-                jobWorkflowState: proof.durable.job.workflowState, fillAttemptCount: fillers[0].attemptCount,
+                jobWorkflowState: proof.durable.job.workflowState, fillAttemptOrdinal: fillers[0].attemptCount,
+                fillBrowserStartCount: 1 as const,
                 submitAttemptCount, resultReceiptCount: proof.durable.result.count,
                 executionSettlementCount: proof.durable.execution.settledCount }
             }))
@@ -5759,6 +5832,109 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
       expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
       selectedJobFullLoopPhase("objective_wave_skill_comparison_verified")
+
+      const sourceGroups = parseObjectiveTailorSourceGroups(finalContent?.objectiveTailorSourceGroups)
+      const sourceManifest = parseFinalTaskGraphSourceManifest(finalContent?.taskGraphSources)
+      if (!sourceGroups || !sourceManifest || sourceGroups.graphRevision !== graphRow.revision
+        || sourceManifest.graphRevision !== graphRow.revision) throw new Error("Objective Job evidence source binding is unavailable")
+      const sourceKeyForNodeKey = (nodeKey: string): string => {
+        const source = sourceManifest.sources.find(value => jsonString(graphNodes[value.nodeIndex], "key") === nodeKey)
+        if (!source) throw new Error(`Objective Job evidence source node is unavailable: ${nodeKey}`)
+        return source.sourceKey
+      }
+      const greenhouseScoutTaskId = jsonString(nodeForKey("scout-greenhouse"), "taskId")
+      if (!greenhouseScoutTaskId) throw objectiveScoutProofFailure("task_lookup", "missing_task_id")
+      const greenhouseScoutTasks = await testDb.subAgentTask.findMany({ where: {
+        id: greenhouseScoutTaskId, sessionId, turnId: sourceTurnId, rootTaskId: sourceRootTaskId,
+        role: "scout", taskType: "job_discovery", status: "completed",
+      }, select: { id: true, status: true, result: true } })
+      if (greenhouseScoutTasks.length !== 1) throw objectiveScoutProofFailure("task_lookup", "row_count")
+      const greenhouseScoutTask = greenhouseScoutTasks[0]!
+      const greenhouseCandidates = await persistedObjectiveScoutCandidateIds(greenhouseScoutTask.status, greenhouseScoutTask.result)
+      const knownGreenhouseJobIds = jobIds.slice(0, 3)
+      if (greenhouseCandidates.length !== 3) throw objectiveScoutProofFailure("candidate_set", "candidate_count")
+      if (new Set(greenhouseCandidates).size !== greenhouseCandidates.length) throw objectiveScoutProofFailure("candidate_set", "duplicate_candidate")
+      if (knownGreenhouseJobIds.length !== 3 || new Set(knownGreenhouseJobIds).size !== 3
+        || greenhouseCandidates.some(jobId => !knownGreenhouseJobIds.includes(jobId))
+        || knownGreenhouseJobIds.some(jobId => !greenhouseCandidates.includes(jobId))) {
+        throw objectiveScoutProofFailure("candidate_set", "expected_job_set")
+      }
+      const greenhouseAnalystAKey = sourceKeyForNodeKey("analyst-greenhouse-a")
+      const greenhouseAnalystBKey = sourceKeyForNodeKey("analyst-greenhouse-b")
+      const expectedAnalyzedSourceKeyByJobId = new Map<string, string>([
+        [greenhouseCandidates[0]!, greenhouseAnalystAKey], [greenhouseCandidates[1]!, greenhouseAnalystAKey],
+        [greenhouseCandidates[2]!, greenhouseAnalystBKey],
+      ])
+      expect([...expectedAnalyzedSourceKeyByJobId.values()].filter(sourceKey => sourceKey === greenhouseAnalystAKey)).toHaveLength(2)
+      expect([...expectedAnalyzedSourceKeyByJobId.values()].filter(sourceKey => sourceKey === greenhouseAnalystBKey)).toHaveLength(1)
+      const evidenceNodeKeys = {
+        discoveredJobs: ["scout-greenhouse", "scout-greenhouse", "scout-greenhouse", "scout-lever", "scout-lever", "scout-lever", "scout-workday", "scout-workday"],
+        analyzedJobs: ["analyst-greenhouse-a", "analyst-greenhouse-a", "analyst-greenhouse-b", "analyst-lever", "analyst-lever", "analyst-lever", "analyst-workday", "analyst-workday"],
+      } as const
+      const assertJobEvidence = (value: unknown, group: "discoveredJobs" | "analyzedJobs") => {
+        const evidence = parseObjectiveJobEvidence(value)
+        if (!evidence) throw new Error(`Objective ${group} evidence is not a safe DTO`)
+        const expectedKeys = evidenceNodeKeys[group].map(sourceKeyForNodeKey)
+        expect(evidence).toMatchObject({ schemaVersion: "agent-harness.v2.objective-job-evidence.v1",
+          graphRevision: graphRow.revision, group, coverage: "complete", count: 8 })
+        expect(evidence.jobs.map(job => job.ordinal)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+        expect([...new Set(evidence.jobs.flatMap(job => job.sourceKeys))].sort()).toEqual([...new Set(expectedKeys)].sort())
+        const byPostingUrl = new Map(evidence.jobs.map(job => [job.postingUrl, job] as const))
+        expect(new Set(byPostingUrl.keys()).size).toBe(8)
+        for (const [index] of jobIds.entries()) {
+          const postingUrl = `https://boards.greenhouse.io/example-objective/jobs/${index + 1}`
+          const job = byPostingUrl.get(postingUrl)
+          const expectedSourceKey = group === "analyzedJobs" && index < knownGreenhouseJobIds.length
+            ? expectedAnalyzedSourceKeyByJobId.get(jobIds[index]!) : expectedKeys[index]
+          if (!(job && expectedSourceKey && job.role === "Software Engineer"
+            && job.company === `Synthetic Employer ${index + 1}` && job.location === "Dublin"
+            && job.postingUrl === postingUrl && job.sourceKeys.length === 1 && job.sourceKeys[0] === expectedSourceKey)) {
+            throw objectiveScoutProofFailure("source_assignment", "evidence_source_mismatch")
+          }
+        }
+        return evidence
+      }
+      const { GET: getObjectiveJobEvidence } = await import("@/app/api/agent/sessions/[id]/final-items/[itemId]/objective-job-groups/[group]/route")
+      const readJobEvidence = (bearer: string, group: "discoveredJobs" | "analyzedJobs", revision: number) =>
+        getObjectiveJobEvidence(apiRequest(`/api/agent/sessions/${sessionId}/final-items/${finalItemId}/objective-job-groups/${group}?graphRevision=${revision}`, bearer, "GET"), {
+          params: Promise.resolve({ id: sessionId, itemId: finalItemId, group }),
+        })
+      const evidenceResponses = await Promise.all([
+        readJobEvidence(postWaveOwnerToken, "discoveredJobs", graphRow.revision),
+        readJobEvidence(postWaveOwnerToken, "analyzedJobs", graphRow.revision),
+      ])
+      for (const response of evidenceResponses) {
+        expect(response.status).toBe(200)
+        expect(response.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+      }
+      const evidenceEnvelopes = await Promise.all(evidenceResponses.map(jsonResponse))
+      expect(evidenceEnvelopes.every(value => Object.keys(value).length === 1 && Object.hasOwn(value, "jobEvidence"))).toBe(true)
+      const discoveredEvidence = assertJobEvidence(evidenceEnvelopes[0]?.jobEvidence, "discoveredJobs")
+      const analyzedEvidence = assertJobEvidence(evidenceEnvelopes[1]?.jobEvidence, "analyzedJobs")
+      expect(new Set(discoveredEvidence.jobs.flatMap(job => job.sourceKeys))).toEqual(new Set(sourceGroups.groups.discoveredJobs))
+      expect(new Set(analyzedEvidence.jobs.flatMap(job => job.sourceKeys))).toEqual(new Set(sourceGroups.groups.analyzedJobs))
+      const evidenceJson = JSON.stringify(evidenceEnvelopes)
+      for (const forbidden of [requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE,
+        requirementFixture.OBJECTIVE_WAVE_RUST_REQUIREMENT_QUOTE, "PrivateFixtureSkill", pastedSkillsFactId,
+        "jobId", "taskId", "sourceTaskIds", "sourceTurnId", "sourceRootTaskId", graphRow.id, ...jobIds, ...sourceTaskIds]) {
+        expect(evidenceJson).not.toContain(forbidden)
+      }
+      for (const group of ["discoveredJobs", "analyzedJobs"] as const) {
+        const foreignResponse = await readJobEvidence(postWaveForeignToken, group, graphRow.revision)
+        expect(foreignResponse.status).toBe(404)
+        expect(await jsonResponse(foreignResponse)).not.toHaveProperty("jobEvidence")
+        const staleResponse = await readJobEvidence(postWaveOwnerToken, group, graphRow.revision + 1)
+        expect(staleResponse.status).toBe(404)
+        expect(await jsonResponse(staleResponse)).not.toHaveProperty("jobEvidence")
+      }
+      const postEvidenceStats = await requestFixtureStats()
+      expect(postEvidenceStats.objectiveGetCounts).toEqual(postComparisonStats.objectiveGetCounts)
+      expect(postEvidenceStats.objectiveSubmitReceipts).toEqual(postComparisonStats.objectiveSubmitReceipts)
+      expect(postEvidenceStats.submitCount).toBe(postComparisonStats.submitCount)
+      expect(postEvidenceStats.reviewedSubmitCount).toBe(postComparisonStats.reviewedSubmitCount)
+      expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
+      expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
+      selectedJobFullLoopPhase("objective_wave_job_evidence_verified")
     } finally {
       if (sourceWorker && worker !== sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
       if (worker && !exited(worker)) await stopFixture(worker)

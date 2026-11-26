@@ -6,6 +6,8 @@ import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-fina
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, sameTaskGraphFinalSummaryBinding, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
 import { buildTaskGraphFinalSourceManifest } from "./subagents/task-graph-final-source-manifest.js"
 import { objectiveTailorFinalOutcomeSidecarMatches, readObjectiveTailorFinalOutcomeSidecar } from "./subagents/objective-tailor-final-sidecar.js"
+import { objectiveTailorSourceGroupsValueMatches, readObjectiveTailorSourceGroups } from "./subagents/objective-tailor-source-groups.js"
+import { OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD } from "@jobcopilot/agent-protocol"
 
 export type FinalTerminalReason = "goal_satisfied" | "partial_result" | "budget_exhausted" | "no_progress" | "unrecoverable_error" | "final_unverified"
 
@@ -83,6 +85,7 @@ export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummary
   const content = record(finalContent)
   if (!expected || !current) return expected === undefined && current === undefined
     && !Object.hasOwn(content, "taskGraphSources") && !Object.hasOwn(content, "objectiveTailorFinalOutcomes")
+    && !Object.hasOwn(content, OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD)
     && !hasMisplacedResponseSourceField(content) && !hasSerializedSources(response)
   if (!sameTaskGraphFinalSummaryBinding(expected, current)) return false
   const expectedOutcome = readObjectiveTailorFinalOutcomeSidecar(expected), currentOutcome = readObjectiveTailorFinalOutcomeSidecar(current)
@@ -92,6 +95,13 @@ export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummary
     ? !hasOutcomeSidecar || !objectiveTailorFinalOutcomeSidecarMatches(expected, content.objectiveTailorFinalOutcomes)
       || !objectiveTailorFinalOutcomeSidecarMatches(current, content.objectiveTailorFinalOutcomes)
     : hasOutcomeSidecar) return false
+  const expectedGroups = readObjectiveTailorSourceGroups(expected, finalItemId), currentGroups = readObjectiveTailorSourceGroups(current, finalItemId)
+  if (expectedGroups.status === "invalid" || currentGroups.status === "invalid" || expectedGroups.status !== currentGroups.status) return false
+  const hasSourceGroups = Object.hasOwn(content, OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD)
+  if (expectedGroups.status === "ready"
+    ? !hasSourceGroups || !objectiveTailorSourceGroupsValueMatches(expectedGroups, ownDataValue(content, OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD))
+      || !objectiveTailorSourceGroupsValueMatches(currentGroups, ownDataValue(content, OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD))
+    : hasSourceGroups) return false
   let saved: unknown
   try { saved = JSON.parse(response) as unknown } catch { return false }
   let projectedResponse: string
@@ -119,6 +129,13 @@ function hasMisplacedResponseSourceField(content: Record<string, unknown>): bool
 }
 function hasOutcomeSourceField(value: Record<string, unknown>): boolean {
   return Object.hasOwn(value, "taskGraphSources") || Object.hasOwn(value, "objectiveTailorFinalOutcomes")
+    || Object.hasOwn(value, OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD)
+}
+function ownDataValue(value: Record<string, unknown>, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor && "value" in descriptor ? descriptor.value : undefined
+  } catch { return undefined }
 }
 function sameJson(left: unknown, right: unknown): boolean {
   try {

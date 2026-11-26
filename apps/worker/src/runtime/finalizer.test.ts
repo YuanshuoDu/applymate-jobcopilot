@@ -160,8 +160,14 @@ describe("deterministic finalizer", () => {
       sourceCounts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } },
       reportedScoreFloor: { status: "unavailable" } }
     expect(terminal.finalContent.objectiveTailorFinalOutcomes).toEqual(sidecar)
+    const sourceGroups = terminal.finalContent.objectiveTailorSourceGroups
+    expect(sourceGroups).toBeDefined()
+    expect(sourceGroups?.groups.discoveredJobs).toHaveLength(1)
+    expect(sourceGroups?.groups.analyzedJobs).toHaveLength(1)
     expect(terminal.finalContent.final).not.toHaveProperty("objectiveTailorFinalOutcomes")
+    expect(terminal.finalContent.final).not.toHaveProperty("objectiveTailorSourceGroups")
     expect(JSON.parse(terminal.response)).not.toHaveProperty("objectiveTailorFinalOutcomes")
+    expect(JSON.parse(terminal.response)).not.toHaveProperty("objectiveTailorSourceGroups")
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), terminal.finalContent, terminal.response, terminal.finalItemId)).toBe(true)
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent, objectiveTailorFinalOutcomes: undefined }, terminal.response, terminal.finalItemId)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
@@ -177,13 +183,19 @@ describe("deterministic finalizer", () => {
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
       objectiveTailorFinalOutcomes: { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_SCHEMA, slots: sidecar.slots } }, terminal.response, terminal.finalItemId)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      objectiveTailorSourceGroups: { ...sourceGroups!, groups: { ...sourceGroups!.groups, discoveredJobs: [] } } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
       final: { ...terminal.finalContent.final, objectiveTailorFinalOutcomes: sidecar } }, terminal.response, terminal.finalItemId)).toBe(false)
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
+      final: { ...terminal.finalContent.final, objectiveTailorSourceGroups: sourceGroups } }, terminal.response, terminal.finalItemId)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
       answerEvidence: { objectiveTailorFinalOutcomes: sidecar } }, terminal.response, terminal.finalItemId)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), { ...terminal.finalContent,
       evidenceRefs: [{ objectiveTailorFinalOutcomes: sidecar }] }, terminal.response, terminal.finalItemId)).toBe(false)
     const injectedResponse = JSON.stringify({ ...JSON.parse(terminal.response), objectiveTailorFinalOutcomes: sidecar })
     expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), terminal.finalContent, injectedResponse, terminal.finalItemId)).toBe(false)
+    const injectedGroupsResponse = JSON.stringify({ ...JSON.parse(terminal.response), objectiveTailorSourceGroups: sourceGroups })
+    expect(taskGraphFinalSummaryCopiesMatch(binding, waveGraphBinding(), terminal.finalContent, injectedGroupsResponse, terminal.finalItemId)).toBe(false)
   })
 
   it("rejects matching but noncanonical copies even when the bound summary remains correct", () => {

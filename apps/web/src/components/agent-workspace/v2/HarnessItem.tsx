@@ -11,7 +11,7 @@ import { useI18n, type Lang } from '@/lib/i18n'
 import type { TimelineItem } from './timeline-reducer'
 import { contentParts, itemText, type HarnessContentPart, type SuggestedActionCommand } from './harness-item-types'
 import { FinalAnswerEvidenceDisclosure } from './FinalAnswerEvidenceDisclosure'
-import { FinalTaskGraphSources } from './FinalTaskGraphSources'
+import { FinalTaskGraphSources, type ObjectiveTailorSourceGroup, type ObjectiveTailorSourceGroupSelection } from './FinalTaskGraphSources'
 import { ObjectiveTailorFinalOutcomes } from './ObjectiveTailorFinalOutcomes'
 import { HarnessMarkdown } from './HarnessMarkdown'
 import { NativeVerificationFeedbackCard } from './NativeVerificationFeedbackCard'
@@ -28,10 +28,20 @@ export interface PlanStep {
   label: string
   status: string
 }
+type CardSourceGroupSelection = ObjectiveTailorSourceGroupSelection & Readonly<{ itemIdentity: string }>
+type SourceGroupSelector = (group: ObjectiveTailorSourceGroup, sourceKeys: readonly string[], graphRevision: number) => void
 
 export function HarnessItem({ item, highlightedFinal = false, onSuggestedAction }: HarnessItemProps) {
   const { t, lang } = useI18n()
   const reactId = React.useId()
+  const itemIdentity = `${item.sessionId ?? ''}:${item.id}`
+  const [sourceGroupSelection, setSourceGroupSelection] = React.useState<CardSourceGroupSelection | null>(null)
+  const sourceGroupRequestId = React.useRef(0)
+  const selectSourceGroup = React.useCallback<SourceGroupSelector>((group, sourceKeys, graphRevision) => {
+    setSourceGroupSelection({ itemIdentity, group, sourceKeys: [...sourceKeys], graphRevision, requestId: ++sourceGroupRequestId.current })
+  }, [itemIdentity])
+  const resetSourceGroup = React.useCallback(() => setSourceGroupSelection(null), [])
+  const activeSourceGroupSelection = sourceGroupSelection?.itemIdentity === itemIdentity ? sourceGroupSelection : null
   const relatedTaskSourcesId = hasMatchingObjectiveSourceCounts(item) ? relatedTaskSourcesFragmentId(reactId) : undefined
   const final = item.phase === 'final_answer'
   const accent = final ? 'var(--c-success)' : item.type === 'reasoning_summary' ? '#7c3aed' : 'var(--primary)'
@@ -56,7 +66,7 @@ export function HarnessItem({ item, highlightedFinal = false, onSuggestedAction 
         <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{title}</span>
         {final && <span data-agent-final-label="true" style={{ marginLeft: 'auto', color: accent, fontSize: 10, fontWeight: 700 }}>{t('agent.finalAnswer')}</span>}
       </div>
-      {renderItemBody(item, t, lang, onSuggestedAction, relatedTaskSourcesId)}
+      {renderItemBody(item, t, lang, onSuggestedAction, relatedTaskSourcesId, activeSourceGroupSelection, selectSourceGroup, resetSourceGroup)}
       <div style={{ marginTop: 11, paddingTop: 8, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 10 }}>
         {t('agent.itemStatus')}: {itemStatusLabel(item.status, t)}
       </div>
@@ -77,7 +87,8 @@ export function reducePlanSteps(value: unknown): PlanStep[] {
 }
 
 function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: Lang,
-  onSuggestedAction?: HarnessItemProps['onSuggestedAction'], relatedTaskSourcesId?: string) {
+  onSuggestedAction?: HarnessItemProps['onSuggestedAction'], relatedTaskSourcesId?: string,
+  sourceGroupSelection?: ObjectiveTailorSourceGroupSelection | null, onSourceGroupSelect?: SourceGroupSelector, onSourceGroupReset?: () => void) {
   if (item.type === 'plan') return <PlanBody item={item} t={t} />
   if (item.type === 'tool_call' || item.type === 'tool_result') return <ToolLifecycleCard item={item} t={t} lang={lang} />
   if (item.type === 'reasoning_summary') {
@@ -90,10 +101,11 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
   const answerEvidence = finalAnswerEvidence(item)
   const taskGraphSources = item.type === 'agent_message' && item.phase === 'final_answer' && item.status === 'completed'
     ? <FinalTaskGraphSources content={item.content} sessionId={item.sessionId} finalItemId={item.id} lang={lang}
-      navigationTargetId={relatedTaskSourcesId} /> : null
+      navigationTargetId={relatedTaskSourcesId} sourceGroupSelection={sourceGroupSelection} /> : null
   const objectiveTailorFinalOutcomes = item.type === 'agent_message' && item.phase === 'final_answer' && item.status === 'completed'
     ? <ObjectiveTailorFinalOutcomes content={item.content} lang={lang} sessionId={item.sessionId} sourceTurnId={item.turnId}
-      rootTaskId={item.taskId} finalItemId={item.id} relatedTaskSourcesId={relatedTaskSourcesId} /> : null
+      rootTaskId={item.taskId} finalItemId={item.id} relatedTaskSourcesId={relatedTaskSourcesId}
+      onSourceGroupSelect={onSourceGroupSelect} onSourceGroupReset={onSourceGroupReset} /> : null
   return <>
     <div style={{ display: 'grid', gap: 8 }}>
       {summary && <section aria-label={summaryLabel} data-agent-final-summary="true">

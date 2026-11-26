@@ -15,7 +15,10 @@ import {
   type TaskGraphSourceRoleResultStatus,
   type TaskGraphSourceTaskStatus,
 } from '@/lib/agent/session/final-task-graph-source-manifest'
+import { parseObjectiveTailorFinalOutcomesFromContent } from '@/lib/agent/session/objective-tailor-final-content'
+import { readObjectiveTailorSourceGroups } from '@/lib/agent/session/objective-tailor-source-groups'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
+import { ObjectiveContributingJobs } from './ObjectiveContributingJobs'
 import { TaskGraphVerificationSummary } from './TaskGraphVerificationSummary'
 
 export interface FinalTaskGraphSourceDetail {
@@ -32,15 +35,28 @@ type RequestState = RequestIdentity & (Readonly<{ state: 'loading' | 'unavailabl
   state: 'ready'; detail: FinalTaskGraphSourceDetail
 }>)
 
-export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang, navigationTargetId }: {
+export type ObjectiveTailorSourceGroup = 'discoveredJobs' | 'analyzedJobs'
+export type ObjectiveTailorSourceGroupSelection = Readonly<{
+  group: ObjectiveTailorSourceGroup
+  sourceKeys: readonly string[]
+  graphRevision: number
+  requestId: number
+}>
+
+export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang, navigationTargetId, sourceGroupSelection }: {
   readonly content: unknown
   readonly sessionId: string
   readonly finalItemId: string
   readonly lang: Lang
   readonly navigationTargetId?: string
+  readonly sourceGroupSelection?: ObjectiveTailorSourceGroupSelection | null
 }) {
-  const manifest = parseFinalTaskGraphSourceManifest(record(content)?.taskGraphSources)
+  const contentRow = record(content)
+  const manifest = parseFinalTaskGraphSourceManifest(contentRow?.taskGraphSources)
+  const finalOutcomes = parseObjectiveTailorFinalOutcomesFromContent(content)
+  const currentGroups = readObjectiveTailorSourceGroups(contentRow?.objectiveTailorSourceGroups, manifest, finalOutcomes)
   const disclosureId = React.useId()
+  const sectionRef = React.useRef<HTMLElement | null>(null)
   const [selectedKey, setSelectedKey] = React.useState<string | null>(null)
   const [request, setRequest] = React.useState<RequestState | null>(null)
 
@@ -55,17 +71,42 @@ export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang, n
     return () => controller.abort()
   }, [finalItemId, selectedKey, sessionId])
 
+  const activeGroup = sourceGroupSelection && currentGroups
+    && sourceGroupSelection.graphRevision === currentGroups.graphRevision
+    && sourceGroupSelection.sourceKeys.length > 0
+    && sameSourceKeys(sourceGroupSelection.sourceKeys, currentGroups.groups[sourceGroupSelection.group])
+    ? sourceGroupSelection : null
+
+  React.useEffect(() => {
+    if (!sourceGroupSelection || !manifest || !activeGroup) return
+    sectionRef.current?.focus()
+  }, [activeGroup, manifest?.graphRevision, sourceGroupSelection?.requestId])
+
+  React.useEffect(() => {
+    if (activeGroup && selectedKey && !activeGroup.sourceKeys.includes(selectedKey)) setSelectedKey(null)
+  }, [activeGroup?.requestId, selectedKey])
+
   if (!manifest) return null
   const label = (key: TaskGraphPlanLabelKey) => taskGraphPlanLabel(lang, key)
   const selected = manifest.sources.find(source => source.sourceKey === selectedKey)
   const activeRequest = selected && requestMatchesIdentity(request, { sessionId, finalItemId, sourceKey: selected.sourceKey }) ? request : null
+  const selectedSourceKeys = new Set(activeGroup?.sourceKeys ?? [])
+  const visibleSources = activeGroup ? manifest.sources.filter(source => selectedSourceKeys.has(source.sourceKey)) : manifest.sources
+  const jobEvidenceExpectation = activeGroup ? objectiveJobEvidenceExpectation(finalOutcomes, activeGroup.group) : null
   return <section aria-label={label('agent.taskGraph.sources.title')} data-agent-related-task-sources="true"
-    id={navigationTargetId} tabIndex={navigationTargetId ? -1 : undefined} style={sectionStyle}>
+    data-objective-source-group-selection={activeGroup ? 'true' : undefined}
+    data-objective-source-group={activeGroup?.group}
+    ref={sectionRef} id={navigationTargetId} tabIndex={navigationTargetId || activeGroup ? -1 : undefined} style={sectionStyle}>
     <h3 style={headingStyle}>{label('agent.taskGraph.sources.title')}</h3>
     <p style={noteStyle}>{label('agent.taskGraph.sources.disclaimer')}</p>
-    <ul style={listStyle}>{manifest.sources.map(source => {
+    {activeGroup && jobEvidenceExpectation && <ObjectiveContributingJobs key={`${activeGroup.group}:${activeGroup.graphRevision}:${activeGroup.sourceKeys.join(',')}`}
+      sessionId={sessionId} finalItemId={finalItemId} lang={lang} group={activeGroup.group} graphRevision={activeGroup.graphRevision}
+      sourceKeys={activeGroup.sourceKeys} expectedCount={jobEvidenceExpectation.expectedCount}
+      expectedCoverage={jobEvidenceExpectation.expectedCoverage} />}
+    <ul style={listStyle}>{visibleSources.map(source => {
       const isSelected = selectedKey === source.sourceKey
-      return <li key={source.nodeIndex}>
+      const isGroupMember = selectedSourceKeys.has(source.sourceKey)
+      return <li key={source.nodeIndex} data-objective-source-group-member={isGroupMember ? 'true' : undefined}>
         <button type="button" aria-expanded={isSelected} aria-controls={`task-graph-source-detail-${disclosureId}-${source.nodeIndex}`}
           onClick={() => setSelectedKey(isSelected ? null : source.sourceKey)} style={buttonStyle}>
           {label(roleLabel(source.role))} · {label(statusLabel(source.taskStatus))} · {label(resultLabel(source.resultState))}
@@ -161,6 +202,18 @@ function record(value: unknown): Record<string, unknown> | null {
   try { const prototype = Object.getPrototypeOf(value); return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : null } catch { return null }
 }
 function oneOf<T extends string>(value: unknown, values: readonly T[]): value is T { return typeof value === 'string' && values.includes(value as T) }
+
+function sameSourceKeys(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((sourceKey, index) => sourceKey === right[index])
+}
+
+function objectiveJobEvidenceExpectation(outcome: ReturnType<typeof parseObjectiveTailorFinalOutcomesFromContent>,
+  group: ObjectiveTailorSourceGroup): Readonly<{ expectedCount: number; expectedCoverage: 'complete' | 'partial' }> | null {
+  if (!outcome || !('sourceCounts' in outcome)) return null
+  const count = outcome.sourceCounts[group]
+  return count.knownCount !== null && count.knownCount > 0 && (count.coverage === 'complete' || count.coverage === 'partial')
+    ? { expectedCount: count.knownCount, expectedCoverage: count.coverage } : null
+}
 
 const sectionStyle: React.CSSProperties = { display: 'grid', gap: 6, marginTop: 10, paddingTop: 8, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 11 }
 const headingStyle: React.CSSProperties = { margin: 0, color: 'var(--text)', fontSize: 12 }

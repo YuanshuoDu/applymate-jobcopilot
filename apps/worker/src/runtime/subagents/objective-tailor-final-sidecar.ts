@@ -1,11 +1,14 @@
 import {
+  OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD,
   OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA,
   parseObjectiveTailorFinalOutcomeSidecar,
   type ObjectiveTailorFinalOutcomeSidecarV3,
+  type ObjectiveTailorSourceGroups,
 } from "@jobcopilot/agent-protocol"
 import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import { buildTaskGraphFinalSourceManifest } from "./task-graph-final-source-manifest.js"
 import { hasObjectiveTailorFinalOutcome, readBoundObjectiveTailorFinalOutcome } from "./objective-tailor-final-summary-binding.js"
+import { readObjectiveTailorSourceGroups } from "./objective-tailor-source-groups.js"
 
 export type ObjectiveTailorFinalOutcomeSidecarRead =
   | Readonly<{ status: "absent" }>
@@ -15,6 +18,7 @@ export type ObjectiveTailorFinalOutcomeSidecarRead =
 export type TaskGraphFinalSidecars = Readonly<{
   taskGraphSources?: Exclude<ReturnType<typeof buildTaskGraphFinalSourceManifest>, null>
   objectiveTailorFinalOutcomes?: ObjectiveTailorFinalOutcomeSidecarV3
+  [OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD]?: ObjectiveTailorSourceGroups
 }>
 
 export function readObjectiveTailorFinalOutcomeSidecar(value: unknown): ObjectiveTailorFinalOutcomeSidecarRead {
@@ -50,10 +54,13 @@ export function buildTaskGraphFinalSidecars(binding: TaskGraphFinalSummaryBindin
   const taskGraphSources = buildTaskGraphFinalSourceManifest(binding, finalItemId)
   const outcome = readObjectiveTailorFinalOutcomeSidecar(binding)
   if (outcome.status === "invalid") throw new Error("objective_tailor_final_outcome_invalid")
+  const sourceGroups = readObjectiveTailorSourceGroups(binding, finalItemId)
+  if (sourceGroups.status === "invalid") throw new Error("objective_tailor_source_groups_invalid")
   if (!taskGraphSources && outcome.status !== "ready") return null
   return {
     ...(taskGraphSources ? { taskGraphSources } : {}),
     ...(outcome.status === "ready" ? { objectiveTailorFinalOutcomes: outcome.sidecar } : {}),
+    ...(sourceGroups.status === "ready" ? { [OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD]: sourceGroups.groups } : {}),
   }
 }
 

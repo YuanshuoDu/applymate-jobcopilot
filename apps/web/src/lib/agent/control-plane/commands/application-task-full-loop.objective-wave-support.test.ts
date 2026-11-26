@@ -23,7 +23,7 @@ const environment = {
   CLOAK_PROXY_URL: "http://127.0.0.1:9443",
 }
 
-function proof(count = 2) {
+function proof(count = 2, fillAttemptOrdinal = 1) {
   return {
     phase: "between_completed_applications",
     activeAttemptCount: 0,
@@ -36,7 +36,8 @@ function proof(count = 2) {
       fillTurnStatus: "completed",
       jobStatus: "applied",
       jobWorkflowState: "submitted",
-      fillAttemptCount: 1,
+      fillAttemptOrdinal,
+      fillBrowserStartCount: 1,
       submitAttemptCount: 1,
       resultReceiptCount: 1,
       executionSettlementCount: 1,
@@ -111,6 +112,34 @@ describe("Objective wave test rate-limit window", () => {
     await expect(expireObjectiveWaveRateLimitWindow(input(redis, { phaseProof: proof(1) })))
       .resolves.toMatchObject({ completedApplications: 1, expectedCounter: 2, expired: true })
     expect(redis.pexpire).toHaveBeenCalledWith(domainKey, 1_000)
+  })
+
+  it("accepts a later positive filler attempt ordinal when exactly one browser start was sealed", async () => {
+    const redis = redisClient({ domainCount: "2", expireAfterReads: 1 })
+    await expect(expireObjectiveWaveRateLimitWindow(input(redis, { phaseProof: proof(1, 2) })))
+      .resolves.toMatchObject({ completedApplications: 1, expectedCounter: 2, expired: true })
+  })
+
+  it.each([
+    ["zero attempt ordinal", { fillAttemptOrdinal: 0 }],
+    ["duplicate browser starts", { fillBrowserStartCount: 2 }],
+    ["duplicate submit", { submitAttemptCount: 2 }],
+  ])("rejects %s in the closed phase proof", async (_name, change) => {
+    const application = { ...proof(1).applications[0], ...change }
+    const redis = redisClient()
+    await expect(expireObjectiveWaveRateLimitWindow(input(redis, { phaseProof: { ...proof(1), applications: [application] } })))
+      .rejects.toThrow("objective_wave_rate_limit_phase_invalid")
+    expect(redis.get).not.toHaveBeenCalled()
+  })
+
+  it("rejects a missing browser-start count instead of treating it as absent evidence", async () => {
+    const application = proof(1).applications[0]!
+    const { fillBrowserStartCount: _missing, ...withoutBrowserStartCount } = application
+    const redis = redisClient()
+    await expect(expireObjectiveWaveRateLimitWindow(input(redis, { phaseProof: {
+      ...proof(1), applications: [withoutBrowserStartCount],
+    } }))).rejects.toThrow("objective_wave_rate_limit_phase_invalid")
+    expect(redis.get).not.toHaveBeenCalled()
   })
 
   it.each([

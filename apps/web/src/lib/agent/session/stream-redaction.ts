@@ -1,5 +1,6 @@
 import {
   AGENT_STREAM_SCHEMA_VERSION,
+  OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD,
   parseTaskGraphSnapshot,
   TASK_GRAPH_MAX_IDENTIFIER_LENGTH,
   TASK_GRAPH_SCHEMA_VERSION,
@@ -10,6 +11,7 @@ import { projectFinalAnswerContent } from './final-answer-evidence-projection'
 import { isCanonicalTaskGraphSourceManifest } from './final-task-graph-source-detail'
 import { parseFinalTaskGraphSourceManifest } from './final-task-graph-source-manifest'
 import { OBJECTIVE_TAILOR_FINAL_OUTCOMES_FIELD, parseObjectiveTailorFinalOutcomesFromContent, stripObjectiveTailorFinalOutcomes } from './objective-tailor-final-content'
+import { readObjectiveTailorSourceGroups } from './objective-tailor-source-groups'
 import { objectiveTailorProgressHint, parseObjectiveTailorProgressSnapshot } from './objective-tailor-progress-snapshot'
 
 const TASK_GRAPH_PROPOSAL_KEYS = ['kind', 'fingerprint', 'receipt', 'revision', 'item'] as const
@@ -55,7 +57,7 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
   if (isPrivateNativeVerificationEventType(eventType)) return {}
   const finalContent = projectCompletedFinalContent(eventType, payload, identity)
   if (finalContent) return finalContent
-  const redacted = stripObjectiveTailorFinalOutcomes(redactStreamValue(payload))
+  const redacted = stripObjectiveTailorSourceGroups(stripObjectiveTailorFinalOutcomes(redactStreamValue(payload)))
   if (eventType === 'turn.completed') return projectCompletedTurnIdentity(payload, redacted, identity)
   if (eventType !== 'item.started' && eventType !== 'item.delta') return redacted
 
@@ -141,14 +143,26 @@ function projectCompletedFinalContent(eventType: string, payload: unknown, ident
   const text = ownDataValue(rawContent, 'text'), final = ownDataValue(rawContent, 'final')
   const content = projectFinalAnswerContent({ text, final })
   if (!content) {
-    if (!Object.hasOwn(rawContent, 'taskGraphSources') && !Object.hasOwn(rawContent, OBJECTIVE_TAILOR_FINAL_OUTCOMES_FIELD)) return null
+    if (!Object.hasOwn(rawContent, 'taskGraphSources') && !Object.hasOwn(rawContent, OBJECTIVE_TAILOR_FINAL_OUTCOMES_FIELD)
+      && !Object.hasOwn(rawContent, OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD)) return null
     return { itemId: identity.itemId, status: 'completed', content: { text: typeof text === 'string' ? redactSensitiveText(text) : '' } }
   }
   const manifest = parseFinalTaskGraphSourceManifest(ownDataValue(rawContent, 'taskGraphSources'))
   const taskGraphSources = manifest && isCanonicalTaskGraphSourceManifest(identity.itemId, manifest) ? manifest : undefined
   const objectiveTailorFinalOutcomes = parseObjectiveTailorFinalOutcomesFromContent(rawContent)
+  const objectiveTailorSourceGroups = taskGraphSources && objectiveTailorFinalOutcomes
+    ? readObjectiveTailorSourceGroups(ownDataValue(rawContent, OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD), taskGraphSources, objectiveTailorFinalOutcomes) : undefined
   return { itemId: identity.itemId, status: 'completed', content: { ...content, ...(taskGraphSources ? { taskGraphSources } : {}),
-    ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}) } }
+    ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}),
+    ...(objectiveTailorSourceGroups ? { objectiveTailorSourceGroups } : {}) } }
+}
+
+function stripObjectiveTailorSourceGroups(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripObjectiveTailorSourceGroups)
+  const row = isRecord(value) ? value : null
+  if (!row) return value
+  return Object.fromEntries(Object.entries(row).flatMap(([key, child]) => key === OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD
+    ? [] : [[key, stripObjectiveTailorSourceGroups(child)]]))
 }
 
 function ownDataValue(value: Record<string, unknown>, key: string): unknown {

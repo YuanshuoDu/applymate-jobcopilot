@@ -26,7 +26,8 @@ type ObjectiveWavePhaseProof = Readonly<{
     fillTurnStatus: "completed"
     jobStatus: "applied"
     jobWorkflowState: "submitted"
-    fillAttemptCount: 1
+    fillAttemptOrdinal: number
+    fillBrowserStartCount: 1
     submitAttemptCount: 1
     resultReceiptCount: 1
     executionSettlementCount: 1
@@ -204,7 +205,7 @@ function parsePhaseProof(value: unknown): ObjectiveWavePhaseProof {
     throw new Error("objective_wave_rate_limit_phase_invalid")
   }
   const applicationKeys = ["applicationTaskId", "applicationStatus", "checkpoint", "executionSettlementCount",
-    "fillAttemptCount", "fillTurnId", "fillTurnStatus", "jobStatus", "jobWorkflowState", "resultReceiptCount",
+    "fillAttemptOrdinal", "fillBrowserStartCount", "fillTurnId", "fillTurnStatus", "jobStatus", "jobWorkflowState", "resultReceiptCount",
     "submitAttemptCount"]
   const taskIds = new Set<string>(), turnIds = new Set<string>()
   for (const application of value.applications) {
@@ -213,7 +214,8 @@ function parsePhaseProof(value: unknown): ObjectiveWavePhaseProof {
       || taskIds.has(application.applicationTaskId) || turnIds.has(application.fillTurnId)
       || application.applicationStatus !== "submitted" || application.checkpoint !== "submission_verified"
       || application.fillTurnStatus !== "completed" || application.jobStatus !== "applied"
-      || application.jobWorkflowState !== "submitted" || application.fillAttemptCount !== 1
+      || application.jobWorkflowState !== "submitted" || !Number.isSafeInteger(application.fillAttemptOrdinal)
+      || Number(application.fillAttemptOrdinal) < 1 || application.fillBrowserStartCount !== 1
       || application.submitAttemptCount !== 1 || application.resultReceiptCount !== 1
       || application.executionSettlementCount !== 1) {
       throw new Error("objective_wave_rate_limit_phase_invalid")
