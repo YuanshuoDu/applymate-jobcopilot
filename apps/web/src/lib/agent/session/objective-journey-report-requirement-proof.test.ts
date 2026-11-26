@@ -6,7 +6,7 @@ import { canonicalTaskGraphReceiptJson, type TaskGraphReplayReceipt } from "@job
 import { taskGraphEvidenceDigest, taskGraphResultDigest } from "@jobcopilot/shared/task-graph-verification-digest"
 import type { ObjectiveJourneySource } from "./objective-journey-report-source"
 import type { ObjectiveJourneyRequirementRead } from "./objective-journey-report-requirement-receipts"
-import { objectiveJourneyAnalystGraphRequirements, verifyObjectiveJourneyRequirementProof } from "./objective-journey-report-requirement-proof"
+import { objectiveJourneyAnalystGraphRequirements, objectiveJourneyVerifiedRequirementRead, verifyObjectiveJourneyRequirementProof } from "./objective-journey-report-requirement-proof"
 
 const jobId = "123e4567-e89b-42d3-a456-426614174000", userId = "owner-1", sessionId = "session-1"
 const job = { id: jobId, company: "Example", description: "Must know Rust. Apply with care.", keywords: "Rust", location: "Dublin",
@@ -31,6 +31,12 @@ describe("verifyObjectiveJourneyRequirementProof", () => {
     expect(verifyObjectiveJourneyRequirementProof(value.source, value.slot, value.read)).toEqual({ checked: true, hasVerifiedRequirements: true })
   })
 
+  it("returns only an internal verified quote snapshot for the skill matcher", () => {
+    const value = fixture(true)
+    expect(objectiveJourneyVerifiedRequirementRead(value.source, value.slot, value.read)).toEqual({ checked: true,
+      keywords: "Rust", quotes: ["Must know Rust."] })
+  })
+
   it.each([
     ["a non-completed persisted result row", (value: ReturnType<typeof fixture>) => {
       value.read = { ...value.read, items: value.read.items.map(item => item.type === "tool_result" ? { ...item, status: "failed" } : item) }
@@ -51,6 +57,7 @@ describe("verifyObjectiveJourneyRequirementProof", () => {
   it("counts a valid Analyst with no proposals as checked but not positive", () => {
     const value = fixture(false)
     expect(verifyObjectiveJourneyRequirementProof(value.source, value.slot, value.read)).toEqual({ checked: true, hasVerifiedRequirements: false })
+    expect(objectiveJourneyVerifiedRequirementRead(value.source, value.slot, value.read)).toEqual({ checked: true, keywords: "Rust", quotes: [] })
   })
 
   it("matches multiple out-of-order Scout bindings using the Worker's byte ordering", () => {
