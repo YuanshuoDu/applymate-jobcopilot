@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer"
 import { createHash, randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
 import { isDeepStrictEqual } from "node:util"
@@ -1533,6 +1534,66 @@ async function reviewedSourceStructuredResult(taskStatus: string, value: unknown
   const result = jsonRecord(jsonRecord(value)?.structuredResult)
   if (!result || result.role !== role) throw new Error("reviewed_source_worker_result_invalid")
   return result
+}
+
+type ObjectiveScoutProofStage = "task_lookup" | "result_envelope" | "structured_result" | "candidate_set" | "source_assignment"
+type ObjectiveScoutProofCode = "missing_task_id" | "row_count" | "invalid_shape" | "unknown_key" | "missing_field"
+  | "invalid_status" | "oversized" | "invalid_role_result" | "candidate_count" | "duplicate_candidate"
+  | "expected_job_set" | "evidence_source_mismatch"
+
+function objectiveScoutProofFailure(stage: ObjectiveScoutProofStage, code: ObjectiveScoutProofCode): Error {
+  return new Error(`objective_greenhouse_scout_proof:${stage}:${code}`)
+}
+
+async function persistedObjectiveScoutCandidateIds(taskStatus: string, value: unknown): Promise<string[]> {
+  let parsed: unknown = value
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed) as unknown } catch { throw objectiveScoutProofFailure("result_envelope", "invalid_shape") }
+  }
+  const envelope = jsonRecord(parsed)
+  if (!envelope) throw objectiveScoutProofFailure("result_envelope", "invalid_shape")
+  const requiredKeys = ["finalItemId", "finalText", "status", "stepCount", "structuredResult", "toolCallCount"]
+  // These sidecars are written alongside successful child results by Worker runtime paths.
+  const allowedKeys = new Set([...requiredKeys, "discoveryAttempt", "discoveryRecovery", "taskGraphVerificationReport", "taskGraphRepairReceipt"])
+  const ownKeys = Reflect.ownKeys(envelope)
+  if (ownKeys.length !== Object.keys(envelope).length || ownKeys.some(key => typeof key !== "string" || !allowedKeys.has(key))) {
+    throw objectiveScoutProofFailure("result_envelope", "unknown_key")
+  }
+  if (!requiredKeys.every(key => Object.hasOwn(envelope, key))) {
+    throw objectiveScoutProofFailure("result_envelope", "missing_field")
+  }
+
+  let encodedEnvelope: string, encodedStructured: string
+  try {
+    encodedEnvelope = JSON.stringify(envelope) as string
+    encodedStructured = JSON.stringify(envelope.structuredResult) as string
+  } catch { throw objectiveScoutProofFailure("result_envelope", "invalid_shape") }
+  const { TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT, isCanonicalTaskGraphJobId } = await import("../../../../../../worker/src/runtime/subagents/task-graph-result-page-contract")
+  if (typeof encodedEnvelope !== "string" || typeof encodedStructured !== "string"
+    || Buffer.byteLength(encodedEnvelope, "utf8") > TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT
+    || Buffer.byteLength(encodedStructured, "utf8") > TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT) {
+    throw objectiveScoutProofFailure("result_envelope", "oversized")
+  }
+  if (taskStatus !== "completed" || envelope.status !== "completed"
+    || !Number.isSafeInteger(envelope.stepCount) || Number(envelope.stepCount) < 0
+    || !Number.isSafeInteger(envelope.toolCallCount) || Number(envelope.toolCallCount) < 0
+    || (envelope.finalItemId !== null && typeof envelope.finalItemId !== "string")
+    || typeof envelope.finalText !== "string") {
+    throw objectiveScoutProofFailure("result_envelope", "invalid_status")
+  }
+
+  const { validateRoleResult } = await import("../../../../../../worker/src/runtime/subagents/role-results")
+  let candidateIds: string[]
+  try {
+    const result = validateRoleResult(envelope.structuredResult, "scout")
+    if (result.role !== "scout") throw new Error("unexpected_role")
+    candidateIds = result.candidates.map(candidate => candidate.jobId)
+  }
+  catch { throw objectiveScoutProofFailure("structured_result", "invalid_role_result") }
+  if (candidateIds.some(jobId => !isCanonicalTaskGraphJobId(jobId))) {
+    throw objectiveScoutProofFailure("structured_result", "invalid_role_result")
+  }
+  return candidateIds
 }
 
 async function startReviewedFillRouteBridge(): Promise<void> {
@@ -5784,25 +5845,21 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         return source.sourceKey
       }
       const greenhouseScoutTaskId = jsonString(nodeForKey("scout-greenhouse"), "taskId")
-      if (!greenhouseScoutTaskId) throw new Error("Objective Greenhouse Scout source task is unavailable")
+      if (!greenhouseScoutTaskId) throw objectiveScoutProofFailure("task_lookup", "missing_task_id")
       const greenhouseScoutTasks = await testDb.subAgentTask.findMany({ where: {
         id: greenhouseScoutTaskId, sessionId, turnId: sourceTurnId, rootTaskId: sourceRootTaskId,
         role: "scout", taskType: "job_discovery", status: "completed",
       }, select: { id: true, status: true, result: true } })
-      const { projectTaskGraphResult } = await import("../../../../../../worker/src/runtime/subagents/task-graph-result-projection")
-      const greenhouseScoutTask = greenhouseScoutTasks.length === 1 ? greenhouseScoutTasks[0] : undefined
-      const greenhouseProjection = greenhouseScoutTask
-        ? projectTaskGraphResult("scout", greenhouseScoutTask.status, greenhouseScoutTask.result) : undefined
-      const greenhouseCandidates = greenhouseProjection?.availability === "available" && greenhouseProjection.role === "scout"
-        && greenhouseProjection.candidateCount === greenhouseProjection.candidates.length
-        ? greenhouseProjection.candidates.map(candidate => candidate.jobId) : undefined
+      if (greenhouseScoutTasks.length !== 1) throw objectiveScoutProofFailure("task_lookup", "row_count")
+      const greenhouseScoutTask = greenhouseScoutTasks[0]!
+      const greenhouseCandidates = await persistedObjectiveScoutCandidateIds(greenhouseScoutTask.status, greenhouseScoutTask.result)
       const knownGreenhouseJobIds = jobIds.slice(0, 3)
-      if (!greenhouseCandidates || greenhouseCandidates.length !== 3
-        || new Set(greenhouseCandidates).size !== 3 || knownGreenhouseJobIds.length !== 3
-        || new Set(knownGreenhouseJobIds).size !== 3
-        || !greenhouseCandidates.every(jobId => knownGreenhouseJobIds.includes(jobId))
-        || !knownGreenhouseJobIds.every(jobId => greenhouseCandidates.includes(jobId))) {
-        throw new Error("Objective Greenhouse Scout candidate set is invalid")
+      if (greenhouseCandidates.length !== 3) throw objectiveScoutProofFailure("candidate_set", "candidate_count")
+      if (new Set(greenhouseCandidates).size !== greenhouseCandidates.length) throw objectiveScoutProofFailure("candidate_set", "duplicate_candidate")
+      if (knownGreenhouseJobIds.length !== 3 || new Set(knownGreenhouseJobIds).size !== 3
+        || greenhouseCandidates.some(jobId => !knownGreenhouseJobIds.includes(jobId))
+        || knownGreenhouseJobIds.some(jobId => !greenhouseCandidates.includes(jobId))) {
+        throw objectiveScoutProofFailure("candidate_set", "expected_job_set")
       }
       const greenhouseAnalystAKey = sourceKeyForNodeKey("analyst-greenhouse-a")
       const greenhouseAnalystBKey = sourceKeyForNodeKey("analyst-greenhouse-b")
@@ -5831,9 +5888,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           const job = byPostingUrl.get(postingUrl)
           const expectedSourceKey = group === "analyzedJobs" && index < knownGreenhouseJobIds.length
             ? expectedAnalyzedSourceKeyByJobId.get(jobIds[index]!) : expectedKeys[index]
-          expect(Boolean(job && expectedSourceKey && job.role === "Software Engineer"
+          if (!(job && expectedSourceKey && job.role === "Software Engineer"
             && job.company === `Synthetic Employer ${index + 1}` && job.location === "Dublin"
-            && job.postingUrl === postingUrl && job.sourceKeys.length === 1 && job.sourceKeys[0] === expectedSourceKey)).toBe(true)
+            && job.postingUrl === postingUrl && job.sourceKeys.length === 1 && job.sourceKeys[0] === expectedSourceKey)) {
+            throw objectiveScoutProofFailure("source_assignment", "evidence_source_mismatch")
+          }
         }
         return evidence
       }
