@@ -16,6 +16,10 @@ type SlotSource = Readonly<{
   ordinal: number; tailoringStatus: Slot["tailoringStatus"]; sourceReady: boolean; jobId: string | null
   job: Slot["job"]; writerTaskId: string | null; reviewerTaskId: string | null
 }>
+type ArtifactRef = Readonly<{ artifactId: string; version: number; contentHash: string; sourceDigest: string }>
+type PriorArtifact = Readonly<{ writerTaskId: string; reviewerTaskId: string; artifactRef: ArtifactRef; reviewHash: string; toolCallId: string }>
+export type ObjectiveJourneyReadySlotProof = Readonly<{ ordinal: number; jobId: string; writerTaskId: string; reviewerTaskId: string
+  artifactRef: ArtifactRef; reviewHash: string; prior?: PriorArtifact }>
 export type ObjectiveJourneySource = Readonly<{
   userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
   sourceCounts: ObjectiveJourneyReport["sourceCounts"]; slots: readonly SlotSource[]; reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor
@@ -55,6 +59,16 @@ export async function readObjectiveJourneyProofContext(tx: Tx, input: Readonly<{
   if (turns.length !== 1 || !turn || turn.id !== final.turnId || turn.userId !== input.userId || turn.sessionId !== input.sessionId
     || turn.status !== "completed" || turn.source !== "user" || turn.executionMode !== "canonical_task_graph" || turn.rootTaskId !== final.taskId) return null
   return readGraph(tx, input, final, turn, expectedGraphRevision)
+}
+
+/** Returns the immutable effective pair proof for one ready slot without reading application state. */
+export function readObjectiveJourneyReadySlot(context: ObjectiveJourneyProofContext, ordinal: number): ObjectiveJourneyReadySlotProof | null {
+  const marker = context.progress.marker.slots[ordinal - 1], sidecar = context.sidecar.slots[ordinal - 1]
+  const candidate = marker && sidecar?.status === "ready" ? candidateForSlot(marker, ordinal, context.graphRevision, context.progress, context.tasks) : undefined
+  const candidates = context.progress.marker.slots.map((slot, index) => candidateForSlot(slot, index + 1, context.graphRevision, context.progress, context.tasks))
+  if (!candidate || candidates.filter(value => value?.jobId === candidate.jobId).length !== 1) return null
+  const pair = candidate && marker ? readyPair(marker, ordinal, context.graphRevision, candidate.jobId, context.progress, context.tasks) : undefined
+  return candidate && pair ? { ordinal, jobId: candidate.jobId, ...pair } : null
 }
 
 async function readGraph(tx: Tx, input: { userId: string; sessionId: string; finalItemId: string }, final: Row, turn: Row,
@@ -164,7 +178,8 @@ function readyPair(slot: ObjectiveTailorGraph["slots"][number], ordinal: number,
   if (!writerNode || !reviewerNode || !writerTask || !reviewerTask || !source) return undefined
   const proof = objectiveApplicationReviewPairProof({ snapshot: progress, slotOrdinal: ordinal, graphRevision: revision, jobId, source,
     writerTask, reviewerTask, tasks })
-  return proof ? { writerTaskId: writerNode.taskId, reviewerTaskId: reviewerNode.taskId } : undefined
+  return proof ? { writerTaskId: writerNode.taskId, reviewerTaskId: reviewerNode.taskId, artifactRef: proof.artifactRef,
+    reviewHash: proof.reviewHash, ...(proof.prior ? { prior: proof.prior } : {}) } : undefined
 }
 
 function pairSource(slotOrdinal: number, writerTaskId: string | undefined, reviewerTaskId: string | undefined, writerValue: unknown, reviewerValue: unknown) {
