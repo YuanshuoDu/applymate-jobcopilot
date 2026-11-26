@@ -5631,22 +5631,32 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
               if (!recorded || !Number.isSafeInteger(recorded.attemptCount) || recorded.attemptCount < 1) {
                 throw new Error("Objective rate-window Filler attempt was not verified")
               }
-              const fillers = await testDb.subAgentTask.findMany({ where: { id: recorded.fillerTaskId,
-                sessionId, turnId: proof.durable.fillTurnId, rootTaskId: recorded.fillRootTaskId,
-                role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 2,
-                select: { id: true, status: true, attemptCount: true, completedAt: true, leaseOwner: true,
-                  leaseExpiresAt: true, interruptRequestedAt: true } })
+              const slot = submissionSlots.find(value => value.applicationTaskId === proof.durable.task.id
+                && value.ordinal === proof.durable.slot.ordinal)
+              if (!slot) throw new Error("Objective rate-window slot binding was not verified")
+              const [fillers, browserStarts] = await Promise.all([
+                testDb.subAgentTask.findMany({ where: { id: recorded.fillerTaskId,
+                  sessionId, turnId: proof.durable.fillTurnId, rootTaskId: recorded.fillRootTaskId,
+                  role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 2,
+                  select: { id: true, status: true, attemptCount: true, completedAt: true, leaseOwner: true,
+                    leaseExpiresAt: true, interruptRequestedAt: true } }),
+                testDb.applicationTaskEvent.findMany({ where: { taskId: proof.durable.task.id,
+                  type: "reviewed_application_fill_browser_started", actor: "worker" }, take: 2, select: { data: true } }),
+              ])
               const submitAttemptCount = submitAttempts.filter(attempt => attempt.receiptId === proof.durable.approval.id
                 && attempt.jobId === proof.durable.job.id).length
               if (fillers.length !== 1 || fillers[0]?.status !== "completed" || fillers[0]?.attemptCount !== recorded.attemptCount
                 || !(fillers[0]?.completedAt instanceof Date) || fillers[0]?.leaseOwner !== null || fillers[0]?.leaseExpiresAt !== null
-                || fillers[0]?.interruptRequestedAt !== null || submitAttemptCount !== 1) {
+                || fillers[0]?.interruptRequestedAt !== null || browserStarts.length !== 1
+                || !objectiveBrowserStartMatches(browserStarts[0]?.data, slot, proof.durable.fillTurnId,
+                  recorded.fillerTaskId, recorded.attemptCount) || submitAttemptCount !== 1) {
                 throw new Error("Objective rate-window attempt evidence changed")
               }
               return { applicationTaskId: proof.durable.task.id, fillTurnId: proof.durable.fillTurnId,
                 applicationStatus: proof.durable.task.status, checkpoint: proof.durable.task.checkpoint,
                 fillTurnStatus: proof.durable.turn.status, jobStatus: proof.durable.job.status,
-                jobWorkflowState: proof.durable.job.workflowState, fillAttemptCount: fillers[0].attemptCount,
+                jobWorkflowState: proof.durable.job.workflowState, fillAttemptOrdinal: fillers[0].attemptCount,
+                fillBrowserStartCount: 1 as const,
                 submitAttemptCount, resultReceiptCount: proof.durable.result.count,
                 executionSettlementCount: proof.durable.execution.settledCount }
             }))
