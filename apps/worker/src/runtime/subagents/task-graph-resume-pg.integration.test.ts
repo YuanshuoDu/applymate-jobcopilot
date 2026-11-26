@@ -454,28 +454,27 @@ async function answerDisposableNativeQuestion(
   owner: Fixture, wait: NativeQuestionFixture, answer: string,
 ): Promise<{ disposition: string; status: string; waitId: string; turnId: string; nextTurnRevision: number }> {
   if (!databaseUrl) throw new Error("Native clarification broker requires the validated disposable PostgreSQL URL")
-  const previousDatabaseUrl = process.env.DATABASE_URL
-  process.env.DATABASE_URL = databaseUrl
-  let webDatabase: { db: { $connect(): Promise<void>; $disconnect(): Promise<void> } } | undefined
+  const loaded: unknown = webRequire("@prisma/client")
+  const prismaConstructor = loaded && typeof loaded === "object"
+    ? (loaded as { PrismaClient?: unknown }).PrismaClient : undefined
+  if (typeof prismaConstructor !== "function") throw new Error("Web Prisma client constructor is unavailable")
+  const webDatabase = new (prismaConstructor as new (options: { datasourceUrl: string }) => unknown)({
+    datasourceUrl: databaseUrl,
+  }) as DisposableWebPrismaClient & { $connect(): Promise<void> }
   try {
-    const dbModule = "@/lib/db"
     const brokerModule = "@/lib/agent/broker/store"
-    webDatabase = await import(dbModule) as unknown as { db: { $connect(): Promise<void>; $disconnect(): Promise<void> } }
-    await webDatabase.db.$connect()
+    await webDatabase.$connect()
     const broker = await import(brokerModule) as unknown as { answerQuestion(db: unknown, input: {
       sessionId: string; userId: string; waitId: string; clientMessageId: string; expectedTurnId: string
       expectedRevision: number; answer: string; now: Date
     }): Promise<{ disposition: string; status: string; waitId: string; turnId: string; nextTurnRevision: number }> }
-    return await broker.answerQuestion(webDatabase.db, {
+    return await broker.answerQuestion(webDatabase, {
       sessionId: owner.sessionId, userId: owner.userId, waitId: wait.waitId,
       clientMessageId: `p3-discovery-clarification-answer:${owner.suffix}`, expectedTurnId: owner.turnId,
       expectedRevision: wait.turnRevision, answer, now: new Date(),
     })
   } finally {
-    try { await webDatabase?.db.$disconnect() } finally {
-      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL
-      else process.env.DATABASE_URL = previousDatabaseUrl
-    }
+    await webDatabase.$disconnect()
   }
 }
 
@@ -15268,7 +15267,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               if (!scoutNode || !scoutVerification) {
                 throw new Error("Discovery Scout verification contract was unavailable for the persisted mutation")
               }
-              if (candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 1) {
+              if (candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 2) {
                 throw new Error("Discovery Scout snapshot contract was unavailable for the persisted mutation")
               }
               const changedGraphSnapshot: RecordValue = {
