@@ -11,7 +11,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope, objectiveApplicationApprovalSetItemId, parseObjectiveApplicationApprovalSet,
-  parseObjectiveTailorGraph, parseObjectiveTailorFinalOutcomeSidecar, schemaVersion } from "@jobcopilot/agent-protocol"
+  parseObjectiveTailorGraph, parseObjectiveTailorFinalOutcomeSidecar, parseObjectiveTailorSourceGroups, schemaVersion } from "@jobcopilot/agent-protocol"
 import {
   hashAgentReceiptValue,
   hashContent,
@@ -33,6 +33,8 @@ import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from "vit
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
 import { protocolScope, type ApprovalScopeInput } from "@/lib/agent/approval/types"
+import { parseFinalTaskGraphSourceManifest } from "@/lib/agent/session/final-task-graph-source-manifest"
+import { parseObjectiveJobEvidence } from "@/lib/agent/session/objective-job-evidence-contract"
 import type { ApplicationPackage, PipelineCtx } from "@/lib/agent/types"
 import type { ObjectiveWaveHandoffProof, ObjectiveWaveSubmissionSlot } from "./application-task-full-loop.objective-wave-submission"
 
@@ -1767,7 +1769,7 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "objective_score_floor_nine_verified" | "objective_wave_source_ready" | "objective_wave_score_floor_eight_verified"
   | "objective_wave_set_issued" | "objective_wave_stale_retired"
   | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff"
-  | "objective_wave_skill_comparison_verified" | "objective_wave_completed"
+  | "objective_wave_skill_comparison_verified" | "objective_wave_job_evidence_verified" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
 
 function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
@@ -5759,6 +5761,78 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
       expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
       selectedJobFullLoopPhase("objective_wave_skill_comparison_verified")
+
+      const sourceGroups = parseObjectiveTailorSourceGroups(finalContent?.objectiveTailorSourceGroups)
+      const sourceManifest = parseFinalTaskGraphSourceManifest(finalContent?.taskGraphSources)
+      if (!sourceGroups || !sourceManifest || sourceGroups.graphRevision !== graphRow.revision
+        || sourceManifest.graphRevision !== graphRow.revision) throw new Error("Objective Job evidence source binding is unavailable")
+      const sourceKeyForNodeKey = (nodeKey: string): string => {
+        const source = sourceManifest.sources.find(value => jsonString(graphNodes[value.nodeIndex], "key") === nodeKey)
+        if (!source) throw new Error(`Objective Job evidence source node is unavailable: ${nodeKey}`)
+        return source.sourceKey
+      }
+      const evidenceNodeKeys = {
+        discoveredJobs: ["scout-greenhouse", "scout-greenhouse", "scout-greenhouse", "scout-lever", "scout-lever", "scout-lever", "scout-workday", "scout-workday"],
+        analyzedJobs: ["analyst-greenhouse-a", "analyst-greenhouse-a", "analyst-greenhouse-b", "analyst-lever", "analyst-lever", "analyst-lever", "analyst-workday", "analyst-workday"],
+      } as const
+      const assertJobEvidence = (value: unknown, group: "discoveredJobs" | "analyzedJobs") => {
+        const evidence = parseObjectiveJobEvidence(value)
+        if (!evidence) throw new Error(`Objective ${group} evidence is not a safe DTO`)
+        const expectedKeys = evidenceNodeKeys[group].map(sourceKeyForNodeKey)
+        expect(evidence).toMatchObject({ schemaVersion: "agent-harness.v2.objective-job-evidence.v1",
+          graphRevision: graphRow.revision, group, coverage: "complete", count: 8 })
+        expect(evidence.jobs.map(job => job.ordinal)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+        expect([...new Set(evidence.jobs.flatMap(job => job.sourceKeys))].sort()).toEqual([...new Set(expectedKeys)].sort())
+        const byPostingUrl = new Map(evidence.jobs.map(job => [job.postingUrl, job] as const))
+        expect(new Set(byPostingUrl.keys()).size).toBe(8)
+        for (const [index] of jobIds.entries()) {
+          const postingUrl = `https://boards.greenhouse.io/example-objective/jobs/${index + 1}`
+          expect(byPostingUrl.get(postingUrl)).toMatchObject({ role: "Software Engineer",
+            company: `Synthetic Employer ${index + 1}`, location: "Dublin", postingUrl, sourceKeys: [expectedKeys[index]] })
+        }
+        return evidence
+      }
+      const { GET: getObjectiveJobEvidence } = await import("@/app/api/agent/sessions/[id]/final-items/[itemId]/objective-job-groups/[group]/route")
+      const readJobEvidence = (bearer: string, group: "discoveredJobs" | "analyzedJobs", revision: number) =>
+        getObjectiveJobEvidence(apiRequest(`/api/agent/sessions/${sessionId}/final-items/${finalItemId}/objective-job-groups/${group}?graphRevision=${revision}`, bearer, "GET"), {
+          params: Promise.resolve({ id: sessionId, itemId: finalItemId, group }),
+        })
+      const evidenceResponses = await Promise.all([
+        readJobEvidence(postWaveOwnerToken, "discoveredJobs", graphRow.revision),
+        readJobEvidence(postWaveOwnerToken, "analyzedJobs", graphRow.revision),
+      ])
+      for (const response of evidenceResponses) {
+        expect(response.status).toBe(200)
+        expect(response.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+      }
+      const evidenceEnvelopes = await Promise.all(evidenceResponses.map(jsonResponse))
+      expect(evidenceEnvelopes.every(value => Object.keys(value).length === 1 && Object.hasOwn(value, "jobEvidence"))).toBe(true)
+      const discoveredEvidence = assertJobEvidence(evidenceEnvelopes[0]?.jobEvidence, "discoveredJobs")
+      const analyzedEvidence = assertJobEvidence(evidenceEnvelopes[1]?.jobEvidence, "analyzedJobs")
+      expect(new Set(discoveredEvidence.jobs.flatMap(job => job.sourceKeys))).toEqual(new Set(sourceGroups.groups.discoveredJobs))
+      expect(new Set(analyzedEvidence.jobs.flatMap(job => job.sourceKeys))).toEqual(new Set(sourceGroups.groups.analyzedJobs))
+      const evidenceJson = JSON.stringify(evidenceEnvelopes)
+      for (const forbidden of [requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE,
+        requirementFixture.OBJECTIVE_WAVE_RUST_REQUIREMENT_QUOTE, "PrivateFixtureSkill", pastedSkillsFactId,
+        "jobId", "taskId", "sourceTaskIds", "sourceTurnId", "sourceRootTaskId", graphRow.id, ...jobIds, ...sourceTaskIds]) {
+        expect(evidenceJson).not.toContain(forbidden)
+      }
+      for (const group of ["discoveredJobs", "analyzedJobs"] as const) {
+        const foreignResponse = await readJobEvidence(postWaveForeignToken, group, graphRow.revision)
+        expect(foreignResponse.status).toBe(404)
+        expect(await jsonResponse(foreignResponse)).not.toHaveProperty("jobEvidence")
+        const staleResponse = await readJobEvidence(postWaveOwnerToken, group, graphRow.revision + 1)
+        expect(staleResponse.status).toBe(404)
+        expect(await jsonResponse(staleResponse)).not.toHaveProperty("jobEvidence")
+      }
+      const postEvidenceStats = await requestFixtureStats()
+      expect(postEvidenceStats.objectiveGetCounts).toEqual(postComparisonStats.objectiveGetCounts)
+      expect(postEvidenceStats.objectiveSubmitReceipts).toEqual(postComparisonStats.objectiveSubmitReceipts)
+      expect(postEvidenceStats.submitCount).toBe(postComparisonStats.submitCount)
+      expect(postEvidenceStats.reviewedSubmitCount).toBe(postComparisonStats.reviewedSubmitCount)
+      expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
+      expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
+      selectedJobFullLoopPhase("objective_wave_job_evidence_verified")
     } finally {
       if (sourceWorker && worker !== sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
       if (worker && !exited(worker)) await stopFixture(worker)
