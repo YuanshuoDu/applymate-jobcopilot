@@ -6,6 +6,7 @@ import { validateTaskGraphReplaySources, validateTaskGraphToolEvents, validateTa
 import type { ObjectiveJourneySource } from "./objective-journey-report-source"
 
 type Tx = Pick<Prisma.TransactionClient, "$queryRaw" | "subAgentTask" | "job">
+type ReceiptTx = Pick<Prisma.TransactionClient, "$queryRaw">
 type Row = Record<string, unknown>
 const MAX_ITEMS = 1024
 const MAX_EVENTS = MAX_ITEMS * 3
@@ -16,6 +17,13 @@ export type ObjectiveJourneyRequirementRead = Readonly<{
   scope: TaskGraphToolVerificationScope
   taskResult: unknown
   currentJob: Row
+  items: readonly Row[]
+  outcomes: ReadonlyMap<string, "completed" | "failed">
+  replayReceipts: readonly TaskGraphReplayReceipt[]
+  evidenceObservations: readonly Row[]
+}>
+
+export type ObjectiveTaskToolReceiptSet = Readonly<{
   items: readonly Row[]
   outcomes: ReadonlyMap<string, "completed" | "failed">
   replayReceipts: readonly TaskGraphReplayReceipt[]
@@ -48,6 +56,13 @@ export async function readObjectiveJourneyRequirementReceipts(tx: Tx, source: Ob
     || !validAnalystTaskEnvelope(task)
     || jobs.length !== 1 || !currentJob || currentJob.id !== jobId || currentJob.userId !== scope.userId) return null
 
+  const receiptSet = await readObjectiveTaskToolReceiptSet(tx, scope)
+  return receiptSet ? { scope, taskResult: task.result, currentJob, ...receiptSet } : null
+}
+
+/** Reads the exact current-attempt Worker receipt set for one owner-scoped task. */
+export async function readObjectiveTaskToolReceiptSet(tx: ReceiptTx,
+  scope: TaskGraphToolVerificationScope): Promise<ObjectiveTaskToolReceiptSet | null> {
   const items = await readCurrentItems(tx, scope)
   if (!items) return null
   let checkedItems: Row[]
@@ -58,19 +73,19 @@ export async function readObjectiveJourneyRequirementReceipts(tx: Tx, source: Ob
   let outcomes: ReadonlyMap<string, "completed" | "failed">, evidenceObservations: readonly Row[]
   let replayProofs: Parameters<typeof validateTaskGraphReplaySources>[0]
   try {
-  const validation = validateTaskGraphToolEvents(events, checkedItems, scope)
-  const restored = restoreToolCallState(checkedItems, events)
-  const restoredJson = JSON.stringify(restored.observations)
-  if (restored.pending.length !== 0 || restored.observations.length > MAX_OBSERVATIONS || restoredJson === undefined
-    || Buffer.byteLength(restoredJson, "utf8") > MAX_TOTAL_BYTES) return null
-  evidenceObservations = canonicalTaskGraphReadObservations(checkedItems, validation.outcomes)
-  outcomes = validation.outcomes; replayProofs = validation.replays
+    const validation = validateTaskGraphToolEvents(events, checkedItems, scope)
+    const restored = restoreToolCallState(checkedItems, events)
+    const restoredJson = JSON.stringify(restored.observations)
+    if (restored.pending.length !== 0 || restored.observations.length > MAX_OBSERVATIONS || restoredJson === undefined
+      || Buffer.byteLength(restoredJson, "utf8") > MAX_TOTAL_BYTES) return null
+    evidenceObservations = canonicalTaskGraphReadObservations(checkedItems, validation.outcomes)
+    outcomes = validation.outcomes; replayProofs = validation.replays
   } catch { return null }
   const replayReceipts = await readReplayReceipts(tx, scope, checkedItems, replayProofs)
-  return replayReceipts ? { scope, taskResult: task.result, currentJob, items: checkedItems, outcomes, replayReceipts, evidenceObservations } : null
+  return replayReceipts ? { items: checkedItems, outcomes, replayReceipts, evidenceObservations } : null
 }
 
-async function readCurrentItems(tx: Tx, scope: TaskGraphToolVerificationScope): Promise<Row[] | null> {
+async function readCurrentItems(tx: ReceiptTx, scope: TaskGraphToolVerificationScope): Promise<Row[] | null> {
   const rows = await tx.$queryRaw<Row[]>(Prisma.sql`
     SELECT item."id", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."revision",
       item."content", step."id" AS "joinedStepId", step."status" AS "stepStatus", step."attempt" AS "attempt", step."ordinal" AS "ordinal",
@@ -90,7 +105,7 @@ async function readCurrentItems(tx: Tx, scope: TaskGraphToolVerificationScope): 
   return rows
 }
 
-async function readCurrentEvents(tx: Tx, scope: TaskGraphToolVerificationScope, callIds: readonly string[]): Promise<Row[] | null> {
+async function readCurrentEvents(tx: ReceiptTx, scope: TaskGraphToolVerificationScope, callIds: readonly string[]): Promise<Row[] | null> {
   if (callIds.length === 0) return []
   const rows = await tx.$queryRaw<Row[]>(Prisma.sql`
     SELECT event."id", event."itemId", event."taskId", event."correlationId", event."type", event."payload", event."sequence"
@@ -105,7 +120,7 @@ async function readCurrentEvents(tx: Tx, scope: TaskGraphToolVerificationScope, 
   return rows
 }
 
-async function readReplayReceipts(tx: Tx, scope: TaskGraphToolVerificationScope, items: readonly Row[],
+async function readReplayReceipts(tx: ReceiptTx, scope: TaskGraphToolVerificationScope, items: readonly Row[],
   proofs: Parameters<typeof validateTaskGraphReplaySources>[0]): Promise<readonly TaskGraphReplayReceipt[] | null> {
   if (proofs.length === 0) { try { return validateTaskGraphReplaySources(proofs, [], [], items, scope) } catch { return null } }
   const resultIds = proofs.map(proof => proof.source.resultItemId)

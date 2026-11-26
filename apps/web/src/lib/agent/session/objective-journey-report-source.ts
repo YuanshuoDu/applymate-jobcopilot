@@ -89,7 +89,7 @@ async function readGraph(tx: Tx, input: { userId: string; sessionId: string; fin
   if (new Set(allTaskIds).size !== allTaskIds.length) return null
   const rows = await tx.subAgentTask.findMany({ where: { sessionId: input.sessionId, turnId: sourceTurnId, rootTaskId, id: { in: allTaskIds } },
     take: allTaskIds.length + 1, select: { id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true,
-      role: true, taskType: true, status: true, attemptCount: true, leaseOwner: true, leaseExpiresAt: true, result: true, context: true,
+      role: true, taskType: true, status: true, failureReason: true, attemptCount: true, leaseOwner: true, leaseExpiresAt: true, result: true, context: true,
     } }) as unknown[]
   const tasks = new Map<string, Row>()
   for (const value of rows) {

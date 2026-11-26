@@ -30,6 +30,7 @@ describe('FinalTaskGraphSources', () => {
     expect(html).toContain('Related task records')
     expect(html).toContain('not sentence-level citations or independent verification')
     expect(html).toContain('Scout · Completed · Result missing')
+    expect(html).not.toContain('View tool receipts')
     for (const privateValue of [sourceKey, 'private-session-id', 'private-final-item-id', 'graphRevision']) expect(html).not.toContain(privateValue)
   })
 
@@ -68,6 +69,7 @@ describe('FinalTaskGraphSources', () => {
     expect(html).toContain('data-objective-source-group-member="true"')
     expect(html.match(/data-objective-source-group-member="true"/g)).toHaveLength(1)
     expect(html).toContain('View saved jobs')
+    expect(html).not.toContain('View tool receipts')
     expect(html).not.toContain('data-objective-job-evidence="true" aria-busy="true"')
     expect(html).not.toContain(scout)
     expect(html).not.toContain(otherScout)
