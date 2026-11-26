@@ -15671,7 +15671,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [discoveryOwner.turnId])
     const finalResponse = JSON.parse(final.rows[0]?.finalResponse ?? "null") as RecordValue
     await expectGroundedTaskGraphFinalCopies(pool!, discoveryOwner, root.rows[0]!.id, finalResponse, "Shortlist ready")
-    expect(finalResponse.summary).toContain("discovered jobs: 1 (complete)")
+    expect(finalResponse.summary).toContain("discovered jobs: 2 (complete)")
+    expect(finalResponse.summary).toContain("analyzed jobs: 1 (complete)")
     expect(discoveryClarificationReplanObserved).toBe(true)
     const clarificationState = await pool!.query<{
       itemStatus: string; itemContent: unknown; answeredEvents: number; resumedEvents: number; wakeupOutboxes: number; publishedWakeups: number
