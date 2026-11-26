@@ -5,6 +5,7 @@ import React, { useEffect, useState } from 'react'
 import type { Lang } from '@/lib/i18n'
 
 import { SelectedJobDraftArtifact } from './SelectedJobDraftArtifact'
+import { ObjectiveSlotReviewerReceipt } from './ObjectiveSlotReviewerReceipt'
 import { validArtifactRef, type DraftArtifactRef } from './draft-artifact-projection'
 
 export const OBJECTIVE_SLOT_ARTIFACT_SCHEMA = 'agent-harness.v2.objective-slot-artifact.v1' as const
@@ -92,6 +93,8 @@ export function ObjectiveSlotArtifact({ sessionId, finalItemId, graphRevision, s
       <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={visible.artifactRef} />
       <button type="button" onClick={() => setOpenForKey(null)} style={buttonStyle}>{copy.close}</button>
     </>}
+    <ObjectiveSlotReviewerReceipt sessionId={sessionId} finalItemId={finalItemId} graphRevision={graphRevision}
+      slotOrdinal={slotOrdinal} ready={ready} ownedLabel={ownedLabel} lang={lang} />
   </section>
 }
 

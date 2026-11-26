@@ -39,6 +39,7 @@ describe('ObjectiveSlotArtifact', () => {
     const ready = renderToStaticMarkup(<ObjectiveSlotArtifact sessionId="session-1" finalItemId="final-1" graphRevision={8}
       slotOrdinal={1} ready ownedLabel="Example Company — Engineer" lang="en" />)
     expect(ready).toContain('View verified draft')
+    expect(ready).toContain('View Reviewer receipt')
     expect(ready).not.toContain('data-mocked-draft-viewer')
     expect(ready).not.toContain('Request application review')
     expect(renderToStaticMarkup(<ObjectiveSlotArtifact sessionId="session-1" finalItemId="final-1" graphRevision={8}
