@@ -5781,6 +5781,35 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         if (!source) throw new Error(`Objective Job evidence source node is unavailable: ${nodeKey}`)
         return source.sourceKey
       }
+      const greenhouseScoutTaskId = jsonString(nodeForKey("scout-greenhouse"), "taskId")
+      if (!greenhouseScoutTaskId) throw new Error("Objective Greenhouse Scout source task is unavailable")
+      const greenhouseScoutTasks = await testDb.subAgentTask.findMany({ where: {
+        id: greenhouseScoutTaskId, sessionId, turnId: sourceTurnId, rootTaskId: sourceRootTaskId,
+        role: "scout", taskType: "job_discovery", status: "completed",
+      }, select: { id: true, status: true, result: true } })
+      const { projectTaskGraphResult } = await import("../../../../../../worker/src/runtime/subagents/task-graph-result-projection")
+      const greenhouseScoutTask = greenhouseScoutTasks.length === 1 ? greenhouseScoutTasks[0] : undefined
+      const greenhouseProjection = greenhouseScoutTask
+        ? projectTaskGraphResult("scout", greenhouseScoutTask.status, greenhouseScoutTask.result) : undefined
+      const greenhouseCandidates = greenhouseProjection?.availability === "available" && greenhouseProjection.role === "scout"
+        && greenhouseProjection.candidateCount === greenhouseProjection.candidates.length
+        ? greenhouseProjection.candidates.map(candidate => candidate.jobId) : undefined
+      const knownGreenhouseJobIds = jobIds.slice(0, 3)
+      if (!greenhouseCandidates || greenhouseCandidates.length !== 3
+        || new Set(greenhouseCandidates).size !== 3 || knownGreenhouseJobIds.length !== 3
+        || new Set(knownGreenhouseJobIds).size !== 3
+        || !greenhouseCandidates.every(jobId => knownGreenhouseJobIds.includes(jobId))
+        || !knownGreenhouseJobIds.every(jobId => greenhouseCandidates.includes(jobId))) {
+        throw new Error("Objective Greenhouse Scout candidate set is invalid")
+      }
+      const greenhouseAnalystAKey = sourceKeyForNodeKey("analyst-greenhouse-a")
+      const greenhouseAnalystBKey = sourceKeyForNodeKey("analyst-greenhouse-b")
+      const expectedAnalyzedSourceKeyByJobId = new Map<string, string>([
+        [greenhouseCandidates[0]!, greenhouseAnalystAKey], [greenhouseCandidates[1]!, greenhouseAnalystAKey],
+        [greenhouseCandidates[2]!, greenhouseAnalystBKey],
+      ])
+      expect([...expectedAnalyzedSourceKeyByJobId.values()].filter(sourceKey => sourceKey === greenhouseAnalystAKey)).toHaveLength(2)
+      expect([...expectedAnalyzedSourceKeyByJobId.values()].filter(sourceKey => sourceKey === greenhouseAnalystBKey)).toHaveLength(1)
       const evidenceNodeKeys = {
         discoveredJobs: ["scout-greenhouse", "scout-greenhouse", "scout-greenhouse", "scout-lever", "scout-lever", "scout-lever", "scout-workday", "scout-workday"],
         analyzedJobs: ["analyst-greenhouse-a", "analyst-greenhouse-a", "analyst-greenhouse-b", "analyst-lever", "analyst-lever", "analyst-lever", "analyst-workday", "analyst-workday"],
@@ -5797,8 +5826,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         expect(new Set(byPostingUrl.keys()).size).toBe(8)
         for (const [index] of jobIds.entries()) {
           const postingUrl = `https://boards.greenhouse.io/example-objective/jobs/${index + 1}`
-          expect(byPostingUrl.get(postingUrl)).toMatchObject({ role: "Software Engineer",
-            company: `Synthetic Employer ${index + 1}`, location: "Dublin", postingUrl, sourceKeys: [expectedKeys[index]] })
+          const job = byPostingUrl.get(postingUrl)
+          const expectedSourceKey = group === "analyzedJobs" && index < knownGreenhouseJobIds.length
+            ? expectedAnalyzedSourceKeyByJobId.get(jobIds[index]!) : expectedKeys[index]
+          expect(Boolean(job && expectedSourceKey && job.role === "Software Engineer"
+            && job.company === `Synthetic Employer ${index + 1}` && job.location === "Dublin"
+            && job.postingUrl === postingUrl && job.sourceKeys.length === 1 && job.sourceKeys[0] === expectedSourceKey)).toBe(true)
         }
         return evidence
       }
