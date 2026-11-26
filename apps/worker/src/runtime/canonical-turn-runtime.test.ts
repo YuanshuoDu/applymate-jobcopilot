@@ -68,6 +68,7 @@ import type { SubagentLease } from "./subagents/types.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphExecutionScope, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphResultPageRequest } from "./subagents/task-graph-result-page-contract.js"
 import { TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA } from "./subagents/task-graph-discovery-recovery-page-contract.js"
+import { OBJECTIVE_TAILOR_WAVE_BUDGET_PROFILE } from "./subagents/objective-tailor-wave-profile.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { priorConversation } from "./canonical-steering-markers.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
@@ -698,6 +699,7 @@ async function taskGraphRootSurface(
   requestCapture?: HarnessModelRequest[],
   objectiveTaskGraphMode = false,
   objectiveTaskGraphUnavailable?: "coordination" | "child" | "wait",
+  objectiveTailorWaveEnabled = false,
 ) {
   const objectiveProgressFixture = objectiveProgressOrBoundaryOptions && "graph" in objectiveProgressOrBoundaryOptions
     ? objectiveProgressOrBoundaryOptions : undefined
@@ -728,6 +730,9 @@ async function taskGraphRootSurface(
     appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
     appendAndScheduleWithReconciliation: vi.fn(async (_input: TaskGraphScheduleInput) => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
     readCurrent: vi.fn(async () => objectiveProgressFixture?.graph ?? ({ revision: 0, nodes: [] })),
+    readObjectiveTailorWaveCatalog: vi.fn(async () => undefined),
+    appendObjectiveTailorWave: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+    appendObjectiveTailorCorrection: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
   }
   const persistedTurnInput = scheduledAutomation ? {
     automationRunMode: "scheduled",
@@ -741,6 +746,7 @@ async function taskGraphRootSurface(
   const baseProductionFlags = resolveProductionAgentFlags({
     ...(taskGraphPlanningEnabled ? { ENABLE_AGENT_TASK_GRAPH_PLANNING: "1" } : {}),
     ...(boundaryOptions.enabled ? { ENABLE_AGENT_TURN_BOUNDARY_COMPACTION: "1" } : {}),
+    ...(objectiveTailorWaveEnabled ? { ENABLE_AGENT_OBJECTIVE_TAILOR: "1", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1" } : {}),
     ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
   })
   const productionFlags = objectiveTaskGraphUnavailable ? {
@@ -762,6 +768,7 @@ async function taskGraphRootSurface(
     stateLoader: boundaryOptions.stateLoader ?? (async () => ({
       ...state(scheduledAutomation ? { source: "automation", automationRunMode: "scheduled", contextSnapshotPinned: false }
         : boundaryOptions.enabled ? { source: "user", contextSnapshotPinned: false } : { source: "user" }),
+      ...(objectiveTailorWaveEnabled ? { budgetSnapshot: { objectiveTailorProfile: OBJECTIVE_TAILOR_WAVE_BUDGET_PROFILE, limits: { maxSteps: 96 } } } : {}),
       toolPolicySnapshot: { capabilities: ["read"] },
       ...(persistedTurnInput === undefined ? {} : { turnInput: persistedTurnInput }),
       ...(interactiveDiscovery ? { intent: { kind: "interactive_discovery_shortlist" as const, version: 1 as const } } : {}),
@@ -772,9 +779,9 @@ async function taskGraphRootSurface(
       } : {}),
     })),
     rootTaskStore: roots as never, turnEngineStoreFactory: (_pool, guard) => { terminalGuard = guard; return store(events) }, contextBuilderFactory: () => ({ build: async request => {
-      const built = await contextBuilder().build(request)
-      contexts.push(built)
-      return built
+        const built = await contextBuilder().build(request)
+        contexts.push(built)
+        return built
     } }),
     ...(boundaryOptions.runner ? { turnBoundaryCompactionRunner: boundaryOptions.runner } : {}),
     ...(interactiveDiscovery ? { interactiveDiscoveryShortlistLoader: async () => undefined } : {}),
@@ -1834,7 +1841,7 @@ describe("createCanonicalTurnRuntime", () => {
     const laterAnsweredOlderAnswerText = "Berlin, please."
     const objectiveIntent = { kind: "objective_task_graph_execution" as const, version: 1 as const }
     vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime").mockReturnValue({
-      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), clear: () => undefined,
+      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), readProgress: async () => undefined, clear: () => undefined,
     })
     let questionRecovery: "none" | "waiting" | "answered" = "none"
     const questionReads: Array<"none" | "waiting" | "answered"> = []
@@ -3235,7 +3242,7 @@ describe("createCanonicalTurnRuntime", () => {
 
   it("passes the TaskGraph requirement to explicit-objective terminal assessment", async () => {
     vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime").mockReturnValue({
-      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), clear: () => undefined,
+      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), readProgress: async () => undefined, clear: () => undefined,
     })
     const objective = await taskGraphRootSurface(false, false, "jobs.search", "agent.interrupt", false,
       undefined, true, false, false, undefined, undefined, true)
@@ -3255,7 +3262,7 @@ describe("createCanonicalTurnRuntime", () => {
     const finalize = vi.fn(async () => ({ ok: true as const }))
     const clear = vi.fn()
     const factory = vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime")
-      .mockReturnValue({ complete, finalize, clear })
+      .mockReturnValue({ complete, finalize, readProgress: async () => undefined, clear })
     try {
       const objective = await taskGraphRootSurface(false, false, "", "agent.interrupt", false,
         undefined, true, false, false, undefined, undefined, true)
@@ -3292,7 +3299,7 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const factory = vi.spyOn(canonicalTurnContextBuilderModule, "createCanonicalTurnContextBuilder")
     vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime").mockReturnValue({
-      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), clear: () => undefined,
+      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), readProgress: async () => undefined, clear: () => undefined,
     })
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: lease.ownerId,
@@ -3317,6 +3324,22 @@ describe("createCanonicalTurnRuntime", () => {
     await builderInput?.readObjectiveTailorCatalog?.(scope)
     expect(catalogReader).toHaveBeenCalledWith(scope)
     expect(registry.register).toHaveBeenCalledWith(expect.objectContaining({ name: "agent.tailor" }))
+  })
+
+  it("wires only the v2 Root progress reader into its canonical context builder", async () => {
+    const readProgress = vi.fn(async () => undefined)
+    const factory = vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime")
+      .mockReturnValue({ complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), readProgress, clear: () => undefined })
+    const contextFactory = vi.spyOn(canonicalTurnContextBuilderModule, "createCanonicalTurnContextBuilder")
+    try {
+      const objectiveIntent = { kind: "objective_task_graph_execution" as const, version: 1 as const }
+      const wave = await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", false,
+        { goal: "Find roles", intent: objectiveIntent }, true, false, false, undefined, undefined, true, undefined, true)
+      const builder = contextFactory.mock.calls.map(([input]) => input).find(input => input.objectiveTaskGraphMode === true)
+      expect(wave.registeredTools.find(tool => tool.name === "agent.tailor")?.version).toBe("2")
+      expect(builder?.objectiveTailorToolVersion).toBe("2")
+      expect(builder?.readObjectiveTailorWaveProgress).toBe(readProgress)
+    } finally { factory.mockRestore(); contextFactory.mockRestore() }
   })
 
   it("fails an explicit objective closed when planning is unavailable", async () => {

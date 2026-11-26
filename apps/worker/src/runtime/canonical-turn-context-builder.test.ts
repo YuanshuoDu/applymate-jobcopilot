@@ -29,10 +29,11 @@ import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "./context/ro
 import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./context/task-graph-objective-progress.js"
 import { OBJECTIVE_REPORT_SCORE_FLOOR_OBSERVATION_ID } from "./objective-report-score-floor-context.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
-import { OBJECTIVE_TAILOR_WAVE_CATALOG_OBSERVATION_ID } from "./canonical-turn-objective-tailor-wave-context.js"
+import { OBJECTIVE_TAILOR_WAVE_CATALOG_OBSERVATION_ID, OBJECTIVE_TAILOR_WAVE_OUTCOME_OBSERVATION_ID } from "./canonical-turn-objective-tailor-wave-context.js"
 import { mergeTaskGraphCurrentObservation, OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID } from "./canonical-turn-task-graph-context.js"
 import { OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA } from "./subagents/objective-tailor-candidate.js"
 import { OBJECTIVE_TAILOR_WAVE_CATALOG_SCHEMA } from "./subagents/objective-tailor-candidate-v2.js"
+import { OBJECTIVE_TAILOR_WAVE_OUTCOME_SCHEMA } from "./objective-tailor-wave-outcome-projection.js"
 import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
 import type { DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
 import type { DirectRootTaskHistoryLoadInput } from "./context/root-task-history-direct-store.js"
@@ -368,6 +369,47 @@ describe("canonical Turn context builder", () => {
     expect(waveObservation?.content).toEqual({ kind: "objective_tailor_wave_candidate_catalog", catalog: waveCatalog })
     expect(waveReader).toHaveBeenCalledOnce()
     expect(reader).not.toHaveBeenCalled()
+  })
+
+  it("reads the bounded wave outcome only for a v2 Objective Root and binds it to the current graph slots", async () => {
+    const progress = { schemaVersion: OBJECTIVE_TAILOR_WAVE_OUTCOME_SCHEMA, graphRevision: 7,
+      slots: [{ slotId: "tailor-1", effectivePair: "initial", status: "needs_revision" }] } as const
+    const progressReader = vi.fn(async () => progress)
+    const pair = (prefix: string) => ({ writer: { taskId: `${prefix}-writer`, status: "completed", readiness: "terminal" },
+      reviewer: { taskId: `${prefix}-reviewer`, status: "completed", readiness: "terminal" } })
+    const currentGraph = { kind: "task_graph_current", revision: 7, objectiveTailorWave: {
+      schemaVersion: "agent-harness.v2.objective-tailor-wave-view.v1", graphRevision: 7, sourceNodeCount: 2, ordinaryPlanAppend: "closed",
+      slots: [{ slotId: "tailor-1", sourceAnalystNodeKey: "analyst-source", effectivePair: "initial", initial: pair("initial") }],
+    } }
+    let captured: StepContextRequest["snapshot"] | undefined
+    const baseBuilder = { build: vi.fn(async request => {
+      captured = request.snapshot
+      return { schemaVersion: "agent-harness.v2" as const, sessionId: request.sessionId, turnId: request.turnId,
+        stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}" }
+    }) }
+    const build = async (overrides: { objectiveTaskGraphMode: boolean; selectedJobMode: boolean; objectiveTailorToolVersion: "1" | "2" }) => {
+      const builder = createCanonicalTurnContextBuilder({
+        pool: { connect: async () => { throw new Error("injected readers avoid database access") } } as unknown as Pick<pg.Pool, "connect">,
+        store: store([]), baseBuilder, scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
+        turnInput: { goal: "Find roles", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT },
+        rootTaskObjective: { goal: "Find roles", successCriteria: [] }, planningEnabled: true,
+        objectiveTaskGraphMode: overrides.objectiveTaskGraphMode, selectedJobMode: overrides.selectedJobMode,
+        objectiveTailorToolVersion: overrides.objectiveTailorToolVersion, readObjectiveTailorWaveProgress: progressReader,
+        rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget,
+      })
+      await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "progress-step", snapshot: {
+        system: [], profile: [], steerHistory: [], businessRefs: [], taskGraphRevision: 7, toolObservations: [{ id: "task-graph-current", content: currentGraph }],
+      } })
+    }
+    await build({ objectiveTaskGraphMode: true, selectedJobMode: false, objectiveTailorToolVersion: "2" })
+    expect(progressReader).toHaveBeenCalledOnce()
+    expect(captured?.toolObservations.find(item => item.id === OBJECTIVE_TAILOR_WAVE_OUTCOME_OBSERVATION_ID)?.content)
+      .toEqual({ kind: "objective_tailor_wave_outcomes", ...progress })
+    progressReader.mockClear()
+    await build({ objectiveTaskGraphMode: true, selectedJobMode: false, objectiveTailorToolVersion: "1" })
+    await build({ objectiveTaskGraphMode: true, selectedJobMode: true, objectiveTailorToolVersion: "2" })
+    expect(progressReader).not.toHaveBeenCalled()
+    expect(captured?.toolObservations.some(item => item.id === OBJECTIVE_TAILOR_WAVE_OUTCOME_OBSERVATION_ID)).toBe(false)
   })
 
   it("reuses the immutable report-only score floor on Objective planning and strips caller observations", async () => {
