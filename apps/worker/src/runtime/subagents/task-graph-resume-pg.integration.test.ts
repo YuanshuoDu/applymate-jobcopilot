@@ -132,6 +132,11 @@ const SCOUT_VERIFICATION = {
   role: "scout",
   criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
 } as const
+const DISCOVERY_OPTIONS_SCOUT_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "scout",
+  criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }],
+} as const
 const BROAD_LOCATION_SCOUT_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout",
   criteria: [
@@ -14738,18 +14743,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     await activateFixtureTurn(pool!, discoveryOwner)
 
-    const discoveryClarificationQuestion = "Which city should the next analysis prioritize?"
+    const discoveryClarificationQuestion = "Which city in Europe should the next analysis prioritize?"
     const discoveryClarificationAnswer = "Dublin"
-    const discoveryOriginalGoal = "Find a strong software engineering role in Dublin"
+    const discoveryOriginalGoal = "Find strong software engineering roles across Europe"
     const jobId = fixtureJobId(discoveryOwner.suffix)
+    const otherJobId = fixtureJobId(discoveryOwner.suffix, 1)
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
       discoveryOwner.turnId,
       JSON.stringify({ goal: discoveryOriginalGoal, intent: { kind: "interactive_discovery_shortlist", version: 1 } }),
       discoveryOwner.sessionId, discoveryOwner.userId,
     ])
     await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
-      VALUES ($1, $2, 'Fixture Labs', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/discovery', 'Build reliable services', 'greenhouse', CURRENT_TIMESTAMP)`, [
-      jobId, discoveryOwner.userId,
+      VALUES ($1, $2, 'Fixture Labs', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/discovery-dublin', 'Build reliable services', 'greenhouse', CURRENT_TIMESTAMP),
+             ($3, $2, 'Fixture Labs', 'Software Engineer', 'Amsterdam', 'saved', 'https://jobs.example.invalid/discovery-amsterdam', 'Build reliable services', 'greenhouse', CURRENT_TIMESTAMP)`, [
+      jobId, discoveryOwner.userId, otherJobId,
     ])
 
     const flags: ProductionAgentFlags = {
@@ -14806,7 +14813,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.plan")
               yield { type: "tool_call_completed", callId: "p3-discovery-plan-scout", name: "agent.plan", arguments: {
                 expectedRevision: 0,
-                nodes: [{ key: "scout", templateId: "scout", goal: "Find matching fixture roles", successCriteria: ["Read one owner job"], dependsOn: [], verification: SCOUT_VERIFICATION }],
+                nodes: [{ key: "scout", templateId: "scout", goal: "Find eligible software engineering roles across Europe",
+                  successCriteria: ["Find owner jobs in distinct European locations"], dependsOn: [], verification: DISCOVERY_OPTIONS_SCOUT_VERIFICATION }],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
@@ -14841,10 +14849,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               )
               const scoutResult = record(scout.rows[0]?.result)
               const scoutReport = record(scoutResult?.taskGraphVerificationReport)
+              const scoutStructuredResult = record(scoutResult?.structuredResult)
+              const scoutCandidates = Array.isArray(scoutStructuredResult?.candidates)
+                ? scoutStructuredResult.candidates.map(record).filter((candidate): candidate is RecordValue => candidate !== null) : []
+              const scoutCandidateIds = scoutCandidates.flatMap(candidate => typeof candidate.jobId === "string" ? [candidate.jobId] : [])
               if (scout.rows.length !== 1 || typeof scout.rows[0]?.attemptCount !== "number"
                 || typeof scoutReport?.resultDigest !== "string") {
                 throw new Error("Discovery Scout proof was unavailable before clarification")
               }
+              expect(scoutCandidateIds.length === 2 && scoutCandidateIds.includes(jobId) && scoutCandidateIds.includes(otherJobId)).toBe(true)
               discoveryScoutAttemptCount = scout.rows[0].attemptCount
               discoveryScoutResultDigest = scoutReport.resultDigest
               discoveryScoutVerificationReceipt = scoutReport
@@ -14880,8 +14893,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(nodes.map(node => node?.key)).toEqual(["scout"])
               expect(nodes[0]?.taskId).toBe(discoveryScoutTaskId)
               expect(nodes[0]?.status).toBe("completed")
-              expect(nodes[0]?.goal === "Find matching fixture roles").toBe(true)
-              expect(JSON.stringify(nodes[0]?.successCriteria) === JSON.stringify(["Read one owner job"])).toBe(true)
+              expect(nodes[0]?.goal === "Find eligible software engineering roles across Europe").toBe(true)
+              expect(JSON.stringify(nodes[0]?.successCriteria) === JSON.stringify(["Find owner jobs in distinct European locations"])).toBe(true)
               expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
               const rootTaskId = await readOwnedTaskGraphRootId(pool!, discoveryOwner, request.metadata.taskId)
               const scout = await pool!.query<{ attemptCount: number; result: unknown }>(
@@ -14890,11 +14903,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                    AND "parentTaskId" = $4 AND "role" = 'scout'`,
                 [discoveryScoutTaskId, discoveryOwner.sessionId, discoveryOwner.turnId, rootTaskId],
               )
-              const revalidatedScoutReport = record(record(scout.rows[0]?.result)?.taskGraphVerificationReport)
+              const revalidatedScoutResult = record(scout.rows[0]?.result)
+              const revalidatedScoutReport = record(revalidatedScoutResult?.taskGraphVerificationReport)
+              const revalidatedScoutCandidates = Array.isArray(record(revalidatedScoutResult?.structuredResult)?.candidates)
+                ? (record(revalidatedScoutResult?.structuredResult)?.candidates as unknown[]).map(record)
+                  .filter((candidate): candidate is RecordValue => candidate !== null) : []
+              const revalidatedScoutCandidateIds = revalidatedScoutCandidates.flatMap(candidate => typeof candidate.jobId === "string" ? [candidate.jobId] : [])
               expect(scout.rows).toHaveLength(1)
               expect(scout.rows[0]?.attemptCount).toBe(discoveryScoutAttemptCount)
               expect(revalidatedScoutReport?.resultDigest).toBe(discoveryScoutResultDigest)
               expect(revalidatedScoutReport).toEqual(discoveryScoutVerificationReceipt)
+              expect(revalidatedScoutCandidateIds.length === 2 && revalidatedScoutCandidateIds.includes(jobId)
+                && revalidatedScoutCandidateIds.includes(otherJobId)).toBe(true)
               const revision = graph?.revision
               if (typeof revision !== "number") throw new Error("Discovery replan did not receive the durable post-answer graph revision")
               expect(revision === discoveryScoutGraphRevision).toBe(true)
@@ -14902,7 +14922,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               discoveryClarificationReplanObserved = true
               yield { type: "tool_call_completed", callId: "p3-discovery-plan-analyst", name: "agent.plan", arguments: {
                 expectedRevision: revision,
-                nodes: [{ key: "analyst", templateId: "analyst", goal: "Score the discovered " + discoveryClarificationAnswer + " role",
+                nodes: [{ key: "analyst", templateId: "analyst", goal: `Score the discovered ${discoveryClarificationAnswer} role`,
                   successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"], verification: DISCOVERY_ANALYST_VERIFICATION }],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -14928,7 +14948,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(nodes.map(node => node?.status)).toEqual(["completed", "completed"])
               expect(nodes[0]?.taskId).toBe(discoveryScoutTaskId)
               expect(nodes[1]?.taskId).toBe(discoveryAnalystTaskId)
-              expect(nodes[1]?.goal === "Score the discovered " + discoveryClarificationAnswer + " role").toBe(true)
+              expect(nodes[1]?.goal === `Score the discovered ${discoveryClarificationAnswer} role`).toBe(true)
               expect(JSON.stringify(nodes[1]?.successCriteria) === JSON.stringify(["Return an evidence-bound score"])).toBe(true)
               expect(JSON.stringify(nodes[1]?.dependsOn) === JSON.stringify(["scout"])).toBe(true)
               expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
@@ -14940,11 +14960,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                    AND "parentTaskId" = $4 AND "role" = 'scout'`,
                 [discoveryScoutTaskId, discoveryOwner.sessionId, discoveryOwner.turnId, rootTaskId],
               )
-              const scoutReport = record(record(scout.rows[0]?.result)?.taskGraphVerificationReport)
+              const preservedScoutResult = record(scout.rows[0]?.result)
+              const scoutReport = record(preservedScoutResult?.taskGraphVerificationReport)
+              const scoutCandidates = Array.isArray(record(preservedScoutResult?.structuredResult)?.candidates)
+                ? (record(preservedScoutResult?.structuredResult)?.candidates as unknown[]).map(record)
+                  .filter((candidate): candidate is RecordValue => candidate !== null) : []
+              const scoutCandidateIds = scoutCandidates.flatMap(candidate => typeof candidate.jobId === "string" ? [candidate.jobId] : [])
               expect(scout.rows).toHaveLength(1)
               expect(scout.rows[0]?.attemptCount).toBe(discoveryScoutAttemptCount)
               expect(scoutReport?.resultDigest).toBe(discoveryScoutResultDigest)
               expect(scoutReport).toEqual(discoveryScoutVerificationReceipt)
+              expect(scoutCandidateIds.length === 2 && scoutCandidateIds.includes(jobId) && scoutCandidateIds.includes(otherJobId)).toBe(true)
               expect(typeof graph?.revision).toBe("number")
               expect(graph?.revision).toBeGreaterThan(discoveryScoutGraphRevision)
               const publicReportKeys = ["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"]
@@ -15319,6 +15345,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           } satisfies ModelAdapter
         }
         let round = 0
+        const searchInput = { target: "Software Engineer", limit: 10 }
         const adapter: ModelAdapter = {
           id: `p3-interactive-discovery-${task.role}-fixture`, profile,
           async *stream(request) {
@@ -15329,7 +15356,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
               discoveryChildStage = "search_call_emitted"
               discoveryJobsSearchCallEmitted = true
-              yield { type: "tool_call_completed", callId: `p3-discovery-read-${task.role}`, name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              yield { type: "tool_call_completed", callId: `p3-discovery-read-${task.role}`, name: "jobs.search", arguments: searchInput }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
@@ -15338,10 +15365,42 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               : `p3-discovery-wait-analyst:${discoveryOwner.turnId}`
             discoveryChildStage = "parent_wait"
             await waitForPersistedTaskWait(pool!, discoveryOwner.turnId, waitKey)
-            const evidence = { id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }
+            const pairedSearch = latestToolResultForExactToolInput(request, "jobs.search", searchInput)
+            const searchedJobs = Array.isArray(record(pairedSearch?.result)?.jobs)
+              ? (record(pairedSearch?.result)?.jobs as unknown[]).map(record)
+                .filter((job): job is RecordValue => job !== null) : []
+            const dublinJob = searchedJobs.find(job => job.id === jobId && job.location === "Dublin")
+            const amsterdamJob = searchedJobs.find(job => job.id === otherJobId && job.location === "Amsterdam")
+            if (searchedJobs.length !== 2 || !dublinJob || !amsterdamJob
+              || dublinJob.source !== "greenhouse" || amsterdamJob.source !== "greenhouse") {
+              throw new Error("Discovery child did not read both owner-scoped European options")
+            }
+            const evidenceFor = (job: RecordValue) => ({
+              id: `read:job:${String(job.id)}`, kind: "job", ref: String(job.id), source: String(job.source),
+            })
             const result = task.role === "scout"
-              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId, source: evidence.source, url: null, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Found the fixture role" }
-              : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId, score: 8.5, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Strong match" }
+              ? {
+                schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+                candidates: [dublinJob, amsterdamJob].map(job => {
+                  const evidence = evidenceFor(job)
+                  return { jobId: String(job.id), source: String(job.source), url: null, evidenceIds: [evidence.id] }
+                }),
+                evidence: [evidenceFor(dublinJob), evidenceFor(amsterdamJob)], summary: "Found two eligible European roles",
+              }
+              : (() => {
+                const selectedCity = /^Score the discovered (.+) role$/.exec(task.goal)?.[1]
+                if (selectedCity !== discoveryClarificationAnswer) {
+                  throw new Error("Analyst task did not carry the user-selected European city")
+                }
+                const selectedJob = [dublinJob, amsterdamJob].find(job => job.location === selectedCity)
+                if (!selectedJob) throw new Error("Analyst task city did not select a Scout candidate")
+                const evidence = evidenceFor(selectedJob)
+                return {
+                  schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                  findings: [{ jobId: String(selectedJob.id), score: 8.5, evidenceIds: [evidence.id] }],
+                  evidence: [evidence], summary: "Strong match in the user-selected city",
+                }
+              })()
             const resultText = JSON.stringify(result)
             if (task.role === "scout" && discoveryScoutResultProjections.length < 4) {
               discoveryScoutResultProjections.push(canonicalDiscoveryScoutResultDiagnostic(request, resultText, jobId))
