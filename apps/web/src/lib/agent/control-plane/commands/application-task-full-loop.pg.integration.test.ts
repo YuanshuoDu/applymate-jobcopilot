@@ -36,6 +36,7 @@ import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } fr
 import { protocolScope, type ApprovalScopeInput } from "@/lib/agent/approval/types"
 import { parseFinalTaskGraphSourceManifest } from "@/lib/agent/session/final-task-graph-source-manifest"
 import { parseObjectiveJobEvidence } from "@/lib/agent/session/objective-job-evidence-contract"
+import { parseObjectiveSourceToolReceiptEvidence } from "@/lib/agent/session/objective-source-tool-receipts-contract"
 import type { ApplicationPackage, PipelineCtx } from "@/lib/agent/types"
 import type { ObjectiveWaveHandoffProof, ObjectiveWaveSubmissionSlot } from "./application-task-full-loop.objective-wave-submission"
 
@@ -1830,7 +1831,8 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "objective_score_floor_nine_verified" | "objective_wave_source_ready" | "objective_wave_score_floor_eight_verified"
   | "objective_wave_set_issued" | "objective_wave_stale_retired"
   | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff"
-  | "objective_wave_skill_comparison_verified" | "objective_wave_job_evidence_verified" | "objective_wave_completed"
+  | "objective_wave_skill_comparison_verified" | "objective_wave_job_evidence_verified"
+  | "objective_wave_tool_receipts_verified" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
 
 function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
@@ -5935,6 +5937,69 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
       expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
       selectedJobFullLoopPhase("objective_wave_job_evidence_verified")
+
+      const { GET: getObjectiveSourceToolReceipts } = await import(
+        "@/app/api/agent/sessions/[id]/final-items/[itemId]/task-graph-sources/[sourceKey]/tool-receipts/route")
+      const readSourceToolReceipts = (bearer: string, sourceKey: string, revision: number) =>
+        getObjectiveSourceToolReceipts(apiRequest(
+          `/api/agent/sessions/${sessionId}/final-items/${finalItemId}/task-graph-sources/${sourceKey}/tool-receipts?graphRevision=${revision}`,
+          bearer, "GET"), { params: Promise.resolve({ id: sessionId, itemId: finalItemId, sourceKey }) })
+      const receiptSources = [
+        { nodeKey: "scout-greenhouse", role: "scout" as const, toolNames: ["jobs.search"] as const },
+        { nodeKey: "analyst-greenhouse-a", role: "analyst" as const, toolNames: ["jobs.get", "jobs.get"] as const },
+      ] as const
+      const selectedReceiptSources = receiptSources.map(source => ({ ...source, sourceKey: sourceKeyForNodeKey(source.nodeKey) }))
+      const receiptReads = await Promise.all(selectedReceiptSources.map(source =>
+        readSourceToolReceipts(postWaveOwnerToken, source.sourceKey, graphRow.revision)))
+      const receiptEvidenceBySource = new Map<string, ReturnType<typeof parseObjectiveSourceToolReceiptEvidence>>()
+      for (const [index, response] of receiptReads.entries()) {
+        const source = selectedReceiptSources[index]!
+        expect(response.status).toBe(200)
+        expect(response.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+        const envelope = await jsonResponse(response)
+        expect(Object.keys(envelope)).toEqual(["toolReceiptEvidence"])
+        const evidence = parseObjectiveSourceToolReceiptEvidence(envelope.toolReceiptEvidence)
+        expect(evidence).toBeDefined()
+        if (!evidence) throw new Error("Objective source tool receipt evidence is unavailable")
+        expect(evidence).toMatchObject({ schemaVersion: "agent-harness.v2.objective-tool-receipt-evidence.v1",
+          graphRevision: graphRow.revision, sourceKey: source.sourceKey, role: source.role })
+        expect(evidence.receipts.map(receipt => receipt.ordinal)).toEqual(
+          evidence.receipts.map((_, ordinal) => ordinal + 1))
+        expect(evidence.receipts.map(receipt => receipt.toolName)).toEqual(source.toolNames)
+        expect(evidence.receipts.every(receipt => receipt.delivery === "fresh"
+          && /^rcp_[A-Za-z0-9_-]{43}$/.test(receipt.receiptKey))).toBe(true)
+        expect(evidence.receipts.every(receipt => Object.keys(receipt).sort().join(",") ===
+          "delivery,ordinal,receiptKey,toolName")).toBe(true)
+        receiptEvidenceBySource.set(source.sourceKey, evidence)
+        const encoded = JSON.stringify(envelope)
+        expect([sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds, ...jobIds,
+          "toolCallId", "taskId", "jobId", "input", "output", "errorCode", "hash"].some(value => encoded.includes(value))).toBe(false)
+      }
+      const repeatedReceiptReads = await Promise.all(selectedReceiptSources.map(source =>
+        readSourceToolReceipts(postWaveOwnerToken, source.sourceKey, graphRow.revision)))
+      for (const [index, response] of repeatedReceiptReads.entries()) {
+        const source = selectedReceiptSources[index]!, envelope = await jsonResponse(response)
+        const repeated = parseObjectiveSourceToolReceiptEvidence(envelope.toolReceiptEvidence)
+        expect(response.status).toBe(200)
+        expect(repeated?.receipts.map(receipt => receipt.receiptKey)).toEqual(
+          receiptEvidenceBySource.get(source.sourceKey)?.receipts.map(receipt => receipt.receiptKey))
+      }
+      for (const source of selectedReceiptSources) {
+        const foreignResponse = await readSourceToolReceipts(postWaveForeignToken, source.sourceKey, graphRow.revision)
+        expect(foreignResponse.status).toBe(404)
+        expect(await jsonResponse(foreignResponse)).not.toHaveProperty("toolReceiptEvidence")
+        const staleResponse = await readSourceToolReceipts(postWaveOwnerToken, source.sourceKey, graphRow.revision + 1)
+        expect(staleResponse.status).toBe(404)
+        expect(await jsonResponse(staleResponse)).not.toHaveProperty("toolReceiptEvidence")
+      }
+      const postReceiptStats = await requestFixtureStats()
+      expect(postReceiptStats.objectiveGetCounts).toEqual(postEvidenceStats.objectiveGetCounts)
+      expect(postReceiptStats.objectiveSubmitReceipts).toEqual(postEvidenceStats.objectiveSubmitReceipts)
+      expect(postReceiptStats.submitCount).toBe(postEvidenceStats.submitCount)
+      expect(postReceiptStats.reviewedSubmitCount).toBe(postEvidenceStats.reviewedSubmitCount)
+      expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
+      expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
+      selectedJobFullLoopPhase("objective_wave_tool_receipts_verified")
     } finally {
       if (sourceWorker && worker !== sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
       if (worker && !exited(worker)) await stopFixture(worker)
