@@ -116,25 +116,50 @@ function loaded(options: FixtureOptions = {}): LoadedGraph {
     state, tasks: new Map([[taskId, task]]), discoveryTurnEligibility: options.turn ?? "ordinary" }
 }
 
-function loadedRepair(): LoadedGraph {
-  const repairOf = { graphRootTaskId: "root-1", nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] }
+type RepairFixtureOptions = Partial<{
+  attemptCount: number
+  includeAttempt: boolean
+  discoveryAttempt: unknown
+  includeRecovery: boolean
+  discoveryRecovery: unknown
+  report: unknown
+  includeReceipt: boolean
+  receipt: unknown
+  repairRootTaskId: string
+  repairTargetNodeKey: string
+  repairTargetTaskId: string
+  repairCriterionIds: readonly string[]
+  taskRole: string
+  taskType: string
+  extraResult: Readonly<Record<string, unknown>>
+}>
+
+function loadedRepair(options: RepairFixtureOptions = {}): LoadedGraph {
+  const repairOf = { graphRootTaskId: options.repairRootTaskId ?? "root-1", nodeKey: options.repairTargetNodeKey ?? "target",
+    taskId: options.repairTargetTaskId ?? "target-task", criterionIds: [...(options.repairCriterionIds ?? ["candidate-count"])] }
   const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
     { key: "target", templateId: "scout", goal: "Find candidates", successCriteria: ["Return candidates"], dependsOn: [], depth: 1,
       taskId: "target-task", verification, verificationDisposition: "typed", registeredScoutEnvelope: scoutEnvelope },
     { key: "repair", templateId: "scout", goal: "Repair candidate discovery", successCriteria: ["Return candidates"], dependsOn: [], depth: 1,
       taskId: "repair-task", verification, verificationDisposition: "typed", repairOf, registeredScoutEnvelope: scoutEnvelope },
   ] })
-  const repairReceipt = {
-    schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: "root-1", targetNodeKey: "target", targetTaskId: "target-task",
-    criterionIds: ["candidate-count"], repairNodeKey: "repair", repairTaskId: "repair-task", verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
-    evidenceDigest: report.evidenceDigest,
+  const repairReport = Object.hasOwn(options, "report") ? options.report : report
+  const repairReceipt = Object.hasOwn(options, "receipt") ? options.receipt : {
+    schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: repairOf.graphRootTaskId,
+    targetNodeKey: repairOf.nodeKey, targetTaskId: repairOf.taskId, criterionIds: repairOf.criterionIds,
+    repairNodeKey: "repair", repairTaskId: "repair-task", verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: report.evidenceDigest,
   }
   const target: GraphTaskRow = { id: "target-task", status: "failed", role: "scout", taskType: "job_discovery",
     expectedOutputSchema: TASK_GRAPH_TEMPLATES.scout.expectedOutputSchema, allowedActions: TASK_GRAPH_TEMPLATES.scout.allowedActions,
     attemptCount: 1, failureReason: null, result: { status: "failed", taskGraphVerificationReport: failedReport } }
-  const repair: GraphTaskRow = { id: "repair-task", status: "completed", role: "scout", taskType: "job_discovery",
+  const attemptCount = options.attemptCount ?? 2
+  const repair: GraphTaskRow = { id: "repair-task", status: "completed", role: options.taskRole ?? "scout", taskType: options.taskType ?? "job_discovery",
     expectedOutputSchema: TASK_GRAPH_TEMPLATES.scout.expectedOutputSchema, allowedActions: TASK_GRAPH_TEMPLATES.scout.allowedActions,
-    attemptCount: 2, failureReason: null, result: { ...canonicalScoutEnvelope, taskGraphVerificationReport: report, taskGraphRepairReceipt: repairReceipt } }
+    contextIsObject: true, hasPrivateSelectionContext: false,
+    attemptCount, failureReason: null, result: { ...canonicalScoutEnvelope, ...options.extraResult, taskGraphVerificationReport: repairReport,
+      ...(options.includeReceipt === false ? {} : { taskGraphRepairReceipt: repairReceipt }),
+      ...(options.includeAttempt ? { discoveryAttempt: Object.hasOwn(options, "discoveryAttempt") ? options.discoveryAttempt : attemptSidecar(attemptCount) } : {}),
+      ...(options.includeRecovery ? { discoveryRecovery: Object.hasOwn(options, "discoveryRecovery") ? options.discoveryRecovery : recovery } : {}) } }
   const tasks = new Map([[target.id, target], [repair.id, repair]])
   const state = taskGraphState(snapshot, 2, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), [])
   return { rootTaskId: "root-1", snapshot, item: { id: "task_graph:root-1", revision: 2, content: snapshot, createdAt: new Date(0) }, state, tasks }
@@ -241,6 +266,72 @@ describe("current TaskGraph query footprint projection", () => {
     expect(graph.nodes[1]).toMatchObject({ repairOf: { nodeKey: "target", taskId: "target-task" }, verificationReport: report })
     expect(graph.nodes[1]?.repairReceipt).toMatchObject({ repairTaskId: "repair-task", evidenceDigest: report.evidenceDigest })
     expect(graph.nodes[1]?.resultProjection).toEqual(projectTaskGraphResult("scout", "completed", canonicalScoutEnvelope))
+    expect(graph.nodes[1]).not.toHaveProperty("discoveryAttemptHealth")
+    expect(graph.nodes[1]).not.toHaveProperty("discoveryQueryFootprint")
+  })
+
+  it("projects a repaired Scout with its exact current discovery attempt and repair receipt", () => {
+    const graph = currentTaskGraph(loadedRepair({ includeAttempt: true }))
+    const node = graph.nodes[1]!
+
+    expect(node.resultProjection).toEqual(projectTaskGraphResult("scout", "completed", canonicalScoutEnvelope))
+    expect(node).toMatchObject({
+      repairOf: { graphRootTaskId: "root-1", nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] },
+      verificationReport: report,
+      repairReceipt: { graphRootTaskId: "root-1", targetTaskId: "target-task", repairTaskId: "repair-task", evidenceDigest: report.evidenceDigest },
+    })
+    expect(graph.nodes.map(item => item.key)).toEqual(["target", "repair"])
+    expect(node).not.toHaveProperty("discoveryAttemptHealth")
+    expect(node).not.toHaveProperty("discoveryQueryFootprint")
+  })
+
+  it("keeps repaired results unavailable for stale or malformed attempts and any recovery sidecar", () => {
+    const invalid = [
+      loadedRepair({ includeAttempt: true, discoveryAttempt: attemptSidecar(1) }),
+      loadedRepair({ includeAttempt: true, discoveryAttempt: { ...attemptSidecar(2), unknown: true } }),
+      loadedRepair({ includeAttempt: true, discoveryAttempt: { ...attemptSidecar(2), health: { ...health, unknown: true } } }),
+      loadedRepair({ includeAttempt: true, discoveryAttempt: { ...attemptSidecar(2), queryFootprint: { ...footprint, unknown: true } } }),
+      loadedRepair({ includeAttempt: true, includeRecovery: true }),
+      loadedRepair({ includeAttempt: true, includeRecovery: true, discoveryRecovery: { ...recovery, unknown: true } }),
+      loadedRepair({ includeAttempt: true, extraResult: { unknownMetadata: true } }),
+      loadedRepair({ includeAttempt: true, taskRole: "analyst" }),
+      loadedRepair({ includeAttempt: true, taskType: "private_research" }),
+    ]
+    for (const fixture of invalid) {
+      expect(currentTaskGraph(fixture).nodes[1]?.resultProjection?.availability).toBe("unavailable")
+      expect(currentTaskGraph(fixture).nodes[1]).not.toHaveProperty("discoveryAttemptHealth")
+      expect(currentTaskGraph(fixture).nodes[1]).not.toHaveProperty("discoveryQueryFootprint")
+    }
+  })
+
+  it("keeps a repair result fail-closed when its persisted repair proof drifts", () => {
+    const base = loadedRepair()
+    const receipt = (base.tasks.get("repair-task")!.result as Record<string, unknown>).taskGraphRepairReceipt as Record<string, unknown>
+    const missingReceipt = loadedRepair({ includeReceipt: false })
+    const missingReport = loadedRepair({ report: undefined })
+    const malformedReport = loadedRepair({ report: { ...report, unknown: true } })
+    const mismatchedEvidence = loadedRepair({ report: { ...report, evidenceDigest: "c".repeat(64) } })
+    const forgedReceipts = [
+      { ...receipt, graphRootTaskId: "foreign-root" },
+      { ...receipt, targetNodeKey: "foreign-target-node" },
+      { ...receipt, targetTaskId: "foreign-target-task" },
+      { ...receipt, criterionIds: ["foreign-criterion"] },
+      { ...receipt, repairNodeKey: "foreign-repair-node" },
+      { ...receipt, repairTaskId: "foreign-repair-task" },
+      { ...receipt, evidenceDigest: "c".repeat(64) },
+    ]
+
+    expect(() => currentTaskGraph(missingReceipt)).toThrow("task_graph_verification_report_invalid")
+    expect(() => currentTaskGraph(missingReport)).toThrow("task_graph_verification_report_invalid")
+    expect(() => currentTaskGraph(malformedReport)).toThrow("task_graph_verification_report_invalid")
+    expect(() => currentTaskGraph(mismatchedEvidence)).toThrow("task_graph_verification_report_invalid")
+    for (const forged of forgedReceipts) {
+      expect(() => currentTaskGraph(loadedRepair({ receipt: forged }))).toThrow("task_graph_verification_report_invalid")
+    }
+    expect(() => currentTaskGraph(loadedRepair({ repairRootTaskId: "foreign-root" })))
+      .toThrow("task_graph_verification_report_invalid")
+    expect(() => currentTaskGraph(loadedRepair({ repairTargetTaskId: "foreign-target-task" })))
+      .toThrow("task_graph_snapshot_repair_invalid")
   })
 
   it("preserves the source envelope byte bound while removing verified metadata", () => {

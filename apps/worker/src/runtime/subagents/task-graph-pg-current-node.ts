@@ -7,9 +7,11 @@ import { taskGraphNativeCurrentView } from "./task-graph-native-result.js"
 import { projectTaskGraphResult, taskGraphResultProjectionBytes, taskGraphResultProjectionItemCount,
   TASK_GRAPH_RESULT_PROJECTION_ITEMS_TOTAL, TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT,
   TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT } from "./task-graph-result-projection.js"
-import type { LoadedGraph } from "./task-graph-pg-state.js"
+import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
+import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { projectTaskGraphDiscoveryAttemptHealth, projectTaskGraphDiscoveryAttemptQueryFootprint,
   type TaskGraphDiscoveryTurnEligibility } from "./task-graph-discovery-attempt-health.js"
+import { parseDiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import { parseDiscoveryQueryFootprint, type DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
 import { parseDiscoveryRecovery } from "./task-graph-discovery-recovery-contract.js"
 import { isOrdinaryGenericScout } from "./task-graph-discovery-recovery-page.js"
@@ -54,8 +56,13 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
     const structuredOutputFailureCategory = classifyTaskGraphStructuredOutputFailure({ snapshotNode: stored, task, verificationReport, hasRepairReceipt: Boolean(repairReceipt) })
     const discoveryAttemptHealth = projectTaskGraphDiscoveryAttemptHealth(stored, task, taskResult)
     const attemptProperty = dataProperty(taskResult, "discoveryAttempt")
-    const discoveryAttemptValidated = Boolean(discoveryAttemptHealth && ordinaryGenericScout && attemptProperty.present
+    const ordinaryDiscoveryAttemptValidated = Boolean(discoveryAttemptHealth && ordinaryGenericScout && attemptProperty.present
       && validDiscoveryAttemptFootprint(attemptProperty.value))
+    const repairDiscoveryAttemptValidated = Boolean(repairOf && repairReceipt && task.status === "completed"
+      && verificationReport?.status === "passed" && isRegisteredScoutRepair(stored, task)
+      && attemptProperty.present && parseDiscoveryAttemptSidecar(attemptProperty.value, task.attemptCount ?? NaN)
+      && validDiscoveryAttemptFootprint(attemptProperty.value))
+    const discoveryAttemptValidated = ordinaryDiscoveryAttemptValidated || repairDiscoveryAttemptValidated
     const recoveryProperty = dataProperty(taskResult, "discoveryRecovery")
     const discoveryRecovery = task.status === "completed" && ordinaryGenericScout && recoveryProperty.present
       ? parseDiscoveryRecovery(recoveryProperty.value) : undefined
@@ -114,6 +121,11 @@ function taskGraphProjectionSource(
 function validDiscoveryAttemptFootprint(value: unknown): boolean {
   const sidecar = dataProperty(value, "queryFootprint")
   return !sidecar.present || Boolean(parseDiscoveryQueryFootprint(sidecar.value))
+}
+function isRegisteredScoutRepair(node: StoredTaskGraphNode, task: GraphTaskRow): boolean {
+  if (!node.repairOf) return false
+  // Reuse the canonical registered-Scout identity check; the caller separately validates repairOf/report/receipt.
+  return isOrdinaryGenericScout({ ...node, repairOf: undefined }, task)
 }
 function dataProperty(value: unknown, key: string): { present: boolean; value?: unknown } {
   try {
