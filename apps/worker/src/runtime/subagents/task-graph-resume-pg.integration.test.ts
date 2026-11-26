@@ -14921,6 +14921,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(discoveryScoutAttemptCount).toBe(1)
               expect(discoveryScoutResultDigest).toMatch(/^[a-f0-9]{64}$/)
               expect(request.tools.some(tool => record(tool)?.name === "agent.ask_user")).toBe(true)
+              yield { type: "usage", inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 }
               yield { type: "tool_call_completed", callId: "p3-discovery-clarification", name: "agent.ask_user", arguments: {
                 question: discoveryClarificationQuestion,
                 choices: [{ label: discoveryClarificationAnswer, value: discoveryClarificationAnswer }],
