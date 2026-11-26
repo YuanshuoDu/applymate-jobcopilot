@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
-import { parseObjectiveApplicationTypedSourceResult } from "./objective-application-review-source-verification"
+import { parseObjectiveApplicationTypedSourceResult, parseObjectiveVerifiedSourceResultForRead } from "./objective-application-review-source-verification"
 
 const digest = "a".repeat(64)
 
@@ -49,6 +49,16 @@ describe("persisted typed Objective source result", () => {
       ...baseline.taskGraphVerificationReport, resultDigest: "b".repeat(64),
     } }, "scout", "scout-task")).toBeUndefined()
     expect(parseObjectiveApplicationTypedSourceResult({ ...baseline, discoveryAttempt: { attemptCount: 1, health: {} } }, "scout", "scout-task")).toBeUndefined()
+  })
+
+  it("keeps partial results read-only while the application reader remains completed-only", () => {
+    const partial = sourceResult("scout")
+    partial.structuredResult = { ...partial.structuredResult, status: "partial" }
+    partial.taskGraphVerificationReport.resultDigest = workerDigest(partial.structuredResult)
+    expect(parseObjectiveApplicationTypedSourceResult(partial, "scout", "scout-task")).toBeUndefined()
+    expect(parseObjectiveVerifiedSourceResultForRead(partial, "scout", "scout-task")).toEqual(partial.structuredResult)
+    partial.taskGraphVerificationReport.resultDigest = digest
+    expect(parseObjectiveVerifiedSourceResultForRead(partial, "scout", "scout-task")).toBeUndefined()
   })
 })
 

@@ -1,17 +1,16 @@
 import type { Prisma } from "@prisma/client"
 import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, parseObjectiveTailorFinalOutcomeSidecar,
-  type ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
+  type ObjectiveTailorGraph, type ObjectiveTailorSourceGroups } from "@jobcopilot/agent-protocol"
 import { objectiveApplicationReviewPairProof, validObjectiveApplicationSourceManifest } from "../broker/objective-application-review-source-proof"
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, isCanonicalTaskGraphSourceManifest } from "./final-task-graph-source-detail"
-import { parseFinalTaskGraphSourceManifest } from "./final-task-graph-source-manifest"
+import { parseFinalTaskGraphSourceManifest, type FinalTaskGraphSourceManifest } from "./final-task-graph-source-manifest"
 import { readFinalTaskGraphSourceSnapshot } from "./objective-tailor-final-source-graph"
 import { parseObjectiveTailorProgressSnapshot } from "./objective-tailor-progress-snapshot"
+import { readObjectiveTailorSourceGroups } from "./objective-tailor-source-groups"
 import type { ObjectiveJourneyReport, ObjectiveJourneyReportedScoreFloor } from "./objective-journey-report-contract"
 import { objectiveJourneyAnalystGraphRequirements } from "./objective-journey-report-requirement-proof"
-
 type Tx = Prisma.TransactionClient
-type Row = Record<string, unknown>
-type Slot = ObjectiveJourneyReport["slots"][number]
+type Row = Record<string, unknown>; type Slot = ObjectiveJourneyReport["slots"][number]
 type SourceGraphNodes = readonly Row[]
 type SlotSource = Readonly<{
   ordinal: number; tailoringStatus: Slot["tailoringStatus"]; sourceReady: boolean; jobId: string | null
@@ -24,8 +23,21 @@ export type ObjectiveJourneySource = Readonly<{
   userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
   sourceCounts: ObjectiveJourneyReport["sourceCounts"]; slots: readonly SlotSource[]; reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor
 }>
-
+export type ObjectiveJourneyProofContext = Readonly<{
+  userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
+  manifest: FinalTaskGraphSourceManifest
+  sidecar: NonNullable<ReturnType<typeof parseObjectiveTailorFinalOutcomeSidecar>>
+  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>
+  tasks: ReadonlyMap<string, Row>; graphNodes: SourceGraphNodes; sourceGroups?: ObjectiveTailorSourceGroups
+}>
 export async function readObjectiveJourneySource(tx: Tx, input: Readonly<{ userId: string; sessionId: string; finalItemId: string }>): Promise<ObjectiveJourneySource | null> {
+  const context = await readObjectiveJourneyProofContext(tx, input)
+  if (!context || !validObjectiveApplicationSourceManifest(context.manifest, input.finalItemId, context.progress, context.tasks)) return null
+  return readSlots(tx, input, context.sourceTurnId, context.rootTaskId, context.graphRevision, context.progress, context.sidecar, context.tasks, context.graphNodes)
+}
+/** Reads the owned graph proof before the report-specific completed-only gate. */
+export async function readObjectiveJourneyProofContext(tx: Tx, input: Readonly<{ userId: string; sessionId: string; finalItemId: string }>,
+  expectedGraphRevision?: number): Promise<ObjectiveJourneyProofContext | null> {
   if (![input.userId, input.sessionId, input.finalItemId].every(id)) return null
   const sessions = await tx.agentSession.findMany({ where: { id: input.sessionId, userId: input.userId }, take: 2, select: { id: true, userId: true } })
   const finals = await tx.agentItem.findMany({ where: { id: input.finalItemId, sessionId: input.sessionId, type: "agent_message",
@@ -42,10 +54,10 @@ export async function readObjectiveJourneySource(tx: Tx, input: Readonly<{ userI
   const turn = turns[0] && record(turns[0])
   if (turns.length !== 1 || !turn || turn.id !== final.turnId || turn.userId !== input.userId || turn.sessionId !== input.sessionId
     || turn.status !== "completed" || turn.source !== "user" || turn.executionMode !== "canonical_task_graph" || turn.rootTaskId !== final.taskId) return null
-  return readGraph(tx, input, final, turn)
+  return readGraph(tx, input, final, turn, expectedGraphRevision)
 }
-
-async function readGraph(tx: Tx, input: { userId: string; sessionId: string; finalItemId: string }, final: Row, turn: Row): Promise<ObjectiveJourneySource | null> {
+async function readGraph(tx: Tx, input: { userId: string; sessionId: string; finalItemId: string }, final: Row, turn: Row,
+  expectedGraphRevision?: number): Promise<ObjectiveJourneyProofContext | null> {
   const sourceTurnId = turn.id, rootTaskId = turn.rootTaskId
   if (!id(sourceTurnId) || !id(rootTaskId)) return null
   const graphId = canonicalTaskGraphItemId(rootTaskId)
@@ -59,12 +71,14 @@ async function readGraph(tx: Tx, input: { userId: string; sessionId: string; fin
   const root = roots[0] && record(roots[0]), graphRow = graphs[0] && record(graphs[0]), finalContent = record(final.content)
   const manifest = parseFinalTaskGraphSourceManifest(finalContent?.taskGraphSources)
   const sidecar = parseObjectiveTailorFinalOutcomeSidecar(finalContent?.objectiveTailorFinalOutcomes)
+  const sourceGroups = manifest && sidecar ? readObjectiveTailorSourceGroups(finalContent?.objectiveTailorSourceGroups, manifest, sidecar) : undefined
   const result = record(root?.result), progress = graphRow && parseObjectiveTailorProgressSnapshot(graphRow.content)
   if (roots.length !== 1 || !root || root.id !== rootTaskId || root.status !== "completed" || root.failureReason !== null
     || !(root.completedAt instanceof Date) || root.leaseOwner !== null || root.leaseExpiresAt !== null
     || result?.status !== "completed" || result.finalItemId !== input.finalItemId || graphs.length !== 1 || !graphRow
     || graphRow.id !== graphId || graphRow.sessionId !== input.sessionId || graphRow.turnId !== sourceTurnId || graphRow.taskId !== rootTaskId
-    || graphRow.type !== "task_graph" || !Number.isSafeInteger(graphRow.revision) || !manifest || !sidecar || !progress
+    || graphRow.type !== "task_graph" || !Number.isSafeInteger(graphRow.revision) || expectedGraphRevision !== undefined && graphRow.revision !== expectedGraphRevision
+    || !manifest || !sidecar || !progress
     || progress.marker.slots.length !== sidecar.slots.length || !isCanonicalTaskGraphSourceManifest(input.finalItemId, manifest)
     || graphRow.revision !== manifest.graphRevision || "graphRevision" in sidecar && sidecar.graphRevision !== graphRow.revision) return null
   const projected = readFinalTaskGraphSourceSnapshot(graphRow.content, final.content)
@@ -84,24 +98,19 @@ async function readGraph(tx: Tx, input: { userId: string; sessionId: string; fin
       || task.rootTaskId !== rootTaskId) return null
     tasks.set(task.id, task)
   }
-  if (rows.length !== allTaskIds.length || allTaskIds.some(taskId => !tasks.has(taskId))
-    || !validObjectiveApplicationSourceManifest(manifest, input.finalItemId, progress, tasks)) return null
-  return readSlots(tx, input, sourceTurnId, rootTaskId, Number(graphRow.revision), progress, sidecar, tasks, graphNodes)
+  if (rows.length !== allTaskIds.length || allTaskIds.some(taskId => !tasks.has(taskId))) return null
+  return { userId: input.userId, sessionId: input.sessionId, sourceTurnId, rootTaskId, finalItemId: input.finalItemId,
+    graphRevision: Number(graphRow.revision), manifest, sidecar, progress, tasks, graphNodes, ...(sourceGroups ? { sourceGroups } : {}) }
 }
-
 function sourceGraphNodes(value: unknown): SourceGraphNodes | undefined {
-  try {
-    const nodes = record(value)?.nodes
-    if (!Array.isArray(nodes) || Object.getPrototypeOf(nodes) !== Array.prototype || nodes.length > 8
-      || Reflect.ownKeys(nodes).length !== nodes.length + 1) return undefined
-    const rows = nodes.map(record)
-    return rows.every((row): row is Row => !!row) ? rows : undefined
+  try { const nodes = record(value)?.nodes
+    if (!Array.isArray(nodes) || Object.getPrototypeOf(nodes) !== Array.prototype || nodes.length > 8 || Reflect.ownKeys(nodes).length !== nodes.length + 1) return undefined
+    const rows = nodes.map(record); return rows.every((row): row is Row => !!row) ? rows : undefined
   } catch { return undefined }
 }
-
 async function readSlots(tx: Tx, input: { userId: string; sessionId: string; finalItemId: string }, sourceTurnId: string, rootTaskId: string, graphRevision: number,
   progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, sidecar: NonNullable<ReturnType<typeof parseObjectiveTailorFinalOutcomeSidecar>>,
-  tasks: Map<string, Row>, graphNodes: SourceGraphNodes): Promise<ObjectiveJourneySource | null> {
+  tasks: ReadonlyMap<string, Row>, graphNodes: SourceGraphNodes): Promise<ObjectiveJourneySource | null> {
   const candidates = progress.marker.slots.map((slot, index) => candidateForSlot(slot, index + 1, graphRevision, progress, tasks))
   const jobIds = candidates.flatMap(candidate => candidate ? [candidate.jobId] : [])
   const frequencies = new Map<string, number>()
@@ -137,9 +146,8 @@ async function readSlots(tx: Tx, input: { userId: string; sessionId: string; fin
     rootTaskId, finalItemId: input.finalItemId, graphRevision, sourceCounts, slots,
     ...(reportedScoreFloor ? { reportedScoreFloor } : {}) }
 }
-
 function candidateForSlot(slot: ObjectiveTailorGraph["slots"][number], ordinal: number, revision: number,
-  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>):
+  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: ReadonlyMap<string, Row>):
   { jobId: string; sourceAnalystKeys: readonly string[]; analystProofDigest: string; jobMaterialDigest: string } | undefined {
   const writerNode = progress.nodes.find(node => node.key === slot.writerNodeKey), writer = writerNode && tasks.get(writerNode.taskId)
   const context = writer && record(writer.context), selected = context && exactRecord(context.selectedJobPreparation, "jobId")
@@ -156,9 +164,8 @@ function candidateForSlot(slot: ObjectiveTailorGraph["slots"][number], ordinal: 
     && witness.admittedRevision <= revision ? { jobId: witness.jobId, sourceAnalystKeys: witness.sourceAnalystKeys,
       analystProofDigest: witness.analystProofDigest, jobMaterialDigest: witness.materialDigest } : undefined
 }
-
 function requirementAnalystFor(nodeKey: string, candidate: NonNullable<ReturnType<typeof candidateForSlot>>,
-  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>,
+  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: ReadonlyMap<string, Row>,
   graphNodes: SourceGraphNodes): SlotSource["requirementAnalyst"] {
   const node = progress.nodes.find(value => value.key === nodeKey), task = node && tasks.get(node.taskId)
   const typedNode = graphNodes.find(value => value.key === nodeKey), verification = objectiveJourneyAnalystGraphRequirements(typedNode?.verification)
@@ -176,9 +183,8 @@ function requirementAnalystFor(nodeKey: string, candidate: NonNullable<ReturnTyp
     ? { nodeKey, taskId: node.taskId, attemptCount: Number(task.attemptCount), proofDigest: candidate.analystProofDigest,
       jobMaterialDigest: candidate.jobMaterialDigest, criteriaIds, dependencyNodeKeys, dependencies } : null
 }
-
 function readyPair(slot: ObjectiveTailorGraph["slots"][number], ordinal: number, revision: number,
-  jobId: string, progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: Map<string, Row>) {
+  jobId: string, progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: ReadonlyMap<string, Row>) {
   const correction = slot.correction, writerNode = progress.nodes.find(node => node.key === (correction?.writerNodeKey ?? slot.writerNodeKey))
   const reviewerNode = progress.nodes.find(node => node.key === (correction?.reviewerNodeKey ?? slot.reviewerNodeKey))
   const writerTask = writerNode && tasks.get(writerNode.taskId), reviewerTask = reviewerNode && tasks.get(reviewerNode.taskId)
@@ -188,7 +194,6 @@ function readyPair(slot: ObjectiveTailorGraph["slots"][number], ordinal: number,
     writerTask, reviewerTask, tasks })
   return proof ? { writerTaskId: writerNode.taskId, reviewerTaskId: reviewerNode.taskId } : undefined
 }
-
 function pairSource(slotOrdinal: number, writerTaskId: string | undefined, reviewerTaskId: string | undefined, writerValue: unknown, reviewerValue: unknown) {
   const writer = record(record(writerValue)?.structuredResult), reviewer = record(record(reviewerValue)?.structuredResult)
   const ref = record(writer?.artifactRef)
@@ -200,7 +205,6 @@ function pairSource(slotOrdinal: number, writerTaskId: string | undefined, revie
   return { slotOrdinal, writerTaskId, reviewerTaskId, artifactId: ref.artifactId, version: ref.version,
     contentHash: ref.contentHash, sourceDigest: ref.sourceDigest, reviewHash: reviewer.reviewHash }
 }
-
 function candidateWitness(value: unknown): { jobId: string; slotId: string; writerNodeKey: string; reviewerNodeKey: string;
   sourceAnalystKeys: readonly string[]; analystProofDigest: string; materialDigest: string; admittedRevision: number } | undefined {
   const row = record(value), candidate = row && record(row.candidate), sources = row?.sourceAnalystKeys

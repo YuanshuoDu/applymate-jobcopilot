@@ -9,19 +9,28 @@ const CRITERION = /^[a-z][a-z0-9._-]{0,63}$/
 
 /** Parses only the exact completed typed-source result persisted by the Worker. */
 export function parseObjectiveApplicationTypedSourceResult(value: unknown, role: "scout" | "analyst", taskId: string): Row | undefined {
+  return parseObjectiveTypedSourceResult(value, role, taskId, false)
+}
+
+/** Read-only evidence may use a Worker-proven partial result; application paths stay completed-only. */
+export function parseObjectiveVerifiedSourceResultForRead(value: unknown, role: "scout" | "analyst", taskId: string): Row | undefined {
+  return parseObjectiveTypedSourceResult(value, role, taskId, true)
+}
+
+function parseObjectiveTypedSourceResult(value: unknown, role: "scout" | "analyst", taskId: string, allowPartial: boolean): Row | undefined {
   const envelope = record(typeof value === "string" ? parseJson(value) : value)
   const result = envelope && record(envelope.structuredResult)
-  if (!envelope || !result || !resultEnvelope(envelope, role, taskId, result)) return undefined
+  if (!envelope || !result || !resultEnvelope(envelope, role, taskId, result, allowPartial)) return undefined
   return result
 }
 
-function resultEnvelope(envelope: Row, role: "scout" | "analyst", taskId: string, result: Row): boolean {
+function resultEnvelope(envelope: Row, role: "scout" | "analyst", taskId: string, result: Row, allowPartial: boolean): boolean {
   const required = "finalItemId,finalText,status,stepCount,structuredResult,taskGraphVerificationReport,toolCallCount"
   const optional = ["taskGraphRepairReceipt", ...(role === "scout" ? ["discoveryAttempt"] : [])]
   if (!allowed(envelope, required.split(","), optional) || envelope.status !== "completed"
     || envelope.finalItemId !== null && (typeof envelope.finalItemId !== "string" || !ID.test(envelope.finalItemId))
     || typeof envelope.finalText !== "string" || !count(envelope.stepCount) || !count(envelope.toolCallCount)
-    || result.schemaVersion !== RESULT || result.role !== role || result.status !== "completed"
+    || result.schemaVersion !== RESULT || result.role !== role || result.status !== "completed" && !(allowPartial && result.status === "partial")
     || !passedReport(envelope.taskGraphVerificationReport, result)) return false
   const report = record(envelope.taskGraphVerificationReport)
   return (!Object.hasOwn(envelope, "taskGraphRepairReceipt") || repairReceipt(envelope.taskGraphRepairReceipt, taskId, report!))

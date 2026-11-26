@@ -371,6 +371,18 @@ describe("agent stream redaction", () => {
       .toEqual({ itemId: "final-item", status: "completed", content: "[REDACTED]" })
   })
 
+  it("does not generic-redact an isolated or nested source-group sibling", () => {
+    const sourceGroups = { schemaVersion: 'agent-harness.v2.objective-tailor-source-groups.v1', graphRevision: 1,
+      groups: { discoveredJobs: [`src_${'A'.repeat(43)}`], analyzedJobs: [] } }
+    const isolated = redactStreamEventPayload('item.completed', { itemId: 'final-item', status: 'completed', content: {
+      objectiveTailorSourceGroups: sourceGroups, privatePayload: 'PRIVATE_SOURCE_PAYLOAD',
+    } }, { ...identity, itemId: 'final-item' })
+    expect(isolated).toEqual({ itemId: 'final-item', status: 'completed', content: { text: '' } })
+    expect(JSON.stringify(isolated)).not.toContain('objectiveTailorSourceGroups')
+    const nested = redactStreamEventPayload('item.delta', { safe: 'keep', nested: { objectiveTailorSourceGroups: sourceGroups } }, identity)
+    expect(nested).toEqual({ safe: 'keep', nested: {} })
+  })
+
   it("streams only a canonical TaskGraph source manifest beside the ordinary final answer", () => {
     const objectiveTailorFinalOutcomes = {
       schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA,
@@ -402,8 +414,39 @@ describe("agent stream redaction", () => {
       ...payload.content, objectiveTailorFinalOutcomes: { ...objectiveTailorFinalOutcomes, privateProof: 'PRIVATE' },
     } }, { ...identity, itemId: 'final-item' })
     expect(invalidSidecar).toEqual({ itemId: 'final-item', status: 'completed', content: { text: 'Safe answer', taskGraphSources: manifest } })
-    const nonFinal = redactStreamEventPayload('item.delta', { content: { objectiveTailorFinalOutcomes: objectiveTailorFinalOutcomes } }, identity)
+    const nonFinal = redactStreamEventPayload('item.delta', { content: { objectiveTailorFinalOutcomes: objectiveTailorFinalOutcomes,
+      objectiveTailorSourceGroups: { schemaVersion: 'agent-harness.v2.objective-tailor-source-groups.v1', graphRevision: 3,
+        groups: { discoveredJobs: ['src_private'], analyzedJobs: [] } } } }, identity)
     expect(JSON.stringify(nonFinal)).not.toContain('objectiveTailorFinalOutcomes')
+    expect(JSON.stringify(nonFinal)).not.toContain('objectiveTailorSourceGroups')
+  })
+
+  it('keeps stream and initial reads aligned for a valid source-group sibling', () => {
+    const finalItemId = 'final-item', graphRevision = 4
+    const sourceKey = canonicalTaskGraphSourceKey(finalItemId, graphRevision, 0)
+    const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision, sources: [
+      { sourceKey, nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+    ] }
+    const objectiveTailorFinalOutcomes = {
+      schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision,
+      slots: [{ ordinal: 1, status: 'ready' }],
+      sourceCounts: { discoveredJobs: { knownCount: 1, coverage: 'complete' }, analyzedJobs: { knownCount: 0, coverage: 'partial' } },
+    }
+    const objectiveTailorSourceGroups = {
+      schemaVersion: 'agent-harness.v2.objective-tailor-source-groups.v1', graphRevision,
+      groups: { discoveredJobs: [sourceKey], analyzedJobs: [] },
+    }
+    const payload = { itemId: finalItemId, status: 'completed', content: {
+      text: 'Safe answer', final: { response: 'Safe answer' }, taskGraphSources: manifest,
+      objectiveTailorFinalOutcomes, objectiveTailorSourceGroups,
+    } }
+    const projected = redactStreamEventPayload('item.completed', payload, { ...identity, itemId: finalItemId }) as { content: Record<string, unknown> }
+    expect(projected.content.objectiveTailorSourceGroups).toEqual(objectiveTailorSourceGroups)
+
+    const invalid = redactStreamEventPayload('item.completed', { ...payload, content: {
+      ...payload.content, objectiveTailorSourceGroups: { ...objectiveTailorSourceGroups, groups: { discoveredJobs: ['src_foreign'], analyzedJobs: [] } },
+    } }, { ...identity, itemId: finalItemId }) as { content: Record<string, unknown> }
+    expect(invalid.content).not.toHaveProperty('objectiveTailorSourceGroups')
   })
 
   it('keeps historical V1 final outcomes slot-only', () => {

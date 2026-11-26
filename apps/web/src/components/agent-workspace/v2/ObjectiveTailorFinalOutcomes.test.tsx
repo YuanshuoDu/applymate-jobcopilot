@@ -69,6 +69,43 @@ describe('ObjectiveTailorFinalOutcomes', () => {
     expect(zh).toContain('职位 2: 需要修改')
   })
 
+  it('offers localized group actions only for current positive source evidence', () => {
+    const scout = `src_${'G'.repeat(43)}`, analyst = `src_${'H'.repeat(43)}`
+    const groupedManifest = { ...manifest, sources: [
+      { sourceKey: scout, nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+      { sourceKey: analyst, nodeIndex: 1, role: 'analyst', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'partial' },
+    ] }
+    const v2 = { schemaVersion: schemaV2, graphRevision: 9, slots: sidecar.slots, sourceCounts: {
+      discoveredJobs: { knownCount: 1, coverage: 'complete' as const },
+      analyzedJobs: { knownCount: 1, coverage: 'partial' as const },
+    } }
+    const groups = { schemaVersion: 'agent-harness.v2.objective-tailor-source-groups.v1', graphRevision: 9,
+      groups: { discoveredJobs: [scout], analyzedJobs: [analyst] } }
+    const content = { objectiveTailorFinalOutcomes: v2, objectiveTailorSourceGroups: groups, taskGraphSources: groupedManifest }
+    const html = renderToStaticMarkup(<ObjectiveTailorFinalOutcomes content={content} lang="en" finalItemId="final-item"
+      relatedTaskSourcesId="related-task-sources-card" onSourceGroupSelect={() => undefined} />)
+    expect(html.match(/data-objective-source-group-action=/g)).toHaveLength(2)
+    expect(html).toContain('data-objective-source-group-action="discoveredJobs"')
+    expect(html).toContain('data-objective-source-group-action="analyzedJobs"')
+    expect(html).toContain('aria-controls="related-task-sources-card"')
+    expect(html.match(/type="button"/g)).toHaveLength(2)
+    expect(html).toContain('View discovery evidence')
+    expect(html).toContain('View analysis evidence')
+    expect(html).not.toContain(scout)
+    expect(html).not.toContain(analyst)
+
+    const invalid = renderToStaticMarkup(<ObjectiveTailorFinalOutcomes content={{ ...content,
+      objectiveTailorSourceGroups: { ...groups, graphRevision: 8 } }} lang="en" finalItemId="final-item"
+      relatedTaskSourcesId="related-task-sources-card" onSourceGroupSelect={() => undefined} />)
+    expect(invalid).not.toContain('data-objective-source-group-action=')
+    const zero = renderToStaticMarkup(<ObjectiveTailorFinalOutcomes content={{ objectiveTailorFinalOutcomes: {
+      ...v2, sourceCounts: { discoveredJobs: { knownCount: 0, coverage: 'complete' as const }, analyzedJobs: v2.sourceCounts.analyzedJobs },
+    }, objectiveTailorSourceGroups: { ...groups, groups: { discoveredJobs: [], analyzedJobs: [analyst] } }, taskGraphSources: groupedManifest }}
+      lang="en" finalItemId="final-item" relatedTaskSourcesId="related-task-sources-card" onSourceGroupSelect={() => undefined} />)
+    expect(zero).not.toContain('data-objective-source-group-action="discoveredJobs"')
+    expect(zero).toContain('data-objective-source-group-action="analyzedJobs"')
+  })
+
   it('links localized source counts only to a matching same-revision source list', () => {
     const v2 = { schemaVersion: schemaV2, graphRevision: 9, slots: sidecar.slots, sourceCounts: {
       discoveredJobs: { knownCount: 3, coverage: 'complete' },

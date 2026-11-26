@@ -79,6 +79,28 @@ it('projects only a valid Objective Tailor sidecar on completed final answers', 
     { text: 'Answer', final: { response: 'Different' }, objectiveTailorFinalOutcomes: finalOutcomes })).toEqual({ text: 'Fallback' })
 })
 
+it('projects a source-group sibling only when it matches the canonical manifest and outcome', () => {
+  const objectiveTailorFinalOutcomes = {
+    schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v2', graphRevision: 4,
+    slots: [{ ordinal: 1, status: 'ready' }],
+    sourceCounts: { discoveredJobs: { knownCount: 1, coverage: 'complete' }, analyzedJobs: { knownCount: 0, coverage: 'partial' } },
+  }
+  const objectiveTailorSourceGroups = {
+    schemaVersion: 'agent-harness.v2.objective-tailor-source-groups.v1', graphRevision: 4,
+    groups: { discoveredJobs: [sourceKey], analyzedJobs: [] },
+  }
+  const valid = projectFinalAnswerTaskGraphSourceContent(finalItemId, 'final_answer', 'completed', 'Answer', undefined, null, {
+    text: 'Answer', final: { response: 'Answer' }, taskGraphSources: content.taskGraphSources,
+    objectiveTailorFinalOutcomes, objectiveTailorSourceGroups,
+  })
+  expect(valid).toHaveProperty('objectiveTailorSourceGroups', objectiveTailorSourceGroups)
+  const invalid = projectFinalAnswerTaskGraphSourceContent(finalItemId, 'final_answer', 'completed', 'Answer', undefined, null, {
+    text: 'Answer', final: { response: 'Answer' }, taskGraphSources: content.taskGraphSources,
+    objectiveTailorFinalOutcomes, objectiveTailorSourceGroups: { ...objectiveTailorSourceGroups, graphRevision: 5 },
+  })
+  expect(invalid).not.toHaveProperty('objectiveTailorSourceGroups')
+})
+
 function input(overrides: Record<string, unknown> = {}) {
   const childResult = { status: 'completed', stepCount: 1, toolCallCount: 1, finalItemId: 'PRIVATE_FINAL_ID',
     finalText: 'PRIVATE_MODEL_TEXT', structuredResult: { role: 'scout', status: 'completed', summary: 'PRIVATE_SUMMARY' } }

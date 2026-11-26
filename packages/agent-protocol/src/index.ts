@@ -231,5 +231,11 @@ export type {
   ObjectiveTailorFinalOutcomeSidecarV3,
   ObjectiveTailorReportedScoreFloor,
 } from './objective-tailor-final-outcome-sidecar.js'
+export {
+  OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD,
+  OBJECTIVE_TAILOR_SOURCE_GROUPS_SCHEMA,
+  parseObjectiveTailorSourceGroups,
+} from './objective-tailor-source-groups.js'
+export type { ObjectiveTailorSourceGroups } from './objective-tailor-source-groups.js'
 
 export { parseObjectiveReportScoreFloor } from './objective-report-score-floor.js'
