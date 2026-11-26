@@ -90,7 +90,8 @@ function roleFacts(result: Row, role: JobRole): JobFact[] | undefined {
   for (const value of items) {
     const row = record(value), ids = row && dense(row.evidenceIds, 50)
     const evidenceIds = ids && ids.length > 0 && ids.every(safeId) ? ids : undefined
-    if (!row || !evidenceIds || !exact(row, role === 'scout' ? ['evidenceIds', 'jobId', 'source', 'url'] : ['evidenceIds', 'jobId', 'score'])
+    if (!row || !evidenceIds || !exact(row, role === 'scout' ? ['evidenceIds', 'jobId', 'source', 'url'] : ['evidenceIds', 'jobId', 'score'],
+      role === 'analyst' ? ['requirementCitations'] : [])
       || !safeId(row.jobId) || new Set(evidenceIds).size !== evidenceIds.length
       || role === 'scout' && (row.url !== null && !label(row.url, 2_048) || !label(row.source, 256))
       || role === 'analyst' && (typeof row.score !== 'number' || !Number.isFinite(row.score) || row.score < 0 || row.score > 10)) return undefined
@@ -121,7 +122,13 @@ function record(value: unknown): Row | undefined {
     && keys.every(key => typeof key === 'string' && Object.getOwnPropertyDescriptor(value, key)?.enumerable
       && Object.hasOwn(Object.getOwnPropertyDescriptor(value, key)!, 'value')) ? value as Row : undefined } catch { return undefined }
 }
-function exact(row: Row, keys: readonly string[]): boolean { return Reflect.ownKeys(row).length === keys.length && Object.keys(row).sort().join(',') === [...keys].sort().join(',') }
+function exact(row: Row, keys: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = [...keys, ...optional], actual = Reflect.ownKeys(row)
+  return actual.length >= keys.length && actual.length <= allowed.length
+    && actual.every(key => typeof key === 'string' && allowed.includes(key)
+      && !!Object.getOwnPropertyDescriptor(row, key)?.enumerable && Object.hasOwn(Object.getOwnPropertyDescriptor(row, key)!, 'value'))
+    && keys.every(key => Object.hasOwn(row, key))
+}
 function dense(value: unknown, maximum: number): unknown[] | undefined {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > maximum) return undefined
   const keys = Reflect.ownKeys(value)
