@@ -54,6 +54,26 @@ describe("Objective slot immutable artifact evidence", () => {
     expect((tx as never as { agentArtifact?: unknown }).agentArtifact).toBeUndefined()
   })
 
+  it("returns an opaque receipt for the exact current passed Reviewer row", async () => {
+    const { readObjectiveSlotReviewerReceiptEvidence } = await import("./objective-slot-artifact")
+    const result = await readObjectiveSlotReviewerReceiptEvidence(txFixture() as never, input)
+    expect(result).toMatchObject({ schemaVersion: "agent-harness.v2.objective-slot-reviewer-receipt.v1", graphRevision: 7,
+      slotOrdinal: 1, artifactVersion: 1, outcome: "passed" })
+    expect(result?.receiptKey).toMatch(/^review-[a-f0-9]{64}$/)
+    expect(JSON.stringify(result)).not.toContain("review-call")
+    expect(JSON.stringify(result)).not.toContain("job-1")
+    expect(JSON.stringify(result)).not.toContain(reviewHash)
+  })
+
+  it("is replay-stable and changes when the verified Reviewer identity changes", async () => {
+    const { readObjectiveSlotReviewerReceiptEvidence } = await import("./objective-slot-artifact")
+    const first = await readObjectiveSlotReviewerReceiptEvidence(txFixture() as never, input)
+    const replay = await readObjectiveSlotReviewerReceiptEvidence(txFixture() as never, input)
+    const changed = await readObjectiveSlotReviewerReceiptEvidence(txFixture({ reviews: [review({ toolCallId: "review-call-2" })] }) as never, input)
+    expect(first?.receiptKey).toBe(replay?.receiptKey)
+    expect(changed?.receiptKey).not.toBe(first?.receiptKey)
+  })
+
   it("keeps a historical corrected version bound to its prior needs-revision receipt", async () => {
     const priorBody = "Initial draft", priorHash = hashArtifactContent(priorBody)
     const currentBody = "Corrected draft", currentRef = { ...ref, version: 2, contentHash: hashArtifactContent(currentBody) }
@@ -65,6 +85,10 @@ describe("Objective slot immutable artifact evidence", () => {
         contentHash: priorHash, status: "needs_revision", reviewHash: `sha256:${"e".repeat(64)}`, toolCallId: "prior-review" })] })
     const { readObjectiveSlotArtifactEvidence } = await import("./objective-slot-artifact")
     expect(await readObjectiveSlotArtifactEvidence(tx as never, input)).toEqual({ schemaVersion: "agent-harness.v2.objective-slot-artifact.v1", graphRevision: 7, slotOrdinal: 1, artifactRef: currentRef })
+    const { readObjectiveSlotReviewerReceiptEvidence } = await import("./objective-slot-artifact")
+    const receipt = await readObjectiveSlotReviewerReceiptEvidence(tx as never, input)
+    expect(receipt).toMatchObject({ graphRevision: 7, slotOrdinal: 1, artifactVersion: 2, outcome: "passed" })
+    expect(receipt?.receiptKey).toMatch(/^review-[a-f0-9]{64}$/)
   })
 
   it.each([
@@ -79,5 +103,7 @@ describe("Objective slot immutable artifact evidence", () => {
     const tx = txFixture(value)
     const { readObjectiveSlotArtifactEvidence } = await import("./objective-slot-artifact")
     expect(await readObjectiveSlotArtifactEvidence(tx as never, input)).toBeNull()
+    const { readObjectiveSlotReviewerReceiptEvidence } = await import("./objective-slot-artifact")
+    expect(await readObjectiveSlotReviewerReceiptEvidence(tx as never, input)).toBeNull()
   })
 })
