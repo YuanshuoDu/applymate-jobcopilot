@@ -19,6 +19,7 @@ import { parseObjectiveTailorFinalOutcomesFromContent } from '@/lib/agent/sessio
 import { readObjectiveTailorSourceGroups } from '@/lib/agent/session/objective-tailor-source-groups'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
 import { ObjectiveContributingJobs } from './ObjectiveContributingJobs'
+import { ObjectiveSourceToolReceipts } from './ObjectiveSourceToolReceipts'
 import { TaskGraphVerificationSummary } from './TaskGraphVerificationSummary'
 
 export interface FinalTaskGraphSourceDetail {
@@ -93,6 +94,8 @@ export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang, n
   const selectedSourceKeys = new Set(activeGroup?.sourceKeys ?? [])
   const visibleSources = activeGroup ? manifest.sources.filter(source => selectedSourceKeys.has(source.sourceKey)) : manifest.sources
   const jobEvidenceExpectation = activeGroup ? objectiveJobEvidenceExpectation(finalOutcomes, activeGroup.group) : null
+  const receiptSource = activeGroup && jobEvidenceExpectation && selected && activeGroup.sourceKeys.includes(selected.sourceKey)
+    && selected.taskStatus === 'completed' && selected.resultState === 'valid' && isReceiptRole(selected.role) ? selected : null
   return <section aria-label={label('agent.taskGraph.sources.title')} data-agent-related-task-sources="true"
     data-objective-source-group-selection={activeGroup ? 'true' : undefined}
     data-objective-source-group={activeGroup?.group}
@@ -117,6 +120,9 @@ export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang, n
             : activeRequest.state === 'ready'
               ? <SourceDetail detail={activeRequest.detail} lang={lang} />
               : <p role="status">{label('agent.taskGraph.sources.unavailable')}</p>}
+          {receiptSource && activeGroup && <ObjectiveSourceToolReceipts key={`${receiptSource.sourceKey}:${activeGroup.graphRevision}:${receiptSource.role}`}
+            sessionId={sessionId} finalItemId={finalItemId} sourceKey={receiptSource.sourceKey} graphRevision={activeGroup.graphRevision}
+            role={receiptSource.role as 'scout' | 'analyst'} lang={lang} />}
         </div>}
       </li>
     })}</ul>
@@ -192,6 +198,7 @@ function statusLabel(status: TaskGraphSourceTaskStatus): TaskGraphPlanLabelKey {
 }
 function resultLabel(state: TaskGraphSourceResultState): TaskGraphPlanLabelKey { return `agent.taskGraph.sources.resultState.${state}` }
 function resultStatusLabel(status: TaskGraphSourceRoleResultStatus): TaskGraphPlanLabelKey { return `agent.taskGraph.sources.resultStatus.${status}` }
+function isReceiptRole(role: TaskGraphSourceRole): role is 'scout' | 'analyst' { return role === 'scout' || role === 'analyst' }
 
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
   try { const keys = Reflect.ownKeys(value); return keys.length === expected.length && keys.every(key => typeof key === 'string'
