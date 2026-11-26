@@ -1766,7 +1766,8 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "objective_single_fill_ready" | "objective_single_submit_approved" | "objective_single_receipt_verified" | "objective_single_completed"
   | "objective_score_floor_nine_verified" | "objective_wave_source_ready" | "objective_wave_score_floor_eight_verified"
   | "objective_wave_set_issued" | "objective_wave_stale_retired"
-  | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff" | "objective_wave_completed"
+  | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff"
+  | "objective_wave_skill_comparison_verified" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
 
 function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
@@ -4507,16 +4508,20 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
       const { Pool } = workerRequire("pg") as { Pool: new (options: { connectionString: string }) => { end(): Promise<void> } }
       const sourceFixture = await import(objectiveTailorWaveSourceFixturePath) as unknown as {
-        seedObjectiveTailorWaveSource(pool: unknown, owner: { userId: string; suffix: string },
+        seedObjectiveTailorWaveSource(pool: unknown, owner: { userId: string; suffix: string; requirementQuote?: string },
           jobIdForSlot: (suffix: string, slot: number) => string): Promise<{
             jobs: readonly Readonly<{ id: string; source: string }>[]; resumeId: string
           }>
+      }
+      const requirementFixture = await import(objectiveTailorWaveRequirementFixturePath) as unknown as {
+        OBJECTIVE_WAVE_REQUIREMENT_QUOTE: string; OBJECTIVE_WAVE_RUST_REQUIREMENT_QUOTE: string
       }
       const sourcePool = new Pool({ connectionString: databaseUrl! })
       const objectiveJobIds = Array.from({ length: 8 }, () => randomUUID())
       let seeded: Awaited<ReturnType<typeof sourceFixture.seedObjectiveTailorWaveSource>>
       try {
-        seeded = await sourceFixture.seedObjectiveTailorWaveSource(sourcePool, { userId, suffix }, (ownerSuffix, slot) => {
+        seeded = await sourceFixture.seedObjectiveTailorWaveSource(sourcePool, { userId, suffix,
+          requirementQuote: `${requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE} ${requirementFixture.OBJECTIVE_WAVE_RUST_REQUIREMENT_QUOTE}` }, (ownerSuffix, slot) => {
           if (ownerSuffix !== suffix) throw new Error("Objective wave source owner scope changed")
           const id = objectiveJobIds[slot]
           if (!id) throw new Error("Objective wave source slot is unsupported")
@@ -4524,12 +4529,14 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         })
       } finally { await sourcePool.end() }
       const jobIds = seeded.jobs.map(job => job.id)
+      const pastedSkillsFactId = `objective-wave-pasted-skills-${runId}`
       reviewedJobIds.push(...jobIds)
       for (const jobId of jobIds) reviewedJobOwners.set(jobId, userId)
+      const comparisonKeywords = "TypeScript, Rust, Terraform"
       const adaptedResumeByJob = new Map<string, string>()
       for (const [index, job] of seeded.jobs.entries()) {
         const url = `https://boards.greenhouse.io/example-objective/jobs/${index + 1}`
-        const updated = await testDb.job.updateMany({ where: { id: job.id, userId }, data: { url } })
+        const updated = await testDb.job.updateMany({ where: { id: job.id, userId }, data: { url, keywords: comparisonKeywords } })
         expect(updated.count).toBe(1)
         const resumeId = `full-loop-objective-wave-adapted-${suffix}-${index}`
         await testDb.resume.create({ data: { id: resumeId, userId, name: `Synthetic wave role ${index + 1}`,
@@ -4662,7 +4669,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(initialReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v3",
         finalItemId, graphRevision: graphRow.revision, reviewCoverage: "complete" })
       expect(initialReport.reportedScoreFloor).toEqual({ status: "complete", minimumScore: 8, qualifyingJobCount: 8 })
-      expect(initialReport.requirementEvidenceCoverage).toEqual({ status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 0 })
+      expect(initialReport.requirementEvidenceCoverage).toEqual({ status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 6 })
       selectedJobFullLoopPhase("objective_wave_score_floor_eight_verified")
       const expectedSourceCounts = jsonRecord(jsonRecord(finalContent?.objectiveTailorFinalOutcomes)?.sourceCounts)
         ?? { discoveredJobs: { knownCount: null, coverage: "unavailable" }, analyzedJobs: { knownCount: null, coverage: "unavailable" } }
@@ -4680,7 +4687,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       // This exact navigation ID is separately bound above and canonically embeds its owner ID.
       const initialReportJson = JSON.stringify(Object.fromEntries(Object.entries(initialReport)
         .filter(([key]) => key !== "finalItemId")))
-      expect([sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds, ...jobIds]
+      expect([sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds, ...jobIds,
+        requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE, requirementFixture.OBJECTIVE_WAVE_RUST_REQUIREMENT_QUOTE]
         .some(privateId => initialReportJson.includes(privateId))).toBe(false)
 
       if (sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
@@ -4919,7 +4927,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(journeyReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v3",
         finalItemId, graphRevision: graphRow.revision, sourceCounts: expectedSourceCounts, reviewCoverage: "complete" })
       expect(journeyReport.reportedScoreFloor).toEqual({ status: "complete", minimumScore: 8, qualifyingJobCount: 8 })
-      expect(journeyReport.requirementEvidenceCoverage).toEqual({ status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 0 })
+      expect(journeyReport.requirementEvidenceCoverage).toEqual({ status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 6 })
       const journeySlots = Array.isArray(journeyReport.slots) ? journeyReport.slots.map(jsonRecord) : []
       expect(journeySlots).toHaveLength(8)
       expect(journeySlots.map(slot => [slot?.ordinal, slot?.tailoringStatus, slot?.reviewStatus,
@@ -4951,7 +4959,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         ...candidates.flatMap(candidate => [candidate.artifactRef.artifactId, candidate.artifactRef.contentHash,
           candidate.artifactRef.sourceDigest]), ...[...intentByApprovalId.values()].map(data => jsonString(data, "materialProofHash") ?? ""),
         "Synthetic confirmed engineering experience for this exact role.",
-        "Synthetic authorized Resume edit after six-slot Objective review."]
+        "Synthetic authorized Resume edit after six-slot Objective review.",
+        requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE, requirementFixture.OBJECTIVE_WAVE_RUST_REQUIREMENT_QUOTE,
+        "Terraform", "PrivateFixtureSkill", pastedSkillsFactId, "pasted_skills", "normalizedValue", "allowedUses"]
         .filter((value): value is string => typeof value === "string" && value.length > 0)
       expect(privateReportMarkers.some(value => journeyReportJson.includes(value))).toBe(false)
 
@@ -5668,6 +5678,85 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(proofs.every(proof => proof.durable.task.status === "submitted" && proof.durable.turn.status === "completed"
         && proof.durable.job.status === "applied" && proof.durable.finalization.itemStatus === "completed")).toBe(true)
       selectedJobFullLoopPhase("objective_wave_completed")
+      const postWaveSessionTurnCount = await testDb.agentTurn.count({ where: { userId, sessionId } })
+      const postWaveApplicationTaskCount = await testDb.applicationTask.count({ where: { userId, sessionId } })
+
+      await testDb.personaFact.create({ data: { id: pastedSkillsFactId, userId, key: "pasted_skills", category: "work",
+        value: "TypeScript, PrivateFixtureSkill", normalizedValue: "typescript, privatefixtureskill", source: "manual",
+        evidence: { label: "Skills" }, status: "confirmed", allowedUses: ["discovery"], consentAt: new Date(), updatedAt: new Date() } })
+      const completedProofByOrdinal = new Map(proofs.map(proof => [proof.durable.slot.ordinal, proof] as const))
+      const completedReportResponse = await getObjectiveJourneyReport(sessionId, finalItemId, token)
+      expect(completedReportResponse.status).toBe(200)
+      expect(completedReportResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+      const completedReportEnvelope = await jsonResponse(completedReportResponse)
+      const completedReport = jsonRecord(completedReportEnvelope.report)
+      if (!completedReport) throw new Error("Objective completed journey report is unavailable")
+      expect(completedReport).toMatchObject({ schemaVersion: "agent-harness.v2.objective-journey-report.v3",
+        finalItemId, graphRevision: graphRow.revision, sourceCounts: expectedSourceCounts, reviewCoverage: "complete",
+        reportedScoreFloor: { status: "complete", minimumScore: 8, qualifyingJobCount: 8 },
+        requirementEvidenceCoverage: { status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 6 } })
+      const completedReportSlots = Array.isArray(completedReport.slots) ? completedReport.slots.map(jsonRecord) : []
+      expect(completedReportSlots).toHaveLength(8)
+      expect(completedReportSlots.every(slot => slot && Object.keys(slot).sort().join(",") ===
+        "applicationStatus,job,ordinal,retirementReason,reviewStatus,reviewTurnId,submissionEvidence,tailoringStatus")).toBe(true)
+      for (const ordinal of currentOrdinals) {
+        const proof = completedProofByOrdinal.get(ordinal), slot = completedReportSlots[ordinal - 1]
+        if (!proof || !slot) throw new Error("Objective completed report omitted a submitted slot")
+        expect(slot).toMatchObject({ ordinal, tailoringStatus: "ready", reviewStatus: "approved", reviewTurnId,
+          retirementReason: null, applicationStatus: "submitted", submissionEvidence: {
+            fillTurnId: proof.durable.fillTurnId, finalItemId: proof.durable.finalization.finalItemId,
+          } })
+      }
+      expect(completedReportSlots[staleOrdinal - 1]).toMatchObject({ ordinal: staleOrdinal, tailoringStatus: "ready",
+        reviewStatus: "expired", reviewTurnId, retirementReason: "resume_material_changed",
+        applicationStatus: "not_started", submissionEvidence: null })
+      for (const ordinal of [3, 8]) {
+        expect(completedReportSlots[ordinal - 1]).toMatchObject({ ordinal, tailoringStatus: "rejected",
+          reviewStatus: "not_requested", reviewTurnId: null, retirementReason: null,
+          applicationStatus: "not_started", submissionEvidence: null })
+      }
+      const completedReportJson = JSON.stringify(Object.fromEntries(Object.entries(completedReport)
+        .filter(([key]) => key !== "finalItemId")))
+      expect(privateReportMarkers.some(value => completedReportJson.includes(value))).toBe(false)
+      const comparisonPath = `/api/agent/sessions/${sessionId}/final-items/${finalItemId}/objective-report`
+      const comparisonContext = { params: Promise.resolve({ id: sessionId, itemId: finalItemId }) }
+      const { POST: compareObjective } = await import("@/app/api/agent/sessions/[id]/final-items/[itemId]/objective-report/route")
+      const compare = (bearer: string, graphRevision: number) => compareObjective(
+        apiRequest(comparisonPath, bearer, "POST", { compareConfirmedSkills: true, graphRevision }), comparisonContext)
+      const comparisonResponse = await compare(token, graphRow.revision)
+      expect(comparisonResponse.status).toBe(200)
+      expect(comparisonResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+      const comparisonEnvelope = await jsonResponse(comparisonResponse)
+      expect(comparisonEnvelope).toEqual({ comparison: {
+        schemaVersion: "agent-harness.v2.objective-skill-comparison.v1", finalItemId, graphRevision: graphRow.revision,
+        coverage: "complete", skills: [
+          { label: "TypeScript", evidenceStatus: "confirmed_persona_match", slotOrdinals: [1, 2, 4, 5, 6, 7] },
+          { label: "Rust", evidenceStatus: "needs_confirmation", slotOrdinals: [1, 2, 4, 5, 6, 7] },
+        ], suggestedTerms: ["TypeScript"],
+      } })
+      const comparison = jsonRecord(comparisonEnvelope.comparison)
+      if (!comparison) throw new Error("Objective skill comparison is unavailable")
+      const comparisonJson = JSON.stringify(Object.fromEntries(Object.entries(comparison)
+        .filter(([key]) => key !== "finalItemId")))
+      for (const forbidden of [requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE,
+        requirementFixture.OBJECTIVE_WAVE_RUST_REQUIREMENT_QUOTE, "Terraform", "PrivateFixtureSkill", pastedSkillsFactId,
+        "pasted_skills", "normalizedValue", "allowedUses", ...jobIds, sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds]) {
+        expect(comparisonJson).not.toContain(forbidden)
+      }
+      const foreignComparisonResponse = await compare(await signedBearer(ids.foreignUser), graphRow.revision)
+      expect(foreignComparisonResponse.status).toBe(404)
+      expect(await jsonResponse(foreignComparisonResponse)).not.toHaveProperty("comparison")
+      const staleComparisonResponse = await compare(token, graphRow.revision + 1)
+      expect(staleComparisonResponse.status).toBe(404)
+      expect(await jsonResponse(staleComparisonResponse)).not.toHaveProperty("comparison")
+      const postComparisonStats = await requestFixtureStats()
+      expect(postComparisonStats.objectiveGetCounts).toEqual(finalWaveStats.objectiveGetCounts)
+      expect(postComparisonStats.objectiveSubmitReceipts).toEqual(finalWaveStats.objectiveSubmitReceipts)
+      expect(postComparisonStats.submitCount).toBe(finalWaveStats.submitCount)
+      expect(postComparisonStats.reviewedSubmitCount).toBe(finalWaveStats.reviewedSubmitCount)
+      expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
+      expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
+      selectedJobFullLoopPhase("objective_wave_skill_comparison_verified")
     } finally {
       if (sourceWorker && worker !== sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
       if (worker && !exited(worker)) await stopFixture(worker)
