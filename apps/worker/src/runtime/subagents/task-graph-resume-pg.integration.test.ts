@@ -505,6 +505,63 @@ async function waitForPersistedNativeQuestion(pool: Pool, owner: Fixture, toolCa
   throw new Error("Native clarification question did not reach its durable waiting state")
 }
 
+async function nativeQuestionWaitFailureDiagnostic(
+  pool: Pool, owner: Fixture, toolCallId: string,
+  state: Readonly<{ rootStage: string; rootExecutions: number; rootModelFailure: string | null; childStage: string; jobsSearchAppeared: boolean }>,
+): Promise<RecordValue> {
+  try {
+    const result = await pool.query<{
+      turnStatus: string; rootStatus: string; rootFailureReason: string | null; askUserCallCount: number
+      matchingCallStatus: string | null; matchingResultStatus: string | null; matchingErrorCode: string | null; questionCount: number
+    }>(
+      `SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus", root."failureReason" AS "rootFailureReason",
+         (SELECT COUNT(*)::int FROM "agent_items" AS call
+           WHERE call."sessionId" = turn."sessionId" AND call."turnId" = turn."id" AND call."taskId" = root."id"
+             AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'agent.ask_user') AS "askUserCallCount",
+         (SELECT call."status" FROM "agent_items" AS call
+           WHERE call."sessionId" = turn."sessionId" AND call."turnId" = turn."id" AND call."taskId" = root."id"
+             AND call."type" = 'tool_call' AND call."content"->>'toolCallId' = $4 ORDER BY call."createdAt" DESC LIMIT 1) AS "matchingCallStatus",
+         (SELECT result."status" FROM "agent_items" AS result
+           WHERE result."sessionId" = turn."sessionId" AND result."turnId" = turn."id" AND result."taskId" = root."id"
+             AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = $4 ORDER BY result."createdAt" DESC LIMIT 1) AS "matchingResultStatus",
+         (SELECT result."content"->>'errorCode' FROM "agent_items" AS result
+           WHERE result."sessionId" = turn."sessionId" AND result."turnId" = turn."id" AND result."taskId" = root."id"
+             AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = $4 ORDER BY result."createdAt" DESC LIMIT 1) AS "matchingErrorCode",
+         (SELECT COUNT(*)::int FROM "agent_items" AS question
+           WHERE question."sessionId" = turn."sessionId" AND question."turnId" = turn."id" AND question."taskId" = root."id"
+             AND question."type" = 'question' AND question."content"->>'toolCallId' = $4) AS "questionCount"
+       FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+         AND root."turnId" = turn."id" AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL
+       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3`,
+      [owner.turnId, owner.sessionId, owner.userId, toolCallId],
+    )
+    const row = result.rows[0]
+    const modelFailureName = state.rootModelFailure?.match(/^([A-Za-z][A-Za-z0-9_.-]{0,63}):/)?.[1]
+    return {
+      available: result.rows.length === 1,
+      rootStage: diagnosticEnum(state.rootStage, new Set(["not_started", "initial_plan", "scout_wait", "clarification_wait", "replan", "analyst_plan_receipt", "analyst_wait", "final"])) ?? "other",
+      rootExecutions: diagnosticBoundedCount(state.rootExecutions),
+      rootModelFailureClass: state.rootModelFailure === null ? "none"
+        : diagnosticEnum(modelFailureName, new Set(["AssertionError", "CoordinationError", "TaskGraphCommandError", "Error"])) ?? "other",
+      childStage: diagnosticEnum(state.childStage, new Set(["not_started", "search_visibility", "search_call_emitted", "parent_wait", "result_emitted"])) ?? "other",
+      jobsSearchAppeared: state.jobsSearchAppeared,
+      turnStatus: diagnosticEnum(row?.turnStatus, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+      rootStatus: diagnosticEnum(row?.rootStatus, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+      rootFailureReasonCode: diagnosticErrorCode(row?.rootFailureReason),
+      askUserCallCount: diagnosticBoundedCount(row?.askUserCallCount),
+      matchingCallStatus: diagnosticEnum(row?.matchingCallStatus, ITEM_DIAGNOSTIC_STATUSES) ?? "none",
+      matchingResultStatus: diagnosticEnum(row?.matchingResultStatus, ITEM_DIAGNOSTIC_STATUSES) ?? "none",
+      matchingErrorCode: diagnosticErrorCode(row?.matchingErrorCode),
+      questionCount: diagnosticBoundedCount(row?.questionCount),
+    }
+  } catch {
+    return { available: false, rootStage: diagnosticEnum(state.rootStage,
+      new Set(["not_started", "initial_plan", "scout_wait", "clarification_wait", "replan", "analyst_plan_receipt", "analyst_wait", "final"])) ?? "other" }
+  }
+}
+
 function expectAdmittedNativeClarificationObservation(
   request: HarnessModelRequest, expectedQuestion: string, expectedAnswer: string, expectedGraphRevision: number,
 ): void {
@@ -15535,7 +15592,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     }
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: discoveryOwner.turnId, sessionId: discoveryOwner.sessionId, ownerId: discoveryOwner.ownerId })
-    const nativeQuestion = await waitForPersistedNativeQuestion(pool!, discoveryOwner, "p3-discovery-clarification")
+    let nativeQuestion: NativeQuestionFixture
+    try {
+      nativeQuestion = await waitForPersistedNativeQuestion(pool!, discoveryOwner, "p3-discovery-clarification")
+    } catch {
+      const diagnostics = await nativeQuestionWaitFailureDiagnostic(pool!, discoveryOwner, "p3-discovery-clarification", {
+        rootStage: discoveryRootStage, rootExecutions: rootExecution, rootModelFailure: discoveryRootModelFailure,
+        childStage: discoveryChildStage, jobsSearchAppeared: discoveryJobsSearchAppeared,
+      })
+      throw new Error(`Native clarification wait diagnostics=${JSON.stringify(diagnostics)}`)
+    }
     expect(nativeQuestion.content.question === discoveryClarificationQuestion).toBe(true)
     expect(nativeQuestion.content.waitKind).toBe("question")
     const answer = await answerDisposableNativeQuestion(discoveryOwner, nativeQuestion, discoveryClarificationAnswer)
