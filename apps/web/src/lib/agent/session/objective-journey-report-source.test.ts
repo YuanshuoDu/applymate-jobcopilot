@@ -3,7 +3,7 @@ import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA } from "@jobcopilot/ag
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey } from "./final-task-graph-source-detail"
 import { readFinalTaskGraphSourceSnapshot } from "./objective-tailor-final-source-graph"
 import { parseObjectiveTailorProgressSnapshot } from "./objective-tailor-progress-snapshot"
-import { readObjectiveJourneySource } from "./objective-journey-report-source"
+import { readObjectiveJourneyProofContext, readObjectiveJourneyReadySlot, readObjectiveJourneySource } from "./objective-journey-report-source"
 
 const mocks = vi.hoisted(() => ({ pairProof: vi.fn(), validManifest: vi.fn() }))
 vi.mock("../broker/objective-application-review-source-proof", async importOriginal => {
@@ -37,6 +37,16 @@ describe("readObjectiveJourneySource", () => {
     fixture.taskRows[fixture.taskRows.length - 1] = { ...fixture.taskRows[0] }
     const result = await readObjectiveJourneySource(fixture.client as never, { userId, sessionId, finalItemId: finalId })
     expect(result).toBeNull()
+  })
+
+  it("rejects a ready slot when its candidate Job witness is duplicated by another slot", async () => {
+    const fixture = sourceFixture(), firstWriter = fixture.taskRows.find(row => row.id === "task-writer-1")!
+    const secondWriter = fixture.taskRows.find(row => row.id === "task-writer-2")!
+    firstWriter.context = secondWriter.context
+    const context = await readObjectiveJourneyProofContext(fixture.client as never, { userId, sessionId, finalItemId: finalId })
+    expect(context).not.toBeNull()
+    expect(readObjectiveJourneyReadySlot(context!, 2)).toBeNull()
+    expect(mocks.pairProof).not.toHaveBeenCalled()
   })
 
   it("projects only the closed V3 reported floor from the verified final sidecar", async () => {

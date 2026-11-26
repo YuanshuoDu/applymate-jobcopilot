@@ -76,6 +76,8 @@ describe('ObjectiveJourneyReport', () => {
     expect(html).toContain('Unresolved</dt><dd>0</dd>')
     expect(html).toContain('Submission confirmed with verified fill evidence.')
     expect(html).toContain('View fill evidence')
+    expect((html.match(/View verified draft/g) ?? []).length).toBe(1)
+    expect(html).not.toContain('Request application review')
     expect(html).not.toContain('fill-final-1')
     expect(html).not.toContain('review-turn-1')
     expect(html).not.toContain('href=')
@@ -112,6 +114,14 @@ describe('ObjectiveJourneyReport', () => {
     api.state = { data: { report: { ...journeyWithFloor, reportedScoreFloor: { status: 'not_requested' } } },
       loading: false, error: null, refetch: vi.fn() }
     expect(renderToStaticMarkup(view(floor))).toContain('data-objective-journey-report="unavailable"')
+  })
+
+  it('does not offer a draft action without the report-owned job label', () => {
+    const noOwnedJob = { ...journey, slots: [{ ...journey.slots[0]!, job: null }, journey.slots[1]!] }
+    api.state = { data: { report: noOwnedJob }, loading: false, error: null, refetch: vi.fn() }
+    const html = renderToStaticMarkup(view())
+    expect(html).toContain('Job 1')
+    expect(html).not.toContain('View verified draft')
   })
 
   it('shows observed confirmations and an unresolved count when some application states are unknown', () => {
