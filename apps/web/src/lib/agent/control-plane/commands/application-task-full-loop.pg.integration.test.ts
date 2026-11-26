@@ -5678,6 +5678,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(proofs.every(proof => proof.durable.task.status === "submitted" && proof.durable.turn.status === "completed"
         && proof.durable.job.status === "applied" && proof.durable.finalization.itemStatus === "completed")).toBe(true)
       selectedJobFullLoopPhase("objective_wave_completed")
+      const postWaveOwnerToken = await signedBearer(userId)
+      const postWaveForeignToken = await signedBearer(ids.foreignUser)
       const postWaveSessionTurnCount = await testDb.agentTurn.count({ where: { userId, sessionId } })
       const postWaveApplicationTaskCount = await testDb.applicationTask.count({ where: { userId, sessionId } })
 
@@ -5685,7 +5687,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         value: "TypeScript, PrivateFixtureSkill", normalizedValue: "typescript, privatefixtureskill", source: "manual",
         evidence: { label: "Skills" }, status: "confirmed", allowedUses: ["discovery"], consentAt: new Date(), updatedAt: new Date() } })
       const completedProofByOrdinal = new Map(proofs.map(proof => [proof.durable.slot.ordinal, proof] as const))
-      const completedReportResponse = await getObjectiveJourneyReport(sessionId, finalItemId, token)
+      const completedReportResponse = await getObjectiveJourneyReport(sessionId, finalItemId, postWaveOwnerToken)
       expect(completedReportResponse.status).toBe(200)
       expect(completedReportResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
       const completedReportEnvelope = await jsonResponse(completedReportResponse)
@@ -5723,7 +5725,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const { POST: compareObjective } = await import("@/app/api/agent/sessions/[id]/final-items/[itemId]/objective-report/route")
       const compare = (bearer: string, graphRevision: number) => compareObjective(
         apiRequest(comparisonPath, bearer, "POST", { compareConfirmedSkills: true, graphRevision }), comparisonContext)
-      const comparisonResponse = await compare(token, graphRow.revision)
+      const comparisonResponse = await compare(postWaveOwnerToken, graphRow.revision)
       expect(comparisonResponse.status).toBe(200)
       expect(comparisonResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
       const comparisonEnvelope = await jsonResponse(comparisonResponse)
@@ -5743,10 +5745,10 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         "pasted_skills", "normalizedValue", "allowedUses", ...jobIds, sourceTurnId, sourceRootTaskId, graphRow.id, ...sourceTaskIds]) {
         expect(comparisonJson).not.toContain(forbidden)
       }
-      const foreignComparisonResponse = await compare(await signedBearer(ids.foreignUser), graphRow.revision)
+      const foreignComparisonResponse = await compare(postWaveForeignToken, graphRow.revision)
       expect(foreignComparisonResponse.status).toBe(404)
       expect(await jsonResponse(foreignComparisonResponse)).not.toHaveProperty("comparison")
-      const staleComparisonResponse = await compare(token, graphRow.revision + 1)
+      const staleComparisonResponse = await compare(postWaveOwnerToken, graphRow.revision + 1)
       expect(staleComparisonResponse.status).toBe(404)
       expect(await jsonResponse(staleComparisonResponse)).not.toHaveProperty("comparison")
       const postComparisonStats = await requestFixtureStats()
