@@ -159,6 +159,24 @@ describe('HarnessItem renderers', () => {
     expect(links.every(id => !id?.includes('same-final-item'))).toBe(true)
   })
 
+  it('keeps source-group actions bounded and independently wired per final card', () => {
+    const scout = `src_${'F'.repeat(43)}`
+    const content = { text: 'Answer', objectiveTailorFinalOutcomes: {
+      schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: 2,
+      slots: [{ ordinal: 1, status: 'ready' }], sourceCounts: {
+        discoveredJobs: { knownCount: 1, coverage: 'complete' }, analyzedJobs: { knownCount: 0, coverage: 'complete' },
+      },
+    }, objectiveTailorSourceGroups: { schemaVersion: 'agent-harness.v2.objective-tailor-source-groups.v1', graphRevision: 2,
+      groups: { discoveredJobs: [scout], analyzedJobs: [] } }, taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION,
+        graphRevision: 2, sources: [{ sourceKey: scout, nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' }] } }
+    const duplicate = item({ id: 'grouped-final-item', sessionId: 'session-1', turnId: 'source-turn-1', taskId: 'root-1', phase: 'final_answer', content })
+    const html = renderToStaticMarkup(<I18nProvider><><HarnessItem item={duplicate} /><HarnessItem item={duplicate} /></></I18nProvider>)
+    expect(html.match(/data-objective-source-group-action="discoveredJobs"/g)).toHaveLength(2)
+    expect(html.match(/data-objective-source-group-action="analyzedJobs"/g)).toBeNull()
+    expect([...html.matchAll(/<a href="#([^"]+)">View related task evidence<\/a>/g)].map(match => match[1])).toHaveLength(2)
+    expect(html).not.toContain(scout)
+  })
+
   it('omits source navigation when source counts or their same-revision manifest are invalid', () => {
     const sidecar = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V2_SCHEMA, graphRevision: 2,
       slots: [{ ordinal: 1, status: 'ready' }], sourceCounts: {

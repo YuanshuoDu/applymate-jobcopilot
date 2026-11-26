@@ -45,6 +45,48 @@ describe('FinalTaskGraphSources', () => {
     expect(withoutNavigation).not.toContain('tabindex="-1"')
   })
 
+  it('marks only the validated group rows without opening lazy task detail', () => {
+    const scout = `src_${'S'.repeat(43)}`, otherScout = `src_${'T'.repeat(43)}`, analyst = `src_${'U'.repeat(43)}`
+    const groupedManifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 12, sources: [
+      { sourceKey: scout, nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+      { sourceKey: otherScout, nodeIndex: 1, role: 'scout', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed' },
+      { sourceKey: analyst, nodeIndex: 2, role: 'analyst', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'partial' },
+    ] }
+    const groups = { schemaVersion: 'agent-harness.v2.objective-tailor-source-groups.v1', graphRevision: 12,
+      groups: { discoveredJobs: [scout], analyzedJobs: [analyst] } }
+    const groupedContent = { taskGraphSources: groupedManifest, objectiveTailorFinalOutcomes: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v2', graphRevision: 12,
+      slots: [{ ordinal: 1, status: 'ready' }], sourceCounts: {
+        discoveredJobs: { knownCount: 1, coverage: 'complete' }, analyzedJobs: { knownCount: 1, coverage: 'complete' },
+      },
+    }, objectiveTailorSourceGroups: groups }
+    const html = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources content={groupedContent}
+      sessionId="session" finalItemId="item" lang="en" sourceGroupSelection={{ group: 'discoveredJobs',
+        sourceKeys: [scout], graphRevision: 12, requestId: 1 }} /></I18nProvider>)
+    expect(html).toContain('data-objective-source-group-selection="true"')
+    expect(html).toContain('data-objective-source-group="discoveredJobs"')
+    expect(html).toContain('data-objective-source-group-member="true"')
+    expect(html.match(/data-objective-source-group-member="true"/g)).toHaveLength(1)
+    expect(html).not.toContain(scout)
+    expect(html).not.toContain(otherScout)
+    expect(html).not.toContain(analyst)
+    expect(html).not.toContain('data-task-graph-source-detail="true"')
+
+    const stale = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources content={groupedContent}
+      sessionId="session" finalItemId="item" lang="en" sourceGroupSelection={{ group: 'discoveredJobs',
+        sourceKeys: [scout], graphRevision: 11, requestId: 2 }} /></I18nProvider>)
+    expect(stale).not.toContain('data-objective-source-group-selection="true"')
+    expect(stale).not.toContain('data-objective-source-group-member="true"')
+    expect(stale).not.toContain('tabindex="-1"')
+
+    const changed = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources content={{ ...groupedContent,
+      objectiveTailorSourceGroups: { ...groups, groups: { discoveredJobs: [otherScout], analyzedJobs: [analyst] } } }}
+      sessionId="session" finalItemId="item" lang="en" sourceGroupSelection={{ group: 'discoveredJobs',
+        sourceKeys: [scout], graphRevision: 12, requestId: 3 }} /></I18nProvider>)
+    expect(changed).not.toContain('data-objective-source-group-selection="true"')
+    expect(changed).not.toContain('data-objective-source-group-member="true"')
+  })
+
   it('omits the panel when the manifest is absent or malformed', () => {
     for (const content of [{ text: 'Answer' }, { taskGraphSources: { ...manifest, taskId: 'private' } }]) {
       const html = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources

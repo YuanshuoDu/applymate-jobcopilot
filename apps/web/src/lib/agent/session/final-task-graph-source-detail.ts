@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD,
   projectPlanLedger,
   projectTaskGraphVerificationSummary,
   type TaskGraphVerificationDisplayNode,
@@ -20,6 +21,7 @@ import {
 import { projectFinalAnswerContent } from './final-answer-evidence-projection'
 import { readFinalTaskGraphSourceSnapshot } from './objective-tailor-final-source-graph'
 import { parseObjectiveTailorFinalOutcomesFromContent } from './objective-tailor-final-content'
+import { readObjectiveTailorSourceGroups } from './objective-tailor-source-groups'
 
 export interface FinalTaskGraphSourceDetail {
   readonly goal: string
@@ -50,8 +52,11 @@ export function projectFinalAnswerTaskGraphSourceContent(finalItemId: string, ph
   const taskGraphSources = manifest && isCanonicalTaskGraphSourceManifest(finalItemId, manifest) ? manifest : undefined
   const objectiveTailorFinalOutcomes = phase === 'final_answer' && status === 'completed' && hasCanonicalFinalAnswerContent(rawContent)
     ? parseObjectiveTailorFinalOutcomesFromContent(rawContent) : undefined
+  const objectiveTailorSourceGroups = taskGraphSources && objectiveTailorFinalOutcomes
+    ? readObjectiveTailorSourceGroups(record(rawContent)?.[OBJECTIVE_TAILOR_SOURCE_GROUPS_FIELD], taskGraphSources, objectiveTailorFinalOutcomes) : undefined
   return { text: answerText, ...(summary ? { summary } : {}), ...(answerEvidence ? { answerEvidence } : {}),
-    ...(taskGraphSources ? { taskGraphSources } : {}), ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}) }
+    ...(taskGraphSources ? { taskGraphSources } : {}), ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}),
+    ...(objectiveTailorSourceGroups ? { objectiveTailorSourceGroups } : {}) }
 }
 
 export function projectFinalTaskGraphSourceDetail(input: {
