@@ -1,14 +1,18 @@
 import type { Prisma } from "@prisma/client"
 import { OBJECTIVE_TAILOR_FINAL_OUTCOME_SIDECAR_V3_SCHEMA, parseObjectiveTailorFinalOutcomeSidecar,
-  type ObjectiveTailorGraph, type ObjectiveTailorSourceGroups } from "@jobcopilot/agent-protocol"
-import { objectiveApplicationReviewPairProof, validObjectiveApplicationSourceManifest } from "../broker/objective-application-review-source-proof"
-import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, isCanonicalTaskGraphSourceManifest } from "./final-task-graph-source-detail"
+  type ObjectiveTailorSourceGroups } from "@jobcopilot/agent-protocol"
+import { validObjectiveApplicationSourceManifest } from "../broker/objective-application-review-source-proof"
+import { canonicalTaskGraphItemId, isCanonicalTaskGraphSourceManifest } from "./final-task-graph-source-detail"
 import { parseFinalTaskGraphSourceManifest, type FinalTaskGraphSourceManifest } from "./final-task-graph-source-manifest"
 import { readFinalTaskGraphSourceSnapshot } from "./objective-tailor-final-source-graph"
 import { parseObjectiveTailorProgressSnapshot } from "./objective-tailor-progress-snapshot"
 import { readObjectiveTailorSourceGroups } from "./objective-tailor-source-groups"
 import type { ObjectiveJourneyReport, ObjectiveJourneyReportedScoreFloor } from "./objective-journey-report-contract"
 import { objectiveJourneyAnalystGraphRequirements } from "./objective-journey-report-requirement-proof"
+import { readObjectiveJourneyReadySlot, readObjectiveJourneySlotCandidate, readObjectiveJourneySlotPair } from "./objective-journey-slot-source"
+import type { ObjectiveJourneyReadySlotProof, ObjectiveJourneySlotCandidate } from "./objective-journey-slot-source"
+export { readObjectiveJourneyReadySlot }
+export type { ObjectiveJourneyReadySlotProof }
 type Tx = Prisma.TransactionClient
 type Row = Record<string, unknown>; type Slot = ObjectiveJourneyReport["slots"][number]
 type SourceGraphNodes = readonly Row[]
@@ -16,26 +20,17 @@ type SlotSource = Readonly<{
   ordinal: number; tailoringStatus: Slot["tailoringStatus"]; sourceReady: boolean; jobId: string | null
   job: Slot["job"]; writerTaskId: string | null; reviewerTaskId: string | null
   requirementAnalyst?: Readonly<{ nodeKey: string; taskId: string; attemptCount: number; proofDigest: string;
-    jobMaterialDigest: string; criteriaIds: readonly string[]; dependencyNodeKeys: readonly string[];
-    dependencies: readonly Readonly<{ nodeKey: string; taskId: string }>[] }> | null
-}>
-export type ObjectiveJourneySource = Readonly<{
-  userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
-  sourceCounts: ObjectiveJourneyReport["sourceCounts"]; slots: readonly SlotSource[]; reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor
-}>
-export type ObjectiveJourneyProofContext = Readonly<{
-  userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
-  manifest: FinalTaskGraphSourceManifest
-  sidecar: NonNullable<ReturnType<typeof parseObjectiveTailorFinalOutcomeSidecar>>
-  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>
-  tasks: ReadonlyMap<string, Row>; graphNodes: SourceGraphNodes; sourceGroups?: ObjectiveTailorSourceGroups
-}>
+    jobMaterialDigest: string; criteriaIds: readonly string[]; dependencyNodeKeys: readonly string[]; dependencies: readonly Readonly<{ nodeKey: string; taskId: string }>[] }> | null }>
+export type ObjectiveJourneySource = Readonly<{ userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
+  sourceCounts: ObjectiveJourneyReport["sourceCounts"]; slots: readonly SlotSource[]; reportedScoreFloor?: ObjectiveJourneyReportedScoreFloor }>
+export type ObjectiveJourneyProofContext = Readonly<{ userId: string; sessionId: string; sourceTurnId: string; rootTaskId: string; finalItemId: string; graphRevision: number
+  manifest: FinalTaskGraphSourceManifest; sidecar: NonNullable<ReturnType<typeof parseObjectiveTailorFinalOutcomeSidecar>>
+  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>; tasks: ReadonlyMap<string, Row>; graphNodes: SourceGraphNodes; sourceGroups?: ObjectiveTailorSourceGroups }>
 export async function readObjectiveJourneySource(tx: Tx, input: Readonly<{ userId: string; sessionId: string; finalItemId: string }>): Promise<ObjectiveJourneySource | null> {
   const context = await readObjectiveJourneyProofContext(tx, input)
   if (!context || !validObjectiveApplicationSourceManifest(context.manifest, input.finalItemId, context.progress, context.tasks)) return null
   return readSlots(tx, input, context.sourceTurnId, context.rootTaskId, context.graphRevision, context.progress, context.sidecar, context.tasks, context.graphNodes)
 }
-/** Reads the owned graph proof before the report-specific completed-only gate. */
 export async function readObjectiveJourneyProofContext(tx: Tx, input: Readonly<{ userId: string; sessionId: string; finalItemId: string }>,
   expectedGraphRevision?: number): Promise<ObjectiveJourneyProofContext | null> {
   if (![input.userId, input.sessionId, input.finalItemId].every(id)) return null
@@ -103,15 +98,13 @@ async function readGraph(tx: Tx, input: { userId: string; sessionId: string; fin
     graphRevision: Number(graphRow.revision), manifest, sidecar, progress, tasks, graphNodes, ...(sourceGroups ? { sourceGroups } : {}) }
 }
 function sourceGraphNodes(value: unknown): SourceGraphNodes | undefined {
-  try { const nodes = record(value)?.nodes
-    if (!Array.isArray(nodes) || Object.getPrototypeOf(nodes) !== Array.prototype || nodes.length > 8 || Reflect.ownKeys(nodes).length !== nodes.length + 1) return undefined
+  try { const nodes = record(value)?.nodes; if (!Array.isArray(nodes) || Object.getPrototypeOf(nodes) !== Array.prototype || nodes.length > 8 || Reflect.ownKeys(nodes).length !== nodes.length + 1) return undefined
     const rows = nodes.map(record); return rows.every((row): row is Row => !!row) ? rows : undefined
   } catch { return undefined }
 }
 async function readSlots(tx: Tx, input: { userId: string; sessionId: string; finalItemId: string }, sourceTurnId: string, rootTaskId: string, graphRevision: number,
-  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, sidecar: NonNullable<ReturnType<typeof parseObjectiveTailorFinalOutcomeSidecar>>,
-  tasks: ReadonlyMap<string, Row>, graphNodes: SourceGraphNodes): Promise<ObjectiveJourneySource | null> {
-  const candidates = progress.marker.slots.map((slot, index) => candidateForSlot(slot, index + 1, graphRevision, progress, tasks))
+  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, sidecar: NonNullable<ReturnType<typeof parseObjectiveTailorFinalOutcomeSidecar>>, tasks: ReadonlyMap<string, Row>, graphNodes: SourceGraphNodes): Promise<ObjectiveJourneySource | null> {
+  const candidates = progress.marker.slots.map((slot, index) => readObjectiveJourneySlotCandidate(slot, index + 1, graphRevision, progress, tasks))
   const jobIds = candidates.flatMap(candidate => candidate ? [candidate.jobId] : [])
   const frequencies = new Map<string, number>()
   for (const jobId of jobIds) frequencies.set(jobId, (frequencies.get(jobId) ?? 0) + 1)
@@ -131,7 +124,7 @@ async function readSlots(tx: Tx, input: { userId: string; sessionId: string; fin
     const candidate = candidates[index]
     const jobRow = candidate && frequencies.get(candidate.jobId) === 1 ? jobById.get(candidate.jobId) : undefined
     const job = jobRow ? jobLabel(jobRow) : undefined
-    const pair = status === "ready" && candidate && job ? readyPair(marker, ordinal, graphRevision, candidate.jobId, progress, tasks) : undefined
+    const pair = status === "ready" && candidate && job ? readObjectiveJourneySlotPair(marker, ordinal, graphRevision, candidate.jobId, progress, tasks) : undefined
     const requirementAnalyst = status === "ready" && pair && candidate && job
       ? requirementAnalystFor(marker.sourceAnalystNodeKey, candidate, progress, tasks, graphNodes) : null
     slots.push({ ordinal, tailoringStatus: status, sourceReady: !!pair && !!job, jobId: job ? candidate?.jobId ?? null : null,
@@ -146,25 +139,7 @@ async function readSlots(tx: Tx, input: { userId: string; sessionId: string; fin
     rootTaskId, finalItemId: input.finalItemId, graphRevision, sourceCounts, slots,
     ...(reportedScoreFloor ? { reportedScoreFloor } : {}) }
 }
-function candidateForSlot(slot: ObjectiveTailorGraph["slots"][number], ordinal: number, revision: number,
-  progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: ReadonlyMap<string, Row>):
-  { jobId: string; sourceAnalystKeys: readonly string[]; analystProofDigest: string; jobMaterialDigest: string } | undefined {
-  const writerNode = progress.nodes.find(node => node.key === slot.writerNodeKey), writer = writerNode && tasks.get(writerNode.taskId)
-  const context = writer && record(writer.context), selected = context && exactRecord(context.selectedJobPreparation, "jobId")
-  const witness = context && candidateWitness(context.objectiveTailorCandidateWitness)
-  const contextKeys = context && Object.keys(context).sort().join(",")
-  const allowed = "objectiveTailorCandidateMode,objectiveTailorCandidateWitness,selectedJobPreparation"
-  const withDependencies = `${allowed},taskGraphDependencyResults`
-  const sourceNodes = new Map(progress.nodes.map(node => [node.key, node]))
-  return context?.objectiveTailorCandidateMode === true && (contextKeys === allowed || contextKeys === withDependencies)
-    && selected?.jobId === witness?.jobId && witness?.slotId === `tailor-${ordinal}`
-    && witness.writerNodeKey === slot.writerNodeKey && witness.reviewerNodeKey === slot.reviewerNodeKey
-    && witness.sourceAnalystKeys.includes(slot.sourceAnalystNodeKey)
-    && witness.sourceAnalystKeys.every(key => sourceNodes.get(key)?.templateId === "analyst")
-    && witness.admittedRevision <= revision ? { jobId: witness.jobId, sourceAnalystKeys: witness.sourceAnalystKeys,
-      analystProofDigest: witness.analystProofDigest, jobMaterialDigest: witness.materialDigest } : undefined
-}
-function requirementAnalystFor(nodeKey: string, candidate: NonNullable<ReturnType<typeof candidateForSlot>>,
+function requirementAnalystFor(nodeKey: string, candidate: ObjectiveJourneySlotCandidate,
   progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: ReadonlyMap<string, Row>,
   graphNodes: SourceGraphNodes): SlotSource["requirementAnalyst"] {
   const node = progress.nodes.find(value => value.key === nodeKey), task = node && tasks.get(node.taskId)
@@ -182,58 +157,6 @@ function requirementAnalystFor(nodeKey: string, candidate: NonNullable<ReturnTyp
     && Number.isSafeInteger(task.attemptCount) && Number(task.attemptCount) >= 1 && task.leaseOwner === null && task.leaseExpiresAt === null
     ? { nodeKey, taskId: node.taskId, attemptCount: Number(task.attemptCount), proofDigest: candidate.analystProofDigest,
       jobMaterialDigest: candidate.jobMaterialDigest, criteriaIds, dependencyNodeKeys, dependencies } : null
-}
-function readyPair(slot: ObjectiveTailorGraph["slots"][number], ordinal: number, revision: number,
-  jobId: string, progress: NonNullable<ReturnType<typeof parseObjectiveTailorProgressSnapshot>>, tasks: ReadonlyMap<string, Row>) {
-  const correction = slot.correction, writerNode = progress.nodes.find(node => node.key === (correction?.writerNodeKey ?? slot.writerNodeKey))
-  const reviewerNode = progress.nodes.find(node => node.key === (correction?.reviewerNodeKey ?? slot.reviewerNodeKey))
-  const writerTask = writerNode && tasks.get(writerNode.taskId), reviewerTask = reviewerNode && tasks.get(reviewerNode.taskId)
-  const source = pairSource(ordinal, writerNode?.taskId, reviewerNode?.taskId, writerTask?.result, reviewerTask?.result)
-  if (!writerNode || !reviewerNode || !writerTask || !reviewerTask || !source) return undefined
-  const proof = objectiveApplicationReviewPairProof({ snapshot: progress, slotOrdinal: ordinal, graphRevision: revision, jobId, source,
-    writerTask, reviewerTask, tasks })
-  return proof ? { writerTaskId: writerNode.taskId, reviewerTaskId: reviewerNode.taskId } : undefined
-}
-function pairSource(slotOrdinal: number, writerTaskId: string | undefined, reviewerTaskId: string | undefined, writerValue: unknown, reviewerValue: unknown) {
-  const writer = record(record(writerValue)?.structuredResult), reviewer = record(record(reviewerValue)?.structuredResult)
-  const ref = record(writer?.artifactRef)
-  if (!writerTaskId || !reviewerTaskId || !ref || !reviewer || !id(ref.artifactId)
-    || typeof ref.version !== "number" || !Number.isSafeInteger(ref.version) || ref.version < 1
-    || typeof ref.contentHash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(ref.contentHash)
-    || typeof ref.sourceDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(ref.sourceDigest)
-    || typeof reviewer.reviewHash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(reviewer.reviewHash)) return undefined
-  return { slotOrdinal, writerTaskId, reviewerTaskId, artifactId: ref.artifactId, version: ref.version,
-    contentHash: ref.contentHash, sourceDigest: ref.sourceDigest, reviewHash: reviewer.reviewHash }
-}
-function candidateWitness(value: unknown): { jobId: string; slotId: string; writerNodeKey: string; reviewerNodeKey: string;
-  sourceAnalystKeys: readonly string[]; analystProofDigest: string; materialDigest: string; admittedRevision: number } | undefined {
-  const row = record(value), candidate = row && record(row.candidate), sources = row?.sourceAnalystKeys
-  if (!row || !candidate || Object.keys(row).sort().join(",") !== "admittedRevision,analystProofDigest,candidate,candidateRef,reviewerNodeKey,schemaVersion,slotId,sourceAnalystKeys,sourceGraphDigest,sourceGraphRevision,sourceStatusDigest,writerNodeKey"
-    || Object.keys(candidate).sort().join(",") !== "jobId,materialDigest,score" || !id(candidate.jobId)
-    || typeof candidate.materialDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(candidate.materialDigest)
-    || row.schemaVersion !== "agent-harness.v2.objective-tailor-wave-witness.v1" || typeof row.slotId !== "string"
-    || typeof row.writerNodeKey !== "string" || typeof row.reviewerNodeKey !== "string" || !denseStrings(sources)
-    || !Number.isSafeInteger(row.admittedRevision) || Number(row.admittedRevision) < 1
-    || !Number.isSafeInteger(row.sourceGraphRevision) || Number(row.sourceGraphRevision) < 1 || Number(row.admittedRevision) <= Number(row.sourceGraphRevision)
-    || typeof candidate.score !== "number" || !Number.isFinite(candidate.score) || candidate.score < 0 || candidate.score > 10
-    || typeof row.candidateRef !== "string" || !/^otc2_[a-f0-9]{64}$/.test(row.candidateRef)
-    || ![row.analystProofDigest, row.sourceGraphDigest, row.sourceStatusDigest].every(value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value))) return undefined
-  return { jobId: candidate.jobId, slotId: row.slotId, writerNodeKey: row.writerNodeKey, reviewerNodeKey: row.reviewerNodeKey,
-    sourceAnalystKeys: sources, analystProofDigest: row.analystProofDigest as string, materialDigest: candidate.materialDigest,
-    admittedRevision: Number(row.admittedRevision) }
-}
-function denseStrings(value: unknown): value is string[] {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length < 1 || value.length > 8) return false
-  try {
-    if (Reflect.ownKeys(value).length !== value.length + 1) return false
-    const items: string[] = []
-    for (let index = 0; index < value.length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
-      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value") || !id(descriptor.value)) return false
-      items.push(descriptor.value)
-    }
-    return new Set(items).size === items.length
-  } catch { return false }
 }
 function jobLabel(row: Row): Slot["job"] | undefined {
   return typeof row.company === "string" && row.company.trim() === row.company && row.company.length > 0 && row.company.length <= 160

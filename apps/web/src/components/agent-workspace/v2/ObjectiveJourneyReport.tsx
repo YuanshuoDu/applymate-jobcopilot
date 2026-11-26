@@ -11,6 +11,8 @@ import {
 import type { Lang } from '@/lib/i18n'
 import { objectiveJourneySkillComparisonKey, ObjectiveJourneySkillComparison } from './ObjectiveJourneySkillComparison'
 
+import { ObjectiveSlotArtifact } from './ObjectiveSlotArtifact'
+
 type ExpectedCounts = Report['sourceCounts']
 type ExpectedSlot = Readonly<{ ordinal: number; tailoringStatus: Report['slots'][number]['tailoringStatus'] }>
 
@@ -76,6 +78,9 @@ export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, 
           </dl>
           {slot.retirementReason && <p style={statusStyle}>{copy.retirement}: {copy.retirementReason[slot.retirementReason]}</p>}
           {hint && <p role="note" style={statusStyle}>{hint}</p>}
+          {slot.job && <ObjectiveSlotArtifact key={objectiveSlotArtifactKey(sessionId, finalItemId, graphRevision, slot.ordinal, slot.job)}
+            sessionId={sessionId} finalItemId={finalItemId} graphRevision={graphRevision} slotOrdinal={slot.ordinal}
+            ready={slot.tailoringStatus === 'ready'} ownedLabel={`${slot.job.company} — ${slot.job.role}`} lang={lang} />}
           {slot.submissionEvidence && <div data-objective-submission-evidence="verified" style={evidenceStyle}>
             <span>{copy.confirmedSubmission}</span>
             <button type="button" onClick={() => openFillEvidence(slot.ordinal, slot.submissionEvidence!.finalItemId)}>
@@ -164,6 +169,10 @@ function submittedSummary(report: Report, copy: typeof en): string {
   const confirmed = report.slots.filter(slot => slot.applicationStatus === 'submitted').length
   const unknown = report.slots.some(slot => slot.applicationStatus === 'unknown')
   return `${confirmed}${unknown ? copy.outcomeUnavailableSuffix : ''}`
+}
+
+function objectiveSlotArtifactKey(sessionId: string, finalItemId: string, graphRevision: number, ordinal: number, job: { company: string; role: string }): string {
+  return JSON.stringify([sessionId, finalItemId, graphRevision, ordinal, job.company, job.role])
 }
 
 function safeId(value: unknown): value is string {

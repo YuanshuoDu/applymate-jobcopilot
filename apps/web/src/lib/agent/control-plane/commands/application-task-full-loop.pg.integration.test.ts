@@ -36,6 +36,8 @@ import { protocolScope, type ApprovalScopeInput } from "@/lib/agent/approval/typ
 import { parseFinalTaskGraphSourceManifest } from "@/lib/agent/session/final-task-graph-source-manifest"
 import { parseObjectiveJobEvidence } from "@/lib/agent/session/objective-job-evidence-contract"
 import { parseObjectiveSourceToolReceiptEvidence } from "@/lib/agent/session/objective-source-tool-receipts-contract"
+import { parseObjectiveSlotArtifactResponse } from "@/components/agent-workspace/v2/ObjectiveSlotArtifact"
+import { parseObjectiveSlotReviewerReceiptResponse } from "@/lib/agent/session/objective-slot-reviewer-receipt-contract"
 import type { ApplicationPackage, PipelineCtx } from "@/lib/agent/types"
 import type { ObjectiveWaveHandoffProof, ObjectiveWaveSubmissionSlot } from "./application-task-full-loop.objective-wave-submission"
 
@@ -1771,7 +1773,7 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "objective_wave_set_issued" | "objective_wave_stale_retired"
   | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff"
   | "objective_wave_skill_comparison_verified" | "objective_wave_job_evidence_verified"
-  | "objective_wave_tool_receipts_verified" | "objective_wave_completed"
+  | "objective_wave_tool_receipts_verified" | "objective_wave_artifact_receipts_verified" | "objective_wave_completed"
   | "fill_form_wait_started" | "fill_form_filled" | "final_checks_started" | "final_checks_completed"
 
 function selectedJobFullLoopPhase(phase: SelectedJobFullLoopPhase): void {
@@ -5879,6 +5881,98 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
       selectedJobFullLoopPhase("objective_wave_job_evidence_verified")
 
+      const verifyObjectiveArtifactReceipts = async () => {
+        const { GET: getObjectiveSlotArtifact } = await import(
+          "@/app/api/agent/sessions/[id]/final-items/[itemId]/objective-report/slots/[ordinal]/artifact/route")
+        const { GET: getObjectiveSlotReviewerReceipt } = await import(
+          "@/app/api/agent/sessions/[id]/final-items/[itemId]/objective-report/slots/[ordinal]/artifact/reviewer-receipt/route")
+        const readObjectiveSlotArtifact = (bearer: string, ordinal: number, revision: number) =>
+          getObjectiveSlotArtifact(apiRequest(
+            `/api/agent/sessions/${sessionId}/final-items/${finalItemId}/objective-report/slots/${ordinal}/artifact?graphRevision=${revision}`,
+            bearer, "GET"), { params: Promise.resolve({ id: sessionId, itemId: finalItemId, ordinal: String(ordinal) }) })
+        const readObjectiveSlotReviewerReceipt = (bearer: string, ordinal: number, revision: number) =>
+          getObjectiveSlotReviewerReceipt(apiRequest(
+            `/api/agent/sessions/${sessionId}/final-items/${finalItemId}/objective-report/slots/${ordinal}/artifact/reviewer-receipt?graphRevision=${revision}`,
+            bearer, "GET"), { params: Promise.resolve({ id: sessionId, itemId: finalItemId, ordinal: String(ordinal) }) })
+        const artifactOrdinals = [1, 2] as const
+        const artifactBaselineStats = await requestFixtureStats()
+        const artifactRefs = new Map<number, ReturnType<typeof parseObjectiveSlotArtifactResponse>>()
+        const reviewerReceipts = new Map<number, ReturnType<typeof parseObjectiveSlotReviewerReceiptResponse>>()
+        for (const ordinal of artifactOrdinals) {
+          const reportSlot = completedReportSlots[ordinal - 1], candidate = currentByOrdinal.get(ordinal)
+          expect(Boolean(reportSlot && reportSlot.ordinal === ordinal && reportSlot.tailoringStatus === "ready" && candidate)).toBe(true)
+          const [artifactResponse, reviewerResponse] = await Promise.all([
+            readObjectiveSlotArtifact(postWaveOwnerToken, ordinal, graphRow.revision),
+            readObjectiveSlotReviewerReceipt(postWaveOwnerToken, ordinal, graphRow.revision),
+          ])
+          expect(artifactResponse.status).toBe(200)
+          expect(reviewerResponse.status).toBe(200)
+          expect(artifactResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+          expect(reviewerResponse.headers.get("Cache-Control")).toBe("private, no-store, max-age=0")
+          const artifactEnvelope = await jsonResponse(artifactResponse), reviewerEnvelope = await jsonResponse(reviewerResponse)
+          expect(Object.keys(artifactEnvelope)).toEqual(["artifactEvidence"])
+          expect(Object.keys(reviewerEnvelope)).toEqual(["reviewerReceipt"])
+          const rawReviewerReceipt = jsonRecord(reviewerEnvelope.reviewerReceipt)
+          expect(Boolean(rawReviewerReceipt && Object.keys(rawReviewerReceipt).sort().join(",") ===
+            "artifactVersion,graphRevision,outcome,receiptKey,schemaVersion,slotOrdinal"
+            && typeof rawReviewerReceipt.receiptKey === "string" && /^review-[a-f0-9]{64}$/.test(rawReviewerReceipt.receiptKey))).toBe(true)
+          const artifactRef = parseObjectiveSlotArtifactResponse(artifactEnvelope, { graphRevision: graphRow.revision, slotOrdinal: ordinal })
+          const reviewerReceipt = parseObjectiveSlotReviewerReceiptResponse(reviewerEnvelope, { graphRevision: graphRow.revision, slotOrdinal: ordinal })
+          expect(Boolean(artifactRef && candidate && artifactRef.artifactId === candidate.artifactRef.artifactId
+            && artifactRef.version === candidate.artifactRef.version && artifactRef.contentHash === candidate.artifactRef.contentHash
+            && artifactRef.sourceDigest === candidate.artifactRef.sourceDigest)).toBe(true)
+          expect(Boolean(reviewerReceipt && artifactRef && reviewerReceipt.artifactVersion === artifactRef.version
+            && reviewerReceipt.outcome === "passed")).toBe(true)
+          if (!artifactRef || !reviewerReceipt) throw new Error("Objective artifact or Reviewer receipt evidence is unavailable")
+          artifactRefs.set(ordinal, artifactRef)
+          reviewerReceipts.set(ordinal, reviewerReceipt)
+          const serialized = JSON.stringify({ artifactEvidence: artifactEnvelope.artifactEvidence, reviewerReceipt: reviewerEnvelope.reviewerReceipt })
+          expect([objectiveCorrectedCoverLetter, reviewedCoverLetter, sourceTurnId, sourceRootTaskId, graphRow.id,
+            ...sourceTaskIds, ...jobIds].some(value => serialized.includes(value))).toBe(false)
+        }
+        expect(Boolean(currentByOrdinal.get(1)?.corrected === false && artifactRefs.get(1)?.version === currentByOrdinal.get(1)?.artifactRef.version)).toBe(true)
+        expect(Boolean(currentByOrdinal.get(2)?.corrected === true && artifactRefs.get(2)?.version === currentByOrdinal.get(2)?.artifactRef.version
+          && reviewerReceipts.get(2)?.artifactVersion === artifactRefs.get(2)?.version)).toBe(true)
+        expect(Boolean(currentByOrdinal.get(1)?.jobId && currentByOrdinal.get(2)?.jobId
+          && currentByOrdinal.get(1)?.jobId !== currentByOrdinal.get(2)?.jobId)).toBe(true)
+        expect(Boolean(reviewerReceipts.get(1)?.slotOrdinal === 1 && reviewerReceipts.get(2)?.slotOrdinal === 2
+          && reviewerReceipts.get(1)?.receiptKey !== reviewerReceipts.get(2)?.receiptKey)).toBe(true)
+        for (const ordinal of artifactOrdinals) {
+          const [artifactResponse, reviewerResponse] = await Promise.all([
+            readObjectiveSlotArtifact(postWaveOwnerToken, ordinal, graphRow.revision),
+            readObjectiveSlotReviewerReceipt(postWaveOwnerToken, ordinal, graphRow.revision),
+          ])
+          const repeatedArtifact = parseObjectiveSlotArtifactResponse(await jsonResponse(artifactResponse), {
+            graphRevision: graphRow.revision, slotOrdinal: ordinal })
+          const repeatedReviewer = parseObjectiveSlotReviewerReceiptResponse(await jsonResponse(reviewerResponse), {
+            graphRevision: graphRow.revision, slotOrdinal: ordinal })
+          expect(Boolean(repeatedArtifact && artifactRefs.get(ordinal)
+            && JSON.stringify(repeatedArtifact) === JSON.stringify(artifactRefs.get(ordinal)))).toBe(true)
+          expect(Boolean(repeatedReviewer && reviewerReceipts.get(ordinal)
+            && repeatedReviewer.receiptKey === reviewerReceipts.get(ordinal)?.receiptKey)).toBe(true)
+          const foreignArtifact = await readObjectiveSlotArtifact(postWaveForeignToken, ordinal, graphRow.revision)
+          const foreignReviewer = await readObjectiveSlotReviewerReceipt(postWaveForeignToken, ordinal, graphRow.revision)
+          const staleArtifact = await readObjectiveSlotArtifact(postWaveOwnerToken, ordinal, graphRow.revision + 1)
+          const staleReviewer = await readObjectiveSlotReviewerReceipt(postWaveOwnerToken, ordinal, graphRow.revision + 1)
+          expect(foreignArtifact.status).toBe(404)
+          expect(foreignReviewer.status).toBe(404)
+          expect(staleArtifact.status).toBe(404)
+          expect(staleReviewer.status).toBe(404)
+          expect(Object.hasOwn(await jsonResponse(foreignArtifact), "artifactEvidence")).toBe(false)
+          expect(Object.hasOwn(await jsonResponse(foreignReviewer), "reviewerReceipt")).toBe(false)
+          expect(Object.hasOwn(await jsonResponse(staleArtifact), "artifactEvidence")).toBe(false)
+          expect(Object.hasOwn(await jsonResponse(staleReviewer), "reviewerReceipt")).toBe(false)
+        }
+        const postArtifactStats = await requestFixtureStats()
+        expect(postArtifactStats.objectiveGetCounts).toEqual(artifactBaselineStats.objectiveGetCounts)
+        expect(postArtifactStats.objectiveSubmitReceipts).toEqual(artifactBaselineStats.objectiveSubmitReceipts)
+        expect(postArtifactStats.submitCount).toBe(artifactBaselineStats.submitCount)
+        expect(postArtifactStats.reviewedSubmitCount).toBe(artifactBaselineStats.reviewedSubmitCount)
+        expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
+        expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
+      }
+
+
       const { GET: getObjectiveSourceToolReceipts } = await import(
         "@/app/api/agent/sessions/[id]/final-items/[itemId]/task-graph-sources/[sourceKey]/tool-receipts/route")
       const readSourceToolReceipts = (bearer: string, sourceKey: string, revision: number) =>
@@ -5941,6 +6035,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(postWaveSessionTurnCount)
       expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(postWaveApplicationTaskCount)
       selectedJobFullLoopPhase("objective_wave_tool_receipts_verified")
+      await verifyObjectiveArtifactReceipts()
+      selectedJobFullLoopPhase("objective_wave_artifact_receipts_verified")
     } finally {
       if (sourceWorker && worker !== sourceWorker && !exited(sourceWorker)) await stopFixture(sourceWorker)
       if (worker && !exited(worker)) await stopFixture(worker)
