@@ -38,6 +38,10 @@
       "types": "./dist/agent-redaction.d.ts",
       "default": "./dist/agent-redaction.js"
     },
+    "./objective-job-requirement-evidence": {
+      "types": "./dist/objective-job-requirement-evidence.d.ts",
+      "default": "./dist/objective-job-requirement-evidence.js"
+    },
     "./pinned-outbound": {
       "types": "./dist/pinned-outbound.d.ts",
       "default": "./dist/pinned-outbound.js"

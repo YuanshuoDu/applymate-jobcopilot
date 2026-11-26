@@ -5,6 +5,7 @@ import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { taskGraphEvidenceDigest } from "./task-graph-pg-verification-receipt-validation.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { scheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
+import { objectiveJobRequirementMaterialDigest } from "@jobcopilot/shared/objective-job-requirement-evidence"
 import { readObjectiveJobRequirementEvidence, readObjectiveTailorJobRequirementEvidence } from "./objective-job-requirement-receipt.js"
 
 const mocks = vi.hoisted(() => ({ load: vi.fn(), getJob: vi.fn(), scheduledProof: vi.fn() }))
@@ -26,18 +27,18 @@ function result(quote = "Required: Rust."): AnalystResult {
     findings: [{ jobId, score: 8, evidenceIds: [`read:job:${jobId}`],
       requirementCitations: [{ evidenceId: `read:job:${jobId}`, quote }] }] }
 }
-function call(id = "call-1", requestJobId = jobId, attemptCount = 2) {
+function call(id = "call-1", requestJobId = jobId, attemptCount = 2, status: "completed" | "failed" = "completed", errorCode: string | null = null) {
   return { id: `call-item-${id}`, type: "tool_call", taskId: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId,
-    stepId: `step-${id}`, attempt: attemptCount, revision: 1,
-    content: { toolCallId: id, toolName: "jobs.get", toolVersion: "1", input: { jobId: requestJobId }, status: "completed", errorCode: null } }
+    stepId: `step-${id}`, status: "completed", attempt: attemptCount, ordinal: 0, revision: 1,
+    content: { toolCallId: id, toolName: "jobs.get", toolVersion: "1", input: { jobId: requestJobId }, status, errorCode } }
 }
-function toolResult(id = "call-1", outputJob = job(), attemptCount = 2) {
+function toolResult(id = "call-1", outputJob = job(), attemptCount = 2, errorCode: string | null = null) {
   return { id: `result-item-${id}`, type: "tool_result", taskId: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId,
-    stepId: `step-${id}`, attempt: attemptCount, revision: 1,
-    content: { toolCallId: id, status: "completed", output: { job: outputJob }, errorCode: null } }
+    stepId: `step-${id}`, status: "completed", attempt: attemptCount, ordinal: 0, revision: 1,
+    content: { toolCallId: id, output: { job: outputJob }, errorCode } }
 }
 function setup(options: { inputJobId?: string; outputJob?: ReturnType<typeof job>; attemptCount?: number;
-  duplicate?: boolean; replay?: boolean; currentJob?: ReturnType<typeof job>; quote?: string; description?: string } = {}) {
+  duplicate?: boolean; replay?: boolean; unrelatedFailed?: boolean; currentJob?: ReturnType<typeof job>; quote?: string; description?: string } = {}) {
   const inputJobId = options.inputJobId ?? jobId, attemptCount = options.attemptCount ?? 2
   const outputJob = options.outputJob ?? job(options.description ? { description: options.description } : {})
   const items = [call("call-1", inputJobId, attemptCount), toolResult("call-1", outputJob, attemptCount)]
@@ -48,17 +49,23 @@ function setup(options: { inputJobId?: string; outputJob?: ReturnType<typeof job
     outcomes.set("call-2", "completed")
     if (options.replay) replayReceipts.push({ currentCallId: "call-2", sourceCallItem: ["call-item-call-1", 1], sourceResultItem: ["result-item-call-1", 1] })
   }
+  if (options.unrelatedFailed) {
+    const unrelatedJobId = "123e4567-e89b-42d3-a456-426614174001"
+    items.push(call("unrelated", unrelatedJobId, attemptCount, "failed", "tool_execution_failed"),
+      toolResult("unrelated", job({ id: unrelatedJobId }), attemptCount, "tool_execution_failed"))
+    outcomes.set("unrelated", "failed")
+  }
   const receipts = { items, outcomes, replayReceipts, evidenceObservations: [] }
   const evidence = result(options.quote), resultDigest = taskGraphResultDigest(evidence), evidenceIds = evidence.evidence.map(item => item.id)
   mocks.load.mockResolvedValue(receipts)
   mocks.getJob.mockResolvedValue(options.currentJob ?? (options.description ? job({ description: options.description }) : job()))
-  return { evidence, client: { query: vi.fn() } as never, proof: { evidenceIds, resultDigest,
+  return { evidence, receipts, client: { query: vi.fn() } as never, proof: { evidenceIds, resultDigest,
     evidenceDigest: taskGraphEvidenceDigest(items, outcomes, evidenceIds, resultDigest, replayReceipts) } }
 }
-function input(analystResult: AnalystResult, proof?: ReturnType<typeof setup>["proof"]) {
+function input(analystResult: AnalystResult, proof?: ReturnType<typeof setup>["proof"], jobIds = [jobId]) {
   const resultDigest = taskGraphResultDigest(analystResult), evidenceIds = analystResult.evidence.map(item => item.id)
   return { scope, graphItemId: "task-graph-root-1", graphRevision: 4, analystNodeKey: "analyst-source-1", result: analystResult,
-    resultDigest, evidenceDigest: proof?.evidenceDigest ?? "", evidenceIds: proof?.evidenceIds ?? evidenceIds, jobIds: [jobId] }
+    resultDigest, evidenceDigest: proof?.evidenceDigest ?? "", evidenceIds: proof?.evidenceIds ?? evidenceIds, jobIds }
 }
 
 describe("completed Objective Job requirement receipts", () => {
@@ -66,6 +73,9 @@ describe("completed Objective Job requirement receipts", () => {
 
   it("binds a unique exact posting quote to the owned same-attempt jobs.get receipt and material digest", async () => {
     const value = setup()
+    expect(objectiveJobRequirementMaterialDigest(job())).toBe(scheduledDraftJobMaterialDigest(job()))
+    const privateTextJob = job({ description: "Email recruiter@example.com or call +1 (555) 123-4567" })
+    expect(objectiveJobRequirementMaterialDigest(privateTextJob)).toBe(scheduledDraftJobMaterialDigest(privateTextJob))
     const output = await readObjectiveJobRequirementEvidence(value.client, input(value.evidence, value.proof))
 
     expect(output).toMatchObject({ status: "verified", proposedCount: 1, receipts: [{ userId: scope.userId, sessionId: scope.sessionId,
@@ -87,6 +97,44 @@ describe("completed Objective Job requirement receipts", () => {
     const value = setup(options)
     await expect(readObjectiveJobRequirementEvidence(value.client, input(value.evidence, value.proof)))
       .resolves.toMatchObject({ status: "unavailable", proposedCount: 1, receipts: [] })
+  })
+
+  it.each(["failed", "started"] as const)("rejects a %s persisted tool_result row", async status => {
+    const value = setup()
+    ;(value.receipts.items[1] as Record<string, unknown>).status = status
+    await expect(readObjectiveJobRequirementEvidence(value.client, input(value.evidence, value.proof)))
+      .resolves.toMatchObject({ status: "unavailable", proposedCount: 1, receipts: [] })
+  })
+
+  it("rejects a legacy or extra status field inside canonical tool_result content", async () => {
+    const value = setup(), resultItem = value.receipts.items[1] as Record<string, unknown>
+    resultItem.content = { ...(resultItem.content as Record<string, unknown>), status: "completed" }
+    await expect(readObjectiveJobRequirementEvidence(value.client, input(value.evidence, value.proof)))
+      .resolves.toMatchObject({ status: "unavailable", proposedCount: 1, receipts: [] })
+  })
+
+  it("keeps an unrelated failed jobs.get outside the selected Job proof", async () => {
+    const value = setup({ unrelatedFailed: true })
+    await expect(readObjectiveJobRequirementEvidence(value.client, input(value.evidence, value.proof)))
+      .resolves.toMatchObject({ status: "verified", proposedCount: 1, receipts: [{ jobId }] })
+  })
+
+  it("keeps a failed selected Job partial while retaining the valid selected Job receipt", async () => {
+    const value = setup(), secondJobId = "123e4567-e89b-42d3-a456-426614174001", secondJob = job({ id: secondJobId })
+    value.receipts.items.push(call("failed-selected", secondJobId, 2, "failed", "tool_execution_failed"),
+      toolResult("failed-selected", secondJob, 2, "tool_execution_failed"))
+    value.receipts.outcomes.set("failed-selected", "failed")
+    const secondEvidenceId = `read:job:${secondJobId}`
+    const evidence: AnalystResult = { ...value.evidence,
+      evidence: [...value.evidence.evidence, { id: secondEvidenceId, kind: "job", ref: secondJobId, source: "greenhouse" }],
+      findings: [...value.evidence.findings, { jobId: secondJobId, score: 7, evidenceIds: [secondEvidenceId],
+        requirementCitations: [{ evidenceId: secondEvidenceId, quote: "Required: Rust." }] }] }
+    mocks.getJob.mockImplementation(async (_userId: string, requestedJobId: string) => requestedJobId === secondJobId ? secondJob : job())
+    const evidenceIds = evidence.evidence.map(item => item.id), resultDigest = taskGraphResultDigest(evidence)
+    const proof = { evidenceIds, resultDigest,
+      evidenceDigest: taskGraphEvidenceDigest(value.receipts.items, value.receipts.outcomes, evidenceIds, resultDigest, value.receipts.replayReceipts) }
+    await expect(readObjectiveJobRequirementEvidence(value.client, input(evidence, proof, [jobId, secondJobId])))
+      .resolves.toMatchObject({ status: "partial", proposedCount: 2, receipts: [{ jobId }] })
   })
 
   it("rejects distinct competing reads but deduplicates an exact receipt replay", async () => {
