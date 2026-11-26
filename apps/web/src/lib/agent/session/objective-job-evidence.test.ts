@@ -43,14 +43,27 @@ describe('Objective saved Job evidence', () => {
     expect(evidence).toMatchObject({ group: 'analyzedJobs', coverage: 'complete', jobs: [{ role: 'Reviewer', sourceKeys: [analystKey] }] })
   })
 
-  const invalidCases: ReadonlyArray<readonly [string, { count?: number; sourceRole?: 'scout' | 'analyst'; tamperDigest?: boolean; rows?: unknown[] }]> = [
+  it('projects cited Analyst findings without exposing citation text', async () => {
+    const analyst = sourceTask('analyst-task', 'analyst', 'completed', ['job-3'], { citation: true })
+    mocks.context.mockResolvedValue(context({
+      sources: [source(analystKey, 0, 'analyst', 'completed')], nodes: [{ taskId: 'analyst-task', templateId: 'analyst' }], tasks: [analyst],
+      count: 1, coverage: 'complete', group: 'analyzedJobs', keys: [analystKey],
+    }))
+    const evidence = await readObjectiveJobEvidence(tx([job('job-3', 'Reviewer', null, 'https://jobs.example/3')]) as never,
+      { userId, sessionId, finalItemId, graphRevision, group: 'analyzedJobs' })
+    expect(evidence).toMatchObject({ group: 'analyzedJobs', jobs: [{ role: 'Reviewer' }] })
+    expect(JSON.stringify(evidence)).not.toContain('PRIVATE_REQUIREMENT_QUOTE')
+  })
+
+  const invalidCases: ReadonlyArray<readonly [string, { count?: number; sourceRole?: 'scout' | 'analyst'; tamperDigest?: boolean; citation?: boolean; rows?: unknown[] }]> = [
     ['count drift', { count: 2 }],
     ['foreign source role', { sourceRole: 'analyst' }],
     ['tampered digest', { tamperDigest: true }],
+    ['Scout citation extension', { citation: true }],
     ['missing owned Job', { rows: [] }],
   ]
   it.each(invalidCases)('fails closed for %s', async (_label, options) => {
-    const task = sourceTask('scout-task', 'scout', 'completed', ['job-1'], { tamperDigest: options.tamperDigest })
+    const task = sourceTask('scout-task', 'scout', 'completed', ['job-1'], { tamperDigest: options.tamperDigest, citation: options.citation })
     mocks.context.mockResolvedValue(context({
       sources: [source(scoutKey, 0, options.sourceRole ?? 'scout', 'completed')], nodes: [{ taskId: 'scout-task', templateId: 'scout' }], tasks: [task],
       count: options.count ?? 1, coverage: 'complete', group: 'discoveredJobs', keys: [scoutKey],
@@ -79,13 +92,14 @@ function context(input: { sources: unknown[]; nodes: unknown[]; tasks: unknown[]
 function source(sourceKey: string, nodeIndex: number, role: 'scout' | 'analyst', roleResultStatus: 'completed' | 'partial') {
   return { sourceKey, nodeIndex, role, taskStatus: 'completed', resultState: 'valid', roleResultStatus }
 }
-function sourceTask(id: string, role: 'scout' | 'analyst', status: 'completed' | 'partial', jobIds: string[], options: { multiline?: boolean; tamperDigest?: boolean } = {}) {
+function sourceTask(id: string, role: 'scout' | 'analyst', status: 'completed' | 'partial', jobIds: string[], options: { multiline?: boolean; tamperDigest?: boolean; citation?: boolean } = {}) {
   const evidence = jobIds.map(jobId => ({ id: `evidence-${id}-${jobId}`, kind: 'job', ref: jobId, source: 'greenhouse' }))
+  const citation = options.citation ? { requirementCitations: [{ evidenceId: evidence[0]!.id, quote: 'PRIVATE_REQUIREMENT_QUOTE' }] } : {}
   const structuredResult = role === 'scout'
     ? { schemaVersion: 'agent-harness.v2.subagent.result', role, status, summary: options.multiline ? 'Private model summary\nwith details' : 'summary',
-      candidates: jobIds.map((jobId, index) => ({ jobId, source: 'greenhouse', url: `https://jobs.example/${jobId}`, evidenceIds: [evidence[index]!.id] })), evidence }
+      candidates: jobIds.map((jobId, index) => ({ jobId, source: 'greenhouse', url: `https://jobs.example/${jobId}`, evidenceIds: [evidence[index]!.id], ...citation })), evidence }
     : { schemaVersion: 'agent-harness.v2.subagent.result', role, status, summary: 'summary',
-      findings: jobIds.map((jobId, index) => ({ jobId, score: 8, evidenceIds: [evidence[index]!.id] })), evidence }
+      findings: jobIds.map((jobId, index) => ({ jobId, score: 8, evidenceIds: [evidence[index]!.id], ...citation })), evidence }
   return { id, parentTaskId: 'root-1', role, taskType: role === 'scout' ? 'job_discovery' : 'job_analysis', status: 'completed',
     result: envelope(structuredResult, options.tamperDigest) }
 }
