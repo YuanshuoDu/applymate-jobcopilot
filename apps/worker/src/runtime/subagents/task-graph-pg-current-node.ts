@@ -5,14 +5,17 @@ import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGrap
 import { classifyTaskGraphStructuredOutputFailure } from "./task-graph-structured-failure-category.js"
 import { taskGraphNativeCurrentView } from "./task-graph-native-result.js"
 import { projectTaskGraphResult, taskGraphResultProjectionBytes, taskGraphResultProjectionItemCount,
-  TASK_GRAPH_RESULT_PROJECTION_ITEMS_TOTAL, TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT } from "./task-graph-result-projection.js"
+  TASK_GRAPH_RESULT_PROJECTION_ITEMS_TOTAL, TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT,
+  TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT } from "./task-graph-result-projection.js"
 import type { LoadedGraph } from "./task-graph-pg-state.js"
 import { projectTaskGraphDiscoveryAttemptHealth, projectTaskGraphDiscoveryAttemptQueryFootprint,
   type TaskGraphDiscoveryTurnEligibility } from "./task-graph-discovery-attempt-health.js"
+import { parseDiscoveryQueryFootprint, type DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
+import { parseDiscoveryRecovery } from "./task-graph-discovery-recovery-contract.js"
+import { isOrdinaryGenericScout } from "./task-graph-discovery-recovery-page.js"
 import { SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
 import { isScheduledTaskGraphSpecializedEnvelope } from "./task-graph-pg-specialized-envelope.js"
-import type { DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
 
 export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
   if (!loaded.state || !loaded.snapshot) return { revision: 0, nodes: [] }
@@ -47,11 +50,21 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       || stored.verificationDisposition === "typed" && (task.status === "completed" || task.status === "failed") && !verificationReport
       || hasReceipt && !repairReceipt
       || stored.repairOf && task.status === "completed" && verificationReport?.status === "passed" && !repairReceipt) throw new Error("task_graph_verification_report_invalid")
-    const structuredOutputFailureCategory = classifyTaskGraphStructuredOutputFailure({ snapshotNode: stored, task, verificationReport, hasRepairReceipt: Boolean(repairReceipt) }), discoveryAttemptHealth = projectTaskGraphDiscoveryAttemptHealth(stored, task, taskResult)
+    const ordinaryGenericScout = isOrdinaryGenericScout(stored, task)
+    const structuredOutputFailureCategory = classifyTaskGraphStructuredOutputFailure({ snapshotNode: stored, task, verificationReport, hasRepairReceipt: Boolean(repairReceipt) })
+    const discoveryAttemptHealth = projectTaskGraphDiscoveryAttemptHealth(stored, task, taskResult)
+    const attemptProperty = dataProperty(taskResult, "discoveryAttempt")
+    const discoveryAttemptValidated = Boolean(discoveryAttemptHealth && ordinaryGenericScout && attemptProperty.present
+      && validDiscoveryAttemptFootprint(attemptProperty.value))
+    const recoveryProperty = dataProperty(taskResult, "discoveryRecovery")
+    const discoveryRecovery = task.status === "completed" && ordinaryGenericScout && recoveryProperty.present
+      ? parseDiscoveryRecovery(recoveryProperty.value) : undefined
+    const discoveryRecoveryValidated = Boolean(discoveryRecovery && discoveryRecovery.attemptCount === task.attemptCount)
     let discoveryQueryFootprint: DiscoveryQueryFootprint | undefined
     try { discoveryQueryFootprint = projectTaskGraphDiscoveryAttemptQueryFootprint(stored, task, task.result, turn) } catch { discoveryQueryFootprint = undefined }
     if (discoveryQueryFootprint) hasOrdinaryQueryFootprint = true
-    const projectionSource = taskGraphProjectionSource(task.result, taskResult, Boolean(verificationReport), Boolean(repairReceipt))
+    const projectionSource = taskGraphProjectionSource(task.result, taskResult, Boolean(verificationReport), Boolean(repairReceipt),
+      discoveryAttemptValidated, discoveryRecoveryValidated)
     const proposedProjection = projectTaskGraphResult(task.role, task.status, projectionSource)
     const bytes = taskGraphResultProjectionBytes(proposedProjection)
     const items = taskGraphResultProjectionItemCount(proposedProjection)
@@ -83,14 +96,38 @@ function taskGraphProjectionSource(
   result: Record<string, unknown> | null,
   hasValidatedReport: boolean,
   hasValidatedReceipt: boolean,
+  hasValidatedDiscoveryAttempt: boolean,
+  hasValidatedDiscoveryRecovery: boolean,
 ): unknown {
-  if (!result || (!hasValidatedReport && !hasValidatedReceipt)) return original
+  if (!result || (!hasValidatedReport && !hasValidatedReceipt && !hasValidatedDiscoveryAttempt && !hasValidatedDiscoveryRecovery)
+    || !sourceWithinProjectionBound(original)) return original
   const copy = Object.create(Object.getPrototypeOf(result)) as Record<PropertyKey, unknown>
   for (const key of Reflect.ownKeys(result)) {
-    if ((hasValidatedReport && key === "taskGraphVerificationReport") || (hasValidatedReceipt && key === "taskGraphRepairReceipt")) continue
+    if ((hasValidatedReport && key === "taskGraphVerificationReport") || (hasValidatedReceipt && key === "taskGraphRepairReceipt")
+      || (hasValidatedDiscoveryAttempt && key === "discoveryAttempt")
+      || (hasValidatedDiscoveryRecovery && key === "discoveryRecovery")) continue
     Object.defineProperty(copy, key, Object.getOwnPropertyDescriptor(result, key)!)
   }
   return copy
+}
+
+function validDiscoveryAttemptFootprint(value: unknown): boolean {
+  const sidecar = dataProperty(value, "queryFootprint")
+  return !sidecar.present || Boolean(parseDiscoveryQueryFootprint(sidecar.value))
+}
+function dataProperty(value: unknown, key: string): { present: boolean; value?: unknown } {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { present: false }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor ? { present: true, ...(descriptor.enumerable && "value" in descriptor ? { value: descriptor.value } : {}) } : { present: false }
+  } catch { return { present: true } }
+}
+function sourceWithinProjectionBound(value: unknown): boolean {
+  try {
+    if (typeof value === "string") return Buffer.byteLength(value, "utf8") <= TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT
+    const encoded = JSON.stringify(value)
+    return typeof encoded === "string" && Buffer.byteLength(encoded, "utf8") <= TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT
+  } catch { return false }
 }
 function resultSummary(value: unknown): string | null {
   const row = parseObject(value)

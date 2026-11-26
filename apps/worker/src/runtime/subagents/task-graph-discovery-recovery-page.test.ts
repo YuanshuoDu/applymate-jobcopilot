@@ -6,7 +6,7 @@ import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState, ty
 import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { DISCOVERY_RECOVERY_SCHEMA_VERSION } from "./task-graph-discovery-recovery-contract.js"
-import { projectTaskGraphDiscoveryRecoveryPage } from "./task-graph-discovery-recovery-page.js"
+import { isOrdinaryGenericScout, projectTaskGraphDiscoveryRecoveryPage } from "./task-graph-discovery-recovery-page.js"
 import { TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, type TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discovery-recovery-page-contract.js"
 
 const id = (index: number) => `c${String(index).padStart(24, "0")}`
@@ -72,6 +72,19 @@ function loaded(options: Fixture = {}): LoadedGraph {
 }
 
 describe("failed Scout discovery-recovery observation pages", () => {
+  it("shares the existing exact generic-Scout applicability gate with current-node projection", () => {
+    const eligible = loaded()
+    const node = eligible.snapshot!.nodes[0]!
+    expect(isOrdinaryGenericScout(node, eligible.tasks.get(node.taskId)!)).toBe(true)
+
+    for (const invalid of [loaded({ role: "analyst" }), loaded({ taskType: "private_research" }),
+      loaded({ allowedActions: [...expectedEnvelope.allowedActions, "private.tool"] }),
+      loaded({ contextIsObject: false }), loaded({ context: { selectedJobPreparation: undefined } })]) {
+      const invalidNode = invalid.snapshot!.nodes[0]!
+      expect(isOrdinaryGenericScout(invalidNode, invalid.tasks.get(invalidNode.taskId)!)).toBe(false)
+    }
+  })
+
   it("pages only canonical IDs with an explicit unverified status and attempt-pinned continuation", () => {
     const graph = loaded()
     expect(graph.tasks.get("task-scout-a")).toMatchObject({ contextIsObject: true, hasPrivateSelectionContext: false })
