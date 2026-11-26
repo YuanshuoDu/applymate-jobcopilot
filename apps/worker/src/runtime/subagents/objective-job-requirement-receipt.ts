@@ -55,12 +55,12 @@ export async function readObjectiveJobRequirementEvidence(client: Queryable,
     const receipts = await loadTaskGraphVerificationReceipts(client, input.scope)
     if (taskGraphEvidenceDigest(receipts.items, receipts.outcomes, input.evidenceIds, input.resultDigest, receipts.replayReceipts)
       !== input.evidenceDigest) return unavailable(proposals.length)
-    const deliveries = deliveryCandidates(receipts, input.scope)
-    if (!deliveries) return unavailable(proposals.length)
     const byJob = new Map<string, typeof proposals>()
     for (const proposal of proposals) byJob.set(proposal.jobId, [...(byJob.get(proposal.jobId) ?? []), proposal])
     const verified: ObjectiveJobRequirementReceipt[] = []
     for (const [jobId, values] of byJob) {
+      const deliveries = deliveryCandidates(receipts, input.scope, jobId)
+      if (!deliveries) continue
       const currentJob = await createPostgresReadToolDataSource(client).getJob(input.scope.userId, jobId)
       const materialDigest = currentJob && scheduledDraftJobMaterialDigest(currentJob)
       if (!currentJob || currentJob.id !== jobId || typeof currentJob.description !== "string" || !materialDigest) continue
@@ -127,7 +127,8 @@ function makeReceipt(input: ObjectiveJobRequirementInput, proposal: ObjectiveJob
     deliveries: verified.deliveries }
 }
 
-function deliveryCandidates(receipts: TaskGraphVerificationReceipts, scope: TaskGraphVerificationScope): ObjectiveJobRequirementDeliveryCandidate[] | undefined {
+function deliveryCandidates(receipts: TaskGraphVerificationReceipts, scope: TaskGraphVerificationScope,
+  selectedJobId: string): ObjectiveJobRequirementDeliveryCandidate[] | undefined {
   const results = new Map<string, Row>()
   for (const item of receipts.items) if (item.type === "tool_result") {
     const content = record(item.content), id = content && text(content.toolCallId) ? content.toolCallId : undefined
@@ -139,26 +140,45 @@ function deliveryCandidates(receipts: TaskGraphVerificationReceipts, scope: Task
     if (item.type !== "tool_call") continue
     const content = record(item.content)
     if (content?.toolName !== "jobs.get") continue
-    const toolCallId = content.toolCallId
-    if (!text(toolCallId) || item.taskId !== scope.taskId || item.sessionId !== scope.sessionId || item.turnId !== scope.turnId
-      || Number(item.attempt) !== scope.attemptCount) return undefined
-    const result = results.get(toolCallId), resultContent = record(result?.content)
-    if (result && (result.taskId !== scope.taskId || result.sessionId !== scope.sessionId || result.turnId !== scope.turnId
-      || Number(result.attempt) !== scope.attemptCount || !resultContent)) return undefined
+    const toolCallId = text(content.toolCallId) ? content.toolCallId : undefined
+    const input = record(content.input), inputJobId = input && text(input.jobId) ? input.jobId : undefined
+    const result = toolCallId ? results.get(toolCallId) : undefined
+    const resultContent = record(result?.content), outputJobId = resultContent && resultJobId(resultContent.output)
+    if (inputJobId !== selectedJobId && outputJobId !== selectedJobId) continue
+    if (!text(toolCallId) || !text(item.id) || item.status !== "completed" || item.taskId !== scope.taskId || item.sessionId !== scope.sessionId
+      || item.turnId !== scope.turnId || !text(item.stepId) || Number(item.attempt) !== scope.attemptCount
+      || !Number.isSafeInteger(Number(item.ordinal)) || Number(item.ordinal) < 0 || !Number.isSafeInteger(Number(item.revision))
+      || Number(item.revision) < 0 || content.status !== "completed" || content.errorCode !== null
+      || receipts.outcomes.get(toolCallId) !== "completed") return undefined
+    if (!result || !resultContent || !text(result.id) || result.status !== "completed" || result.taskId !== scope.taskId
+      || result.sessionId !== scope.sessionId || result.turnId !== scope.turnId || result.stepId !== item.stepId
+      || Number(result.attempt) !== scope.attemptCount || Number(result.ordinal) !== Number(item.ordinal)
+      || !Number.isSafeInteger(Number(result.revision)) || Number(result.revision) < 0 || resultContent.toolCallId !== toolCallId
+      || resultContent.errorCode !== null || !exactResultContent(resultContent)) return undefined
     const replay = replayByCall.get(toolCallId)
-    deliveries.push({ call: { id: String(item.id), stepId: String(item.stepId), attempt: Number(item.attempt),
+    const delivery = { call: { id: String(item.id), stepId: String(item.stepId), attempt: Number(item.attempt),
       ordinal: Number(item.ordinal), revision: Number(item.revision) },
     callContent: { toolCallId, toolName: String(content.toolName), toolVersion: String(content.toolVersion), input: content.input,
       status: String(content.status), errorCode: content.errorCode },
     outcome: receipts.outcomes.get(toolCallId) ?? null,
-    result: result ? { id: String(result.id), stepId: String(result.stepId), attempt: Number(result.attempt),
-      ordinal: Number(result.ordinal), revision: Number(result.revision) } : null,
-    resultContent: resultContent ? { toolCallId: String(resultContent.toolCallId), output: resultContent.output,
-      status: String(resultContent.status), errorCode: resultContent.errorCode } : null,
+    result: { id: String(result.id), stepId: String(result.stepId), attempt: Number(result.attempt),
+      ordinal: Number(result.ordinal), revision: Number(result.revision) },
+    resultContent: { toolCallId: String(resultContent.toolCallId), output: resultContent.output,
+      status: "completed", errorCode: resultContent.errorCode },
     replay: replay ? { currentCallId: replay.currentCallId, sourceCallItemId: replay.sourceCallItem[0],
-      sourceResultItemId: replay.sourceResultItem[0] } : null })
+      sourceResultItemId: replay.sourceResultItem[0] } : null }
+    deliveries.push(delivery)
   }
   return deliveries
+}
+function exactResultContent(value: Row): boolean {
+  const keys = Reflect.ownKeys(value)
+  return keys.length === 3 && keys.every(key => typeof key === "string" && ["errorCode", "output", "toolCallId"].includes(key)
+    && Boolean(Object.getOwnPropertyDescriptor(value, key)?.enumerable && "value" in Object.getOwnPropertyDescriptor(value, key)!))
+}
+function resultJobId(value: unknown): string | undefined {
+  const output = record(value), job = record(output?.job)
+  return job && text(job.id) ? job.id : undefined
 }
 function validInput(input: ObjectiveJobRequirementInput): boolean {
   const scope = input.scope
