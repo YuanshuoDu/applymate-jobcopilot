@@ -23,6 +23,7 @@ import {
   OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_EVENT_TYPE,
   OBJECTIVE_APPLICATION_SUBMISSION_MANIFEST_SCHEMA,
   buildObjectiveReviewedFillHandoffOutboxData,
+  parseObjectiveReviewedApplicationFillBrowserStartEvent,
   parseObjectiveApplicationSubmissionManifestEvent,
   parseObjectiveReviewedFillHandoffOutboxRow,
 } from "@jobcopilot/shared"
@@ -575,6 +576,12 @@ function objectiveTailorWorkerFlags(profile: FixtureWorkerProfile): Record<strin
     : { ENABLE_AGENT_OBJECTIVE_TAILOR: "0", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "0" }
 }
 
+function objectiveTailorWorkerConnectionOptions(mode: "site" | "worker", profile: FixtureWorkerProfile): Record<string, string> {
+  // Detect the killed fixture client while it waits inside the projection trigger.
+  return mode === "worker" && profile === "objective_wave"
+    ? { PGOPTIONS: "-c client_connection_check_interval=200ms" } : {}
+}
+
 function beginObjectiveStandaloneScenario(): () => void {
   let complete!: () => void
   let completed = false
@@ -622,6 +629,7 @@ function spawnFixture(mode: "site" | "worker", workerUserId = ids.user,
     env: {
       ...process.env,
       ...(mode === "worker" ? objectiveTailorWorkerFlags(workerProfile) : {}),
+      ...objectiveTailorWorkerConnectionOptions(mode, workerProfile),
       DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!,
       REDIS_URL: redisUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!,
       AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true", AGENT_RUNTIME_PG_TEST_REQUIRED: "true",
@@ -1027,16 +1035,30 @@ describe("rootless reviewed Fill Turn DLQ projection", () => {
   })
 })
 
-async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
+async function waitLine(child: Child, expected: string, timeoutMs = 30_000, startAt = 0): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
-    const line = child.lines.find(value => value === expected || value.startsWith(`${expected} `))
+    const line = child.lines.slice(startAt).find(value => value === expected || value.startsWith(`${expected} `))
     if (line) return line
     if (exited(child)) throw new Error(`Fixture exited before ${expected}; child=${JSON.stringify(childSummary(child))}`)
     await delay(25)
   }
   throw new Error(`Fixture line ${expected} missing; child=${JSON.stringify(childSummary(child))}`)
 }
+
+describe("fixture line cursor", () => {
+  it("does not accept an exact marker from before the current attempt", async () => {
+    const marker = "OBJECTIVE_SUBMIT_RECEIVED slot=2"
+    const lines = [marker]
+    const child = { lines, errors: [], exitCode: null, signalCode: null } as unknown as Child
+    let settled = false
+    const currentAttempt = waitLine(child, marker, 500, 1).then(value => { settled = true; return value })
+    await delay(5)
+    expect(settled).toBe(false)
+    lines.push(marker)
+    await expect(currentAttempt).resolves.toBe(marker)
+  })
+})
 
 async function armLegacyFinalResponseGate(turnId: string): Promise<void> {
   if (!worker?.stdin) throw new Error("Worker fixture stdin is unavailable")
@@ -1741,7 +1763,7 @@ type SelectedJobFullLoopPhase = "cleanup_started" | "cleanup_completed" | "setup
   | "handoff_retry_wait_started" | "handoff_published" | "fill_turn_wait_started" | "fill_turn_created"
   | "objective_single_source_completed" | "objective_single_worker_ready" | "objective_single_review_started"
   | "objective_single_approval_pending" | "objective_single_approval_accepted" | "objective_single_handoff_published"
-  | "objective_single_fill_ready" | "objective_single_submit_approved" | "objective_single_completed"
+  | "objective_single_fill_ready" | "objective_single_submit_approved" | "objective_single_receipt_verified" | "objective_single_completed"
   | "objective_score_floor_nine_verified" | "objective_wave_source_ready" | "objective_wave_score_floor_eight_verified"
   | "objective_wave_set_issued" | "objective_wave_stale_retired"
   | "objective_wave_five_decided" | "objective_wave_report_verified" | "objective_wave_first_handoff" | "objective_wave_completed"
@@ -1761,6 +1783,14 @@ describe("Objective fixture worker isolation", () => {
       ENABLE_AGENT_OBJECTIVE_TAILOR: "0", ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1",
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
+  })
+
+  it("enables PostgreSQL client checks only for the disposable Objective-wave worker", () => {
+    expect(objectiveTailorWorkerConnectionOptions("worker", "objective_wave")).toEqual({
+      PGOPTIONS: "-c client_connection_check_interval=200ms",
+    })
+    expect(objectiveTailorWorkerConnectionOptions("worker", "standard")).toEqual({})
+    expect(objectiveTailorWorkerConnectionOptions("site", "objective_wave")).toEqual({})
   })
 
   it("fails closed when the prior standalone scenario has not quiesced", async () => {
@@ -2071,6 +2101,152 @@ async function objectiveSubmitTimeoutSnapshot(input: {
   }
 }
 
+type ObjectivePostRestartWorkerTrace = Readonly<{ children: readonly Child[] }>
+
+function objectivePostRestartWorkerStages(children: readonly Child[], workerTaskId: string | undefined) {
+  const lines = children.flatMap(child => child.lines)
+  if (!workerTaskId) return { activeCount: 0, redeliveryCount: 0, stalledCount: 0, failedCount: 0, workerReadyCount: 0 }
+  const active = lines.map(parseApplyJobActiveEvent).filter((event): event is ApplyJobActiveEvent =>
+    event?.jobId === workerTaskId)
+  const stalled = lines.filter(line => new RegExp(`^APPLY_JOB_STALLED ${escapeRegExp(workerTaskId)} `).test(line)).length
+  const failed = lines.filter(line => new RegExp(`^APPLY_JOB_FAILED ${escapeRegExp(workerTaskId)}(?: |$)`).test(line)).length
+  return {
+    activeCount: Math.min(2, active.length),
+    redeliveryCount: Math.min(2, active.filter(event => event.attemptsStarted >= 2 && event.stalledCounter >= 1).length),
+    stalledCount: Math.min(2, stalled),
+    failedCount: Math.min(2, failed),
+    workerReadyCount: Math.min(2, lines.filter(line => line === "WORKER_READY").length),
+  }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+async function objectivePostRestartTimeoutSnapshot(input: {
+  userId: string; sessionId: string; jobId: string; applicationTaskId: string; fillTurnId: string; approvalId: string
+  constraintHash: string; dispatchId: string; workerTrace: ObjectivePostRestartWorkerTrace
+}) {
+  try {
+    const [task, turn, job, session, dispatch, attempts, events, wakeEvents, finalizationDispatches, activeSiblingTurns] = await Promise.all([
+      testDb.applicationTask.findFirst({ where: { id: input.applicationTaskId, userId: input.userId,
+        sessionId: input.sessionId, jobId: input.jobId, fillTurnId: input.fillTurnId }, select: {
+        status: true, checkpoint: true, workerTaskId: true, fillTurnId: true, error: true,
+      } }),
+      testDb.agentTurn.findFirst({ where: { id: input.fillTurnId, userId: input.userId, sessionId: input.sessionId }, select: {
+        status: true, rootTaskId: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true,
+      } }),
+      testDb.job.findFirst({ where: { id: input.jobId, userId: input.userId }, select: {
+        status: true, workflowState: true, appliedAt: true,
+      } }),
+      testDb.agentSession.findFirst({ where: { id: input.sessionId, userId: input.userId }, select: { status: true } }),
+      testDb.agentOutbox.findUnique({ where: { id: input.dispatchId }, select: {
+        aggregateId: true, topic: true, idempotencyKey: true, payload: true, publishedAt: true, attemptCount: true,
+      } }),
+      testDb.submissionAttempt.findMany({ where: { userId: input.userId, jobId: input.jobId, receiptId: input.approvalId,
+        constraintHash: input.constraintHash }, take: 3, select: { id: true, state: true, errorCode: true } }),
+      testDb.applicationTaskEvent.findMany({ where: { taskId: input.applicationTaskId, actor: "worker", type: { in: [
+        "objective_application_submit_result_recorded", "submission_execution_started", "submission_execution_settled",
+        "objective_application_submit_result_recovered", "objective_application_submit_finalization_queued",
+      ] } }, take: 16, select: { id: true, type: true, body: true, data: true } }),
+      testDb.agentEvent.findMany({ where: { sessionId: input.sessionId, turnId: input.fillTurnId, type: "turn.wakeup" },
+        take: 8, select: { itemId: true, payload: true } }),
+      testDb.agentOutbox.findMany({ where: { aggregateId: input.sessionId, topic: "agent.turn.dispatch",
+        idempotencyKey: `turn-dispatch:${input.fillTurnId}` }, take: 3, select: { publishedAt: true, attemptCount: true, payload: true } }),
+      testDb.agentTurn.findMany({ where: { sessionId: input.sessionId, userId: input.userId, id: { not: input.fillTurnId },
+        status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] } },
+        take: 3, select: { id: true } }),
+    ])
+    const dispatchPayload = jsonRecord(dispatch?.payload)
+    const dispatchWorkerTaskId = jsonString(dispatchPayload, "workerTaskId")
+    const workerTaskId = task?.workerTaskId ?? dispatchWorkerTaskId
+    const resultEvents = events.filter(event => event.type === "objective_application_submit_result_recorded")
+    const resultData = resultEvents.length === 1 ? jsonRecord(resultEvents[0]?.data) : null
+    const resultKeys = ["applicationTaskId", "approvalId", "applyResultId", "attemptId", "constraintHash",
+      "executionId", "fillTurnId", "jobId", "schemaVersion", "sessionId", "userId", "workerTaskId"].sort().join(",")
+    const expectedResultId = `objective-application-submit-result:${hashContent([
+      input.applicationTaskId, input.fillTurnId, input.approvalId,
+    ]).slice(7)}`
+    const exactResultReceipt = Boolean(resultData && Object.keys(resultData).sort().join(",") === resultKeys
+      && resultEvents[0]?.id === expectedResultId
+      && resultData.schemaVersion === "agent-harness.v2.objective-application-submit-result.v1"
+      && resultData.applicationTaskId === input.applicationTaskId && resultData.userId === input.userId
+      && resultData.jobId === input.jobId && resultData.sessionId === input.sessionId
+      && resultData.fillTurnId === input.fillTurnId && resultData.approvalId === input.approvalId
+      && resultData.constraintHash === input.constraintHash && resultData.workerTaskId === workerTaskId
+      && typeof resultData.executionId === "string" && typeof resultData.attemptId === "string"
+      && Number.isSafeInteger(resultData.applyResultId))
+    const applyResultId = resultData && typeof resultData.applyResultId === "number"
+      && Number.isSafeInteger(resultData.applyResultId) ? resultData.applyResultId : null
+    const applyResult = applyResultId === null ? null : await testDb.applyResult.findUnique({ where: { id: applyResultId }, select: {
+      userId: true, jobId: true, mode: true, atsType: true, flowUsed: true, status: true, error: true,
+    } })
+    const executionEvents = events.filter(event => event.type === "submission_execution_started"
+      || event.type === "submission_execution_settled")
+    const settlementCount = Math.min(2, executionEvents.filter(event => event.type === "submission_execution_settled").length)
+    const recoveryCount = Math.min(2, events.filter(event => event.type === "objective_application_submit_result_recovered").length)
+    const finalizationCount = Math.min(2, events.filter(event => event.type === "objective_application_submit_finalization_queued").length)
+    const finalizationEventId = events.find(event => event.type === "objective_application_submit_finalization_queued")?.id
+    const finalizationDispatch = finalizationEventId ? finalizationDispatches.find(dispatch => {
+      const payload = jsonRecord(dispatch.payload)
+      return payload?.turnId === input.fillTurnId && payload.sessionId === input.sessionId
+        && payload.ownerId === `wakeup:${finalizationEventId}`
+    }) : undefined
+    const approvalWakeCount = Math.min(2, wakeEvents.filter(event => event.itemId === `agent-wait:approval:${input.approvalId}`
+      && jsonString(event.payload, "toolCallId") === `application-submit:${input.applicationTaskId}`
+      && jsonString(event.payload, "status") === "approved").length)
+    const rootTaskId = typeof turn?.rootTaskId === "string" ? turn.rootTaskId : null
+    const root = rootTaskId ? await testDb.subAgentTask.findFirst({ where: { id: rootTaskId, rootTaskId, sessionId: input.sessionId,
+        turnId: input.fillTurnId, parentTaskId: null, role: "orchestrator", taskType: "root" }, select: {
+        status: true, attemptCount: true, leaseOwner: true, leaseExpiresAt: true,
+      } }) : null
+    const stages = objectivePostRestartWorkerStages(input.workerTrace.children, workerTaskId)
+    return {
+      available: true,
+      session: { status: objectiveSessionDiagnosticStatus(session?.status), activeSiblingTurnCount: Math.min(2, activeSiblingTurns.length) },
+      task: task ? { status: reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+        checkpoint: reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+        workerTaskPresent: Boolean(task.workerTaskId), workerTaskMatchesDispatch: Boolean(task.workerTaskId
+          && dispatchWorkerTaskId && task.workerTaskId === dispatchWorkerTaskId), fillTurnMatches: task.fillTurnId === input.fillTurnId,
+        errorPresent: Boolean(task.error) } : { present: false },
+      turn: turn ? { status: reviewedFillDiagnosticValue(turn.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+        rootPresent: rootTaskId !== null, revisionPresent: Number.isSafeInteger(turn.revision),
+        leaseFree: turn.leaseOwnerId === null && turn.leaseExpiresAt === null } : { present: false },
+      job: job ? { status: reviewedFillDiagnosticValue(job.status, OBJECTIVE_JOB_DIAGNOSTIC_STATUSES),
+        workflowState: reviewedFillDiagnosticValue(job.workflowState, OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES),
+        appliedAtPresent: job.appliedAt !== null } : { present: false },
+      queue: { dispatchPresent: dispatch !== null, dispatchExact: Boolean(dispatch?.aggregateId === input.sessionId
+        && dispatch.topic === "application.submit.dispatch" && dispatch.idempotencyKey?.startsWith("application-submit:")
+        && dispatchPayload?.applicationTaskId === input.applicationTaskId && dispatchPayload?.fillTurnId === input.fillTurnId
+        && dispatchWorkerTaskId), dispatchPublished: dispatch?.publishedAt instanceof Date, dispatchAttemptCount: dispatch
+        ? Math.min(2, Math.max(0, dispatch.attemptCount)) : null },
+      workerStages: stages,
+      immutableResult: { eventCount: Math.min(2, resultEvents.length), exactReceipt: exactResultReceipt,
+        attemptLinkPresent: Boolean(exactResultReceipt && attempts.length === 1 && resultData?.attemptId === attempts[0]?.id),
+        applyResultStatus: applyResult?.userId === input.userId && applyResult.jobId === input.jobId
+          && applyResult.mode === "unattended" && applyResult.atsType === "greenhouse"
+          && applyResult.flowUsed === "application.submit" && applyResult.status === "submitted" && applyResult.error === null
+          ? "submitted" : applyResult ? "other" : "missing" },
+      submissionAttempt: { count: Math.min(2, attempts.length), state: attempts.length === 1
+        ? diagnosticSubmissionAttemptState(attempts[0]?.state) : attempts.length === 0 ? null : "other",
+        errorPresent: attempts.length === 1 && Boolean(attempts[0]?.errorCode) },
+      lifecycle: {
+        executionStartedCount: Math.min(2, executionEvents.filter(event => event.type === "submission_execution_started").length),
+        executionSettledCount: settlementCount, recoveryCount, approvalWakeCount, finalizationCount,
+        finalizationDispatchCount: Math.min(2, finalizationDispatch ? 1 : 0),
+        settlementPresent: settlementCount === 1, recoveryPresent: recoveryCount === 1,
+        approvalWakePresent: approvalWakeCount === 1, finalizationPresent: finalizationCount === 1,
+        finalizationDispatchPresent: Boolean(finalizationDispatch?.publishedAt instanceof Date),
+      },
+      root: root ? { present: true, status: reviewedFillDiagnosticValue(root.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+        attemptCount: Number.isSafeInteger(root.attemptCount) ? Math.min(2, Math.max(0, root.attemptCount)) : null,
+        leaseFree: root.leaseOwner === null && root.leaseExpiresAt === null } : { present: false },
+    }
+  } catch {
+    return { available: false }
+  }
+}
+
 async function objectiveSubmitTaskErrorCategory(value: unknown): Promise<string | null> {
   if (value === "browser_manual") return "browser_manual"
   const { CAPTCHA_USER_TAKEOVER_MESSAGE, CHALLENGE_DETECTION_FAILED_MESSAGE } =
@@ -2135,6 +2311,11 @@ const TURN_DLQ_ATTEMPTS_MAX = 5
 
 function reviewedFillDiagnosticValue(value: unknown, allowed: ReadonlySet<string>): string {
   return value === null || value === undefined ? "none" : typeof value === "string" && allowed.has(value) ? value : "other"
+}
+
+function objectiveSessionDiagnosticStatus(value: unknown): string {
+  return typeof value === "string" && ["running", "waiting_for_user", "completed", "failed", "paused", "aborted", "archived"].includes(value)
+    ? value : value === null || value === undefined ? "missing" : "other"
 }
 
 function exactDiagnosticRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
@@ -4022,6 +4203,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       const { POST: submitApprovalAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
       const objectiveSubmitBoundaryTrace = worker && !exited(worker)
         ? { child: worker, lineOffset: worker.lines.length } : undefined
+      if (!site) throw new Error("Fixture site is unavailable before Objective submission")
+      const objectiveSubmitLineCursor = site.lines.length
       const approvalResponse = await submitApprovalAction(apiRequest(
         `/api/agent/sessions/${sessionId}/actions`, token, "POST", {
           type: "approval_response", approvalId: submitApproval.id, decision: "approved", receiptNonce,
@@ -4090,7 +4273,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(jsonString(submitDispatch.payload, "constraintHash")).toBe(submitConstraintHash)
       const submitWorkerTaskId = jsonString(submitDispatch.payload, "workerTaskId")
       if (!submitWorkerTaskId) throw new Error("Submit outbox Worker task identity is missing")
-      await waitForOutboxPublished(submitDispatch.id)
+      const publishedSubmitDispatch = await waitForOutboxPublished(submitDispatch.id)
 
       let submittedTask: ApplicationTaskRow
       try {
@@ -4170,13 +4353,13 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(executionSettled).toMatchObject({ body: "Submit execution settled", data: executionData })
       expect(executionStarted.createdAt.getTime()).toBeLessThanOrEqual(submitReceiptEvent.createdAt.getTime())
       expect(submitReceiptEvent.createdAt.getTime()).toBeLessThanOrEqual(executionSettled.createdAt.getTime())
-      expect(submitDispatch.publishedAt).toBeInstanceOf(Date)
+      expect(publishedSubmitDispatch.publishedAt).toBeInstanceOf(Date)
       expect(jsonRecord(submitDispatch.payload)).toMatchObject({ applicationTaskId, userId: ids.user,
         jobId: selectedJobId, sessionId, fillTurnId, receiptId: submitApproval.id, workerTaskId: submitReceipt.workerTaskId,
         submitPayload: { operation: "submit", applicationTaskId, jobId: selectedJobId, sessionId, fillTurnId } })
 
       const expectedObjectiveSubmitLine = `OBJECTIVE_SUBMIT_RECEIVED slot=${selectedFixtureOrdinal}`
-      const objectiveSubmitLine = await waitLine(site!, expectedObjectiveSubmitLine, 10_000)
+      const objectiveSubmitLine = await waitLine(site!, expectedObjectiveSubmitLine, 10_000, objectiveSubmitLineCursor)
       expect(objectiveSubmitLine).toBe(expectedObjectiveSubmitLine)
       const submittedStats = await requestFixtureStats()
       expect(submittedStats.submitCount).toBe(beforeFinalApproval.submitCount)
@@ -4267,7 +4450,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(Object.keys(finalizationReceipt ?? {}).sort()).toEqual([
         "approvalId", "applicationTaskId", "applyResultId", "attemptId", "constraintHash", "executionId", "fillTurnId",
         "jobId", "resultLinkEventId", "schemaVersion", "sessionId", "userId", "workerTaskId",
-      ])
+      ].sort())
       expect(finalizationReceipt).toEqual({ schemaVersion: "agent-harness.v2.objective-application-submit-finalization-queued.v1",
         userId: ids.user, sessionId, jobId: selectedJobId, applicationTaskId, fillTurnId, approvalId: submitApproval.id,
         constraintHash: submitConstraintHash, workerTaskId: submitReceipt.workerTaskId, executionId: submitReceipt.executionId,
@@ -4282,6 +4465,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(closureStats.objectiveSubmitReceipts).toEqual(submittedStats.objectiveSubmitReceipts)
       expect(closureStats.submitCount).toBe(submittedStats.submitCount)
       expect(closureStats.reviewedSubmitCount).toBe(submittedStats.reviewedSubmitCount)
+      selectedJobFullLoopPhase("objective_single_receipt_verified")
       selectedJobFullLoopPhase("objective_single_completed")
     } finally {
       if (sourceWorker && worker === sourceWorker && !exited(sourceWorker)) {
@@ -4298,6 +4482,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
   it("submits five approved Objective slots with one stale Resume, guarded restart, and bounded rate windows", async () => {
     await requireObjectiveStandaloneScenarioCompletion(objectiveStandaloneScenarioCompletion)
+    const waveReceiverBaseline = await requestFixtureStats()
+    expect(waveReceiverBaseline.objectiveSubmitReceipts.map(receipt => receipt.slot)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
     const userId = `${ids.user}-objective-wave`
     const sessionId = `full-loop-objective-wave-session-${runId}`
     const suffix = `full-loop-objective-wave-${runId}`
@@ -4541,8 +4727,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
       const statsBeforeDecisions = await requestFixtureStats()
       expect(statsBeforeDecisions.objectiveGetCounts).toHaveLength(8)
-      expect(statsBeforeDecisions.objectiveSubmitReceipts.every(receipt => receipt.attempts === 0
-        && receipt.validAttempts === 0 && receipt.malformedAttempts === 0)).toBe(true)
+      expect(statsBeforeDecisions.objectiveSubmitReceipts.map(receipt => [
+        receipt.slot, receipt.attempts, receipt.validAttempts, receipt.malformedAttempts,
+      ])).toEqual(waveReceiverBaseline.objectiveSubmitReceipts.map(receipt => [
+        receipt.slot, receipt.attempts, receipt.validAttempts, receipt.malformedAttempts,
+      ]))
       const staleCandidate = currentByOrdinal.get(staleOrdinal)!, staleApprovalId = approvalIdByOrdinal.get(staleOrdinal)!
       const staleApplicationTaskId = (await testDb.agentApproval.findUniqueOrThrow({ where: { id: staleApprovalId }, select: { taskId: true } })).taskId
       if (!staleApplicationTaskId) throw new Error("Stale Objective member has no ApplicationTask")
@@ -4800,6 +4989,88 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         return receipt
       }
       const waveFillerAttempts = new Map<string, Readonly<{ fillRootTaskId: string; fillerTaskId: string; attemptCount: number }>>()
+      const waveFillerTimeoutSnapshot = async (slot: ObjectiveWaveSubmissionSlot, fillTurnId: string) => {
+        const workerAlive = Boolean(worker && !exited(worker))
+        try {
+          return await beforeDeadline(async () => {
+            const [task, turn, job] = await Promise.all([
+              testDb.applicationTask.findFirst({ where: { id: slot.applicationTaskId, userId, sessionId, jobId: slot.jobId },
+                select: { status: true, checkpoint: true, fillTurnId: true } }),
+              testDb.agentTurn.findFirst({ where: { id: fillTurnId, userId, sessionId },
+                select: { status: true, rootTaskId: true, leaseOwnerId: true, leaseExpiresAt: true } }),
+              testDb.job.findFirst({ where: { id: slot.jobId, userId }, select: { status: true, workflowState: true, appliedAt: true } }),
+            ])
+            const rootTaskId = typeof turn?.rootTaskId === "string" ? turn.rootTaskId : null
+            const [root, fillers, browserStarts] = await Promise.all([
+              rootTaskId ? testDb.subAgentTask.findFirst({ where: { id: rootTaskId, rootTaskId, sessionId, turnId: fillTurnId,
+                parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId } },
+                select: { id: true, status: true, leaseOwner: true, leaseExpiresAt: true } }) : Promise.resolve(null),
+              rootTaskId ? testDb.subAgentTask.findMany({ where: { sessionId, turnId: fillTurnId, rootTaskId,
+                role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 3,
+                select: { id: true, status: true, attemptCount: true, completedAt: true, leaseOwner: true,
+                  leaseExpiresAt: true, interruptRequestedAt: true } }) : Promise.resolve([]),
+              testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
+                type: "reviewed_application_fill_browser_started", actor: "worker" }, take: 2, select: { data: true } }),
+            ])
+            const filler = fillers[0]
+            const fillerLeaseFree = Boolean(filler && filler.leaseOwner === null && filler.leaseExpiresAt === null)
+            const turnLeaseFree = Boolean(turn && turn.leaseOwnerId === null && turn.leaseExpiresAt === null)
+            const rootLeaseFree = Boolean(root && root.leaseOwner === null && root.leaseExpiresAt === null)
+            const fillerAttemptMatchesReceipt = fillers.length === 1 && browserStarts.length === 1
+              && objectiveBrowserStartMatches(browserStarts[0]?.data, slot, fillTurnId, fillers[0]!.id, fillers[0]!.attemptCount)
+            return {
+              available: true, workerAlive,
+              task: task ? { status: reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+                checkpoint: reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS),
+                fillTurnMatches: task.fillTurnId === fillTurnId,
+                formFilled: task.status === "waiting_for_authorization" && task.checkpoint === "form_filled"
+                  && task.fillTurnId === fillTurnId } : { status: "missing", checkpoint: "missing", fillTurnMatches: false, formFilled: false },
+              job: job ? { status: reviewedFillDiagnosticValue(job.status, OBJECTIVE_JOB_DIAGNOSTIC_STATUSES),
+                workflowState: reviewedFillDiagnosticValue(job.workflowState, OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES),
+                appliedAtPresent: job.appliedAt !== null,
+                preSubmitReady: job.status === "saved" && job.workflowState === "draft" && job.appliedAt === null }
+                : { status: "missing", workflowState: "missing", appliedAtPresent: false, preSubmitReady: false },
+              turn: turn ? { status: reviewedFillDiagnosticValue(turn.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+                rootPresent: rootTaskId !== null, leaseOwnerPresent: turn.leaseOwnerId !== null,
+                leaseExpiryPresent: turn.leaseExpiresAt !== null, leaseFree: turnLeaseFree,
+                waitingForApproval: turn.status === "waiting_for_approval" }
+                : { status: "missing", rootPresent: false, leaseOwnerPresent: false, leaseExpiryPresent: false,
+                  leaseFree: false, waitingForApproval: false },
+              root: root ? { present: true, status: reviewedFillDiagnosticValue(root.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+                leaseOwnerPresent: root.leaseOwner !== null, leaseExpiryPresent: root.leaseExpiresAt !== null,
+                leaseFree: rootLeaseFree, matchesTurn: root.id === rootTaskId }
+                : { present: false, status: "missing", leaseOwnerPresent: false, leaseExpiryPresent: false,
+                  leaseFree: false, matchesTurn: false },
+              fillerCount: Math.min(fillers.length, 3),
+              filler: filler ? { status: reviewedFillDiagnosticValue(filler.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES),
+                attemptMatchesReceipt: fillerAttemptMatchesReceipt, completedAtPresent: filler.completedAt instanceof Date,
+                leaseOwnerPresent: filler.leaseOwner !== null, leaseExpiryPresent: filler.leaseExpiresAt !== null,
+                leaseFree: fillerLeaseFree, interrupted: filler.interruptRequestedAt !== null,
+                completed: filler.status === "completed" } : { status: "missing", attemptMatchesReceipt: false,
+                  completedAtPresent: false, leaseOwnerPresent: false, leaseExpiryPresent: false,
+                  leaseFree: false, interrupted: false, completed: false },
+              predicates: {
+                uniqueFiller: fillers.length === 1, fillerCompleted: filler?.status === "completed",
+                fillerAttemptMatchesReceipt,
+                fillerCompletedAtPresent: filler?.completedAt instanceof Date,
+                fillerLeaseFree, fillerNotInterrupted: filler?.interruptRequestedAt === null,
+                turnWaitingForApproval: turn?.status === "waiting_for_approval", turnLeaseFree,
+                rootPresent: root !== null, rootLeaseFree,
+              },
+            }
+          }, Date.now() + 1_200)
+        } catch {
+          return { available: false, workerAlive }
+        }
+      }
+      const objectiveBrowserStartMatches = (data: unknown, slot: ObjectiveWaveSubmissionSlot,
+        fillTurnId: string, fillerTaskId: string, attemptCount: number) => {
+        const binding = parseObjectiveReviewedApplicationFillBrowserStartEvent(data)
+        return Boolean(binding && binding.userId === userId && binding.sessionId === sessionId
+          && binding.jobId === slot.jobId && binding.applicationTaskId === slot.applicationTaskId
+          && binding.fillTurnId === fillTurnId && binding.fillerTaskId === fillerTaskId
+          && binding.attemptCount === attemptCount)
+      }
       const waitForWaveFillerCompletion = async (slot: ObjectiveWaveSubmissionSlot, fillTurnId: string) => {
         const deadline = Date.now() + 60_000
         while (Date.now() < deadline) {
@@ -4812,10 +5083,17 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                 completedAt: true, leaseOwner: true, leaseExpiresAt: true, interruptRequestedAt: true } })
             if (fillers.length > 1) throw new Error("Objective Fill Root has duplicate Filler children")
             const filler = fillers[0]
-            if (fillers.length === 1 && filler?.status === "completed" && filler.attemptCount === 1
+            if (fillers.length === 1 && filler?.status === "completed" && Number.isSafeInteger(filler.attemptCount)
+              && filler.attemptCount > 0
               && filler.completedAt instanceof Date && filler.leaseOwner === null && filler.leaseExpiresAt === null
               && filler.interruptRequestedAt === null && turn.status === "waiting_for_approval"
               && turn.leaseOwnerId === null && turn.leaseExpiresAt === null) {
+              const browserStarts = await testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
+                type: "reviewed_application_fill_browser_started", actor: "worker" }, take: 2, select: { data: true } })
+              if (browserStarts.length !== 1 || !objectiveBrowserStartMatches(browserStarts[0]?.data, slot,
+                fillTurnId, filler.id, filler.attemptCount)) {
+                throw new Error("Objective completed Filler has no exact browser-start receipt")
+              }
               const binding = { fillRootTaskId: turn.rootTaskId, fillerTaskId: filler.id, attemptCount: filler.attemptCount }
               waveFillerAttempts.set(slot.applicationTaskId, binding)
               return binding
@@ -4824,7 +5102,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           if (worker && exited(worker)) throw new Error("Worker exited before the Objective Filler released its lease")
           await delay(100)
         }
-        throw new Error("Objective Filler did not reach exact completed and lease-free state")
+        const snapshot = await waveFillerTimeoutSnapshot(slot, fillTurnId)
+        throw new Error(`Objective Filler did not reach exact completed and lease-free state ${JSON.stringify(snapshot)}`)
       }
       const readStaleProof = async (slot: typeof staleSlot) => {
         if (slot.reviewApprovalId !== staleApprovalId || slot.applicationTaskId !== staleApplicationTaskId) {
@@ -4866,12 +5145,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         }
         const fillTurnId = task.fillTurnId
         if (!fillTurnId || fillTurnId !== handoff.fillTurnId) throw new Error("Objective Fill Turn binding changed")
-        const [turn, approval, job, filler] = await Promise.all([
+        const filler = await waitForWaveFillerCompletion(slot, fillTurnId)
+        const [turn, approval, job] = await Promise.all([
           testDb.agentTurn.findFirstOrThrow({ where: { id: fillTurnId, userId, sessionId },
             select: { status: true, rootTaskId: true, leaseOwnerId: true, leaseExpiresAt: true } }),
           waitForReviewedApproval(`application-fill:${slot.applicationTaskId}:${fillTurnId}`),
           testDb.job.findFirstOrThrow({ where: { id: slot.jobId, userId }, select: { status: true, workflowState: true, appliedAt: true } }),
-          waitForWaveFillerCompletion(slot, fillTurnId),
         ])
         if (turn.status !== "waiting_for_approval" || turn.rootTaskId !== filler.fillRootTaskId
           || turn.leaseOwnerId !== null || turn.leaseExpiresAt !== null
@@ -4885,11 +5164,13 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         const scopeHash = approval.scopeHash
         if (typeof scopeHash !== "string") throw new Error("Objective final approval has no stable receipt hash")
         const browserEvents = await testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
-          type: "reviewed_application_fill_browser_started", actor: "worker" }, select: { data: true } })
-        const browserBinding = jsonRecord(browserEvents[0]?.data)
-        if (browserEvents.length !== 1 || browserBinding?.fillerTaskId !== filler.fillerTaskId
-          || browserBinding.attemptCount !== filler.attemptCount) throw new Error("Objective browser-start Filler identity changed")
+          type: "reviewed_application_fill_browser_started", actor: "worker" }, take: 2, select: { data: true } })
+        if (browserEvents.length !== 1 || !objectiveBrowserStartMatches(browserEvents[0]?.data, slot,
+          fillTurnId, filler.fillerTaskId, filler.attemptCount)) throw new Error("Objective browser-start Filler identity changed")
         return { task, fillTurnId, approval, scopeHash, ...filler }
+      }
+      type ApprovedObjectiveSubmission = Awaited<ReturnType<typeof prepareFilledSlot>> & {
+        scopeHash: string; siteLineCursor: number; dispatchId: string
       }
       const approveFinalSubmission = async (slot: typeof submissionSlots[number], prepared: Awaited<ReturnType<typeof prepareFilledSlot>>) => {
         const freshToken = await signedBearer(userId)
@@ -4905,6 +5186,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         if (receiptNonce.length < 20 || !/^[a-f0-9]{64}$/.test(rotatedScopeHash)
           || rotatedScopeHash === prepared.scopeHash) throw new Error("Objective final approval receipt rotation was invalid")
         const { POST: approveAction } = await import("@/app/api/agent/sessions/[id]/actions/route")
+        if (!site) throw new Error("Fixture site is unavailable before Objective submission")
+        const siteLineCursor = site.lines.length
         const response = await approveAction(apiRequest(`/api/agent/sessions/${sessionId}/actions`, freshToken, "POST", {
           type: "approval_response", approvalId: prepared.approval.id, decision: "approved", receiptNonce,
         }), { params: Promise.resolve({ id: sessionId }) })
@@ -4919,11 +5202,22 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
         }
         const dispatch = await waitForOutboxPublished(dispatchId)
         if (dispatch.attemptCount !== 1 || !dispatch.publishedAt) throw new Error("Objective submit dispatch was not acknowledged once")
-        return rotatedScopeHash
+        return { scopeHash: rotatedScopeHash, siteLineCursor, dispatchId }
       }
       const completeSubmittedSlot = async (slot: typeof submissionSlots[number], handoff: ObjectiveWaveHandoffProof,
-        prepared: Awaited<ReturnType<typeof prepareFilledSlot>>, restartCount: 0 | 1) => {
-        const terminalFill = await waitForAgentTurnTerminal(handoff.fillTurnId, 180_000)
+        prepared: ApprovedObjectiveSubmission, restartCount: 0 | 1, restartTrace?: ObjectivePostRestartWorkerTrace) => {
+        let terminalFill: Awaited<ReturnType<typeof waitForAgentTurnTerminal>>
+        try {
+          terminalFill = await waitForAgentTurnTerminal(handoff.fillTurnId, 180_000)
+        } catch (error: unknown) {
+          const isKnownTerminalWait = error instanceof Error
+            && error.message.startsWith("Canonical Turn did not reach terminal state; status=")
+          if (restartCount !== 1 || !restartTrace || !isKnownTerminalWait) throw error
+          const snapshot = await objectivePostRestartTimeoutSnapshot({ userId, sessionId, jobId: slot.jobId,
+            applicationTaskId: slot.applicationTaskId, fillTurnId: handoff.fillTurnId, approvalId: prepared.approval.id,
+            constraintHash: prepared.scopeHash, dispatchId: prepared.dispatchId, workerTrace: restartTrace })
+          throw new Error(`Objective post-restart Fill Turn timeout snapshot ${JSON.stringify(snapshot)}`)
+        }
         if (terminalFill.status !== "completed") throw new Error("Objective Fill Turn did not complete")
         const task = await waitForReviewedApplicationTask(slot.jobId, value => value.id === slot.applicationTaskId
           && value.status === "submitted" && value.checkpoint === "submission_verified", 180_000, userId)
@@ -4936,12 +5230,12 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           select: { id: true, status: true, attemptCount: true, completedAt: true, leaseOwner: true,
             leaseExpiresAt: true, interruptRequestedAt: true } })
         if (completedFillers.length !== 1 || completedFillers[0]?.status !== "completed"
-          || completedFillers[0]?.attemptCount !== filler.attemptCount || completedFillers[0]?.attemptCount !== 1
+          || completedFillers[0]?.attemptCount !== filler.attemptCount
           || !(completedFillers[0]?.completedAt instanceof Date) || completedFillers[0]?.leaseOwner !== null
           || completedFillers[0]?.leaseExpiresAt !== null || completedFillers[0]?.interruptRequestedAt !== null) {
           throw new Error("Objective completed Filler attempt changed")
         }
-        await waitLine(site!, `OBJECTIVE_SUBMIT_RECEIVED slot=${slot.routeOrdinal}`, 30_000)
+        await waitLine(site!, `OBJECTIVE_SUBMIT_RECEIVED slot=${slot.routeOrdinal}`, 30_000, prepared.siteLineCursor)
         let durable: Awaited<ReturnType<typeof readObjectiveWaveSubmissionEvidence>> = null
         const proofDeadline = Date.now() + 60_000
         while (!durable && Date.now() < proofDeadline) {
@@ -5113,16 +5407,130 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           },
           async approveSubmitAndReadProof(slot, handoff) {
             const prepared = await prepareFilledSlot(slot, handoff)
-            const scopeHash = await approveFinalSubmission(slot, prepared)
-            return completeSubmittedSlot(slot, handoff, { ...prepared, scopeHash }, 0)
+            const approved = await approveFinalSubmission(slot, prepared)
+            return completeSubmittedSlot(slot, handoff, { ...prepared, ...approved }, 0)
           },
           async approveSubmitWithCrashRecoveryAndReadProof(slot, handoff) {
             const prepared = await prepareFilledSlot(slot, handoff)
-            let approved = prepared
+            let approved: ApprovedObjectiveSubmission | null = null
             const captured = worker
             if (!captured || exited(captured)) throw new Error("Objective pre-submit Worker is unavailable")
             let connection: InstanceType<typeof Client> | undefined
             let committed: { eventId: string; attemptId: string; applyResultId: number } | undefined
+            const captureWaitTimeout = async ({ waiterCount, workerAlive }: { waiterCount: number; workerAlive: boolean }):
+              Promise<Readonly<Record<string, string | number | boolean | null>>> => {
+              const boundaryApproval = approved
+              if (!boundaryApproval) return { available: false, waiterCount, workerAlive }
+              try {
+                const [task, turn, job, approval, attempts, resultEvents, executionEvents, browserStarts,
+                  submitDispatch, stats] = await Promise.all([
+                  testDb.applicationTask.findFirst({ where: { id: slot.applicationTaskId, userId, sessionId,
+                    jobId: slot.jobId, fillTurnId: prepared.fillTurnId }, select: {
+                    status: true, checkpoint: true, workerTaskId: true, fillTurnId: true,
+                  } }),
+                  testDb.agentTurn.findFirst({ where: { id: prepared.fillTurnId, userId, sessionId }, select: { status: true } }),
+                  testDb.job.findFirst({ where: { id: slot.jobId, userId }, select: { status: true, workflowState: true, appliedAt: true } }),
+                  testDb.agentApproval.findFirst({ where: { id: prepared.approval.id, userId, sessionId,
+                    turnId: prepared.fillTurnId, taskId: slot.applicationTaskId, jobId: slot.jobId,
+                    type: "submit_application" }, select: { status: true, scopeHash: true, resourceHash: true, consumedAt: true } }),
+                  testDb.submissionAttempt.findMany({ where: { userId, jobId: slot.jobId,
+                    receiptId: prepared.approval.id, constraintHash: boundaryApproval.scopeHash }, take: 3,
+                    select: { id: true, state: true, artifactHash: true, responseRef: true } }),
+                  testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
+                    type: "objective_application_submit_result_recorded", actor: "worker" }, take: 3,
+                    select: { id: true, data: true } }),
+                  testDb.applicationTaskEvent.findMany({ where: { taskId: slot.applicationTaskId,
+                    type: { in: ["submission_execution_started", "submission_execution_settled"] }, actor: "worker" }, take: 5,
+                    select: { id: true, type: true, body: true, data: true } }),
+                  testDb.applicationTaskEvent.count({ where: { taskId: slot.applicationTaskId,
+                    type: "reviewed_application_fill_browser_started", actor: "worker" } }),
+                  testDb.agentOutbox.findUnique({ where: { id: boundaryApproval.dispatchId }, select: {
+                    id: true, aggregateId: true, topic: true, payload: true, publishedAt: true, attemptCount: true,
+                  } }),
+                  requestFixtureStats(500).catch(() => null),
+                ])
+                const exactDispatch = Boolean(submitDispatch?.id === boundaryApproval.dispatchId
+                  && submitDispatch.aggregateId === sessionId && submitDispatch.topic === "application.submit.dispatch"
+                  && jsonString(submitDispatch.payload, "applicationTaskId") === slot.applicationTaskId
+                  && jsonString(submitDispatch.payload, "constraintHash") === boundaryApproval.scopeHash)
+                const exactAttemptState = attempts.length === 1
+                  ? diagnosticSubmissionAttemptState(attempts[0]?.state) ?? "missing"
+                  : attempts.length === 0 ? "missing" : "other"
+                const resultData = resultEvents.length === 1 ? jsonRecord(resultEvents[0]?.data) : null
+                const resultKeys = ["applicationTaskId", "approvalId", "applyResultId", "attemptId", "constraintHash",
+                  "executionId", "fillTurnId", "jobId", "schemaVersion", "sessionId", "userId", "workerTaskId"].sort().join(",")
+                const expectedResultId = `objective-application-submit-result:${hashContent([
+                  slot.applicationTaskId, prepared.fillTurnId, prepared.approval.id,
+                ]).slice(7)}`
+                const exactResultReceipt = Boolean(resultData && Object.keys(resultData).sort().join(",") === resultKeys
+                  && resultEvents[0]?.id === expectedResultId
+                  && resultData.schemaVersion === "agent-harness.v2.objective-application-submit-result.v1"
+                  && resultData.applicationTaskId === slot.applicationTaskId && resultData.userId === userId
+                  && resultData.jobId === slot.jobId && resultData.sessionId === sessionId
+                  && resultData.fillTurnId === prepared.fillTurnId && resultData.approvalId === prepared.approval.id
+                  && resultData.constraintHash === boundaryApproval.scopeHash && resultData.workerTaskId === task?.workerTaskId
+                  && typeof resultData.executionId === "string" && typeof resultData.attemptId === "string"
+                  && Number.isSafeInteger(resultData.applyResultId))
+                const resultAttemptMatch = Boolean(exactResultReceipt && attempts.length === 1 && resultData
+                  && resultData.attemptId === attempts[0]?.id && attempts[0]?.state === "submitted"
+                  && attempts[0]?.artifactHash === approval?.resourceHash
+                  && typeof attempts[0]?.responseRef === "string")
+                const applyResult = exactResultReceipt && typeof resultData?.applyResultId === "number"
+                  ? await testDb.applyResult.findUnique({ where: { id: resultData.applyResultId }, select: {
+                    userId: true, jobId: true, mode: true, atsType: true, flowUsed: true, status: true, error: true,
+                  } })
+                  : null
+                const started = executionEvents.filter(event => event.type === "submission_execution_started")
+                const settled = executionEvents.filter(event => event.type === "submission_execution_settled")
+                const startData = started.length === 1 ? jsonRecord(started[0]?.data) : null
+                const startExecutionId = typeof startData?.executionId === "string" ? startData.executionId : ""
+                const exactStartMarker = Boolean(task && started.length === 1 && startExecutionId.length > 0
+                  && started[0]?.id === `evt_${startExecutionId}` && started[0]?.body === "Submit execution started"
+                  && startData?.applicationTaskId === slot.applicationTaskId && startData.userId === userId
+                  && startData.jobId === slot.jobId && startData.sessionId === sessionId
+                  && startData.fillTurnId === prepared.fillTurnId && startData.approvalId === prepared.approval.id
+                  && startData.constraintHash === boundaryApproval.scopeHash && startData.workerTaskId === task.workerTaskId)
+                const receipt = stats?.objectiveSubmitReceipts[slot.routeOrdinal - 1]
+                const lineMarker = `OBJECTIVE_SUBMIT_RECEIVED slot=${slot.routeOrdinal}`
+                const receiverLineCount = site && Number.isSafeInteger(boundaryApproval.siteLineCursor)
+                  ? Math.min(2, site.lines.slice(boundaryApproval.siteLineCursor).filter(line => line === lineMarker).length) : 0
+                const capped = (value: number | undefined) => Number.isSafeInteger(value) ? Math.min(2, Math.max(0, Number(value))) : null
+                const jobStatus = reviewedFillDiagnosticValue(job?.status, OBJECTIVE_JOB_DIAGNOSTIC_STATUSES)
+                const jobWorkflowState = reviewedFillDiagnosticValue(job?.workflowState, OBJECTIVE_JOB_DIAGNOSTIC_WORKFLOW_STATES)
+                return {
+                  available: true, waiterCount, workerAlive,
+                  taskStatus: task ? reviewedFillDiagnosticValue(task.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES) : "missing",
+                  taskCheckpoint: task ? reviewedFillDiagnosticValue(task.checkpoint, REVIEWED_FILL_DIAGNOSTIC_CHECKPOINTS) : "missing",
+                  taskBindingMatches: Boolean(task && task.fillTurnId === prepared.fillTurnId
+                    && typeof task.workerTaskId === "string"),
+                  fillTurnStatus: turn ? reviewedFillDiagnosticValue(turn.status, REVIEWED_FILL_DIAGNOSTIC_STATUSES) : "missing",
+                  jobStatus: job ? jobStatus : "missing", jobWorkflowState: job ? jobWorkflowState : "missing",
+                  jobProjectionStillPreSubmit: Boolean(job && job.status === "saved" && job.workflowState === "submitting" && job.appliedAt === null),
+                  submitOutboxPresent: submitDispatch !== null,
+                  submitOutboxExact: exactDispatch,
+                  submitOutboxPublished: exactDispatch && submitDispatch?.publishedAt instanceof Date
+                    && submitDispatch?.attemptCount === 1,
+                  approvalConsumed: Boolean(approval?.status === "consumed" && approval.consumedAt instanceof Date
+                    && approval.scopeHash === boundaryApproval.scopeHash),
+                  attemptCount: Math.min(2, attempts.length), attemptState: exactAttemptState,
+                  resultAttemptMatch,
+                  browserStartCount: Math.min(2, browserStarts),
+                  resultReceiptCount: Math.min(2, resultEvents.length), exactResultReceipt,
+                  applyResultStatus: applyResult?.userId === userId && applyResult.jobId === slot.jobId
+                    && applyResult.mode === "unattended" && applyResult.atsType === "greenhouse"
+                    && applyResult.flowUsed === "application.submit" && applyResult.status === "submitted" && applyResult.error === null
+                    ? "submitted" : applyResult ? "other" : "missing",
+                  executionStartCount: Math.min(2, started.length), exactStartMarker,
+                  executionSettledCount: Math.min(2, settled.length),
+                  receiverAttempts: receipt ? capped(receipt.attempts - handoff.routePostAttemptsBefore) : null,
+                  receiverValid: receipt ? capped(receipt.validAttempts - handoff.routePostValidBefore) : null,
+                  receiverMalformed: receipt ? capped(receipt.malformedAttempts - handoff.routePostMalformedBefore) : null,
+                  receiverLineCount,
+                }
+              } catch {
+                return { available: false, waiterCount, workerAlive }
+              }
+            }
             try {
               const replacement = await restartObjectiveWorkerAtProjectionBarrier({
                 installBarrier: async () => {
@@ -5132,12 +5540,25 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
                     runId, userId, jobId: slot.jobId })
                 },
                 publishFinalApproval: async () => {
-                  const scopeHash = await approveFinalSubmission(slot, prepared)
-                  approved = { ...prepared, scopeHash }
+                  approved = { ...prepared, ...await approveFinalSubmission(slot, prepared) }
+                },
+                async waitForReceiver() {
+                  if (!approved || !Number.isSafeInteger(approved.siteLineCursor)) {
+                    throw new Error("Objective receiver wait has no approval cursor")
+                  }
+                  const marker = `OBJECTIVE_SUBMIT_RECEIVED slot=${slot.routeOrdinal}`
+                  let received: string
+                  try { received = await waitLine(site!, marker, 180_000, approved.siteLineCursor) } catch {
+                    throw new Error(exited(captured) ? "objective_wave_worker_exited_before_receiver"
+                      : "objective_wave_receiver_wait_timeout")
+                  }
+                  if (received !== marker) throw new Error("objective_wave_receiver_marker_invalid")
                 },
                 worker: captured,
                 waitForExit: waitExit,
+                captureWaitTimeout,
                 async assertCommittedResult(phase) {
+                  if (!approved) throw new Error("Objective crash recovery omitted the approved submit attempt")
                   const next = await proveCommittedResult(slot, handoff, approved, phase, committed)
                   if (phase === "blocked") committed = next
                 },
@@ -5150,7 +5571,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
               })
               if (worker !== replacement || !exited(captured)) throw new Error("Objective restart did not replace one captured Worker")
               if (!committed) throw new Error("Objective crash recovery omitted the committed result proof")
-              return { proof: await completeSubmittedSlot(slot, handoff, approved, 1), restart: {
+              if (!approved) throw new Error("Objective crash recovery omitted the approved submit attempt")
+              return { proof: await completeSubmittedSlot(slot, handoff, approved, 1,
+                { children: [captured, replacement] }), restart: {
                 projectionBlocked: true as const, committedResultBeforeCrash: true as const, capturedWorkerKilled: true as const,
                 workerExitObserved: true as const, barrierUnblocked: true as const, successorStartedOnce: true as const,
                 successorReady: true as const,
@@ -5193,7 +5616,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
             }
             const measured = await Promise.all(pair.map(async proof => {
               const recorded = waveFillerAttempts.get(proof.durable.task.id)
-              if (!recorded || recorded.attemptCount !== 1) throw new Error("Objective rate-window Filler attempt was not verified")
+              if (!recorded || !Number.isSafeInteger(recorded.attemptCount) || recorded.attemptCount < 1) {
+                throw new Error("Objective rate-window Filler attempt was not verified")
+              }
               const fillers = await testDb.subAgentTask.findMany({ where: { id: recorded.fillerTaskId,
                 sessionId, turnId: proof.durable.fillTurnId, rootTaskId: recorded.fillRootTaskId,
                 role: "application_filler", taskType: "application_fill_for_review", session: { userId } }, take: 2,

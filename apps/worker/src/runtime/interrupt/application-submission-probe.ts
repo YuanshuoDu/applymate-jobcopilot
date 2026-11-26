@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from "pg"
 import { markSubmissionRequestStarted, type ApplicationSubmissionStartScope } from "../../db/application-task-state.js"
 import { readSubmissionTurnState, withReviewedApplicationSubmitRequestFence, type ReviewedSubmitSourceExpectation } from "../../db/reviewed-application-submit-request-fence.js"
 import { appendFencedSubmitAudit } from "../../queue/application-submit-fence.js"
+import { createObjectiveSubmissionFenceAcquisition, type ObjectiveSubmissionFenceClient } from "./objective-submission-fence-acquisition.js"
 
 export const APPLICATION_SUBMISSION_STOP_POLL_MS = 250
 
@@ -11,59 +12,58 @@ export type ApplicationSubmissionStopProbe = {
 }
 
 export type ApplicationSubmissionStartFence = {
-  state: "ready" | "stopped" | "inactive" | "uncertain"
+  state: "ready" | "stopped" | "inactive" | "uncertain" | "cancelled" | "unavailable"
+  markerCommitted?: true
   release(commit: boolean): Promise<void>
-}
-
-let submissionFenceQueue: Promise<void> = Promise.resolve()
-
-async function acquireSubmissionFencePermit(): Promise<() => void> {
-  let releaseCurrent!: () => void
-  const current = new Promise<void>((resolve) => { releaseCurrent = resolve })
-  const previous = submissionFenceQueue
-  submissionFenceQueue = previous.then(() => current)
-  await previous
-
-  let released = false
-  return () => {
-    if (released) return
-    released = true
-    releaseCurrent()
-  }
 }
 
 /** Commit the durable marker, then hold a fresh exact fence through request initiation. */
 export async function acquireApplicationSubmissionStartFence(
   pool: Pool,
   scope: ApplicationSubmissionStartScope,
+  options: Readonly<{ signal?: AbortSignal; timeoutMs?: number }> = {},
 ): Promise<ApplicationSubmissionStartFence> {
-  const releasePermit = await acquireSubmissionFencePermit()
+  const acquisition = createObjectiveSubmissionFenceAcquisition({ parentSignal: options.signal, timeoutMs: options.timeoutMs })
+  let permitRelease: (() => void) | null = null
   let permitReleased = false
   const releasePermitOnce = (): void => {
     if (permitReleased) return
     permitReleased = true
-    releasePermit()
+    permitRelease?.()
+    acquisition.dispose()
   }
+  permitRelease = await acquisition.acquirePermit()
+  if (!permitRelease) return declined(acquisition.cancellation() === "timed_out" ? "unavailable" : "cancelled", releasePermitOnce)
   let markerClient: PoolClient | undefined
   let boundaryClient: PoolClient | undefined
+  let markerLease: ObjectiveSubmissionFenceClient | undefined
+  let boundaryLease: ObjectiveSubmissionFenceClient | undefined
   let open = false
   let released = false
   let markerCommitted = false
+  let markerCommitAttempted = false
   let markerExpectedSource: ReviewedSubmitSourceExpectation = undefined
   const releaseReservedMarkerClient = (): void => {
-    const reserved = markerClient
+    const reserved = markerLease
+    markerLease = undefined
     markerClient = undefined
     reserved?.release()
   }
   const releaseBoundaryClient = (): void => {
-    const reserved = boundaryClient
+    const reserved = boundaryLease
+    boundaryLease = undefined
     boundaryClient = undefined
     reserved?.release()
   }
   try {
-    markerClient = await pool.connect()
+    markerLease = (await acquisition.connect(pool)) ?? undefined
+    markerClient = markerLease?.queryClient
+    if (!markerClient) return declined(acquisition.cancellation() === "timed_out" ? "unavailable" : "cancelled", releasePermitOnce)
     const markerConnection = markerClient
-    if (!markerConnection) throw new Error("Submission marker connection was not reserved")
+    if (acquisition.signal.aborted) {
+      releaseReservedMarkerClient()
+      return declined(acquisition.cancellation() === "timed_out" ? "unavailable" : "cancelled", releasePermitOnce)
+    }
     await markerConnection.query("BEGIN")
     open = true
     await markerConnection.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
@@ -92,26 +92,19 @@ export async function acquireApplicationSubmissionStartFence(
       return declined(markerAttempt.value, releasePermitOnce)
     }
     markerExpectedSource = markerAttempt.objectiveSource ? { kind: "objective", source: markerAttempt.objectiveSource } : markerAttempt.sourceTurnId
-    try {
-      await markerConnection.query("COMMIT")
-      markerCommitted = true
-    } catch {
-      // The durable marker may or may not have committed. Never release the
-      // browser request in this case; the queue will persist an uncertain
-      // outcome under the exact attempt fence.
-      await markerConnection.query("ROLLBACK").catch(() => undefined)
-      open = false
-      releaseReservedMarkerClient()
-      releasePermitOnce()
-      return { state: "uncertain", release: async () => undefined }
-    }
+    if (acquisition.signal.aborted) return declined(acquisition.cancellation() === "timed_out" ? "unavailable" : "cancelled", releasePermitOnce)
+    markerCommitAttempted = true
+    await markerConnection.query("COMMIT")
+    markerCommitted = true
     open = false
     releaseReservedMarkerClient()
 
     // A user may bind a successor between persisting the marker and sending the
     // request. Reacquire the same exact lock order and only then release the
     // paused browser route; a superseded payload never reaches the ATS.
-    boundaryClient = await pool.connect()
+    boundaryLease = (await acquisition.connect(pool)) ?? undefined
+    boundaryClient = boundaryLease?.queryClient
+    if (!boundaryClient) return declined("uncertain", releasePermitOnce)
     const boundary = boundaryClient
     await boundary.query("BEGIN")
     open = true
@@ -132,23 +125,24 @@ export async function acquireApplicationSubmissionStartFence(
       await boundary.query("COMMIT")
       open = false
       releaseBoundaryClient()
-      return declined("inactive", releasePermitOnce)
+      return declined(isObjectiveSource(markerExpectedSource) ? "uncertain" : "inactive", releasePermitOnce)
     }
     if (boundaryAttempt.value === "stopped") {
       await boundary.query("ROLLBACK")
       open = false
       releaseBoundaryClient()
-      return declined("stopped", releasePermitOnce)
+      return declined("stopped", releasePermitOnce, isObjectiveSource(markerExpectedSource))
     }
 
     const release = async (commit: boolean): Promise<void> => {
       if (released) return
       released = true
       try {
+        if (acquisition.signal.aborted) throw new Error("Objective submission fence acquisition ended.")
         await boundary.query(commit ? "COMMIT" : "ROLLBACK")
         open = false
       } catch (error: unknown) {
-        if (open) await boundary.query("ROLLBACK").catch(() => undefined)
+        if (open && !boundaryLease?.isReleased) await boundary.query("ROLLBACK").catch(() => undefined)
         open = false
         throw error
       } finally {
@@ -159,19 +153,30 @@ export async function acquireApplicationSubmissionStartFence(
   } catch (error: unknown) {
     try {
       const active = boundaryClient ?? markerClient
-      if (active && open) await active.query("ROLLBACK").catch(() => undefined)
+      const activeLease = boundaryLease ?? markerLease
+      if (active && open && !activeLease?.isReleased) await active.query("ROLLBACK").catch(() => undefined)
+      open = false
       if (boundaryClient) { released = true; releaseBoundaryClient() }
     } finally {
       try { releaseReservedMarkerClient() } finally { releasePermitOnce() }
     }
-    if (markerCommitted) return { state: "uncertain", release: async () => undefined }
+    if (markerCommitted || markerCommitAttempted) return { state: "uncertain", release: async () => undefined }
+    if (acquisition.cancellation()) return declined(acquisition.cancellation() === "timed_out" ? "unavailable" : "cancelled", releasePermitOnce)
     throw error
   }
 }
 
-async function declined(state: "stopped" | "inactive", releasePermit: () => void): Promise<ApplicationSubmissionStartFence> {
+async function declined(
+  state: ApplicationSubmissionStartFence["state"],
+  releasePermit: () => void,
+  markerCommitted = false,
+): Promise<ApplicationSubmissionStartFence> {
   releasePermit()
-  return { state, release: async () => undefined }
+  return { state, ...(markerCommitted ? { markerCommitted: true as const } : {}), release: async () => undefined }
+}
+
+function isObjectiveSource(source: ReviewedSubmitSourceExpectation): boolean {
+  return typeof source === "object" && source !== null && source.kind === "objective"
 }
 
 export async function isApplicationSubmissionStopped(pool: Pool, scope: ApplicationSubmissionStartScope): Promise<boolean> {

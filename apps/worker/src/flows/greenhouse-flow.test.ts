@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { runGreenhouseFlow } from "./greenhouse-flow.js";
 import { detectFlow } from "./index.js";
+import type { ObjectiveGreenhouseSubmissionObservation, ObjectiveSubmissionObservationOutcome } from "./objective-greenhouse-submission-observation.js";
 import type { Page } from "playwright-core";
 
 const COVER_LETTER_UNION = "textarea[name*='cover' i], textarea[id*='cover' i], textarea[placeholder*='cover' i]";
@@ -46,6 +47,14 @@ function objectivePage(options: { upload?: boolean; readback?: boolean; lateChan
     $$: vi.fn().mockResolvedValue([]), waitForLoadState: vi.fn().mockResolvedValue(undefined),
   } as unknown as Page
   return { page, events, cover, upload, submit }
+}
+
+function observation(outcome: ObjectiveSubmissionObservationOutcome = "confirmed") {
+  return {
+    arm: vi.fn().mockReturnValue(true), accept: vi.fn().mockReturnValue(true), reject: vi.fn(),
+    forward: vi.fn().mockReturnValue(true), waitForConfirmation: vi.fn().mockResolvedValue(outcome),
+    outcome: vi.fn().mockReturnValue(outcome), dispose: vi.fn(),
+  } as unknown as ObjectiveGreenhouseSubmissionObservation;
 }
 
 function reviewedTask(content: string) {
@@ -230,13 +239,41 @@ describe("runGreenhouseFlow", () => {
   it("submits Objective material only after exact letter readback and approved Resume upload", async () => {
     const { page, events, upload } = objectivePage()
     const beforeSubmit = vi.fn(async () => { events.push("guard"); return true })
+    const submitObservation = observation()
     const result = await runGreenhouseFlow(page, {
       ...reviewedTask("Approved letter"), resumePath: "/tmp/approved-resume.pdf", allowSubmit: true, beforeSubmit,
-    }, { reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true })
+    }, { reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true, submissionObservation: submitObservation })
 
     expect(result.status).toBe("submitted")
     expect(upload.setInputFiles).toHaveBeenCalledWith("/tmp/approved-resume.pdf")
     expect(events).toEqual(["cover-read", "cover-fill", "cover-read", "upload", "cover-read", "guard", "click"])
+    expect(submitObservation.waitForConfirmation).toHaveBeenCalledOnce()
+    expect(submitObservation.dispose).toHaveBeenCalledOnce()
+    expect(page.waitForLoadState).not.toHaveBeenCalled()
+  })
+
+  it("keeps Objective flow manual when the correlated document has no confirmation", async () => {
+    const { page } = objectivePage()
+    const submitObservation = observation("confirmation_missing")
+    const result = await runGreenhouseFlow(page, {
+      ...reviewedTask("Approved letter"), resumePath: "/tmp/approved-resume.pdf", allowSubmit: true,
+      beforeSubmit: vi.fn().mockResolvedValue(true),
+    }, { reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true, submissionObservation: submitObservation })
+
+    expect(result).toMatchObject({ status: "manual", error: "objective_submit_observation_confirmation_missing" })
+    expect(page.waitForLoadState).not.toHaveBeenCalled()
+  })
+
+  it("fails closed before clicking if Objective observation is unavailable", async () => {
+    const { page, submit } = objectivePage()
+    const result = await runGreenhouseFlow(page, {
+      ...reviewedTask("Approved letter"), resumePath: "/tmp/approved-resume.pdf", allowSubmit: true,
+      beforeSubmit: vi.fn().mockResolvedValue(true),
+    }, { reviewedCoverLetter: "Approved letter", objectiveReviewedSubmission: true })
+
+    expect(result.status).toBe("submission_blocked")
+    expect(submit.click).not.toHaveBeenCalled()
+    expect(page.waitForLoadState).not.toHaveBeenCalled()
   })
 
   it.each([

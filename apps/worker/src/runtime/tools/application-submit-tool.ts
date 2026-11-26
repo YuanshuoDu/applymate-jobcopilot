@@ -25,6 +25,15 @@ export const ApplicationSubmitOutputSchema = Type.Object({
 export type ApplicationSubmitInput = Static<typeof ApplicationSubmitInputSchema>
 export type ApplicationSubmitOutput = Static<typeof ApplicationSubmitOutputSchema>
 
+/** Trusted Worker signal for a marker that may have committed before forwarding was resolved. */
+export class ObjectiveSubmissionUncertainError extends Error {
+  readonly code = "submission_in_flight"
+  constructor() {
+    super("Objective submission boundary outcome is uncertain.")
+    this.name = "ObjectiveSubmissionUncertainError"
+  }
+}
+
 export interface SubmissionApprovalStore {
   inspectSubmissionInTransaction(client: PoolClient, id: string, expected: ApplicationSubmitIdentity, now?: Date): Promise<AgentApproval | null>
   consumeSubmissionInTransaction(client: PoolClient, id: string, expected: ApplicationSubmitIdentity, now?: Date): Promise<AgentApproval | null>
@@ -211,9 +220,10 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
         if (saved.kind === "fenced") return failed("submission_attempt_fenced")
         return { status: "submitted", confirmationId: result.confirmationId, postSubmitUrl: result.postSubmitUrl ?? null, errorCode: null, output: { confirmationId: result.confirmationId, postSubmitUrl: result.postSubmitUrl ?? null } }
       } catch (error: unknown) {
-        const errorCode = safeErrorCode(error, objectiveSubmission)
-        if (reserved && !submitSucceeded) await deps.attempts.markFailed(identity, errorCode).catch(() => undefined)
-        return failed(publicAttemptErrorCode(errorCode))
+        const objectiveUncertain = objectiveSubmission && error instanceof ObjectiveSubmissionUncertainError
+        const errorCode = objectiveUncertain ? "submission_in_flight" : safeErrorCode(error, objectiveSubmission)
+        if (reserved && !submitSucceeded && !objectiveUncertain) await deps.attempts.markFailed(identity, errorCode).catch(() => undefined)
+        return failed(objectiveUncertain ? "submission_in_flight" : publicAttemptErrorCode(errorCode))
       }
     },
   }
