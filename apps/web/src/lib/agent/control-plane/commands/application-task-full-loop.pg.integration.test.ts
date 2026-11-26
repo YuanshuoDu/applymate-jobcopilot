@@ -3275,6 +3275,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       } finally { await sourcePool.end() }
       reviewedJobIds.push(...seeded.jobs.map(job => job.id))
       for (const jobId of seeded.jobs.map(job => job.id)) reviewedJobOwners.set(jobId, userId)
+      const comparisonKeywords = "TypeScript, Rust"
+      for (const job of seeded.jobs) {
+        const updated = await testDb.job.updateMany({ where: { id: job.id, userId }, data: { keywords: comparisonKeywords } })
+        expect(updated.count).toBe(1)
+      }
 
       const token = await signedBearer(userId), objective = "Assess synthetic roles for a reporting-only score floor"
       const startKey = `objective-score-floor-nine-${runId}`
@@ -3337,6 +3342,49 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       expect(report?.requirementEvidenceCoverage).toEqual({ status: "complete", checkedReadyJobs: 6, verifiedReadyJobs: 6 })
       expect(JSON.stringify(report)).not.toContain(requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE)
       expect(Array.isArray(report?.slots) ? report.slots.map(slot => jsonRecord(slot)?.reviewStatus) : []).toEqual(Array(8).fill("not_requested"))
+      const graphRevisionValue = report?.graphRevision
+      if (typeof graphRevisionValue !== "number" || !Number.isSafeInteger(graphRevisionValue) || graphRevisionValue < 1) {
+        throw new Error("Score floor report graph revision is unavailable")
+      }
+      const graphRevision = graphRevisionValue
+      const comparisonPath = `/api/agent/sessions/${sessionId}/final-items/${finalItemId}/objective-report`
+      const comparisonBody = { compareConfirmedSkills: true, graphRevision }
+      const comparisonContext = { params: Promise.resolve({ id: sessionId, itemId: finalItemId }) }
+      const { POST: compareObjective } = await import("@/app/api/agent/sessions/[id]/final-items/[itemId]/objective-report/route")
+      const compare = (bearer: string) => compareObjective(apiRequest(comparisonPath, bearer, "POST", comparisonBody), comparisonContext)
+      const noConsentResponse = await compare(token)
+      expect(noConsentResponse.status).toBe(200)
+      expect(await jsonResponse(noConsentResponse)).toEqual({ comparison: {
+        schemaVersion: "agent-harness.v2.objective-skill-comparison.v1", finalItemId, graphRevision,
+        coverage: "unavailable", skills: [], suggestedTerms: [],
+      } })
+      const foreignResponse = await compare(await signedBearer(ids.foreignUser))
+      expect(foreignResponse.status).toBe(404)
+      expect(await jsonResponse(foreignResponse)).not.toHaveProperty("comparison")
+      const pastedSkillsFactId = `objective-score-floor-nine-pasted-skills-${runId}`
+      await testDb.personaFact.create({ data: { id: pastedSkillsFactId, userId, key: "pasted_skills", category: "work",
+        value: "TypeScript, PrivateFixtureSkill", normalizedValue: "typescript, privatefixtureskill", source: "manual", evidence: { label: "Skills" }, status: "confirmed",
+        allowedUses: ["discovery"], consentAt: new Date(), updatedAt: new Date() } })
+      const confirmedResponse = await compare(token)
+      expect(confirmedResponse.status).toBe(200)
+      const confirmedBody = await jsonResponse(confirmedResponse)
+      expect(confirmedBody).toEqual({ comparison: {
+        schemaVersion: "agent-harness.v2.objective-skill-comparison.v1", finalItemId, graphRevision, coverage: "complete",
+        skills: [{ label: "TypeScript", evidenceStatus: "confirmed_persona_match", slotOrdinals: [1, 2, 4, 5, 6, 7] }],
+        suggestedTerms: ["TypeScript"],
+      } })
+      const serializedComparison = JSON.stringify(confirmedBody)
+      expect(serializedComparison).not.toContain(requirementFixture.OBJECTIVE_WAVE_REQUIREMENT_QUOTE)
+      for (const forbidden of ["Rust", "PrivateFixtureSkill", pastedSkillsFactId, "pasted_skills", "normalizedValue", "allowedUses", ...seeded.jobs.map(job => job.id)]) {
+        expect(serializedComparison).not.toContain(forbidden)
+      }
+      await testDb.personaFact.update({ where: { id: pastedSkillsFactId }, data: { revokedAt: new Date() } })
+      const revokedResponse = await compare(token)
+      expect(revokedResponse.status).toBe(200)
+      expect(await jsonResponse(revokedResponse)).toEqual({ comparison: {
+        schemaVersion: "agent-harness.v2.objective-skill-comparison.v1", finalItemId, graphRevision,
+        coverage: "unavailable", skills: [], suggestedTerms: [],
+      } })
       expect(await testDb.agentTurn.count({ where: { userId, sessionId } })).toBe(1)
       expect(await testDb.applicationTask.count({ where: { userId, sessionId } })).toBe(0)
       expect(await testDb.agentOutbox.count({ where: { aggregateId: sessionId, topic: "application.submit.dispatch" } })).toBe(0)

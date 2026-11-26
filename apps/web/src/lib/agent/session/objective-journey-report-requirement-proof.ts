@@ -11,6 +11,7 @@ import type { ObjectiveJourneyRequirementRead } from "./objective-journey-report
 type Row = Record<string, unknown>
 type Slot = ObjectiveJourneySource["slots"][number]
 type ProofResult = Readonly<{ checked: boolean; hasVerifiedRequirements: boolean }>
+type VerifiedRequirementRead = Readonly<{ checked: true; keywords: string | null; quotes: readonly string[] }>
 const VERIFIER = "agent-harness.v2.task-graph-verifier.v1"
 const SHA = /^[a-f0-9]{64}$/
 const JOB_KEYS = ["company", "description", "id", "keywords", "location", "role", "salary", "score", "source", "status", "url"]
@@ -31,40 +32,47 @@ export function objectiveJourneyAnalystGraphRequirements(value: unknown): Readon
 /** Verifies the private Analyst result, event receipts, candidate binding and current Job before counting coverage. */
 export function verifyObjectiveJourneyRequirementProof(source: ObjectiveJourneySource, slot: Slot,
   read: ObjectiveJourneyRequirementRead): ProofResult {
+  const verified = objectiveJourneyVerifiedRequirementRead(source, slot, read)
+  return verified ? { checked: true, hasVerifiedRequirements: verified.quotes.length > 0 } : unchecked()
+}
+
+/** Internal report adapter: exposes only verified quote text to the same-process matcher. */
+export function objectiveJourneyVerifiedRequirementRead(source: ObjectiveJourneySource, slot: Slot,
+  read: ObjectiveJourneyRequirementRead): VerifiedRequirementRead | undefined {
   try {
     const analyst = slot.requirementAnalyst, jobId = slot.jobId, scope = read.scope
     if (!slot.sourceReady || slot.tailoringStatus !== "ready" || !analyst || !jobId || scope.userId !== source.userId
       || scope.sessionId !== source.sessionId || scope.turnId !== source.sourceTurnId || scope.rootTaskId !== source.rootTaskId
       || scope.parentTaskId !== source.rootTaskId || scope.taskId !== analyst.taskId || scope.attemptCount !== analyst.attemptCount
-      || read.currentJob.userId !== source.userId) return unchecked()
+      || read.currentJob.userId !== source.userId) return undefined
     const envelope = record(parseJson(read.taskResult)), taskResult = envelope && completedTaskResult(envelope)
-    if (!taskResult) return unchecked()
+    if (!taskResult) return undefined
     const result = record(taskResult.structuredResult), report = parsePassedReport(taskResult.taskGraphVerificationReport, analyst)
-    if (!result || !report || !resultBoundToObservations(result, read) || taskGraphResultDigest(result) !== report.resultDigest) return unchecked()
+    if (!result || !report || !resultBoundToObservations(result, read) || taskGraphResultDigest(result) !== report.resultDigest) return undefined
     const resultDigest = taskGraphResultDigest(result)
     const evidenceIds = verifiedEvidenceIds(read)
-    if (!evidenceIds || taskGraphEvidenceDigest(read.items, read.outcomes, evidenceIds, resultDigest, read.replayReceipts) !== report.evidenceDigest) return unchecked()
+    if (!evidenceIds || taskGraphEvidenceDigest(read.items, read.outcomes, evidenceIds, resultDigest, read.replayReceipts) !== report.evidenceDigest) return undefined
     const reportDigest = digest(report), analystProofDigest = digest({ nodeKey: analyst.nodeKey, taskId: analyst.taskId,
       attemptCount: analyst.attemptCount, resultDigest, evidenceDigest: report.evidenceDigest, reportDigest,
       scouts: [...report.dependencyBindings].sort((left, right) => Buffer.compare(Buffer.from(String(left.nodeKey), "utf8"), Buffer.from(String(right.nodeKey), "utf8"))) })
-    if (!reportDigest || analystProofDigest !== analyst.proofDigest) return unchecked()
+    if (!reportDigest || analystProofDigest !== analyst.proofDigest) return undefined
     const job = exactJob(read.currentJob), currentMaterial = job && objectiveJobRequirementMaterialDigest(job)
-    if (!job || job.id !== jobId || currentMaterial !== analyst.jobMaterialDigest) return unchecked()
+    if (!job || job.id !== jobId || currentMaterial !== analyst.jobMaterialDigest) return undefined
     const proposals = objectiveJobRequirementProposals(result, [jobId])
-    if (!proposals) return unchecked()
+    if (!proposals) return undefined
     const findings = result.findings
-    if (!Array.isArray(findings) || !findings.some(value => record(value)?.jobId === jobId)) return unchecked()
-    if (proposals.length === 0) return { checked: true, hasVerifiedRequirements: false }
+    if (!Array.isArray(findings) || !findings.some(value => record(value)?.jobId === jobId)) return undefined
+    if (proposals.length === 0) return { checked: true, keywords: typeof job.keywords === "string" ? job.keywords : null, quotes: [] }
     const deliveries = deliveryCandidates(read)
-    if (!deliveries) return unchecked()
-    let verified = 0
+    if (!deliveries) return undefined
+    const quotes: string[] = []
     for (const proposal of proposals) {
       const proof = verifyObjectiveJobRequirementEvidence({ proposal, attemptCount: analyst.attemptCount, currentJob: job, deliveries })
-      if (!proof || proof.jobMaterialDigest !== currentMaterial || proof.inputJobId !== jobId || proof.outputJobId !== jobId) return unchecked()
-      verified += 1
+      if (!proof || proof.jobMaterialDigest !== currentMaterial || proof.inputJobId !== jobId || proof.outputJobId !== jobId) return undefined
+      quotes.push(proposal.quote)
     }
-    return { checked: true, hasVerifiedRequirements: verified > 0 }
-  } catch { return unchecked() }
+    return { checked: true, keywords: typeof job.keywords === "string" ? job.keywords : null, quotes: [...new Set(quotes)] }
+  } catch { return undefined }
 }
 
 function completedTaskResult(row: Row): Row | undefined {

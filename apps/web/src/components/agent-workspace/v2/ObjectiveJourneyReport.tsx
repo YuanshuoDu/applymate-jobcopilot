@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useRef, useState } from 'react'
 import { useApi } from '@/lib/hooks'
 import {
   parseObjectiveJourneyReport,
@@ -9,6 +9,7 @@ import {
   type ObjectiveJourneyReport as Report,
 } from '@/lib/agent/session/objective-journey-report-contract'
 import type { Lang } from '@/lib/i18n'
+import { objectiveJourneySkillComparisonKey, ObjectiveJourneySkillComparison } from './ObjectiveJourneySkillComparison'
 
 type ExpectedCounts = Report['sourceCounts']
 type ExpectedSlot = Readonly<{ ordinal: number; tailoringStatus: Report['slots'][number]['tailoringStatus'] }>
@@ -35,16 +36,19 @@ export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, 
   const report = parsed && !query.error && sameReport(parsed, { finalItemId, graphRevision, sourceCounts, reportedScoreFloor, slots }) ? parsed : null
   const copy = lang === 'zh' ? zh : en
   const [missingEvidenceOrdinal, setMissingEvidenceOrdinal] = useState<number | null>(null)
+  const [reportRefreshEpoch, setReportRefreshEpoch] = useState(0)
+  const reportRoot = useRef<HTMLElement>(null)
 
   const refresh = () => {
     setMissingEvidenceOrdinal(null)
+    setReportRefreshEpoch(epoch => epoch + 1)
     void query.refetch()
   }
   const openFillEvidence = (ordinal: number, evidenceFinalItemId: string) => {
     setMissingEvidenceOrdinal(focusObjectiveFillEvidence(evidenceFinalItemId) ? null : ordinal)
   }
 
-  return <section aria-label={copy.title} data-objective-journey-report={report ? 'available' : 'unavailable'} style={sectionStyle}>
+  return <section ref={reportRoot} aria-label={copy.title} data-objective-journey-report={report ? 'available' : 'unavailable'} style={sectionStyle}>
     <h3 style={headingStyle}>{copy.title}</h3>
     {!report && <p role="status" style={statusStyle}>{query.loading && !query.error ? copy.loading : copy.unavailable}</p>}
     {report && <>
@@ -63,7 +67,7 @@ export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, 
       <ol style={listStyle}>
         {report.slots.map(slot => {
           const hint = nextStep(slot, copy)
-          return <li key={slot.ordinal} data-objective-journey-slot={slot.ordinal} style={slotStyle}>
+          return <li key={slot.ordinal} tabIndex={-1} data-objective-journey-slot={slot.ordinal} style={slotStyle}>
           <strong>{slot.job ? `${slot.job.company} — ${slot.job.role}` : `${copy.job} ${slot.ordinal}`}</strong>
           <dl style={detailsStyle}>
             <div><dt>{copy.tailoring}</dt><dd>{copy.tailoringStatus[slot.tailoringStatus]}</dd></div>
@@ -82,6 +86,9 @@ export function ObjectiveJourneyReport({ sessionId, finalItemId, graphRevision, 
           </li>
         })}
       </ol>
+      <ObjectiveJourneySkillComparison key={objectiveJourneySkillComparisonKey({ sessionId, finalItemId, graphRevision,
+        reportRefreshEpoch, report })} reportUrl={url} sessionId={sessionId} finalItemId={finalItemId}
+        graphRevision={graphRevision} report={report} lang={lang} reportRoot={reportRoot} />
     </>}
     <button type="button" disabled={!validIdentity || !enabled || query.loading} onClick={refresh}>
       {query.loading ? copy.refreshing : copy.refresh}

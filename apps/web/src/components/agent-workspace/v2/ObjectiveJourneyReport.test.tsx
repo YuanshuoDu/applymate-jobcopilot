@@ -78,6 +78,8 @@ describe('ObjectiveJourneyReport', () => {
     expect(html).toContain('Unresolved</dt><dd>0</dd>')
     expect(html).toContain('Submission confirmed with verified fill evidence.')
     expect(html).toContain('View fill evidence')
+    expect(html).toContain('Compare with my confirmed Skills for Job discovery')
+    expect(html).not.toContain('PRIVATE')
     expect(html).not.toContain('fill-final-1')
     expect(html).not.toContain('review-turn-1')
     expect(html).not.toContain('href=')
