@@ -18,6 +18,7 @@ import {
 import { parseObjectiveTailorFinalOutcomesFromContent } from '@/lib/agent/session/objective-tailor-final-content'
 import { readObjectiveTailorSourceGroups } from '@/lib/agent/session/objective-tailor-source-groups'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
+import { ObjectiveContributingJobs } from './ObjectiveContributingJobs'
 import { TaskGraphVerificationSummary } from './TaskGraphVerificationSummary'
 
 export interface FinalTaskGraphSourceDetail {
@@ -52,8 +53,8 @@ export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang, n
 }) {
   const contentRow = record(content)
   const manifest = parseFinalTaskGraphSourceManifest(contentRow?.taskGraphSources)
-  const currentGroups = readObjectiveTailorSourceGroups(contentRow?.objectiveTailorSourceGroups, manifest,
-    parseObjectiveTailorFinalOutcomesFromContent(content))
+  const finalOutcomes = parseObjectiveTailorFinalOutcomesFromContent(content)
+  const currentGroups = readObjectiveTailorSourceGroups(contentRow?.objectiveTailorSourceGroups, manifest, finalOutcomes)
   const disclosureId = React.useId()
   const sectionRef = React.useRef<HTMLElement | null>(null)
   const [selectedKey, setSelectedKey] = React.useState<string | null>(null)
@@ -91,12 +92,17 @@ export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang, n
   const activeRequest = selected && requestMatchesIdentity(request, { sessionId, finalItemId, sourceKey: selected.sourceKey }) ? request : null
   const selectedSourceKeys = new Set(activeGroup?.sourceKeys ?? [])
   const visibleSources = activeGroup ? manifest.sources.filter(source => selectedSourceKeys.has(source.sourceKey)) : manifest.sources
+  const jobEvidenceExpectation = activeGroup ? objectiveJobEvidenceExpectation(finalOutcomes, activeGroup.group) : null
   return <section aria-label={label('agent.taskGraph.sources.title')} data-agent-related-task-sources="true"
     data-objective-source-group-selection={activeGroup ? 'true' : undefined}
     data-objective-source-group={activeGroup?.group}
     ref={sectionRef} id={navigationTargetId} tabIndex={navigationTargetId || activeGroup ? -1 : undefined} style={sectionStyle}>
     <h3 style={headingStyle}>{label('agent.taskGraph.sources.title')}</h3>
     <p style={noteStyle}>{label('agent.taskGraph.sources.disclaimer')}</p>
+    {activeGroup && jobEvidenceExpectation && <ObjectiveContributingJobs key={`${activeGroup.group}:${activeGroup.graphRevision}:${activeGroup.sourceKeys.join(',')}`}
+      sessionId={sessionId} finalItemId={finalItemId} lang={lang} group={activeGroup.group} graphRevision={activeGroup.graphRevision}
+      sourceKeys={activeGroup.sourceKeys} expectedCount={jobEvidenceExpectation.expectedCount}
+      expectedCoverage={jobEvidenceExpectation.expectedCoverage} />}
     <ul style={listStyle}>{visibleSources.map(source => {
       const isSelected = selectedKey === source.sourceKey
       const isGroupMember = selectedSourceKeys.has(source.sourceKey)
@@ -199,6 +205,14 @@ function oneOf<T extends string>(value: unknown, values: readonly T[]): value is
 
 function sameSourceKeys(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((sourceKey, index) => sourceKey === right[index])
+}
+
+function objectiveJobEvidenceExpectation(outcome: ReturnType<typeof parseObjectiveTailorFinalOutcomesFromContent>,
+  group: ObjectiveTailorSourceGroup): Readonly<{ expectedCount: number; expectedCoverage: 'complete' | 'partial' }> | null {
+  if (!outcome || !('sourceCounts' in outcome)) return null
+  const count = outcome.sourceCounts[group]
+  return count.knownCount !== null && count.knownCount > 0 && (count.coverage === 'complete' || count.coverage === 'partial')
+    ? { expectedCount: count.knownCount, expectedCoverage: count.coverage } : null
 }
 
 const sectionStyle: React.CSSProperties = { display: 'grid', gap: 6, marginTop: 10, paddingTop: 8, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 11 }

@@ -67,6 +67,8 @@ describe('FinalTaskGraphSources', () => {
     expect(html).toContain('data-objective-source-group="discoveredJobs"')
     expect(html).toContain('data-objective-source-group-member="true"')
     expect(html.match(/data-objective-source-group-member="true"/g)).toHaveLength(1)
+    expect(html).toContain('View saved jobs')
+    expect(html).not.toContain('data-objective-job-evidence="true" aria-busy="true"')
     expect(html).not.toContain(scout)
     expect(html).not.toContain(otherScout)
     expect(html).not.toContain(analyst)
