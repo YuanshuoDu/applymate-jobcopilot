@@ -598,6 +598,12 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
         expect(executed.requests).toHaveLength(1)
         expect(executed.requests[0]?.tools).toEqual([])
         expect(JSON.stringify(executed.requests[0]?.messages)).toContain("PRIVATE-SPONSORSHIP-REVIEW-CANARY")
+        const auditorStepRows = await db.query<{ ordinal: number; attempt: number }>(`SELECT "ordinal", "attempt" FROM "agent_steps"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`, [value.sessionId, value.turnId, review.taskId])
+        expect(auditorStepRows.rows).toHaveLength(1)
+        const auditorStepOrdinal = Number(auditorStepRows.rows[0]?.ordinal)
+        expect(Number(auditorStepRows.rows[0]?.attempt)).toBe(1)
+        expect(auditorStepOrdinal).toBeGreaterThan(auditorWaitStep.ordinal)
 
         const reviewerRows = await db.query<{ status: string; failureReason: string | null; result: unknown; qualityGateResult: unknown;
           context: unknown; expectedOutputSchema: unknown }>(
@@ -649,6 +655,13 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
         const privateReviewStep = await engine.startStep({ owner: executionOwnerFence({ kind: "turn", taskId: root.id, lease: currentRootLease }),
           stepId: `p3-sponsorship-review-private-context-${value.suffix}`, ordinal: 3, attempt: 1,
           inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+        expect(auditorStepOrdinal).toBeLessThan(privateReviewStep.ordinal)
+        const priorRootStepRows = await db.query<{ ordinal: number; attempt: number }>(`SELECT "ordinal", "attempt" FROM "agent_steps"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "ordinal" < $4
+          ORDER BY "ordinal" DESC LIMIT 1`, [value.sessionId, value.turnId, root.id, privateReviewStep.ordinal])
+        expect(priorRootStepRows.rows).toHaveLength(1)
+        expect(Number(priorRootStepRows.rows[0]?.ordinal)).toBe(auditorWaitStep.ordinal)
+        expect(Number(priorRootStepRows.rows[0]?.attempt)).toBe(1)
         const reviewReadStages: SponsorshipPrivateContextReadDiagnosticStage[] = []
         const reviewContext = await readPrivateSponsorshipContext(db, { userId: value.userId, sessionId: value.sessionId,
           turnId: value.turnId, taskId: root.id, rootTaskId: root.id, rootAttemptCount: currentRootAttempt,
