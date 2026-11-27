@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useEffect, useReducer, useRef, type FormEvent, type MutableRefObject } from 'react'
-import { ISO_3166_1_ALPHA_2_CODES } from '@jobcopilot/shared'
+import { ISO_3166_1_ALPHA_2_CODES } from '@jobcopilot/shared/objective-sponsorship-target-country'
 import {
   AgentObjectiveStartCoordinator,
   ObjectiveStartCommandError,
