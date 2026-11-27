@@ -27,7 +27,10 @@ export function validateTaskGraphFollowUpBinding(value: unknown): TaskGraphFollo
     let hasHistorical = false, hasBusiness = false
     for (let index = 0; index < members.length; index++) {
       const member = record(members[index])
-      if (!member || !exact(member, "kind,nodeIndex,nodeKey,role,taskId,taskStatus,taskType,templateId") || member.nodeIndex !== index
+      const memberKeys = member?.kind === "retired"
+        ? "kind,nodeIndex,nodeKey,retirement,role,taskId,taskStatus,taskType,templateId"
+        : "kind,nodeIndex,nodeKey,role,taskId,taskStatus,taskType,templateId"
+      if (!member || !exact(member, memberKeys) || member.nodeIndex !== index
         || !boundedText(member.nodeKey, TASK_GRAPH_LIMITS.maxKeyLength) || !boundedText(member.templateId, TASK_GRAPH_LIMITS.maxTemplateIdLength)
         || !id(member.taskId, 80) || !text(member.role, 64) || !text(member.taskType, 128)
         || !TASK_STATES.includes(member.taskStatus as typeof TASK_STATES[number])
@@ -43,6 +46,12 @@ export function validateTaskGraphFollowUpBinding(value: unknown): TaskGraphFollo
     if (!outcomes || !validSummary(summary as unknown as TaskGraphFinalSummary, outcomes)) return null
     return { summary: summary as unknown as TaskGraphFinalSummary, outcomes }
   } catch { return null }
+}
+
+/** Revalidates the ordinary source portion of an Objective final binding. */
+export function validateObjectiveSourceBinding(value: Record<string, unknown>): boolean {
+  return validateTaskGraphFollowUpBinding({ rootTaskId: value.rootTaskId, graphItemId: value.graphItemId,
+    graphRevision: value.graphRevision, members: value.members, summary: value.summary }) !== null
 }
 
 function readOutcomes(value: unknown, members: ReadonlyMap<string, TaskGraphFinalSummaryMember>): Map<string, Outcome> | null {
@@ -200,5 +209,18 @@ function exact(value: Record<string, unknown>, keys: string): boolean { return R
 function validMemberKind(member: Record<string, unknown>): boolean {
   if (member.kind === "historical") return (member.role === "scout" || member.role === "analyst")
     && member.templateId === member.role && member.taskStatus === "completed"
+  if (member.kind === "retired") return validRetiredMember(member)
   return member.kind === (member.role === "auditor" && member.taskType === "native_verification" ? "internal_control" : "business")
+}
+function validRetiredMember(member: Record<string, unknown>): boolean {
+  const proof = record(member.retirement)
+  return member.role === "scout" && member.templateId === "scout" && member.taskType === "job_discovery"
+    && member.taskStatus === "interrupted" && !!proof
+    && exact(proof, "attempt,interruptRequestedAt,lifecycleEventId,receiptEventId")
+    && positive(proof.attempt) && canonicalTimestamp(proof.interruptRequestedAt)
+    && text(proof.lifecycleEventId, 256) && text(proof.receiptEventId, 256)
+}
+function canonicalTimestamp(value: unknown): boolean {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return false
+  try { return new Date(value).toISOString() === value } catch { return false }
 }

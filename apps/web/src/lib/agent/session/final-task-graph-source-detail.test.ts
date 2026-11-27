@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, projectFinalAnswerTaskGraphSourceContent, projectFinalTaskGraphSourceDetail } from './final-task-graph-source-detail'
-import { TASK_GRAPH_SOURCES_SCHEMA_VERSION, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 } from './final-task-graph-source-manifest'
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 } from './final-task-graph-source-manifest'
 
 const sessionId = 'session_1', userId = 'user_1', finalItemId = 'final_1', turnId = 'turn_1', rootTaskId = 'root_1'
 const sourceKey = canonicalTaskGraphSourceKey(finalItemId, 4, 0)
@@ -282,5 +283,54 @@ describe('projectFinalTaskGraphSourceDetail', () => {
     const failedRoot = rootTaskRow as Record<string, unknown>
     expect(projectFinalTaskGraphSourceDetail({ ...objectiveInput(analystKey),
       taskRows: [{ ...failedRoot, status: 'waiting' }, ...fixture.tasks] } as never)).toBeNull()
+  })
+
+  it('validates v3 retired positions as interrupted Scouts and excludes them from current sources', () => {
+    const base = input()
+    const nodes = [
+      graph.nodes[0],
+      { key: 'retired-scout', templateId: 'scout', goal: 'PRIVATE_RETIRED_GOAL', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'retired_scout' },
+      { key: 'current-scout', templateId: 'scout', goal: 'Find current roles in Berlin', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'child_2' },
+      { key: 'native-control', templateId: 'native_verification', goal: 'Verify evidence', successCriteria: ['Check evidence'], dependsOn: [], depth: 1, taskId: 'control_1' },
+    ]
+    const currentSource = { sourceKey: canonicalTaskGraphSourceKey(finalItemId, 4, 2), nodeIndex: 2, role: 'scout' as const,
+      taskStatus: 'completed' as const, resultState: 'valid' as const, roleResultStatus: 'completed' as const }
+    const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, graphRevision: 4,
+      sources: [currentSource], historicalNodeIndices: [0], retiredNodeIndices: [1] }
+    const taskRows = [
+      ...(base.taskRows as Record<string, unknown>[]),
+      { id: 'retired_scout', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'scout', taskType: 'job_discovery', status: 'interrupted',
+        goal: 'PRIVATE_RETIRED_GOAL', result: { finalText: 'PRIVATE_RETIRED_RESULT', receiptEventId: 'PRIVATE_RECEIPT' }, hasResult: true, updatedAt },
+      { id: 'child_2', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'scout', taskType: 'job_discovery', status: 'completed',
+        goal: 'Find current roles in Berlin', result: { structuredResult: { role: 'scout', status: 'completed', summary: 'PRIVATE_CURRENT_SUMMARY' } }, hasResult: true, updatedAt },
+      { id: 'control_1', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'auditor', taskType: 'native_verification', status: 'completed',
+        goal: 'Verify evidence', result: null, hasResult: false, updatedAt },
+    ]
+    const query = (value: unknown = manifest, scopedRows: readonly unknown[] = taskRows, scopedNodes: readonly unknown[] = nodes,
+      selectedKey = currentSource.sourceKey) => projectFinalTaskGraphSourceDetail({
+      ...base,
+      sourceKey: selectedKey,
+      finalItem: { ...(base.finalItem as object), content: { taskGraphSources: value } },
+      graphRows: [{ ...(base.graphRows as object[])[0], content: { ...graph, nodes: scopedNodes } }],
+      taskRows: scopedRows,
+    } as never)
+
+    const projected = query()
+    expect(projected).toMatchObject({ role: 'scout', taskStatus: 'completed', resultState: 'valid' })
+    const serialized = JSON.stringify(projected)
+    for (const privateValue of ['retired_scout', 'PRIVATE_RETIRED_GOAL', 'PRIVATE_RETIRED_RESULT', 'PRIVATE_RECEIPT', 'PRIVATE_CURRENT_SUMMARY']) {
+      expect(serialized).not.toContain(privateValue)
+    }
+    expect(query(manifest, taskRows, nodes, canonicalTaskGraphSourceKey(finalItemId, 4, 1))).toBeNull()
+
+    const retired = taskRows.find(row => row.id === 'retired_scout')!
+    const replaceRetired = (overrides: Record<string, unknown>) => query(manifest,
+      taskRows.map(row => row.id === 'retired_scout' ? { ...retired, ...overrides } : row))
+    expect(replaceRetired({ status: 'completed' })).toBeNull()
+    expect(replaceRetired({ role: 'analyst' })).toBeNull()
+    expect(replaceRetired({ taskType: 'scout' })).toBeNull()
+    expect(replaceRetired({ parentTaskId: 'child_2' })).toBeNull()
+    expect(query({ ...manifest, retiredNodeIndices: [3] })).toBeNull()
+    expect(query(manifest, taskRows, nodes.map((node, index) => index === 1 ? { ...node!, templateId: 'analyst' } : node!))).toBeNull()
   })
 })

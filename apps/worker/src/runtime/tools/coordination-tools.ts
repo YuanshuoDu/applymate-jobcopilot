@@ -193,12 +193,12 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
       execute: sendMessageExecutor,
     },
     {
-      ...metadata("wait_subagents", "Durably wait for visible subagent results through the AH2-025 adapter", "internal_write", "requires_key"),
+      ...metadata("wait_subagents", "Durably wait for visible subagent results through the AH2-025 adapter. A Root must issue this as the only tool call in its model response.", "internal_write", "requires_key"),
       inputSchema: WaitSubagentsInputSchema, outputSchema: WaitOutputSchema,
       execute: waitExecutor,
     },
     {
-      ...metadata("agent.wait", "Durably wait for visible subagent results through the AH2-025 adapter", "internal_write", "requires_key"),
+      ...metadata("agent.wait", "Durably wait for visible subagent results through the AH2-025 adapter. A Root must issue this as the only tool call in its model response.", "internal_write", "requires_key"),
       inputSchema: WaitSubagentsInputSchema, outputSchema: WaitOutputSchema,
       execute: waitExecutor,
     },

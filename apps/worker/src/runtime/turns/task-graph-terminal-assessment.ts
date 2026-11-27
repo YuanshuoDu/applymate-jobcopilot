@@ -17,6 +17,37 @@ export type GateReport = Readonly<{
   resultDigest: string | null
 }>
 
+export type RepairFeedbackState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
+const ACTIVE_REPAIR_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
+const TERMINAL_REPAIR_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
+
+export function repairStatusFeedback(status: string): RepairFeedbackState {
+  if (ACTIVE_REPAIR_STATUSES.has(status)) return "pending"
+  if (status === "failed") return "rejected"
+  if (TERMINAL_REPAIR_STATUSES.has(status)) return "terminal"
+  return "unavailable"
+}
+
+export function repairReportState(task: { status: string; result: unknown } | undefined): RepairFeedbackState {
+  if (!task) return "missing"
+  if (ACTIVE_REPAIR_STATUSES.has(task.status)) return "pending"
+  if (["completed", "interrupted", "cancelled", "closed"].includes(task.status)) return "terminal"
+  if (task.status === "failed" && Object.hasOwn(row(task.result), "taskGraphVerificationReport")) return "invalid_report"
+  return repairStatusFeedback(task.status)
+}
+
+export function projectVerifiedCompletedTaskIds(
+  reports: ReadonlyMap<string, Pick<GateReport, "status">>,
+  tasks: ReadonlyMap<string, Pick<GraphTaskRow, "status" | "failureReason">>,
+): ReadonlySet<string> {
+  const result = new Set<string>()
+  for (const [taskId, report] of reports) {
+    const task = tasks.get(taskId)
+    if (report.status === "passed" && task?.status === "completed" && task.failureReason === null) result.add(taskId)
+  }
+  return result
+}
+
 export const TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA = "agent-harness.v2.task-graph-denial-checkpoint.v1" as const
 export type TaskGraphDenialCheckpoint = Readonly<{
   schemaVersion: typeof TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA

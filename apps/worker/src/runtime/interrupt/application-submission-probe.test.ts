@@ -106,18 +106,38 @@ describe("application submission Stop probe", () => {
     expect(clients[3]?.query).toHaveBeenLastCalledWith("ROLLBACK");
   });
 
-  it("destroys a ready lease and releases its FIFO permit when the route owner stops awaiting it", async () => {
+  it("retains the ready lease across acquisition abort and timeout until the route owner releases it", async () => {
+    vi.useFakeTimers()
     const { pool, clients, connect } = fakePool()
     const controller = new AbortController()
-    const abandoned = await acquireApplicationSubmissionStartFence(pool, scope, { signal: controller.signal, timeoutMs: 1_000 })
-    expect(abandoned.state).toBe("ready")
+    const ready = await acquireApplicationSubmissionStartFence(pool, scope, { signal: controller.signal, timeoutMs: 1_000 })
+    expect(ready.state).toBe("ready")
 
     controller.abort()
-    const next = await acquireApplicationSubmissionStartFence(pool, scope)
-
-    expect(next.state).toBe("ready")
+    await vi.advanceTimersByTimeAsync(1_001)
+    expect(clients[1]?.release).not.toHaveBeenCalled()
+    const nextAttempt = acquireApplicationSubmissionStartFence(pool, scope)
+    await Promise.resolve()
+    expect(connect).toHaveBeenCalledTimes(2)
+    await ready.release(true)
+    const next = await nextAttempt
+    expect(clients[1]?.query).toHaveBeenLastCalledWith("COMMIT")
+    expect(clients[1]?.release).toHaveBeenCalledOnce()
     expect(connect).toHaveBeenCalledTimes(4)
+    await next.release(false)
+  })
+
+  it("destroys a ready lease once when its route owner forcibly aborts release", async () => {
+    const { pool, clients, connect } = fakePool()
+    const ready = await acquireApplicationSubmissionStartFence(pool, scope)
+    expect(ready.state).toBe("ready")
+    ready.abort?.()
+    ready.abort?.()
+    expect(clients[1]?.release).toHaveBeenCalledOnce()
     expect(clients[1]?.release).toHaveBeenCalledWith(expect.any(Error))
+    await expect(ready.release(true)).rejects.toThrow("Submission fence was forcibly released.")
+    const next = await acquireApplicationSubmissionStartFence(pool, scope)
+    expect(connect).toHaveBeenCalledTimes(4)
     await next.release(false)
   })
 
@@ -255,7 +275,7 @@ describe("application submission Stop probe", () => {
     expect(clients[1]?.release).toHaveBeenCalledOnce();
   });
 
-  it("marks an Objective marker committed when the boundary observes Stop", async () => {
+  it("keeps an Objective boundary Stop uncertain after the marker", async () => {
     const { pool, clients } = fakePool();
     readTurnState
       .mockResolvedValueOnce({ sessionStatus: "running", turnStatus: "in_progress", interrupted: false })
@@ -270,7 +290,7 @@ describe("application submission Stop probe", () => {
 
     const fence = await acquireApplicationSubmissionStartFence(pool, scope);
 
-    expect(fence).toMatchObject({ state: "stopped", markerCommitted: true });
+    expect(fence).toMatchObject({ state: "uncertain", markerCommitted: true });
     expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT");
     expect(clients[1]?.query).toHaveBeenLastCalledWith("ROLLBACK");
     expect(clients.every(client => client.release.mock.calls.length === 1)).toBe(true);
@@ -292,7 +312,7 @@ describe("application submission Stop probe", () => {
     expect(clients.every(client => client.release.mock.calls.length === 1)).toBe(true);
   });
 
-  it("does not mark an ordinary selected stopped boundary as an Objective marker", async () => {
+  it("keeps a reviewed boundary Stop uncertain after the marker", async () => {
     const { pool } = fakePool();
     readTurnState
       .mockResolvedValueOnce({ sessionStatus: "running", turnStatus: "in_progress", interrupted: false })
@@ -307,8 +327,7 @@ describe("application submission Stop probe", () => {
 
     const fence = await acquireApplicationSubmissionStartFence(pool, scope);
 
-    expect(fence).toMatchObject({ state: "stopped" });
-    expect(fence).not.toHaveProperty("markerCommitted");
+    expect(fence).toMatchObject({ state: "uncertain", markerCommitted: true });
   });
 
   it("checks scoped session, Turn, and interruption state", async () => {

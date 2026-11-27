@@ -14,6 +14,7 @@ export type ApplicationSubmissionStopProbe = {
 export type ApplicationSubmissionStartFence = {
   state: "ready" | "stopped" | "inactive" | "uncertain" | "cancelled" | "unavailable"
   markerCommitted?: true
+  abort?(): void
   release(commit: boolean): Promise<void>
 }
 
@@ -40,6 +41,7 @@ export async function acquireApplicationSubmissionStartFence(
   let boundaryLease: ObjectiveSubmissionFenceClient | undefined
   let open = false
   let released = false
+  let forceAborted = false
   let markerCommitted = false
   let markerCommitAttempted = false
   let markerExpectedSource: ReviewedSubmitSourceExpectation = undefined
@@ -125,18 +127,19 @@ export async function acquireApplicationSubmissionStartFence(
       await boundary.query("COMMIT")
       open = false
       releaseBoundaryClient()
-      return declined(isObjectiveSource(markerExpectedSource) ? "uncertain" : "inactive", releasePermitOnce)
+      return declined("uncertain", releasePermitOnce, true)
     }
     if (boundaryAttempt.value === "stopped") {
       await boundary.query("ROLLBACK")
       open = false
       releaseBoundaryClient()
-      return declined("stopped", releasePermitOnce, isObjectiveSource(markerExpectedSource))
+      return declined("uncertain", releasePermitOnce, true)
     }
 
     const release = async (commit: boolean): Promise<void> => {
       if (released) return
       released = true
+      if (forceAborted) throw new Error("Submission fence was forcibly released.")
       try {
         if (acquisition.signal.aborted) throw new Error("Objective submission fence acquisition ended.")
         await boundary.query(commit ? "COMMIT" : "ROLLBACK")
@@ -149,7 +152,17 @@ export async function acquireApplicationSubmissionStartFence(
         try { releaseBoundaryClient() } finally { releasePermitOnce() }
       }
     }
-    return { state: "ready", release }
+    if (acquisition.signal.aborted) throw new Error("Objective submission fence acquisition ended.")
+    // The route gate owns the ready fence; only it may release the transaction.
+    acquisition.dispose()
+    const abort = (): void => {
+      forceAborted = true
+      const reserved = boundaryLease
+      boundaryLease = undefined
+      boundaryClient = undefined
+      try { reserved?.release(new Error("Submission fence release timed out.")) } finally { releasePermitOnce() }
+    }
+    return { state: "ready", release, abort }
   } catch (error: unknown) {
     try {
       const active = boundaryClient ?? markerClient
@@ -175,9 +188,6 @@ async function declined(
   return { state, ...(markerCommitted ? { markerCommitted: true as const } : {}), release: async () => undefined }
 }
 
-function isObjectiveSource(source: ReviewedSubmitSourceExpectation): boolean {
-  return typeof source === "object" && source !== null && source.kind === "objective"
-}
 
 export async function isApplicationSubmissionStopped(pool: Pool, scope: ApplicationSubmissionStartScope): Promise<boolean> {
   const client = await pool.connect()

@@ -182,15 +182,19 @@ function validHandle(item: Row): { id: string; revision: number } | null {
     : null
 }
 
-export function restoreToolCallState(items: readonly Record<string, unknown>[], events: readonly Record<string, unknown>[]): {
+export function restoreToolCallState(items: readonly Record<string, unknown>[], events: readonly Record<string, unknown>[], options?: {
+  readonly resolveMarkedResult: (input: { callId: string; callItem: Row; resultItem?: Row; durableResult?: TaskGraphToolResult }) => TaskGraphToolResult | undefined
+}): {
   readonly observations: readonly TaskGraphToolObservation[]
   readonly pending: readonly TaskGraphPersistedToolCallRecovery[]
 } {
   const calls = new Map<string, Row>()
   const results = new Map<string, Row>()
   for (const item of items) {
-    if (item.type !== "tool_call" && item.type !== "tool_result") continue
     const content = object(item.content)
+    const hasMarker = Object.prototype.hasOwnProperty.call(content, "dependencyWaitBatchRejection")
+    if (hasMarker && (item.type !== "tool_call" || !options || typeof content.toolCallId !== "string")) throw new Error("tool_result_replay_uncertain")
+    if (item.type !== "tool_call" && item.type !== "tool_result") continue
     const callId = content.toolCallId
     if (typeof callId !== "string") continue
     const map = item.type === "tool_call" ? calls : results
@@ -206,7 +210,7 @@ export function restoreToolCallState(items: readonly Record<string, unknown>[], 
     if (!validStatus(callItem.status) || (resultItem && !validStatus(resultItem.status))) throw new Error("tool_result_replay_uncertain")
     if (resultItem && terminalStatus(callItem.status) && terminalStatus(resultItem.status) && callItem.status !== resultItem.status) throw new Error("tool_result_replay_uncertain")
     const durableReceipt = finalByCall.get(callId)
-    const durableResult = durableReceipt?.result
+    const durableResult = options?.resolveMarkedResult({ callId, callItem, resultItem, durableResult: durableReceipt?.result }) ?? durableReceipt?.result
     const persistedStatus = persistedOutcomeStatus(callItem, call, resultItem)
     if (durableResult && persistedStatus && durableResult.status !== persistedStatus) throw new Error("tool_result_replay_uncertain")
     if (durableReceipt && resultItem) assertResultItemMatchesEvent(durableReceipt, resultItem)

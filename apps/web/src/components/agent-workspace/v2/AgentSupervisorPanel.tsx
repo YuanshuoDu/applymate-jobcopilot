@@ -140,8 +140,9 @@ function SessionSupervisorPanel({ sessionId, timeline }: { readonly sessionId: s
     turns,
     items: timeline.items,
     tasks,
+    expectedSessionId: sessionId,
     labels: { task: t('agent.tasks'), step: t('agent.step'), tool: t('agent.toolActor') },
-  }), [t, turns, timeline.items, tasks])
+  }), [sessionId, t, turns, timeline.items, tasks])
   const agendaTaskLabels = useMemo(() => new Map<string, CognitiveAgendaTaskLabel>(tasks.map(task => [task.id, {
     label: safeAgendaTaskLabel(task.role) || safeAgendaTaskLabel(task.taskType),
     root: !task.parentTaskId,

@@ -64,7 +64,7 @@ function fixture(options: {
       const input = inputs[Math.min(sourceReads++, inputs.length - 1)]
       return { rows: [{ input }], rowCount: 1 }
     }
-    if (sql.includes('FROM "application_tasks"')) return { rows: [{ status: "filling", checkpoint: options.taskCheckpoint ?? (phase === "marker" ? "browser_active" : "submission_request_started"), workerTaskId: options.taskWorkerTaskId ?? scope.workerTaskId }], rowCount: 1 }
+    if (sql.includes('FROM "application_tasks"')) return { rows: [{ status: "filling", checkpoint: options.taskCheckpoint ?? (phase === "marker" ? "browser_active" : "submission_request_started"), workerTaskId: options.taskWorkerTaskId === undefined ? scope.workerTaskId : options.taskWorkerTaskId }], rowCount: 1 }
     if (sql.includes('FROM "submission_attempt"')) return { rows: options.attempt === null ? [] : [options.attempt ?? attempt], rowCount: options.attempt === null ? 0 : 1 }
     if (sql.includes('FROM "agent_approvals"')) return { rows: options.approval === null ? [] : [options.approval ?? approval], rowCount: options.approval === null ? 0 : 1 }
     if (sql.includes('FROM "application_task_events"')) {
@@ -236,10 +236,14 @@ describe("reviewed application submit request source fence", () => {
     ["wrong task checkpoint", { taskCheckpoint: "submission_uncertain" }, "marker" as const],
     ["current Worker task changed", { taskWorkerTaskId: "other-worker" }, "marker" as const],
     ["request boundary Worker task changed", { taskWorkerTaskId: "other-worker" }, "boundary" as const],
+    ["request boundary Worker task removed", { taskWorkerTaskId: null }, "boundary" as const],
     ["missing reserved attempt", { attempt: null }, "marker" as const],
     ["attempt artifact differs from the consumed approval", { attempt: { ...attempt, artifactHash: "e".repeat(64) } }, "marker" as const],
     ["approval was not consumed", { approval: { ...approval, status: "approved" } }, "marker" as const],
+    ["approval removed after marker", { approval: null }, "boundary" as const],
+    ["approval revoked after marker", { approval: { ...approval, status: "revoked" } }, "boundary" as const],
     ["boundary event names another worker task", { event: { ...startEvent, workerTaskId: "other-worker" } }, "boundary" as const],
+    ["boundary event names another execution", { event: { ...startEvent, executionId: "other-execution" } }, "boundary" as const],
   ])("rejects %s", async (_name, overrides, phase) => {
     resetMocks()
     const test = fixture({ ...overrides, phase })

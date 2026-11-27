@@ -278,6 +278,42 @@ describe("TaskGraph turn observation", () => {
     expect(encoded).not.toContain("private.example")
   })
 
+  it("admits deadlines as separate untrusted Root context and keeps them out of selected-job context", async () => {
+    const current = mergeTaskGraphCurrentObservation(snapshot(), {
+      revision: 4,
+      nodes: [{ key: "scout", templateId: "scout", goal: "Find roles", successCriteria: ["Return sources"],
+        dependsOn: [], taskId: "child-private", status: "running", readiness: "active", resultSummary: null, failureReason: null }],
+      activeChildDeadlines: {
+        revision: 4, observedAt: "2026-01-01T00:00:00.000Z",
+        entries: [{ nodeKey: "scout", deadlineAt: "2026-01-01T00:05:00.000Z" }],
+      },
+    })
+    const graph = current.toolObservations.find(item => item.id === "task-graph-current")?.content as Record<string, unknown>
+    const deadline = current.toolObservations.find(item => item.id === "task-graph-child-deadlines")
+    const context = await new StepContextBuilder(emptyInputStore()).build({
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1",
+      snapshot: current, now: new Date("2026-01-01T00:01:00.000Z"),
+    })
+    const block = context.blocks.find(item => item.id === "observation:task-graph-child-deadlines")
+    const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false,
+      streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({ context, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1",
+      userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
+    const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const selectedRequest = await selectedJobModelRequest(current)
+    const selectedText = selectedRequest.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(graph).not.toHaveProperty("activeChildDeadlines")
+    expect(deadline?.id).toBe("task-graph-child-deadlines")
+    expect(block?.trust).toBe("external_untrusted")
+    expect(block?.content).toMatchObject({ authorityNotice: expect.stringContaining("advisory only") })
+    expect(requestText).toContain('"deadlineAt":"2026-01-01T00:05:00.000Z"')
+    expect(requestText).toContain("Current child task times are advisory only")
+    expect(JSON.stringify(deadline?.content)).not.toContain("child-private")
+    expect(selectedJobSnapshot(current).toolObservations.some(item => item.id === "task-graph-child-deadlines")).toBe(false)
+    expect(selectedText).not.toContain("task-graph-child-deadlines")
+  })
+
   it("projects only a closed advisory category for an ordinary failed node", () => {
     const node = projectedNode({ ...ordinaryFailedNode(), executionFailureCategory: "structured_output_invalid" })
 

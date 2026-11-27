@@ -40,6 +40,20 @@ describe('timeline event normalizers', () => {
     expect(normalizeTimelineEvent({ ...marker, actor: 'user' })).toBeNull()
   })
 
+  it.each(['session.pause_blocked', 'session.paused'])('retains only canonical public causation for %s across repeated normalization', type => {
+    const causationId = `evt_${'a'.repeat(64)}`
+    const transition = {
+      ...envelope, id: `evt_${'b'.repeat(64)}`, itemId: null, taskId: 'root-turn-1', type, actor: 'orchestrator',
+      causationId, payload: { pauseRequestEventId: 'raw-internal-request-id' },
+    }
+    const normalized = normalizeTimelineEvent(transition)
+
+    expect(normalized?.causationId).toBe(causationId)
+    expect(normalizeTimelineEvent(normalized)).toEqual(normalized)
+    expect(normalizeTimelineEvent({ ...transition, causationId: 'raw-private-cause' })?.causationId).toBeNull()
+    expect(normalizeTimelineEvent({ ...transition, type: 'turn.started' })).not.toHaveProperty('causationId')
+  })
+
   it.each(facts)('preserves valid $type facts and their normalized undefined placeholders', raw => {
     const normalized = normalizeTimelineEvent(raw)
     expect(normalized).toMatchObject({ id: raw.id, type: raw.type, actor: raw.actor, taskId: null, payload: raw.payload })
