@@ -13,12 +13,17 @@ import { assertTerminalPlanningRootHasNoUnresolvedSteering } from "../subagents/
 import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness, readRootTaskHistoryChronologyWitness } from "../context/root-task-history-chronology-witness.js"
+import { resolveRootTaskSponsorshipTargetCountry } from "../context/root-task-objective.js"
+import { SPONSORSHIP_FINAL_ANSWER_TERMINAL_GUARD, parseSponsorshipFinalAnswerBinding } from "../subagents/sponsorship-final-answer-contract.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 
 type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
-type TerminalInput = AtomicTurnCompletionInput & { readonly owner: TurnExecutionOwnerFence; readonly response: string; readonly now: Date }
-export type TurnEngineTerminalGuard = (client: pg.PoolClient, input: TerminalInput, admission?: SessionTerminalAdmission) => Promise<TurnEngineCompletionGateResult>
+type TerminalInput = AtomicTurnCompletionInput & { readonly owner: TurnExecutionOwnerFence; readonly response: string; readonly now: Date; readonly persistedTurnInput?: unknown }
+export type TurnEngineTerminalGuard = ((client: pg.PoolClient, input: TerminalInput, admission?: SessionTerminalAdmission) => Promise<TurnEngineCompletionGateResult>) & {
+  readonly [SPONSORSHIP_FINAL_ANSWER_TERMINAL_GUARD]?: true
+}
 const json = (value: unknown) => JSON.stringify(value)
 const sameJson = (left: unknown, right: unknown) => json(toRepositoryJson(left)) === json(toRepositoryJson(right))
 function markerIdentity(value: SteeringMarkerPayload): string { return JSON.stringify({ schemaVersion: value.schemaVersion, kind: value.kind, status: value.status, sessionId: value.sessionId, turnId: value.turnId, taskId: value.taskId, inputId: value.inputId, idempotencyKey: value.idempotencyKey, obligationId: value.obligationId, goalRevision: value.goalRevision, planRevision: value.planRevision, acceptedSequence: value.acceptedSequence }) }
@@ -155,6 +160,15 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     [owner.turnId, owner.sessionId, owner.userId, owner.ownerId, owner.leaseVersion, owner.taskId])
     const turnRow = turn.rows[0]
     if (!turnRow) throw conflict(`turn ${owner.turnId}`)
+    const sponsorshipCountry = resolveRootTaskSponsorshipTargetCountry(turnRow.input)
+    const taskGraphBinding = Reflect.get(input, TASK_GRAPH_FINAL_SUMMARY_BINDING) as { sponsorshipFinalAnswer?: unknown } | undefined
+    const sponsorshipBinding = taskGraphBinding?.sponsorshipFinalAnswer
+    if (sponsorshipCountry.status === "invalid"
+      || (sponsorshipCountry.status === "valid"
+        ? !parseSponsorshipFinalAnswerBinding(sponsorshipBinding)
+          || parseSponsorshipFinalAnswerBinding(sponsorshipBinding)?.targetCountryCode !== sponsorshipCountry.sponsorshipTargetCountry.countryCode
+          || finalizationGuard?.[SPONSORSHIP_FINAL_ANSWER_TERMINAL_GUARD] !== true
+        : sponsorshipBinding !== undefined)) throw conflict(`sponsorship final answer fence ${owner.turnId}`)
     const root = await client.query<Row>(`SELECT "id", "status", "leaseOwner", "attemptCount", "result", "interruptRequestedAt", "allowedActions" FROM "sub_agent_tasks"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 FOR UPDATE`, [owner.taskId, owner.sessionId, owner.turnId])
     const task = root.rows[0]
@@ -190,7 +204,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-completed:${input.stepId}`])
     if (!prior.rows[0]) throw conflict(`completed step event ${input.stepId}`)
     if (!committed && finalizationGuard) {
-      const decision = await finalizationGuard(client, input, terminalAdmission!)
+      const decision = await finalizationGuard(client, { ...input, persistedTurnInput: turnRow.input }, terminalAdmission!)
       if (!decision || typeof decision !== "object" || decision.ok !== true) {
         if (decision && decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER && typeof decision.feedback === "string" && decision.feedback.length <= 512) {
           const stamped: unknown = Reflect.get(decision, TASK_GRAPH_RECOVERY_REVISION)

@@ -3,12 +3,19 @@ import { readSponsorshipTaskObservationsWithClient, type SponsorshipObservationT
 import { buildSponsorshipReviewPacket } from "./sponsorship-review-packet.js"
 import { readSponsorshipReviewObservation } from "./sponsorship-review-readback.js"
 import { nativeVerificationControlContentMatches, readNativeVerificationControlTasks } from "./native-verification-pg-request.js"
+import { digestNativeVerificationValue } from "./native-verification-contract.js"
 import { toSponsorshipObservationModelFrame, type SponsorshipObservationModelFrame } from "./sponsorship-observation-contract.js"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 
 type Row = Record<string, unknown>
 type Queryable = Pick<pg.PoolClient, "query">
-export type CurrentSponsorshipReviewEntry = Readonly<{ jobId: string; observation: SponsorshipObservationModelFrame }>
+export type CurrentSponsorshipReviewEntry = Readonly<{
+  jobId: string
+  observation: SponsorshipObservationModelFrame
+  reviewerTaskId: string
+  reviewerAttempt: number
+  reviewBindingDigest: string
+}>
 export type SponsorshipCurrentReviewReadDiagnosticStage =
   | "controls_unavailable" | "control_missing" | "reviewer_status_invalid" | "reviewer_attempt_binding_mismatch"
   | "reviewer_country_mismatch" | "reviewer_record_bound"
@@ -75,6 +82,17 @@ export async function readCurrentSponsorshipReviewWithClient(client: Queryable, 
     qualityGateResult: reviewer.qualityGateResult, qualityGateResultOversize: reviewer.qualityGateResultOversize,
     control: reviewer.control, packet: reviewer.packet, source: packet })
   if (!observation) { diagnose("proof_invalid"); return undefined }
+  const modelFrame = toSponsorshipObservationModelFrame(observation)
+  const reviewBindingDigest = `sha256:${digestNativeVerificationValue({
+    owner: { userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId, rootTaskId: input.scope.rootTaskId },
+    rootAttemptCount: input.rootAttemptCount, targetCountryCode: input.targetCountryCode,
+    target, sourceBindingDigest: target.sourceBindingDigest, jobId: target.jobId,
+    reviewerTaskId: reviewer.taskId, reviewerAttempt: reviewer.attemptCount,
+    controlOperationId: reviewer.control.controlOperationId, evidencePacketDigest: reviewer.control.evidencePacketDigest,
+    reviewerResultDigest: digestNativeVerificationValue(reviewer.result), privateReportDigest: digestNativeVerificationValue(reviewer.qualityGateResult),
+    observation: modelFrame,
+  })}`
   diagnose("review_readback_bound")
-  return { jobId: target.jobId, observation: toSponsorshipObservationModelFrame(observation) }
+  return { jobId: target.jobId, observation: modelFrame, reviewerTaskId: reviewer.taskId,
+    reviewerAttempt: reviewer.attemptCount, reviewBindingDigest }
 }

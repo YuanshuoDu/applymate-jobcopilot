@@ -22,6 +22,7 @@ import { isSessionPauseRequestedError } from "../session-gate.js"
 import { signalWasInterrupted } from "../interrupt/registry.js"
 import { completeEmptyAnalystCandidateOnly } from "../subagents/task-graph-empty-analyst-candidate.js"
 import { buildGroundedTaskGraphFinalResponse } from "../subagents/task-graph-final-response.js"
+import { parseSponsorshipFinalAnswerBinding } from "../subagents/sponsorship-final-answer-contract.js"
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string; taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint; readonly [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]?: typeof SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY }>
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
@@ -161,6 +162,18 @@ export async function completeTurnCandidate(input: Readonly<{
     return { kind: "replan", feedback: gate.feedback, ...(gate[SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY] === SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY ? { [SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY]: SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } : {}), ...(checkpoint ? { taskGraphDenialCheckpoint: checkpoint } : {}) }
   }
   const summaryBinding = gate as TaskGraphFinalSummaryBinding | undefined
+  const sponsorshipBinding = parseSponsorshipFinalAnswerBinding(summaryBinding?.sponsorshipFinalAnswer)
+  if (options.sponsorshipFinalAnswerRequired && (!summaryBinding || !sponsorshipBinding
+    || sponsorshipBinding.rootTaskId !== options.identity.rootTaskId || sponsorshipBinding.candidateStepId !== step.id
+    || sponsorshipBinding.targetCountryCode !== options.sponsorshipTargetCountryCode
+    || sponsorshipBinding.rootAttemptCount !== options.sponsorshipRootAttemptCount)) {
+    await writer.append("final.rejected", step.id, null,
+      { code: "business_precondition_failed", blocker: "task_graph_verification_unverified",
+        feedback: "A current source-bound sponsorship result is required before completing this answer.", taskId: options.identity.taskId },
+      `final-rejected:${step.id}:sponsorship-binding-required`)
+    await finishStep(options, writer, step, output, now, input.onStepClosed)
+    return { kind: "replan", feedback: "A current source-bound sponsorship result is required before completing this answer." }
+  }
   if (summaryBinding && (!canPersistFinalResponse(options) || !options.store.recordFinalResponse)) {
     throw new TurnEngineError("persistence_conflict", "Atomic TaskGraph final source publication is unavailable")
   }

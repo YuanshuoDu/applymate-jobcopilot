@@ -87,6 +87,10 @@ export type TurnExecutionOptions = {
   /** Allows a root or child adapter to classify a lost owner without coupling the loop to a lease type. */
   readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
   readonly completionGate?: TurnEngineCompletionGate
+  /** Country-scoped sponsorship objectives must complete only through the closed server-rendered TaskGraph path. */
+  readonly sponsorshipFinalAnswerRequired?: boolean
+  readonly sponsorshipTargetCountryCode?: string
+  readonly sponsorshipRootAttemptCount?: number
   /** Owner-scoped handoff for a TaskGraph failure candidate; never marks the task complete. */
   readonly authorizeEmptyAnalystCandidate?: EmptyAnalystCandidateAuthorizer
   readonly nativeSemanticProgressMode?: NativeSemanticProgressMode

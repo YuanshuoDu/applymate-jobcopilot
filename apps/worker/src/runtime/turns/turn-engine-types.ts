@@ -201,7 +201,7 @@ export type TurnEngineOptions = {
   /** Server-classified restart repair for persisted tool calls, applied before another model request. */
   readonly toolCallRecovery?: readonly ToolCallRecovery[]
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
-} & Pick<TurnExecutionOptions, "refreshTaskGraphBeforeStep" | "refreshTaskGraphAfterReadyWait" | "refreshTaskGraphAfterPlan" | "recoveredFinalCandidate" | "nativeSemanticProgressMode" | "durableWaitControlReader" | "recoveredWaitControl">
+} & Pick<TurnExecutionOptions, "refreshTaskGraphBeforeStep" | "refreshTaskGraphAfterReadyWait" | "refreshTaskGraphAfterPlan" | "recoveredFinalCandidate" | "nativeSemanticProgressMode" | "durableWaitControlReader" | "recoveredWaitControl" | "sponsorshipFinalAnswerRequired" | "sponsorshipTargetCountryCode" | "sponsorshipRootAttemptCount">
 
 export type TurnResumeState = {
   readonly nextOrdinal: number
