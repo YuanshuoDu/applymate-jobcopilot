@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import { createCognitiveAgendaState, reduceCognitiveAgenda } from './timeline-cognitive-agenda'
+import { parseCognitiveAgendaReceipt } from './cognitive-agenda-view'
+import { redactStreamValue } from '../../../lib/agent/session/stream-redaction'
 import type { TimelineEvent } from './timeline-reducer'
 
 const scope = { sessionId: 'session-1', turnId: 'turn-1', taskId: 'task-1', stepId: 'step-1' }
@@ -79,5 +81,29 @@ describe('timeline cognitive agenda reducer', () => {
     expect(reduceCognitiveAgenda(state, event({
       id: 'foreign-turn', sequence: '2', turnId: 'turn-2', payload: { ...receipt(), goalRevision: 9, planRevision: 9 },
     }))).toBe(state)
+  })
+
+  it('retains only the bounded progress projection through SSE and timeline hydration', () => {
+    const raw = {
+      ...receipt(), schemaVersion: 'agent-harness.cognitive-agenda-receipt.v2', goalRevision: 'a'.repeat(64), planRevision: 5,
+      objectiveProgressSnapshot: { schemaVersion: 'agent-harness.v2.objective-progress.v1', advisory: true, revision: 5,
+        requirements: [{ id: 'location_secret', kind: 'candidate_location_in', locations: ['berlin'], status: 'reported_passed' }] },
+      progressDelta: { schemaVersion: 'agent-harness.v2.objective-progress-delta.v1', availability: 'available',
+        previousPlanRevision: 4, currentPlanRevision: 5, requirements: [{ id: 'location_secret', kind: 'candidate_location_in',
+          beforeStatus: 'active', afterStatus: 'reported_passed' }] },
+    }
+    const normalized = parseCognitiveAgendaReceipt(raw, scope)
+    if (!normalized) throw new Error('fixture should produce a safe timeline payload')
+    const hydrated = JSON.parse(JSON.stringify(redactStreamValue(normalized))) as unknown
+    let state = reduceCognitiveAgenda(createCognitiveAgendaState(scope.sessionId), event({ payload: redactStreamValue(raw) }))
+    expect(state.latest?.objectiveProgress).toEqual([{ kind: 'candidate_location_in', status: 'reported_passed', beforeStatus: 'active' }])
+
+    state = reduceCognitiveAgenda(createCognitiveAgendaState(scope.sessionId), event({ payload: hydrated }))
+    expect(state.latest?.objectiveProgress).toEqual(normalized.objectiveProgress)
+    expect(JSON.stringify(state.latest)).not.toContain('location_secret')
+    expect(JSON.stringify(state.latest)).not.toContain('berlin')
+    expect(reduceCognitiveAgenda(createCognitiveAgendaState(scope.sessionId), event({ payload: {
+      ...normalized, objectiveProgress: [{ kind: 'candidate_location_in', status: 'reported_passed', locations: ['berlin'] }],
+    } }))).toMatchObject({ latest: null, scoped: [] })
   })
 })

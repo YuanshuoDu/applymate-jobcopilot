@@ -16,6 +16,7 @@ import { parseTaskGraphCurrentDiscoveryAttemptHealth, parseTaskGraphCurrentDisco
   type TaskGraphDiscoveryTurnEligibility } from "./subagents/task-graph-discovery-attempt-health.js"
 import { withTaskGraphRootSourceIntent } from "./subagents/task-graph-source-intent-context.js"
 import { taskGraphReviewConflictObservation } from "./context/task-graph-review-conflicts.js"
+import { replaceTaskGraphChildDeadlineObservation } from "./context/task-graph-child-deadline-observation.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -154,8 +155,11 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   try { sourceIntent = Object.getOwnPropertyDescriptor(state, "sourceIntent")?.value } catch { sourceIntent = undefined }
   const content = withTaskGraphRootSourceIntent(baseContent, sourceIntent, MAX_TEXT)
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
-  return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
+  const current = retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)
+  return replaceTaskGraphChildDeadlineObservation(current, {
+    revision: Number(state.revision), nodes, packet: ownEnumerableDataValue(state, "activeChildDeadlines"),
+  })
 }
 
 export async function loadTaskGraphCurrentObservation(

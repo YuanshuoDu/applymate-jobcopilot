@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { redactAgentEvent, redactSensitiveText } from "@jobcopilot/shared"
@@ -15,12 +15,15 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationEvide
 import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
 import { transaction } from "./pg-store-persistence.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
+import { createProductionChildExecutor } from "./production-child-runtime.js"
+import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "../selected-job-preparation.js"
 import type { TurnLease } from "../turns/lease.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
-import { verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
+import { reverifyFailedTaskGraphNodeEvidence, taskGraphResultDigest, verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { readScheduledDraftCandidateBinding, validateScheduledDraftCandidateWitness } from "./scheduled-draft-candidate.js"
 import type { TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"
 import { createChildDiscoveryObservers } from "./child-discovery-observers.js"
@@ -35,7 +38,7 @@ import type { TaskGraphOperationalFailureReplacement } from "../planning/task-gr
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
-import type { JobDiscoveryClient, JobDiscoveryOutput } from "../tools/job-discovery-client.js"
+import type { JobDiscoveryClient, JobDiscoveryOutput, JobDiscoveryRequest } from "../tools/job-discovery-client.js"
 import type { ProductionChildRuntimeOptions } from "./production-child-runtime.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -148,7 +151,10 @@ function fixture(): Fixture {
 }
 
 function selectedJobId(value: Fixture): string { return `p3-task-graph-selected-job-${value.sessionId}` }
-function scheduledDraftJobId(value: Fixture, label: string): string { return `draft-${label}-${value.rootTaskId.slice(-36)}` }
+function scheduledDraftJobId(value: Fixture, label: string): string {
+  const suffix = createHash("sha256").update(`${value.rootTaskId}:${label}`).digest("hex").slice(0, 24)
+  return `c${suffix}`
+}
 
 function plainRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
@@ -482,10 +488,10 @@ function scheduledDraftGraphScope(value: Fixture) {
 }
 
 function scheduledDraftRoleResult(role: "scout" | "analyst", jobId: string, hasFinding = true, score = 8): unknown {
-  const evidence = [{ id: `model-job-${role}`, kind: "job", ref: jobId, source: "fixture" }]
+  const evidence = [{ id: `model-job-${role}`, kind: "job", ref: jobId, source: "test" }]
   if (role === "scout") return {
     schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed",
-    candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [evidence[0]!.id] }], evidence, summary: "Fixture candidate",
+    candidates: [{ jobId, source: "test", url: null, evidenceIds: [evidence[0]!.id] }], evidence, summary: "Fixture candidate",
   }
   return {
     schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed",
@@ -515,7 +521,20 @@ async function persistVerifiedScheduledDraftRole(pool: PgPool, value: Fixture, s
   [stepId, value.sessionId, value.turnId, node.taskId, ordinal, attemptCount])
   const job = (structuredResult as { evidence?: Array<{ ref?: string }> }).evidence?.[0]?.ref
   if (typeof job !== "string") throw new Error("Scheduled-draft PostgreSQL fixture has no job evidence")
-  const output = { job: { id: job, source: "fixture" } }
+  const jobRecord = { id: job, company: "Fixture GmbH", role: "Software Engineer", location: "Berlin", status: "saved", score: 80,
+    url: "https://jobs.example.invalid/finalization", source: "test", salary: null,
+    description: "Original selected source for finalization", keywords: null }
+  const jobRow = await pool.query(`INSERT INTO "Job"
+    ("id", "userId", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
+    ON CONFLICT ("id") DO UPDATE SET "company" = EXCLUDED."company", "role" = EXCLUDED."role", "location" = EXCLUDED."location",
+      "status" = EXCLUDED."status", "score" = EXCLUDED."score", "url" = EXCLUDED."url", "source" = EXCLUDED."source",
+      "salary" = EXCLUDED."salary", "description" = EXCLUDED."description", "keywords" = EXCLUDED."keywords", "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "Job"."userId" = EXCLUDED."userId" RETURNING "id"`,
+  [job, value.userId, jobRecord.company, jobRecord.role, jobRecord.location, jobRecord.status, jobRecord.score, jobRecord.url,
+    jobRecord.source, jobRecord.salary, jobRecord.description, jobRecord.keywords])
+  if (jobRow.rows.length !== 1 || jobRow.rows[0]?.id !== job) throw new Error("Scheduled-draft fixture could not persist an owner-scoped full Job source")
+  const output = { job: jobRecord }
   const callContent = { toolCallId: callId, toolName: "jobs.get", toolVersion: "1", input: { jobId: job }, status: "completed", errorCode: null }
   const resultContent = { toolCallId: callId, output, errorCode: null }
   await pool.query(`INSERT INTO "agent_items"
@@ -827,6 +846,13 @@ const BRANCH_SCOUT_VERIFICATION = {
   role: "scout",
   criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
 } as const
+function branchScoutVerification(minimumCandidates: number) {
+  return {
+    schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+    role: "scout" as const,
+    criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: minimumCandidates } }],
+  }
+}
 function branchAnalystVerification(scoutKey: string) {
   return {
     schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
@@ -911,6 +937,113 @@ async function failQueuedTypedTask(pool: PgPool, value: Fixture, taskId: string,
     status: "failed", retryDisposition: "terminal", failureReason: "private executor detail",
     result: { summary: "The executor returned no verifiable result" }, now: new Date() })
   if (result !== "failed") throw new Error("Failed-branch fixture did not terminalize through Worker finish")
+}
+
+async function failScoutWithCanonicalCriterionShortfall(pool: PgPool, value: Fixture, taskId: string) {
+  const ownerId = `worker-criterion-shortfall-${randomUUID()}`
+  const store = new PgSubagentTaskStore(pool)
+  const claimed = await store.claim({ taskId, sessionId: value.sessionId, ownerId,
+    policy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 }, now: new Date() })
+  if (!claimed || claimed.status !== "running" || !claimed.leaseExpiresAt) {
+    throw new Error("Criterion-shortfall fixture could not claim its ordinary Scout")
+  }
+  if (claimed.role !== "scout" || claimed.taskType !== "job_discovery" || claimed.attemptCount !== 1) {
+    throw new Error("Criterion-shortfall fixture did not claim the first ordinary Scout attempt")
+  }
+
+  const jobId = `c${"a".repeat(24)}`
+  const evidenceId = "criterion-shortfall-source"
+  const callId = `criterion-shortfall-discover:${taskId}`
+  const discoveryRequests: JobDiscoveryRequest[] = []
+  const jobDiscoveryClient: JobDiscoveryClient = {
+    async discover(request) {
+      discoveryRequests.push(request)
+      return {
+        jobs: [{ id: jobId, title: "Software Engineer", company: "Fixture Company", location: "Dublin",
+          url: "https://jobs.example.invalid/criterion-shortfall", description: "Fixture role",
+          fullDescription: "Fixture role description", salary: null, logo: null, source: "greenhouse", evidenceRefs: [evidenceId] }],
+        evidence: [{ evidenceId, jobId, kind: "source", source: "greenhouse",
+          url: "https://jobs.example.invalid/criterion-shortfall", summary: "Synthetic canonical discovery evidence" }],
+        nextCursor: null,
+        usage: { ledgerKey: `fixture-${request.toolCallId}`, toolName: "jobs.discover", toolVersion: "1",
+          toolCallId: request.toolCallId, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+          requests: 1, jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0, providerFailures: 0,
+          aiCalls: 0, providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1 },
+      }
+    },
+  }
+  const structuredResult = {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+    candidates: [{ jobId, source: "greenhouse", url: "https://jobs.example.invalid/criterion-shortfall",
+      evidenceIds: [`read:job:${jobId}`] }],
+    evidence: [{ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }],
+    summary: "One candidate was grounded in the canonical discovery receipt.",
+  }
+  const profile = {
+    provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+    continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: true,
+    supportsReasoningSummary: true, supportsResponseContinuation: false, supportsProviderConversation: false,
+    supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" as const,
+  }
+  let modelRounds = 0
+  const execute = createProductionChildExecutor({
+    pool,
+    turnStore: createPgTurnEngineStore(pool),
+    treeBudget: createPgTreeBudgetReservationStore(pool),
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+      settle: async () => undefined, settleUnknown: async () => undefined }),
+    jobDiscoveryClient,
+    modelRuntimeFactory: ({ task }) => ({
+      id: `criterion-shortfall-fixture-${task.id}`, profile,
+      async *stream(_request: HarnessModelRequest) {
+        modelRounds += 1
+        if (modelRounds === 1) {
+          yield { type: "tool_call_completed", callId, name: "jobs.discover",
+            arguments: { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 1 } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify(structuredResult) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }),
+  })
+  const lease = { ...claimed, ownerId, leaseExpiresAt: claimed.leaseExpiresAt, signal: new AbortController().signal }
+  const execution = await execute({ lease })
+  if (execution.status !== "completed" || !execution.result) {
+    throw new Error("Criterion-shortfall fixture did not produce a completed Scout result")
+  }
+  if (modelRounds !== 2 || discoveryRequests.length !== 1) {
+    throw new Error("Criterion-shortfall fixture did not execute one real canonical discovery call")
+  }
+  const request = discoveryRequests[0]!
+  if (request.userId !== value.userId || request.sessionId !== value.sessionId || request.turnId !== value.turnId
+    || request.taskId !== taskId || request.rootTaskId !== value.rootTaskId || request.role !== "scout"
+    || request.leaseOwner !== ownerId || request.attemptCount !== claimed.attemptCount
+    || request.toolCallId !== callId || request.targetRoles.length !== 1 || request.targetRoles[0] !== "Software Engineer"
+    || request.targetLocations.length !== 1 || request.targetLocations[0] !== "Dublin") {
+    throw new Error("Criterion-shortfall fixture discovery call escaped its exact Scout fence")
+  }
+  const finished = await store.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
+    ...execution, now: new Date() })
+  if (finished !== "failed") throw new Error("Criterion-shortfall fixture did not terminalize through Worker finish")
+
+  const taskGraphItem = await pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'task_graph'`,
+  [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId, value.rootTaskId])
+  const snapshot = parseTaskGraphSnapshot(taskGraphItem.rows[0]?.content)
+  const node = snapshot.nodes.find(candidate => candidate.taskId === taskId)
+  if (!node) throw new Error("Criterion-shortfall fixture lost the registered Scout node")
+  const proof = await reverifyFailedTaskGraphNodeEvidence(pool, {
+    scope: { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: value.rootTaskId,
+      parentTaskId: value.rootTaskId, taskId, attemptCount: claimed.attemptCount },
+    snapshot, node, structuredResult,
+  })
+  if (proof.verified || proof.report.status !== "failed" || proof.report.reasonCode !== "criterion_not_met"
+    || proof.report.evidenceDigest === null || proof.report.resultDigest !== taskGraphResultDigest(structuredResult)) {
+    throw new Error("Criterion-shortfall fixture did not preserve an exact, digest-complete failure proof")
+  }
+  return { taskId, callId, jobId, attemptCount: claimed.attemptCount, structuredResult, report: proof.report }
 }
 
 type OperationalResumeFailureReason = "child_resume_unavailable" | "child_resume_evidence_unavailable"
@@ -1051,8 +1184,20 @@ async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool
     failedRoot, failureReason, input, operation, rawCallInput }
 }
 
+async function nextStepOrdinal(pool: PgPool, value: Fixture): Promise<number> {
+  const result = await pool.query<{ nextOrdinal: number }>(`SELECT COALESCE(MAX("ordinal"), 0) + 1 AS "nextOrdinal"
+    FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2`, [value.sessionId, value.turnId])
+  const nextOrdinal = result.rows[0]?.nextOrdinal
+  if (typeof nextOrdinal !== "number" || !Number.isSafeInteger(nextOrdinal) || nextOrdinal < 1) {
+    throw new Error("Failed-branch fixture could not allocate the next Step ordinal")
+  }
+  return nextOrdinal
+}
+
 async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
-  replacementPrefix = "failed-replacement", options: Readonly<{ retainedNodeCount?: number; addNativeSnapshot?: boolean }> = {}) {
+  replacementPrefix = "failed-replacement", options: Readonly<{
+    retainedNodeCount?: number; addNativeSnapshot?: boolean; sourceCriterionShortfall?: boolean
+  }> = {}) {
   await seed(pool, value)
   const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
   const retainedKeys = ["retained-a", "retained-b", "retained-c", "retained-d"].slice(0, options.retainedNodeCount ?? 4)
@@ -1067,7 +1212,7 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
     { key: "source-analyst", templateId: "analyst", goal: "Score initial candidates", successCriteria: ["Score one candidate"],
       dependsOn: ["source-scout"], verification: branchAnalystVerification("source-scout") },
     { key: "source-scout", templateId: "scout", goal: "Find initial candidates", successCriteria: ["Find one candidate"],
-      dependsOn: [], verification: BRANCH_SCOUT_VERIFICATION },
+      dependsOn: [], verification: options.sourceCriterionShortfall ? branchScoutVerification(2) : BRANCH_SCOUT_VERIFICATION },
     { key: "reserve-target", templateId: "analyst", goal: "Score repair target", successCriteria: ["Return one finding"],
       dependsOn: [], verification: ANALYST_VERIFICATION },
     ...retainedKeys.map(key => ({ key, templateId: "analyst" as const,
@@ -1101,7 +1246,12 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
 
   const sourceScout = initial.nodes.find(node => node.key === "source-scout"), sourceAnalyst = initial.nodes.find(node => node.key === "source-analyst")
   if (!sourceScout || !sourceAnalyst) throw new Error("Failed-branch fixture lost the Scout source")
-  await failQueuedTypedTask(commandPool, value, sourceScout.taskId, `worker-fail-source-scout-${randomUUID()}`)
+  const criterionShortfall = options.sourceCriterionShortfall
+    ? await failScoutWithCanonicalCriterionShortfall(commandPool, value, sourceScout.taskId)
+    : undefined
+  if (!options.sourceCriterionShortfall) {
+    await failQueuedTypedTask(commandPool, value, sourceScout.taskId, `worker-fail-source-scout-${randomUUID()}`)
+  }
   let current = await command.readCurrent(readScope(value))
   if (current.nodes.length !== 4 + retainedKeys.length || current.nodes.find(node => node.key === "source-scout")?.status !== "failed"
     || current.nodes.find(node => node.key === "source-analyst")?.status !== "waiting"
@@ -1116,10 +1266,11 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
       outerRoot: outerRoot.rows[0] ? { status: outerRoot.rows[0].status,
         failureReason: safeReason(outerRoot.rows[0].failureReason) } : null })}`)
   }
+  const laterStepOrdinal = await nextStepOrdinal(pool, value)
   await pool.query(`INSERT INTO "agent_steps"
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-    VALUES ($1, $2, $3, $4, 3, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
-  [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId])
+    VALUES ($1, $2, $3, $4, $5, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+  [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId, laterStepOrdinal])
   let planStepId = value.laterStepId
   if (options.addNativeSnapshot) {
     await seedReconciliationAgenda(pool, value, { id: value.laterStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
@@ -1142,10 +1293,11 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "status" = 'streaming'`,
     [value.laterStepId, value.sessionId, value.turnId])
     if (completedNativeStep.rowCount !== 1) throw new Error("Failed-branch fixture could not complete its native command Step")
+    const keepStepOrdinal = await nextStepOrdinal(pool, value)
     await pool.query(`INSERT INTO "agent_steps"
       ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-      VALUES ($1, $2, $3, $4, 4, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
-    [value.keepStepId, value.sessionId, value.turnId, value.rootTaskId])
+      VALUES ($1, $2, $3, $4, $5, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+    [value.keepStepId, value.sessionId, value.turnId, value.rootTaskId, keepStepOrdinal])
     planStepId = value.keepStepId
   }
   const turnUsage = await pool.query(`UPDATE "agent_turns" SET "inputTokens" = 47, "outputTokens" = 13,
@@ -1160,7 +1312,7 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
   const request = branchPlanRequest(scope, templates, current.nodes, current.revision, value.planCallId, replacementPrefix)
   await seedReconciliationToolCall(pool, value, { id: value.planCallId, stepId: planStepId, toolName: "agent.plan",
     input: request.rawCallInput, sequence: await nextEventSequence(pool, value) })
-  return { pool, command, value, templates, sourceTaskIds: [sourceScout.taskId, sourceAnalyst.taskId],
+  return { pool, command, value, templates, sourceTaskIds: [sourceScout.taskId, sourceAnalyst.taskId], criterionShortfall,
     repairTargetId: target.taskId, scope, current, ...request }
 }
 
@@ -1181,8 +1333,10 @@ async function prepareFollowingFailedBranchReplan(prepared: Awaited<ReturnType<t
 }
 
 async function failedBranchImmutableRows(pool: PgPool, value: Fixture, taskIds: readonly string[]): Promise<Record<string, unknown>> {
-  const [tasks, events, outbox, reservations, rootBudget, turnUsage, stepUsage] = await Promise.all([
+  const [tasks, items, events, outbox, reservations, rootBudget, turnUsage, stepUsage] = await Promise.all([
     pool.query(`SELECT * FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`, [taskIds]),
+    pool.query(`SELECT * FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[]) ORDER BY "createdAt", "id"`,
+      [value.sessionId, value.turnId, taskIds]),
     pool.query(`SELECT * FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[]) ORDER BY "sequence", "id"`,
       [value.sessionId, value.turnId, taskIds]),
     pool.query(`SELECT * FROM "agent_outbox" WHERE "aggregateId" = $1
@@ -1196,7 +1350,7 @@ async function failedBranchImmutableRows(pool: PgPool, value: Fixture, taskIds: 
     pool.query(`SELECT "id", "inputTokens", "outputTokens", "estimatedCostUsd"::text AS "estimatedCostUsd"
       FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "id"`, [value.sessionId, value.turnId]),
   ])
-  return { tasks: tasks.rows, events: events.rows, outbox: outbox.rows, reservations: reservations.rows, rootBudget: rootBudget.rows,
+  return { tasks: tasks.rows, items: items.rows, events: events.rows, outbox: outbox.rows, reservations: reservations.rows, rootBudget: rootBudget.rows,
     usage: { turn: turnUsage.rows, steps: stepUsage.rows } }
 }
 
@@ -1406,8 +1560,9 @@ async function seedReconciliationToolCall(pool: PgPool, value: Fixture, call: {
   })
 }
 
-const TENANT_TABLES = ["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox", "agent_inputs"] as const
+const TENANT_TABLES = ["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox", "agent_inputs", "Job"] as const
 const TENANT_POLICIES: ReadonlyArray<readonly [string, string, string]> = [
+  ["Job", "job", `"userId" = public.app_current_user_id()`],
   ["agent_sessions", "session", `"userId" = public.app_current_user_id()`],
   ["agent_turns", "turn", `"userId" = public.app_current_user_id() AND EXISTS (
     SELECT 1 FROM public."agent_sessions" AS session WHERE session."id" = "sessionId" AND session."userId" = public.app_current_user_id())`],
@@ -1437,7 +1592,7 @@ async function installTaskGraphTenantRls(pool: PgPool, policyPrefix: string, set
     FROM pg_class AS relation WHERE relation.oid = ANY(ARRAY[
       'public."agent_sessions"'::regclass, 'public."agent_turns"'::regclass, 'public."sub_agent_tasks"'::regclass,
       'public."agent_steps"'::regclass, 'public."agent_items"'::regclass, 'public."agent_events"'::regclass,
-      'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass
+      'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass, 'public."Job"'::regclass
     ])`)
   for (const table of TENANT_TABLES) {
     const row = prior.rows.find(candidate => candidate.tableName === table)
@@ -1554,6 +1709,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     await adminPool.query(`GRANT SELECT ON "agent_tree_budget_reservations", "agent_native_semantic_rejections", "agent_mailbox_messages",
       "agent_mailbox_hydration_checkpoints", "agent_tool_result_references", "agent_wait_conditions", "agent_transcript_events",
       "agent_approvals", "agent_artifact_version", "agent_artifact_review", "application_tasks" TO "${roleName}"`)
+    await adminPool.query(`GRANT SELECT ("id", "userId", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords", "createdAt", "updatedAt") ON "Job" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_turns" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_steps" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${roleName}"`)
@@ -1654,7 +1810,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
         WHERE role.rolname = current_user AND relation.oid = ANY(ARRAY[
           'public."agent_sessions"'::regclass, 'public."agent_turns"'::regclass, 'public."sub_agent_tasks"'::regclass,
           'public."agent_steps"'::regclass, 'public."agent_items"'::regclass, 'public."agent_events"'::regclass,
-          'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass
+          'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass, 'public."Job"'::regclass
         ]) ORDER BY relation.relname`)
       expect(roleState.rows).toEqual([...TENANT_TABLES].sort().map(tableName => ({
         tenantScope: owner.userId, roleName, isSuperuser: false, bypassesRls: false, tableName, ownsTable: false,
@@ -2757,6 +2913,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(writerContext?.selectedJobPreparation).toEqual({ jobId: highJobId })
     expect(reviewerContext?.selectedJobPreparation).toEqual({ jobId: highJobId })
     expect(writerContext?.scheduledDraftCandidateWitness).toEqual(reviewerContext?.scheduledDraftCandidateWitness)
+    expect((writerContext?.scheduledDraftCandidateWitness as { bindingVersion?: unknown })?.bindingVersion).toBe(2)
+    expect((writerContext?.scheduledDraftCandidateWitness as { jobMaterialDigest?: unknown })?.jobMaterialDigest).toMatch(/^sha256:[a-f0-9]{64}$/)
     expect(writerContext?.scheduledDraftCandidateWitness).toMatchObject({
       candidate: { jobId: highJobId, score: 9 }, sourceAnalystKeys: ["analyst-high"],
       analysts: [{ nodeKey: "analyst-high" }, { nodeKey: "analyst-low" }],
@@ -2942,6 +3100,16 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const restored = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 1
       WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = 2`, [analystTaskId, value.sessionId])
     expect(restored.rowCount).toBe(1)
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), binding.snapshot,
+      binding.graphRevision, binding.jobId, binding.witness)).resolves.toBe(true)
+    const changedMaterial = await adminPool!.query(`UPDATE "Job" SET "description" = 'Changed source for freshness probe'
+      WHERE "id" = $1 AND "userId" = $2`, [jobId, value.userId])
+    expect(changedMaterial.rowCount).toBe(1)
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), binding.snapshot,
+      binding.graphRevision, binding.jobId, binding.witness)).resolves.toBe(false)
+    const restoredMaterial = await adminPool!.query(`UPDATE "Job" SET "description" = 'Original selected source for finalization'
+      WHERE "id" = $1 AND "userId" = $2`, [jobId, value.userId])
+    expect(restoredMaterial.rowCount).toBe(1)
     await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), binding.snapshot,
       binding.graphRevision, binding.jobId, binding.witness)).resolves.toBe(true)
   }, 60_000)
@@ -3945,22 +4113,72 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     }
   }, 90_000)
 
-  it("cancels only a failed Scout's waiting descendants while preserving failed-root proof and usage", async () => {
+  it.each([
+    { label: "an unverified result", sourceCriterionShortfall: false },
+    { label: "a real canonical discovery criterion shortfall", sourceCriterionShortfall: true },
+  ])("cancels only a failed Scout's waiting descendants after $label while preserving source proof and usage", async ({ sourceCriterionShortfall }) => {
     const value = fixture()
     additionalFixtures.push(value)
-    const prepared = await prepareFailedBranchReplan(adminPool!, commandPool!, roleName, value)
+    const prepared = await prepareFailedBranchReplan(adminPool!, commandPool!, roleName, value, "failed-replacement",
+      { sourceCriterionShortfall })
     expect(prepared.current.nodes.filter(node => node.key === "source-analyst" || node.key === "source-scout").map(node => node.key))
       .toEqual(["source-analyst", "source-scout"])
     const failedRootId = prepared.sourceTaskIds[0]!
     const waitingDescendantId = prepared.sourceTaskIds[1]!
     const before = await failedBranchImmutableRows(adminPool!, value, [failedRootId])
-    const sourceRowsBefore = await adminPool!.query<{ id: string; status: string; attemptCount: number }>(
-      `SELECT "id", "status", "attemptCount" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+    const sourceRowsBefore = await adminPool!.query<{ id: string; status: string; attemptCount: number; failureReason: string | null }>(
+      `SELECT "id", "status", "attemptCount", "failureReason" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
       [prepared.sourceTaskIds])
     expect(sourceRowsBefore.rows).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: failedRootId, status: "failed" }),
+      expect.objectContaining({ id: failedRootId, status: "failed", failureReason: sourceCriterionShortfall
+        ? "task_graph_verification_failed" : "task_graph_verification_unverified" }),
       expect.objectContaining({ id: waitingDescendantId, status: "waiting", attemptCount: 0 }),
     ]))
+    if (sourceCriterionShortfall) {
+      const witness = prepared.criterionShortfall
+      if (!witness) throw new Error("Canonical criterion-shortfall proof was not returned")
+      expect(witness?.attemptCount).toBe(1)
+      expect(witness?.report).toMatchObject({
+        verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+        status: "failed",
+        reasonCode: "criterion_not_met",
+        criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+        evidenceDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        resultDigest: taskGraphResultDigest(witness.structuredResult),
+      })
+      const receiptItems = await adminPool!.query<{ id: string; stepId: string; attempt: number; ordinal: number;
+        type: string; status: string; content: unknown }>(`SELECT item."id", item."stepId", step."attempt", step."ordinal",
+          item."type", item."status", item."content"
+        FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId"
+          AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+        WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+          AND item."type" IN ('tool_call', 'tool_result') AND item."content"->>'toolCallId' = $4
+          AND step."attempt" = $5 ORDER BY item."type"`, [value.sessionId, value.turnId, failedRootId,
+        witness.callId, witness.attemptCount])
+      expect(receiptItems.rows).toHaveLength(2)
+      const callItem = receiptItems.rows.find(row => row.type === "tool_call")
+      const resultItem = receiptItems.rows.find(row => row.type === "tool_result")
+      expect(callItem).toMatchObject({ stepId: expect.any(String), attempt: 1, ordinal: expect.any(Number), status: "completed",
+        content: { toolCallId: witness.callId, toolName: "jobs.discover", toolVersion: "1", status: "completed", errorCode: null } })
+      expect(resultItem).toMatchObject({ stepId: callItem?.stepId, attempt: callItem?.attempt, ordinal: callItem?.ordinal,
+        status: "completed", content: { toolCallId: witness.callId, errorCode: null,
+          output: { jobs: [{ id: witness.jobId }], evidence: [{ jobId: witness.jobId }] } } })
+      const receiptEvents = await adminPool!.query<{ type: string; itemId: string | null; taskId: string | null; correlationId: string | null }>(
+        `SELECT "type", "itemId", "taskId", "correlationId" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 ORDER BY "sequence"`,
+        [value.sessionId, value.turnId, callItem?.id])
+      expect(receiptEvents.rows).toEqual(expect.arrayContaining([
+        { type: "tool_call.started", itemId: callItem?.id, taskId: failedRootId, correlationId: witness.callId },
+        { type: "tool_call.completed", itemId: callItem?.id, taskId: failedRootId, correlationId: witness.callId },
+      ]))
+      const terminal = await adminPool!.query<{ status: string; attemptCount: number; failureReason: string | null; result: unknown }>(
+        `SELECT "status", "attemptCount", "failureReason", "result" FROM "sub_agent_tasks"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4`,
+        [failedRootId, value.sessionId, value.turnId, value.rootTaskId])
+      expect(terminal.rows[0]).toMatchObject({ status: "failed", attemptCount: 1, failureReason: "task_graph_verification_failed",
+        result: { taskGraphVerificationReport: witness.report } })
+      expect(taskGraphResultDigest(witness.structuredResult)).toBe(witness.report.resultDigest)
+    }
     expect(before.usage).toMatchObject({
       turn: [{ id: value.turnId, inputTokens: 47, outputTokens: 13, estimatedCostUsd: "0.00420000" }],
       steps: expect.arrayContaining([
@@ -4001,11 +4219,22 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(current.nodes.find(node => node.key === "retained-repair")?.repairOf).toMatchObject({ nodeKey: "reserve-target" })
     expect(current.nodes.find(node => node.key === "failed-replacement-scout")?.status).toBe("queued")
     expect(current.nodes.find(node => node.key === "failed-replacement-analyst")?.status).toBe("waiting")
-    const newRows = await adminPool!.query<{ id: string; status: string; attemptCount: number; result: unknown }>(
-      `SELECT "id", "status", "attemptCount", "result" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+    const replacementIds = new Set(receipt.nodes.map(node => node.taskId))
+    const retainedBefore = prepared.current.nodes.filter(node => !prepared.sourceTaskIds.includes(node.taskId))
+      .map(node => ({ key: node.key, taskId: node.taskId, status: node.status }))
+    const retainedAfter = current.nodes.filter(node => !replacementIds.has(node.taskId))
+      .map(node => ({ key: node.key, taskId: node.taskId, status: node.status }))
+    expect(retainedAfter).toEqual(retainedBefore)
+    const newRows = await adminPool!.query<{ id: string; status: string; attemptCount: number; result: unknown; context: unknown }>(
+      `SELECT "id", "status", "attemptCount", "result", "context" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
       [receipt.nodes.map(node => node.taskId)])
     expect(newRows.rows).toHaveLength(2)
     expect(newRows.rows.every(row => row.attemptCount === 0 && row.result === null)).toBe(true)
+    if (prepared.criterionShortfall) {
+      const newContexts = JSON.stringify(newRows.rows.map(row => row.context)) ?? ""
+      expect(newContexts.includes(prepared.criterionShortfall.jobId)).toBe(false)
+      expect(newContexts.includes("read:job:")).toBe(false)
+    }
 
     const key = steeringReconciliationIdempotencyKey(prepared.scope, value.planCallId)
     const persisted = await adminPool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
@@ -4019,6 +4248,11 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       cancellations: [expect.objectContaining({ source: { nodeKey: "source-analyst", taskId: waitingDescendantId },
         event: { id: cancellationEvent.rows[0]!.id, sequence: cancellationEvent.rows[0]!.sequence, idempotencyKey: cancellationKey } })],
       planEvent: { idempotencyKey: taskGraphProposalKey(value.rootTaskId, prepared.current.revision + 1) } })
+    const beforeReplay = await supersessionDurableRows(adminPool!, value)
+    const restored = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    await expect(restored.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .resolves.toEqual({ ...receipt, status: "duplicate" })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(beforeReplay)
   }, 60_000)
 
   it("accepts a strict native command as the latest pre-call failed-branch snapshot", async () => {
@@ -4482,9 +4716,6 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
       { scoutKey: "scout-finalize", analystKey: "analyst-finalize", jobId, score: 9, hasFinding: true },
     ])
-    await adminPool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
-      VALUES ($1, $2, 'Fixture GmbH', 'Software Engineer', 'Berlin', 'saved', 'https://jobs.example.invalid/finalization',
-        'Original selected source for finalization', 'test', CURRENT_TIMESTAMP)`, [jobId, value.userId])
     await adminPool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
       VALUES ($1, $2, 'Finalization fixture base', $3::jsonb, 'base', 'manual', TRUE, CURRENT_TIMESTAMP)`, [
       `scheduled-draft-resume-${value.sessionId}`, value.userId, JSON.stringify({ text: "Fixture base resume" }),

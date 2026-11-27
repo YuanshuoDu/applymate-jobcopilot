@@ -15,6 +15,26 @@ import type { TurnComposerController } from './agent-turn-commands'
 const componentSource = readFileSync(new URL('./AgentComposerActiveTurn.tsx', import.meta.url), 'utf8')
 
 describe('AgentComposerActiveTurn', () => {
+  it('renders a matching applied plan revision beside the unchanged delivery status', () => {
+    const controller: TurnComposerController = {
+      sessionId: 'session_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 2 },
+      sessionStatus: 'running', delivery: 'steer', setDelivery: vi.fn(), chatInput: '', setChatInput: vi.fn(), sending: false,
+      messages: [{ clientMessageId: 'client_1', text: 'Add Berlin', delivery: 'steer', status: 'consumed', inputId: 'input_1', turnId: 'turn_1' }],
+      appliedSteeringMarkers: [{
+          schemaVersion: 'agent-harness.steering-marker.v1', kind: 'applied', status: 'applied',
+          sessionId: 'session_1', turnId: 'turn_1', taskId: 'root_1', stepId: 'step_1', inputId: 'input_1',
+          idempotencyKey: 'steering-marker:session_1:turn_1:input_1', obligationId: 'steering:input_1',
+          goalRevision: 2, planRevision: 3, acceptedSequence: '12',
+        }],
+      commandError: null, send: vi.fn(), interrupt: vi.fn(), interrupting: false,
+    }
+
+    const html = renderToString(<AgentComposerActiveTurn controller={controller} />)
+    expect(html).toContain('Consumed')
+    expect(html).toContain('Applied to plan · revision 3')
+    expect(html).toContain('aria-live="polite"')
+  })
+
   it('shows delivery choices, all command states, and the interrupt affordance', () => {
     const controller: TurnComposerController = {
       sessionId: 'session_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 2 }, sessionStatus: 'running', refresh: vi.fn(), delivery: 'steer',
