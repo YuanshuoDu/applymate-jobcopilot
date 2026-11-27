@@ -22124,7 +22124,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       subagents: { execute: childExecutor, intervalMs: 10 } })
     try {
       expect(await withinIntegrationDeadline(rootToolNames.promise, "Objective Root did not request plan tools", 30_000)).toEqual(
-        ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.wait"])
+        ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.retire_superseded_scout", "agent.wait"])
       const plan = await withinIntegrationDeadline(initialPlanReceipt.promise, "Objective Root did not return the partition plan", 30_000)
       expect(plan).toMatchObject({ status: "accepted", revision: 1 })
       const planNodes = Array.isArray(plan.nodes) ? plan.nodes.map(record) : []
