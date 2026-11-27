@@ -38,13 +38,14 @@ const child = { id: childId, userId, sessionId, turnId, rootTaskId, parentTaskId
   role: "scout", taskType: "job_discovery", status: "completed", attemptCount: 1,
   context: {}, result: { status: "completed", structuredResult: { candidates: [{ jobId }] } } }
 
-function runtime(options: { ordinal?: number; targetRows?: readonly unknown[]; waitRows?: readonly unknown[] } = {}) {
+function runtime(options: { ordinal?: number; previousRootStep?: { ordinal: number; attempt: number } | null; targetRows?: readonly unknown[]; waitRows?: readonly unknown[] } = {}) {
   const queries: string[] = [], values: unknown[][] = []
   const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
     queries.push(sql)
     values.push(params ?? [])
     if (sql.startsWith("BEGIN") || sql.includes("set_config") || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] }
     if (sql.includes('SELECT step."ordinal"')) return { rows: [{ ordinal: options.ordinal ?? 2, attempt: 1, taskId: rootTaskId, status: "streaming" }] }
+    if (sql.includes('SELECT priorStep."ordinal"')) return { rows: options.previousRootStep === null ? [] : [{ taskId: rootTaskId, ...(options.previousRootStep ?? { ordinal: 1, attempt: 1 }) }] }
     if (sql.includes('SELECT 1 FROM "agent_items"')) return { rows: [{ one: 1 }] }
     if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: options.waitRows ?? [] }
     if (sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_sessions"')) {
@@ -95,7 +96,7 @@ describe("private sponsorship context reader", () => {
     expect(f.client.release).toHaveBeenCalledOnce()
   })
 
-  it("fails closed if the wait is not the immediate previous step or its returned IDs differ", async () => {
+  it("fails closed if the nearest Root step is not the exact wait or its returned IDs differ", async () => {
     const stale = runtime()
     harness.load.mockResolvedValueOnce(receipts([{ ...waitCall, ordinal: 0 }, { ...waitResult, ordinal: 0 }]))
     expect(await readPrivateSponsorshipContext(stale.pool as never, fence)).toBeUndefined()
@@ -108,6 +109,30 @@ describe("private sponsorship context reader", () => {
     harness.load.mockResolvedValueOnce(receipts([waitCall, waitResult], wrongTargets))
     expect(await readPrivateSponsorshipContext(mismatch.pool as never, fence)).toBeUndefined()
     expect(harness.bind).not.toHaveBeenCalled()
+  })
+
+  it("uses the nearest Root-owned step across child ordinals and never crosses a newer Root step or attempt", async () => {
+    const f = runtime({ ordinal: 4, previousRootStep: { ordinal: 1, attempt: 1 } })
+    const result = await readPrivateSponsorshipContext(f.pool as never, fence)
+    expect(result).toHaveLength(1)
+    const predecessorQuery = f.client.query.mock.calls.find(([sql]) => sql.includes('SELECT priorStep."ordinal"'))?.[0]
+    expect(predecessorQuery).toContain('priorStep."taskId" = $3')
+    expect(predecessorQuery).toContain('ORDER BY priorStep."ordinal" DESC LIMIT 1')
+    expect(predecessorQuery).not.toContain('priorStep."attempt" =')
+    const waitLookup = f.client.query.mock.calls.find(([sql]) => sql.includes('SELECT 1 FROM "agent_items"'))
+    expect(waitLookup?.[1]).toEqual([rootTaskId, sessionId, turnId, 1, 1, userId])
+
+    vi.clearAllMocks(); harness.load.mockResolvedValue(receipts()); harness.redact.mockImplementation((value: unknown) => value)
+    const newerRootStep = runtime({ ordinal: 4, previousRootStep: { ordinal: 3, attempt: 1 } })
+    const staleWait = receipts([{ ...waitCall, ordinal: 1 }, { ...waitResult, ordinal: 1 }])
+    harness.load.mockResolvedValueOnce(staleWait)
+    expect(await readPrivateSponsorshipContext(newerRootStep.pool as never, fence)).toBeUndefined()
+    expect(harness.bind).not.toHaveBeenCalled()
+
+    vi.clearAllMocks(); harness.load.mockResolvedValue(receipts()); harness.redact.mockImplementation((value: unknown) => value)
+    const previousAttempt = runtime({ ordinal: 4, previousRootStep: { ordinal: 1, attempt: 2 } })
+    expect(await readPrivateSponsorshipContext(previousAttempt.pool as never, fence)).toBeUndefined()
+    expect(harness.load).not.toHaveBeenCalled()
   })
 
   it("uses only validated matched targets for a ready any-wait and excludes later completions", async () => {

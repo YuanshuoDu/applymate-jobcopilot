@@ -301,8 +301,19 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     const handoff = await durable.suspendAndRelease({ lease: turnLease, waitId: initial.waitId, now: new Date() })
     expect(handoff).toMatchObject({ handoff: "suspended", waitStatus: "waiting" })
 
-    if (mode === "any") await finishScout({ tasks, child: childLeases[0]!, jobId: value.jobIds[0], candidateIndex: 0 })
-    else await finishScout({ tasks, child: childLeases[1]!, jobId: value.jobIds[1], candidateIndex: 1 })
+    // A still-running child may need another model step after Root's wait step.
+    // Step ordinals are Turn-global, so this child step sits between the wait
+    // and the Root's resumed step and must not hide the nearest Root wait.
+    const completingChildIndex = mode === "any" ? 0 : 1
+    const completingChild = childLeases[completingChildIndex]!
+    const completingChildIdentity = executionOwnerFence({ kind: "task", lease: completingChild })
+    const interleavedChildStep = await engine.startStep({ owner: completingChildIdentity,
+      stepId: `p3-sponsorship-private-child-interleave-${value.suffix}`, ordinal: 0,
+      attempt: completingChild.attemptCount, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+    expect(interleavedChildStep.ordinal).toBe(rootWaitStep.ordinal + 1)
+    await engine.updateStep({ owner: completingChildIdentity, stepId: interleavedChildStep.id, status: "completed",
+      finishReason: "stop", errorCode: null, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: new Date() })
+    await finishScout({ tasks, child: completingChild, jobId: value.jobIds[completingChildIndex]!, candidateIndex: completingChildIndex })
     const resolver = await reconcileDurableWaits(db, { ownerId: `p3-sponsorship-private-resolver-${value.suffix}`, now: new Date() })
     expect(resolver.resolved).toBe(1)
     expect(resolver.woken).toBe(1)
@@ -322,6 +333,7 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     const resumedIdentity = executionOwnerFence({ kind: "turn", taskId: root.id, lease: currentRootLease })
     const currentStep = await engine.startStep({ owner: resumedIdentity, stepId: `p3-sponsorship-private-root-resume-${value.suffix}`,
       ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+    expect(currentStep.ordinal).toBe(interleavedChildStep.ordinal + 1)
     const currentRoot = await pool!.query<{ parentTaskId: string | null; attemptCount: number }>(
       `SELECT "parentTaskId", "attemptCount" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
       [root.id, value.sessionId, value.turnId])
