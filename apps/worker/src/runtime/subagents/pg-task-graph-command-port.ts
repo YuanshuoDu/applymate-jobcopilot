@@ -2,7 +2,7 @@ import type { PoolClient } from "pg"
 import { TaskGraphCommandError, type TaskGraphCommandPort, type TaskGraphScheduleInput, type TaskGraphScheduledPrepareInput, type TaskGraphScheduledPrepareReceipt, type TaskGraphScheduleReceipt, type TaskGraphReadScope, type TaskGraphExecutionScope, type TaskGraphCurrentState, type TaskGraphPlanningCurrentState, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { transaction, type Queryable } from "./pg-store-persistence.js"
-import { lockTaskGraphScope, loadTaskGraph, currentTaskGraph } from "./task-graph-pg-state.js"
+import { lockTaskGraphScope, loadTaskGraph, currentTaskGraph, type TaskGraphSourceOptions } from "./task-graph-pg-state.js"
 import { buildTaskGraphPlanningFacts } from "./task-graph-planning-facts.js"
 import { taskGraphItemId } from "./task-graph-snapshot.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
@@ -134,7 +134,7 @@ async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: T
 async function readCurrentForPlanningWithClient(
   client: Pick<PoolClient, "query">, scope: TaskGraphReadScope,
 ): Promise<TaskGraphPlanningCurrentState> {
-  const loaded = await loadCurrentWithClient(client, scope, true)
+  const loaded = await loadCurrentWithClient(client, scope, { includeSourceProvenance: true, discoverCurrentStep: true, includeActiveChildDeadlines: true })
   const current = currentTaskGraph(loaded), planningFacts = buildTaskGraphPlanningFacts(loaded)
   const sourceIntent = current.nodes.map(node => ({ nodeKey: node.key, goal: node.goal, successCriteria: node.successCriteria,
     inputRelation: loaded.sourceInputRelationByNodeKey?.get(node.key) ?? "unknown" as const }))
@@ -159,11 +159,12 @@ async function readCurrentDiscoveryRecoveryPageWithClient(
   return projectTaskGraphDiscoveryRecoveryPage(loaded, request)
 }
 
-async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, includeSourceProvenance = false): Promise<LoadedCurrentGraph> {
+async function loadCurrentWithClient(
+  client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, options: TaskGraphSourceOptions = {},
+): Promise<LoadedCurrentGraph> {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   const parent = await lockTaskGraphScope(client, scope)
-  const loaded = await loadTaskGraph(client, scope, false, includeSourceProvenance
-    ? { includeSourceProvenance: true, discoverCurrentStep: true } : {})
+  const loaded = await loadTaskGraph(client, scope, false, options)
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }

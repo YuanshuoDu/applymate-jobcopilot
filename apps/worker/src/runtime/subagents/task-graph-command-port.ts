@@ -192,6 +192,8 @@ export type TaskGraphCurrentNode = Readonly<{
 export type TaskGraphCurrentState = Readonly<{
   revision: number
   nodes: readonly TaskGraphCurrentNode[]
+  /** Private owner-read timing, projected as a separate advisory and never added to nodes. */
+  activeChildDeadlines?: Readonly<{ revision: number; observedAt: string; entries: readonly Readonly<{ nodeKey: string; deadlineAt: string }>[] }>
   rootSuccessCriteria?: readonly string[]
   planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
   /** Internal owner-read provenance; stripped before model-facing observation construction. */

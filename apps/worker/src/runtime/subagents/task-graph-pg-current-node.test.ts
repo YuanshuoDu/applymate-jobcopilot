@@ -57,3 +57,51 @@ describe("current TaskGraph query footprint projection", () => {
     expect(projected.nodes[0]).not.toHaveProperty("discoveryQueryFootprint")
   })
 })
+
+describe("current TaskGraph active child deadline advisory", () => {
+  function withDeadline(status: string, deadlineAt: unknown, observedAt: unknown = "2026-11-23T12:00:00.000Z") {
+    const base = loaded("ordinary"), task = base.tasks.get("child-1")!
+    const liveTask = { ...task, status: status as typeof task.status, result: status === "completed" ? task.result : null, absoluteDeadlineAt: deadlineAt, deadlineObservedAt: observedAt }
+    const state = taskGraphState(base.snapshot!, 2, new Map([["child-1", { status: liveTask.status, failureReason: null }]]), [])
+    return currentTaskGraph({ ...base, state, tasks: new Map([["child-1", liveTask]]) })
+  }
+
+  it("projects only a future deadline for an active child outside the existing node shape", () => {
+    const projected = withDeadline("running", "2026-11-23T12:30:00.000Z")
+    expect(projected.activeChildDeadlines).toEqual({ revision: 2, observedAt: "2026-11-23T12:00:00.000Z",
+      entries: [{ nodeKey: "scout", deadlineAt: "2026-11-23T12:30:00.000Z" }] })
+    expect(projected.nodes[0]).not.toHaveProperty("absoluteDeadlineAt")
+    expect(JSON.stringify(projected.activeChildDeadlines)).not.toContain("child-1")
+  })
+
+  it("keeps deadline entries in persisted graph node order independent of task row order", () => {
+    const base = loaded("ordinary"), template = base.snapshot!.nodes[0]!
+    const snapshot = { ...base.snapshot!, nodes: ["first", "second", "third"].map((key, index) => ({
+      ...template, key, taskId: `child-${index + 1}`,
+    })) }
+    const task = (id: string) => ({ ...base.tasks.get("child-1")!, id, status: "running" as const, result: null,
+      absoluteDeadlineAt: "2026-11-23T12:30:00.000Z", deadlineObservedAt: "2026-11-23T12:00:00.000Z" })
+    const tasks = new Map([["child-3", task("child-3")], ["child-1", task("child-1")], ["child-2", task("child-2")]])
+    const state = taskGraphState(snapshot, 2, new Map([...tasks].map(([id, row]) => [id, { status: row.status, failureReason: null }])), [])
+    const projected = currentTaskGraph({ ...base, snapshot, state, tasks })
+    expect(projected.activeChildDeadlines?.entries.map(entry => entry.nodeKey)).toEqual(["first", "second", "third"])
+  })
+
+  it.each(["queued", "running", "retrying", "waiting", "waiting_for_user"])("accepts only active status %s", status => {
+    expect(withDeadline(status, "2026-11-23T12:30:00.000Z").activeChildDeadlines?.entries).toHaveLength(1)
+  })
+
+  it.each([
+    ["completed", "2026-11-23T12:30:00.000Z", "2026-11-23T12:00:00.000Z"],
+    ["running", "2026-11-23T11:59:59.999Z", "2026-11-23T12:00:00.000Z"],
+    ["running", "not-a-date", "2026-11-23T12:00:00.000Z"],
+    ["running", "2026-11-23T12:30:00.000Z", "not-a-date"],
+    ["running", null, "2026-11-23T12:00:00.000Z"],
+  ])("omits terminal, expired, malformed or absent deadline %s", (status, deadlineAt, observedAt) => {
+    expect(withDeadline(status, deadlineAt, observedAt).activeChildDeadlines).toBeUndefined()
+  })
+
+  it("remains compatible with an older graph fixture that has no deadline columns", () => {
+    expect(currentTaskGraph(loaded("ordinary")).activeChildDeadlines).toBeUndefined()
+  })
+})
