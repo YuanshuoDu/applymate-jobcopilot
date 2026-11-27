@@ -181,6 +181,7 @@ export function validateTaskGraphReplaySources(proofs: readonly TaskGraphReplayP
     const group = eventGroups.get(event.itemId) ?? []; group.push(event); eventGroups.set(event.itemId, group)
   }
   const receipts: TaskGraphReplayReceipt[] = [], usedCallItems = new Set<string>(), usedResultItems = new Set<string>()
+  const expectedDatabaseParentTaskId = scope.taskId === scope.rootTaskId ? null : scope.parentTaskId
   for (const proof of proofs) {
     const current = currentCalls.get(proof.currentCallId), currentContent = object(current?.content), currentResult = items.find(item => item.type === "tool_result" && object(item.content)?.toolCallId === proof.currentCallId), currentResultContent = object(currentResult?.content)
     const matches = sources.filter((row): row is Row => !!row && row.sourceResultItemId === proof.source.resultItemId)
@@ -188,7 +189,7 @@ export function validateTaskGraphReplaySources(proofs: readonly TaskGraphReplayP
     const source = matches[0]!, callContent = object(source.sourceCallContent), resultContent = object(source.sourceResultContent)
     if (!callContent || !resultContent || !strictText(source.sourceCallItemId) || !strictText(source.sourceResultItemId)
       || source.sourceSessionId !== scope.sessionId || source.sourceTurnId !== scope.turnId || source.sourceTaskId !== scope.taskId
-      || source.sourceRootTaskId !== scope.rootTaskId || source.sourceTurnRootTaskId !== scope.rootTaskId || source.sourceParentTaskId !== scope.parentTaskId || source.sourceUserId !== scope.userId
+      || source.sourceRootTaskId !== scope.rootTaskId || source.sourceTurnRootTaskId !== scope.rootTaskId || source.sourceParentTaskId !== expectedDatabaseParentTaskId || source.sourceUserId !== scope.userId
       || source.sourceResultItemId !== proof.source.resultItemId || source.sourceCallStepId !== source.sourceResultStepId
       || Number(source.sourceCallAttempt) !== Number(source.sourceResultAttempt) || Number(source.sourceResultAttempt) >= scope.attemptCount
       || Number(source.sourceResultAttempt) < 1 || Number(source.sourceCallOrdinal) !== Number(source.sourceResultOrdinal)

@@ -28,7 +28,8 @@ export async function loadTaskGraphVerificationReceipts(client: Queryable, scope
     JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND task."rootTaskId" = $4 AND turn."rootTaskId" = $4
-      AND task."parentTaskId" = $5 AND session."userId" = $6 AND turn."userId" = $6
+      AND (($1 = $4 AND $5 = $4 AND task."id" = $4 AND task."parentTaskId" IS NULL) OR task."parentTaskId" = $5)
+      AND session."userId" = $6 AND turn."userId" = $6
       AND step."attempt" = $7 AND item."type" IN ('tool_call', 'tool_result')
     ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_ITEMS + 1}`,
   [scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId, scope.attemptCount])
@@ -69,7 +70,8 @@ export async function loadTaskGraphVerificationReceipts(client: Queryable, scope
       JOIN "agent_sessions" AS session ON session."id" = result."sessionId"
       JOIN "agent_turns" AS turn ON turn."id" = result."turnId" AND turn."sessionId" = result."sessionId"
       WHERE result."id" = ANY($7::text[]) AND result."type" = 'tool_result' AND result."taskId" = $1 AND result."sessionId" = $2
-        AND result."turnId" = $3 AND task."rootTaskId" = $4 AND turn."rootTaskId" = $4 AND task."parentTaskId" = $5
+        AND result."turnId" = $3 AND task."rootTaskId" = $4 AND turn."rootTaskId" = $4
+        AND (($1 = $4 AND $5 = $4 AND task."id" = $4 AND task."parentTaskId" IS NULL) OR task."parentTaskId" = $5)
         AND session."userId" = $6 AND turn."userId" = $6 AND resultStep."attempt" >= 1 AND resultStep."attempt" < $8
       ORDER BY result."id" LIMIT ${MAX_ITEMS + 1}`,
     [scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId, resultIds, scope.attemptCount])

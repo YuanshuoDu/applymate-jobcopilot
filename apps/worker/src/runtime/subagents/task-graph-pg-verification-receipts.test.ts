@@ -14,7 +14,7 @@ const events = [
   { id: "completed", itemId: "call-item", taskId: scope.taskId, correlationId: "call-1", type: "tool_call.completed", sequence: 2, payload: { taskId: scope.taskId, toolCallId: "call-1", toolName: "jobs.search", status: "completed", errorCode: null } },
 ]
 function client(options: { rows?: typeof rows; events?: typeof events } = {}) {
-  const query = vi.fn(async (sql: string) => {
+  const query = vi.fn(async (sql: string, _values?: readonly unknown[]) => {
     if (sql.includes('SELECT item."id"')) return { rows: options.rows ?? rows, rowCount: (options.rows ?? rows).length }
     if (sql.includes('SELECT event."id"')) return { rows: options.events ?? events, rowCount: (options.events ?? events).length }
     throw new Error("unexpected_verification_receipt_query")
@@ -38,5 +38,18 @@ describe("loadTaskGraphVerificationReceipts", () => {
   it("rejects absent terminal tool lifecycle receipts", async () => {
     const fake = client({ events: [] })
     await expect(loadTaskGraphVerificationReceipts(fake.client, scope)).rejects.toThrow("task_graph_verification_event")
+  })
+
+  it("loads Root receipts with the persisted Root parentTaskId=null shape", async () => {
+    const rootScope: TaskGraphVerificationScope = { ...scope, taskId: "root-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+    const rootRows = rows.map(row => ({ ...row, taskId: rootScope.taskId, rootTaskId: rootScope.rootTaskId, turnRootTaskId: rootScope.rootTaskId }))
+    const rootEvents = events.map(event => ({ ...event, taskId: rootScope.taskId, payload: { ...event.payload, taskId: rootScope.taskId } }))
+    const fake = client({ rows: rootRows as typeof rows, events: rootEvents as typeof events })
+    const receipt = await loadTaskGraphVerificationReceipts(fake.client, rootScope)
+
+    expect(receipt.items).toHaveLength(2)
+    expect(fake.query.mock.calls[0]?.[0]).toContain('task."parentTaskId" IS NULL')
+    expect(fake.query.mock.calls[0]?.[1]).toEqual([rootScope.taskId, rootScope.sessionId, rootScope.turnId,
+      rootScope.rootTaskId, rootScope.parentTaskId, rootScope.userId, rootScope.attemptCount])
   })
 })

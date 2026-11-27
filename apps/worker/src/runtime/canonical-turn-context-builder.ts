@@ -5,7 +5,7 @@ import type { TurnLease } from "./turns/lease.js"
 import { executionOwnerFence, type ExecutionOwnerFence } from "./execution-owner.js"
 import { readCurrentRootBudget, type CurrentRootBudgetObservation } from "./turns/turn-engine-root-budget.js"
 import type { InputClaimStore } from "./context/input-claim-store.js"
-import { createPgContextOwnerFence, StepContextBuilder, type StepContextRequest } from "./context/step-context-builder.js"
+import { createPgContextOwnerFence, StepContextBuilder, type ContextBlock, type StepContextRequest } from "./context/step-context-builder.js"
 import type { HydrationScope } from "./context/steering-reconciliation-context.js"
 import { injectSelectedJobMemory, type SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import { createPgDirectSelectedJobHistoryStore } from "./context/selected-job-history-direct-store.js"
@@ -30,6 +30,8 @@ import { loadOrCreateDiscoveryPersonaSnapshot } from "./context/discovery-person
 import { discoveryPersonaContextBlocks } from "./context/discovery-persona-context-blocks.js"
 import { TurnEngineError } from "./turns/turn-engine-output.js"
 import { TurnLeaseError } from "./turns/lease.js"
+import { readPrivateSponsorshipContext } from "./subagents/sponsorship-private-context-reader.js"
+import { hasSponsorshipWaitHint, withPrivateSponsorshipContext } from "./subagents/sponsorship-private-context-projection.js"
 
 type ContextBuilder = TurnEngineOptions["contextBuilder"]
 type BaseBuilder = Pick<ContextBuilder, "build"> & {
@@ -175,16 +177,47 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
             now: request.now ?? new Date(), crossSessionRootTaskHistoryEnabled: false } })
         built = await base.build({ ...request, snapshot, taskId: input.rootTaskId })
       }
-      if (!discoveryMemoryEnabled) return built
-      const memory = await loadDiscoveryPersonaMemory(request.stepId)
-      const blocks = [...built.blocks, ...discoveryPersonaContextBlocks(memory.projection)]
+      const extraBlocks: ContextBlock[] = []
+      if (discoveryMemoryEnabled) {
+        const memory = await loadDiscoveryPersonaMemory(request.stepId)
+        extraBlocks.push(...discoveryPersonaContextBlocks(memory.projection))
+      }
+      if (input.planningEnabled && !input.selectedJobMode && hasSponsorshipWaitHint(snapshot)) {
+        try {
+          const entries = await readPrivateSponsorshipContext(input.pool, {
+            userId: request.scope.userId, sessionId: request.sessionId, turnId: request.turnId,
+            taskId: request.taskId ?? "", rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount,
+            turnLeaseOwner: input.lease.ownerId, turnLeaseVersion: input.lease.leaseVersion, stepId: request.stepId,
+          }, snapshot.toolObservations.filter(observation => observation.id.startsWith("wait-result:")))
+          extraBlocks.push(...withPrivateSponsorshipContext([], entries))
+        } catch {
+          // Optional source enrichment must never stop the Root's ordinary planning step.
+        }
+      }
+      if (extraBlocks.length === 0) return built
+      const blocks = [...built.blocks, ...extraBlocks].sort((left, right) => {
+        const layerOrder = ["system", "profile", "goal", "steer_history", "business", "tool_observation", "pending_input"]
+        return layerOrder.indexOf(left.layer) - layerOrder.indexOf(right.layer)
+      })
       const context = { ...built, blocks }
       let canonical: string
       try {
         canonical = canonicalJson({ schemaVersion: context.schemaVersion, sessionId: context.sessionId, turnId: context.turnId,
           stepId: context.stepId, inputThroughSequence: context.inputThroughSequence.toString(), consumedInputIds: context.consumedInputIds, blocks })
       } catch {
-        throw new TurnEngineError("persistence_conflict", "Discovery memory could not be verified; start a new Turn.")
+        const withoutPrivateSponsorship = blocks.filter(block => block.id !== "sponsorship-private-guidance"
+          && !block.id.startsWith("sponsorship-private-source-"))
+        if (withoutPrivateSponsorship.length === blocks.length) {
+          throw new TurnEngineError("persistence_conflict", "Discovery memory could not be verified; start a new Turn.")
+        }
+        try {
+          canonical = canonicalJson({ schemaVersion: context.schemaVersion, sessionId: context.sessionId, turnId: context.turnId,
+            stepId: context.stepId, inputThroughSequence: context.inputThroughSequence.toString(), consumedInputIds: context.consumedInputIds,
+            blocks: withoutPrivateSponsorship })
+          return { ...built, blocks: withoutPrivateSponsorship, canonicalJson: canonical }
+        } catch {
+          throw new TurnEngineError("persistence_conflict", "Discovery memory could not be verified; start a new Turn.")
+        }
       }
       return { ...context, canonicalJson: canonical }
     },
