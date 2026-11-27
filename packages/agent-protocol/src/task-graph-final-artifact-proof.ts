@@ -1,5 +1,5 @@
 /** Browser-safe public commitment contract for one private TaskGraph artifact reference. */
-export const TASK_GRAPH_FINAL_ARTIFACT_MANIFEST_SCHEMA = "agent-harness.v2.task-graph-sources.v3" as const
+export const TASK_GRAPH_FINAL_ARTIFACT_MANIFEST_SCHEMA = "agent-harness.v2.task-graph-sources.v4" as const
 
 export type FinalTaskGraphArtifactRef = Readonly<{
   artifactId: string

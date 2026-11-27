@@ -251,7 +251,7 @@ describe("agent artifact repository", () => {
       userId: "user-a", sessionId: "session-a", jobId: "job-a", artifactId: "draft-a", version: 2,
       contentHash: "hash-a", sourceDigest: "source-a", currentSourceDigest: "source-a",
       dependencyTaskId: "reviewer-task", reviewHash: "review-hash",
-      taskFence: { taskId: "writer-task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a", leaseOwner: "worker-a", attemptCount: 1 },
+      taskFence: { taskId: "writer-task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a", leaseOwner: "worker-a", attemptCount: 2 },
     }
     const review = {
       id: "review-row", artifactVersionId: "version-row", userId: expected.userId, sessionId: expected.sessionId,
@@ -264,6 +264,7 @@ describe("agent artifact repository", () => {
     let reviewRows: Record<string, unknown>[] = [review]
     let live = true
     let currentSourceDigest = "source-a"
+    let resumeRows: Record<string, unknown>[] = []
     let head: Record<string, unknown> = { id: expected.artifactId, userId: expected.userId, jobId: expected.jobId, artifactType: "cover_letter", lifecycle: "draft", version: 2, hash: "hash-a", constraintHash: "constraints", provenanceRefs: [], evidenceRefs: [], createdAt: new Date(), updatedAt: new Date() }
     const client = {
       query: vi.fn(async (sql: string, params: readonly unknown[] = []) => {
@@ -274,6 +275,7 @@ describe("agent artifact repository", () => {
         if (sql.includes('FROM "sub_agent_tasks" AS parent')) return { rows: [{ id: expected.taskFence.parentTaskId }], rowCount: 1 }
         if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) return { rows: [{ live }], rowCount: 1 }
         if (sql.includes('FROM "agent_artifact_review"')) return { rows: reviewRows, rowCount: reviewRows.length }
+        if (sql.includes('FROM "agent_artifact_version" AS version_row')) return { rows: resumeRows, rowCount: resumeRows.length }
         if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact"')) return { rows: [head], rowCount: 1 }
         return { rows: [], rowCount: 0 }
       }),
@@ -307,9 +309,33 @@ describe("agent artifact repository", () => {
     live = false
     await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
     live = true
-    head = { ...head, version: 3 }
+    head = { ...head, version: 3, hash: "hash-v3" }
     await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
-    head = { ...head, version: 2 }
+    resumeRows = [{
+      artifactId: expected.artifactId, version: 3, userId: expected.userId, sessionId: expected.sessionId, jobId: expected.jobId,
+      artifactType: "cover_letter", contentHash: "hash-v3", sourceDigest: expected.sourceDigest, previousHash: expected.contentHash,
+      baseId: "base-a", baseHash: "base-hash", taskId: expected.taskFence.taskId, toolCallId: "draft-call",
+      sessionUserId: expected.userId, taskSessionId: expected.sessionId, taskTurnId: expected.taskFence.turnId,
+      taskRootTaskId: expected.taskFence.rootTaskId, taskParentTaskId: expected.taskFence.parentTaskId,
+      taskRole: "writer", taskType: "cover_letter_draft", taskStatus: "running", taskLeaseOwner: expected.taskFence.leaseOwner,
+      taskAttemptCount: 2, taskInterruptRequestedAt: null, taskLeaseLive: true,
+      headVersion: 3, headHash: "hash-v3", callStepId: "step-a", callAttempt: 1, resultStepId: "step-a", resultAttempt: 1,
+      callItemId: "call-item", callRevision: 1, callItemStatus: "completed", callToolCallId: "draft-call",
+      callToolName: "cover_letter.draft", callStatus: "completed", callErrorCode: null, callInputPresent: true,
+      callBaseId: "base-a", callBaseHash: "base-hash", resultItemId: "result-item", resultRevision: 1,
+      resultItemStatus: "completed", resultToolCallId: "draft-call", resultHasErrorCode: true, resultErrorCode: null,
+      resultArtifactRef: { artifactId: expected.artifactId, version: 3, contentHash: "hash-v3", sourceDigest: expected.sourceDigest },
+    }]
+    await expect(repository.readRevisionReview(exactInput)).resolves.toMatchObject({ id: "review-row" })
+    expect(values.find(call => call.sql.includes('FROM "agent_artifact_version" AS version_row'))?.params).toEqual([
+      expected.taskFence.taskId, expected.userId, expected.sessionId, expected.taskFence.turnId, expected.taskFence.rootTaskId,
+      expected.taskFence.parentTaskId, expected.taskFence.leaseOwner, expected.taskFence.attemptCount, expected.jobId,
+      expected.artifactId, expected.version, expected.contentHash, expected.sourceDigest, 3, "hash-v3",
+    ])
+    resumeRows = [{ ...resumeRows[0]!, previousHash: "foreign-predecessor" }]
+    await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
+    head = { ...head, version: 2, hash: "hash-a" }
+    resumeRows = []
     reviewRows = []
     await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
     await expect(repository.readRevisionReview({ ...exactInput, sourceDigest: "old-source" })).resolves.toBeNull()

@@ -4,6 +4,7 @@ import React, { useReducer, useRef, type FormEvent } from 'react'
 import { ObjectiveReplacementCommandError, replaceAgentObjective } from './agent-objective-replacement-command'
 import { AgentLocationScopeControl } from './AgentLocationScopeControl'
 import type { TurnComposerController } from './agent-turn-commands'
+import { appliedPlanRevisionForMessage, appliedSteerStatusLabel } from './agent-applied-steer-status'
 import { useI18n } from '@/lib/i18n'
 
 const composerStatusLabel = {
@@ -76,7 +77,7 @@ export function AgentComposerActiveTurn({ controller }: { controller: TurnCompos
 }
 
 function ActiveTurnSession({ controller }: { controller: TurnComposerController }) {
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
   const [replacement, dispatch] = useReducer(objectiveReplacementFormReducer, initialReplacementState)
   const pendingRef = useRef(false)
   const canOpenReplacement = controller.sessionStatus === 'running' && controller.activeTurn !== null
@@ -178,13 +179,18 @@ function ActiveTurnSession({ controller }: { controller: TurnComposerController 
       )}
       {controller.messages.length > 0 && (
         <div aria-live="polite" style={{ flexBasis: '100%', minWidth: 0, display: 'grid', gap: 3, marginTop: 7 }}>
-          {controller.messages.map(message => (
-            <div key={message.clientMessageId} data-testid={`turn-message-${message.status}`} style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{message.text}</span>
-              <strong>{composerStatusLabel[message.status]}</strong>
-              {message.error && <span>{message.error}</span>}
-            </div>
-          ))}
+          {controller.messages.map(message => {
+            const revision = appliedPlanRevisionForMessage(message, controller.sessionId, controller.appliedSteeringMarkers)
+            const appliedStatus = revision === null ? null : appliedSteerStatusLabel(revision, lang)
+            return (
+              <div key={message.clientMessageId} data-testid={`turn-message-${message.status}`} style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{message.text}</span>
+                <strong>{composerStatusLabel[message.status]}</strong>
+                {appliedStatus && <span data-testid="steer-applied-plan-status">{appliedStatus}</span>}
+                {message.error && <span>{message.error}</span>}
+              </div>
+            )
+          })}
         </div>
       )}
     </div>}

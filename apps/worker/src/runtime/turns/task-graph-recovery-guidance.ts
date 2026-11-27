@@ -69,7 +69,7 @@ function canonicalResumeFailureReport(templateId: string, metadata: NonNullable<
 
 function parseNode(value: unknown, rootTaskId: string): TaskGraphCurrentNode | undefined {
   const row = record(value, ["dependsOn", "failureReason", "goal", "key", "readiness", "resultProjection", "resultSummary", "status", "successCriteria", "taskId", "templateId"],
-    ["executionFailureCategory", "native", "nativeResult", "repairOf", "repairReceipt", "structuredOutputFailureCategory", "verification", "verificationCriterionIds", "verificationReport"])
+    ["discoveryAttemptHealth", "discoveryQueryFootprint", "executionFailureCategory", "native", "nativeResult", "repairOf", "repairReceipt", "structuredOutputFailureCategory", "verification", "verificationCriterionIds", "verificationReport"])
   if (!row || !boundedText(row.key, 128) || !boundedText(row.taskId, 128) || !boundedText(row.templateId, 128)
     || !boundedText(row.goal, 1200) || row.failureReason !== null || row.resultSummary !== null
     || typeof row.status !== "string" || !TASK_STATUSES.has(row.status)
@@ -124,7 +124,7 @@ function currentGraph(context: StepContext, rootTaskId: string, revision: number
   if (matches.length !== 1) return undefined
   const block = matches[0]!
   if (block.layer !== "tool_observation" || block.role !== "data" || block.trust !== "external_untrusted" || block.source !== "tool_or_subagent") return undefined
-  const graph = record(block.content, ["kind", "nodes", "revision"], ["nodeCapacity", "taskReportedCounts"])
+  const graph = record(block.content, ["kind", "nodes", "revision"], ["nodeCapacity", "reviewConflicts", "rootSuccessCriteria", "sourceIntent", "taskReportedCounts", "taskReportedScoutOverlap"])
   if (!graph || graph.kind !== "task_graph_current" || graph.revision !== revision || !Number.isSafeInteger(graph.revision)) return undefined
   const rows = array(graph.nodes, MAX_NODES)
   if (!rows) return undefined

@@ -6,7 +6,7 @@ import { parseTaskGraphVerificationSummary, type TaskGraphVerificationDisplayNod
 import type { Lang } from '@/lib/i18n'
 import {
   parseFinalTaskGraphSourceManifest,
-  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4,
   TASK_GRAPH_SOURCE_RESULT_STATES,
   TASK_GRAPH_SOURCE_ROLES,
   TASK_GRAPH_SOURCE_ROLE_RESULT_STATUSES,
@@ -170,7 +170,7 @@ export function parseFinalTaskGraphSourceDetailResponse(value: unknown): FinalTa
 
 function sourceHasVersionProof(manifest: ReturnType<typeof parseFinalTaskGraphSourceManifest>, source: unknown): boolean {
   const row = record(source)
-  if (!manifest || manifest.schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 || !row) return false
+  if (!manifest || manifest.schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4 || !row) return false
   const listed = manifest.sources.find(candidate => candidate.sourceKey === row.sourceKey && candidate.nodeIndex === row.nodeIndex)
   return !!listed && listed.role === row.role && listed.taskStatus === row.taskStatus && listed.resultState === row.resultState
     && listed.roleResultStatus === row.roleResultStatus && listed.artifactVersionProof === row.artifactVersionProof

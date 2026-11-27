@@ -10,7 +10,7 @@ const sourceKey = `src_${"x".repeat(43)}`
 describe("TaskGraph final artifact version proof protocol", () => {
   it("defines the v3 manifest and returns a detached closed reference", () => {
     const parsed = parseFinalTaskGraphArtifactRef(ref)
-    expect(TASK_GRAPH_FINAL_ARTIFACT_MANIFEST_SCHEMA).toBe("agent-harness.v2.task-graph-sources.v3")
+    expect(TASK_GRAPH_FINAL_ARTIFACT_MANIFEST_SCHEMA).toBe("agent-harness.v2.task-graph-sources.v4")
     expect(parsed).toEqual(ref)
     expect(parsed).not.toBe(ref)
   })

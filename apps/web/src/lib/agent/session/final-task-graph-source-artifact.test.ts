@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { finalTaskGraphArtifactProofInput, SELECTED_JOB_BATCH_TEMPLATE_CATALOG } from '@jobcopilot/agent-protocol'
 
 import { canonicalTaskGraphSourceKey } from './final-task-graph-source-detail'
-import { TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, type FinalTaskGraphSource } from './final-task-graph-source-manifest'
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4, type FinalTaskGraphSource } from './final-task-graph-source-manifest'
 import { finalTaskGraphSourceArtifactCandidate, verifiedFinalTaskGraphSourceArtifactRef } from './final-task-graph-source-artifact'
 
 const sessionId = 'session_1', turnId = 'turn_1', rootTaskId = 'root_1', finalItemId = 'final_1', jobId = 'job_1'

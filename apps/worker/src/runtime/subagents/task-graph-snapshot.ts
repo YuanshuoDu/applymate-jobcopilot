@@ -1,4 +1,7 @@
+import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
+import { taskGraphLifecycleKey } from "./task-graph-receipt-keys.js"
+export { taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-receipt-keys.js"
 import { isValidTaskGraphRepairRelation, TASK_GRAPH_LIMITS, type TaskGraphEvent, type TaskGraphNodeProposal, type TaskGraphRepairOf, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
 import { taskGraphVerificationRole, validateTaskGraphVerificationContract, validateTaskGraphVerificationDependencySelectors, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
@@ -31,6 +34,7 @@ const MAX_DEPTH = TASK_GRAPH_LIMITS.maxDepth, MAX_KEY_LENGTH = TASK_GRAPH_LIMITS
 const MAX_TEMPLATE_ID_LENGTH = TASK_GRAPH_LIMITS.maxTemplateIdLength, MAX_GOAL_LENGTH = TASK_GRAPH_LIMITS.maxGoalLength
 const MAX_CRITERIA = TASK_GRAPH_LIMITS.maxSuccessCriteria, MAX_CRITERION_LENGTH = TASK_GRAPH_LIMITS.maxCriterionLength
 const MAX_DEPENDENCIES = TASK_GRAPH_LIMITS.maxDependencies, MAX_TASK_ID_LENGTH = TASK_GRAPH_LIMITS.maxKeyLength
+
 const LEGACY_NODE_KEYS = "dependsOn,depth,goal,key,successCriteria,taskId,templateId"
 const NODE_KEYS_WITH_DISPOSITION = `${LEGACY_NODE_KEYS},verificationDisposition`
 const NODE_KEYS_WITH_VERIFICATION = `${LEGACY_NODE_KEYS},verification,verificationDisposition`
@@ -187,17 +191,6 @@ function assertTaskGraphSnapshotSize(snapshot: TaskGraphSnapshot): void {
   if (bytes > MAX_SNAPSHOT_BYTES) throw new Error("task_graph_snapshot_too_large")
 }
 
-export function taskGraphItemId(parentTaskId: string): string {
-  const hash = createHash("sha256").update(parentTaskId).digest("hex")
-  return `task-graph-${hash}`
-}
-export function taskGraphProposalKey(parentTaskId: string, expectedRevision: number): string {
-  return `${taskGraphItemId(parentTaskId)}:proposal:${expectedRevision}`
-}
-export function taskGraphLifecycleKey(parentTaskId: string, nodeKey: string, attempt: number, type: string): string {
-  const node = createHash("sha256").update(nodeKey).digest("hex").slice(0, 20)
-  return `${taskGraphItemId(parentTaskId)}:node:${node}:${attempt}:${type}`
-}
 export function taskGraphWaitLifecycleKey(parentTaskId: string, nodeKey: string, attempt: number, waitRowId: string, type: "task.waiting" | "task.queued" | "task.started" = "task.waiting", dispatchGeneration?: number): string {
   if (typeof waitRowId !== "string" || !waitRowId.trim() || waitRowId.trim() !== waitRowId || waitRowId.length > MAX_TASK_ID_LENGTH
     || type !== "task.waiting" && type !== "task.queued" && type !== "task.started"

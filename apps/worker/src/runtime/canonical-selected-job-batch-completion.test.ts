@@ -28,6 +28,10 @@ const refs = {
   "job-a": { artifactId: "draft-a", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` },
   "job-b": { artifactId: "draft-b", version: 5, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}` },
 }
+const correctionRefs = {
+  "job-a": { artifactId: "draft-a", version: 3, contentHash: `sha256:${"9".repeat(64)}`, sourceDigest: refs["job-a"].sourceDigest },
+  "job-b": { artifactId: "draft-b", version: 6, contentHash: `sha256:${"8".repeat(64)}`, sourceDigest: refs["job-b"].sourceDigest },
+}
 type JobId = keyof typeof refs
 
 function makeGraph(statuses: Readonly<Record<string, TaskGraphCurrentNode["status"]>> = {}): TaskGraphCurrentState {
@@ -42,6 +46,17 @@ function makeGraph(statuses: Readonly<Record<string, TaskGraphCurrentNode["statu
     ]
   })
   return { revision: 9, nodes }
+}
+
+function makeCorrectionGraph(): TaskGraphCurrentState {
+  const graph = makeGraph()
+  const nodes = graph.nodes.map(node => node.key === "reviewer-a" && node.resultProjection?.availability === "available" && node.resultProjection.role === "reviewer"
+    ? { ...node, resultProjection: { ...node.resultProjection, reviewStatus: "needs_revision" as const } } : node)
+  const writerTemplate = "cover_letter_writer_slot_1", reviewerTemplate = "cover_letter_reviewer_slot_1"
+  return { revision: graph.revision + 1, nodes: [...nodes,
+    makeNode("writer-a-correction", writerTemplate, "writer-a-correction-task", "writer", correctionRefs["job-a"], "completed", ["reviewer-a"]),
+    makeNode("reviewer-a-correction", reviewerTemplate, "reviewer-a-correction-task", "reviewer", correctionRefs["job-a"], "completed", ["writer-a-correction"]),
+  ] }
 }
 
 function makeNode(
@@ -61,13 +76,19 @@ function makeNode(
 
 function contextRows(graph: TaskGraphCurrentState, options: { crossedJob?: boolean; foreignOwner?: boolean } = {}) {
   return graph.nodes.map((node, index) => {
-    const job = slots[Math.floor(index / 2)]!.jobId
+    const job = slots.find(slot => node.templateId.includes(slot.slotId.replace("-", "_")))!.jobId
     const selectedJobId = options.crossedJob && node.key === "reviewer-b" ? "job-a" : job
+    const dependency = node.dependsOn[0] ? graph.nodes.find(candidate => candidate.key === node.dependsOn[0]) : undefined
+    const dependencyContext = dependency?.resultProjection ? {
+      schemaVersion: "agent-harness.v2.task-graph.dependency-evidence",
+      items: [{ dependencyKey: dependency.key, ...(dependency.templateId.includes("reviewer") ? { dependencyTaskId: dependency.taskId } : {}),
+        role: dependency.templateId.includes("writer") ? "writer" : "reviewer", taskStatus: "completed", result: dependency.resultProjection }],
+    } : undefined
     return {
       taskId: node.taskId,
       taskSessionId: lease.sessionId, taskTurnId: lease.turnId, taskRootTaskId: rootTaskId, taskParentTaskId: rootTaskId,
       taskRole: node.key.startsWith("writer-") ? "writer" : "reviewer",
-      context: { selectedJobPreparation: { jobId: selectedJobId } },
+      context: { selectedJobPreparation: { jobId: selectedJobId }, ...(dependencyContext ? { taskGraphDependencyResults: dependencyContext } : {}) },
       sessionUserId: options.foreignOwner && index === 0 ? "other-user" : lease.userId,
       turnUserId: lease.userId, turnRootTaskId: rootTaskId,
     }
@@ -87,6 +108,12 @@ function makeClient(graph: TaskGraphCurrentState, options: { crossedJob?: boolea
       const ids = values[0] as string[]
       return { rows: contexts.filter(row => ids.includes(row.taskId)) }
     }
+    if (sql.includes('FROM "agent_artifact_version"')) {
+      const jobId = String(values[2]), taskId = String(values[5])
+      const correction = taskId?.includes("correction") ?? false
+      const reference = correction ? correctionRefs[jobId as JobId] : refs[jobId as JobId]
+      return { rows: reference ? [{ ...reference, artifactType: "cover_letter", taskId, previousHash: correction ? refs[jobId as JobId].contentHash : null }] : [] }
+    }
     throw new Error("unexpected completion query")
   })
   return { client: { query } as unknown as PoolClient, query }
@@ -105,7 +132,8 @@ function setup(options: {
   mocks.loadResources.mockResolvedValue(slots)
   mocks.readDraftHead.mockImplementation(async (received: PoolClient, scope: { jobId: JobId; artifactId: string }) => {
     expect(received).toBe(client)
-    return { ...refs[scope.jobId], artifactId: scope.artifactId }
+    const corrected = currentGraph.nodes.some(node => node.key === `writer-${scope.jobId === "job-a" ? "a" : "b"}-correction`)
+    return { ...(corrected ? correctionRefs[scope.jobId] : refs[scope.jobId]), artifactId: scope.artifactId }
   })
   mocks.readReviewReceipt.mockImplementation(async (received: PoolClient, scope: Record<string, unknown>) => {
     expect(received).toBe(client)
@@ -147,7 +175,7 @@ describe("canonical selected-job batch completion transaction adapter", () => {
     expect(result.witness.graph.revision).toBe(9)
     expect(state.readCurrentWithClient).toHaveBeenCalledTimes(1)
     expect(mocks.loadResources).toHaveBeenCalledWith({ client: state.client, lease, expectedRootTaskId: rootTaskId, binding })
-    expect(state.query).toHaveBeenCalledTimes(2)
+    expect(state.query).toHaveBeenCalledTimes(4)
     const rootSql = state.query.mock.calls[0]![0], contextSql = state.query.mock.calls[1]![0]
     expect(rootSql).toContain("FOR UPDATE OF root")
     expect(rootSql).toContain('session."userId" = $2')
@@ -161,8 +189,14 @@ describe("canonical selected-job batch completion transaction adapter", () => {
       lease.userId, lease.sessionId, lease.turnId, rootTaskId,
     ])
     expect(mocks.readDraftHead).toHaveBeenCalledTimes(2)
-    expect(mocks.readSourceDigest).toHaveBeenCalledTimes(4)
+    expect(mocks.readSourceDigest).toHaveBeenCalledTimes(6)
     expect(mocks.readReviewReceipt).toHaveBeenCalledTimes(2)
+    const versionReads = state.query.mock.calls.filter(([sql]) => sql.includes('FROM "agent_artifact_version"'))
+    expect(versionReads.map(([, values]) => values)).toEqual([
+      [lease.userId, lease.sessionId, "job-a", refs["job-a"].artifactId, refs["job-a"].version, "writer-a-task"],
+      [lease.userId, lease.sessionId, "job-b", refs["job-b"].artifactId, refs["job-b"].version, "writer-b-task"],
+    ])
+    expect(versionReads.every(([sql]) => sql.includes('"artifactType" = \'cover_letter\'') && sql.includes('"taskId" = $6'))).toBe(true)
     expect(state.query.mock.calls.every(([sql]) => !sql.includes("BEGIN") && !sql.includes("COMMIT"))).toBe(true)
   })
 
@@ -219,5 +253,23 @@ describe("canonical selected-job batch completion transaction adapter", () => {
     const changed = setup({ graph: changedGraph })
     const rejected = await verifyCanonicalSelectedJobBatchCompletion({ ...changed.input, acceptedWitness: accepted.witness })
     expect(rejected.status).toBe("blocked")
+  })
+
+  it("resolves a correction slot through its latest pair while retaining the initial review proof", async () => {
+    const state = setup({ graph: makeCorrectionGraph() })
+    const result = await verifyCanonicalSelectedJobBatchCompletion(state.input)
+    expect(result.status).toBe("ready")
+    if (result.status !== "ready") return
+    expect(result.outcomes[0]).toMatchObject({ writerTaskId: "writer-a-correction-task", reviewerTaskId: "reviewer-a-correction-task",
+      evidence: { artifactRef: correctionRefs["job-a"] }, priorEvidence: { writerTaskId: "writer-a-task", reviewerTaskId: "reviewer-a-task",
+        artifactRef: refs["job-a"], reviewStatus: "needs_revision" } })
+    expect(result.witness.graph.nodes).toHaveLength(6)
+    const versionReads = state.query.mock.calls.filter(([sql]) => sql.includes('FROM "agent_artifact_version"'))
+    expect(versionReads.map(([, values]) => [values?.[2], values?.[5]])).toEqual([
+      ["job-a", "writer-a-task"], ["job-a", "writer-a-correction-task"], ["job-b", "writer-b-task"],
+    ])
+    expect(state.query.mock.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task'))?.[1]?.[0]).toEqual([
+      "writer-a-task", "reviewer-a-task", "writer-b-task", "reviewer-b-task", "writer-a-correction-task", "reviewer-a-correction-task",
+    ])
   })
 })

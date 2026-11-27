@@ -5,6 +5,7 @@ import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobco
 import { Buffer } from "node:buffer"
 
 import { createChildExecutor, type ChildToolRuntime } from "./child-executor.js"
+import { TaskGraphWriterReviewFeedbackError } from "./task-graph-writer-review-frame.js"
 import { RootAbortController } from "../interrupt/registry.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxHydrationInput, type ChildMailboxReader } from "./child-context.js"
@@ -284,6 +285,87 @@ describe("child executor composition", () => {
     })
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal" })
     expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
+  it("retries only a fresh selected-job Writer receipt-unavailable preflight", async () => {
+    const child: SubagentLease = {
+      ...lease(), role: "writer", taskType: "cover_letter_draft", attemptCount: 1,
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+    }
+    const events: Array<{ type: string; taskId: string }> = []
+    const startStep = vi.fn(async ({ stepId, ordinal }: Parameters<TurnExecutionStore["startStep"]>[0]) => ({ id: stepId, ordinal }))
+    const modelRuntimeFactory = vi.fn(() => textOnlyModel("must not run"))
+    const toolRuntimeFactory = vi.fn(() => { throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable") })
+    const executor = createChildExecutor({
+      store: { ...executionStore(events, []), startStep }, treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
+      modelRuntimeFactory, toolRuntimeFactory,
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({
+      status: "failed", failureReason: "writer_review_receipt_unavailable", retryDisposition: "retryable",
+    })
+    expect(toolRuntimeFactory).toHaveBeenCalledOnce()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+    expect(startStep).not.toHaveBeenCalled()
+    expect(events).toEqual([])
+  })
+
+  type RetryExclusion = {
+    name: string
+    role?: SubagentLease["role"]
+    taskType?: string
+    selectedJob?: boolean
+    attemptCount?: number
+    maxAttempts?: number
+    continuation?: boolean
+    errorCode?: ConstructorParameters<typeof TaskGraphWriterReviewFeedbackError>[0]
+    expectedFailureReason: string
+    runtimeFactoryCalls?: number
+  }
+  const retryExclusions: readonly RetryExclusion[] = [
+    { name: "later attempt", attemptCount: 2, expectedFailureReason: "writer_review_receipt_unavailable" },
+    { name: "same-attempt continuation", continuation: true, expectedFailureReason: "writer_review_receipt_unavailable" },
+    { name: "nonselected Writer", selectedJob: false, expectedFailureReason: "selected_job_context_unavailable", runtimeFactoryCalls: 0 },
+    { name: "non-Writer role", role: "analyst", expectedFailureReason: "writer_review_receipt_unavailable" },
+    { name: "wrong Writer task type", taskType: "cover_letter_review", expectedFailureReason: "writer_review_receipt_unavailable" },
+    { name: "exhausted attempt cap", maxAttempts: 1, expectedFailureReason: "writer_review_receipt_unavailable" },
+    { name: "invalid dependency", errorCode: "writer_review_dependency_invalid", expectedFailureReason: "writer_review_dependency_invalid" },
+    { name: "invalid review status", errorCode: "writer_review_status_invalid", expectedFailureReason: "writer_review_status_invalid" },
+    { name: "invalid review findings", errorCode: "writer_review_findings_invalid", expectedFailureReason: "writer_review_findings_invalid" },
+  ]
+
+  it.each(retryExclusions)("keeps $name preflight failure terminal without running a Step or model", async testCase => {
+    const child: SubagentLease = {
+      ...lease(), role: testCase.role ?? "writer", taskType: testCase.taskType ?? "cover_letter_draft",
+      attemptCount: testCase.attemptCount ?? 1, maxAttempts: testCase.maxAttempts ?? 3,
+      context: testCase.selectedJob === false ? {} : { selectedJobPreparation: { jobId: "job-1" } },
+    }
+    const events: Array<{ type: string; taskId: string }> = []
+    const startStep = vi.fn(async ({ stepId, ordinal }: Parameters<TurnExecutionStore["startStep"]>[0]) => ({ id: stepId, ordinal }))
+    const modelRuntimeFactory = vi.fn(() => textOnlyModel("must not run"))
+    const code = testCase.errorCode ?? "writer_review_receipt_unavailable"
+    const toolRuntimeFactory = vi.fn(() => { throw new TaskGraphWriterReviewFeedbackError(code) })
+    const sameAttemptContinuationLoader = vi.fn(async () => ({
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
+        usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      observations: [], previousFinalText: "prior completed output", leaseExpiresAt: new Date("2099-09-09T12:30:00.000Z"),
+    }))
+    const executor = createChildExecutor({
+      store: { ...executionStore(events, []), startStep }, treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
+      modelRuntimeFactory, toolRuntimeFactory, sameAttemptContinuationLoader,
+    })
+    const result = await executor({
+      lease: child, ...(testCase.continuation ? { continuation: { kind: "children_pending" as const } } : {}),
+    })
+
+    expect(result).toMatchObject({ status: "failed", failureReason: testCase.expectedFailureReason, retryDisposition: "terminal" })
+    expect(toolRuntimeFactory).toHaveBeenCalledTimes(testCase.runtimeFactoryCalls ?? 1)
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+    expect(startStep).not.toHaveBeenCalled()
+    expect(events).toEqual([])
+    if (testCase.continuation) expect(sameAttemptContinuationLoader).toHaveBeenCalledOnce()
   })
 
   it.each([

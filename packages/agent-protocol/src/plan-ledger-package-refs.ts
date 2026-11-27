@@ -1,4 +1,4 @@
-import { parsePersistedTaskGraphNode } from './plan-ledger-task-graph-metadata.js'
+import { parsePersistedTaskGraphNode, readPersistedTaskGraphVerificationSelectors } from './plan-ledger-task-graph-metadata.js'
 import { isStrictNativeTaskGraphNode } from './plan-ledger-native-metadata.js'
 import type { TaskGraphSnapshotNode } from './plan-ledger.js'
 
@@ -20,7 +20,7 @@ export function parsePlanLedgerTaskGraphSnapshotNodes(value: unknown): TaskGraph
 
 function parseTaskGraphSnapshotNodes(value: unknown): TaskGraphSnapshotNode[] | null {
   if (!strictDense(value, PLAN_LEDGER_MAX_PERSISTED_NODES)) return null
-  const nodes: TaskGraphSnapshotNode[] = [], keys = new Set<string>(), ids = new Set<string>(), packageRefs: string[] = []
+  const nodes: TaskGraphSnapshotNode[] = [], normalizedNodes: unknown[] = [], keys = new Set<string>(), ids = new Set<string>(), packageRefs: string[] = []
   const executePartitions: string[][] = []
   for (const raw of value) {
     const normalized = normalizeScheduledNode(raw)
@@ -39,12 +39,32 @@ function parseTaskGraphSnapshotNodes(value: unknown): TaskGraphSnapshotNode[] | 
       executePartitions.push(normalized.packageRefs)
       packageRefs.push(...normalized.packageRefs)
     }
+    normalizedNodes.push(normalized.value)
     nodes.push({ ...node, successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn], depth: Number(node.depth) })
   }
   if (executePartitions.length > 3 || executePartitions.length > 1 && executePartitions.some(refs => refs.length === 0)
     || packageRefs.length > MAX_PACKAGE_REFS || new Set(packageRefs).size !== packageRefs.length
-    || nodes.some(node => node.dependsOn.some(key => !keys.has(key))) || !acyclic(nodes)) return null
+    || nodes.some(node => node.dependsOn.some(key => !keys.has(key))) || !acyclic(nodes)
+    || !validateUnionDependencies(normalizedNodes, nodes)) return null
   return nodes
+}
+
+function validateUnionDependencies(values: readonly unknown[], nodes: readonly TaskGraphSnapshotNode[]): boolean {
+  try {
+    const byKey = new Map(nodes.map(node => [node.key, node] as const)), rawByKey = new Map<string, unknown>()
+    values.forEach((value, index) => rawByKey.set(nodes[index]!.key, value))
+    for (let index = 0; index < values.length; index++) {
+      const info = readPersistedTaskGraphVerificationSelectors(values[index])
+      if (info === null || info?.dependencyNodeKeys.length && info.role !== 'analyst') return false
+      if (!info?.dependencyNodeKeys.length) continue
+      const node = nodes[index]!
+      for (const key of info.dependencyNodeKeys) {
+        const source = byKey.get(key), sourceInfo = readPersistedTaskGraphVerificationSelectors(rawByKey.get(key))
+        if (!source || key === node.key || !node.dependsOn.includes(key) || source.templateId !== 'scout' || sourceInfo?.role !== 'scout') return false
+      }
+    }
+    return true
+  } catch { return false }
 }
 
 function normalizeScheduledNode(value: unknown): Readonly<{ value: unknown; packageRefs?: string[] }> | null {

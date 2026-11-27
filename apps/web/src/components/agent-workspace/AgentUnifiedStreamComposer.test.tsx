@@ -1,4 +1,8 @@
 import { readFileSync } from 'node:fs'
+import React from 'react'
+import { renderToString } from 'react-dom/server'
+import { SessionProvider } from 'next-auth/react'
+import { ToastProvider } from '@/components/ui'
 import {
   canStartOrdinaryChat,
   isObjectiveDraftPending,
@@ -8,8 +12,16 @@ import {
   type AgentObjectiveContextFormState,
 } from './AgentObjectiveContextForm'
 import { canShowObjectiveContextEntry } from './AgentUnifiedStreamComposer'
+import { AgentUnifiedStream } from './AgentUnifiedStream'
+import { AgentTurnComposerProvider, type TurnComposerController } from './agent-turn-commands'
+import type { TimelineSteeringMarkerPayload } from './v2/timeline-steering-markers'
+import type { AgentTimelineSnapshot } from './v2/use-agent-timeline'
+import type { AgentUnifiedStreamProps } from './AgentUnifiedStream.types'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+vi.mock('./AgentUnifiedStreamHeader', () => ({ AgentUnifiedStreamHeader: () => null }))
+vi.mock('./AgentLiveStreamBody', () => ({ AgentLiveStreamBody: () => null }))
 
 const source = readFileSync(new URL('./AgentUnifiedStreamComposer.tsx', import.meta.url), 'utf8')
 const streamSource = readFileSync(new URL('./AgentUnifiedStream.tsx', import.meta.url), 'utf8')
@@ -21,6 +33,53 @@ const emptyFormState: AgentObjectiveContextFormState = {
 }
 
 describe('Agent unified stream composer', () => {
+  it('forwards only current non-restoring Session markers through the provider to the rendered message', () => {
+    const appliedSteeringMarkers = [{
+        schemaVersion: 'agent-harness.steering-marker.v1', kind: 'applied', status: 'applied',
+        sessionId: 'session_1', turnId: 'turn_1', taskId: 'root_1', stepId: 'step_1', inputId: 'input_1',
+        idempotencyKey: 'steering-marker:session_1:turn_1:input_1', obligationId: 'steering:input_1',
+        goalRevision: 2, planRevision: 3, acceptedSequence: '12',
+      }] satisfies TimelineSteeringMarkerPayload[]
+    const controller: TurnComposerController = {
+      sessionId: 'session_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 2 },
+      sessionStatus: 'running', delivery: 'steer', setDelivery: () => {}, chatInput: '', setChatInput: () => {}, sending: false,
+      messages: [{ clientMessageId: 'client_1', text: 'Add Berlin', delivery: 'steer', status: 'accepted', inputId: 'input_1', turnId: 'turn_1' }],
+      appliedSteeringMarkers, commandError: null, send: () => {}, interrupt: () => {}, interrupting: false,
+    }
+    const render = (selectedSessionId: string, timelineSessionId: string, restoring: boolean) => {
+      const timeline: AgentTimelineSnapshot = {
+        sessionId: timelineSessionId, items: [], lastEventId: null, lifecycleRevision: 0, cognitiveAgenda: null,
+        cognitiveAgendas: [], approvalLedger: {
+          sessionId: timelineSessionId, approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0,
+        }, steeringMarkers: {
+          observed: [], applied: appliedSteeringMarkers, active: [], observedCount: 0,
+          appliedCount: appliedSteeringMarkers.length, activeCount: 0,
+        }, connection: 'connected', restoring, error: null,
+      }
+      const props: AgentUnifiedStreamProps = {
+        log: [], running: false, summary: null, applyQueue: [], waitingQuestion: null,
+        savedCount: 0, pendingCount: 0, autonomousMode: false, resetVersion: 0,
+        resumeSessionId: selectedSessionId, timeline,
+        onAnswerQuestion: () => {}, onAnswerOrchestrator: () => {}, onApplied: () => {}, onSessionRecorded: () => {},
+      }
+      return renderToString(
+        <ToastProvider>
+          <SessionProvider session={null}>
+            <AgentTurnComposerProvider value={controller}>
+              <AgentUnifiedStream {...props} />
+            </AgentTurnComposerProvider>
+          </SessionProvider>
+        </ToastProvider>,
+      )
+    }
+
+    const currentSessionHtml = render('session_1', 'session_1', false)
+    expect(currentSessionHtml).toContain('Applied to plan · revision 3')
+    expect(currentSessionHtml).toContain('Accepted')
+    expect(render('session_2', 'session_2', false)).not.toContain('steer-applied-plan-status')
+    expect(render('session_1', 'session_1', true)).not.toContain('steer-applied-plan-status')
+  })
+
   it('uses the active V2 turn composer and creates a session for a new draft', () => {
     expect(source).toContain('turnComposer.send(outgoing)')
     expect(source).toContain("fetch('/api/agent/sessions'")

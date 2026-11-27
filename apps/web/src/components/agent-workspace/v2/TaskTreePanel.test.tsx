@@ -29,6 +29,14 @@ describe("TaskTreePanel", () => {
     expect(html).not.toContain(translate("en", "agent.plan"))
   })
 
+  it("renders a fixed localized child failure instead of an internal reason code", () => {
+    const html = renderToStaticMarkup(<TaskTreePanel nodes={[{
+      id: "task:child-1", kind: "task", label: "Scout", status: "failed", childFailure: "verification_unverified",
+    }]} onSelect={vi.fn()} />)
+    expect(html).toContain("The task result could not be verified.")
+    expect(html).not.toContain("task_graph_verification_unverified")
+  })
+
   it("bounds the visible tree at five levels", () => {
     let current: TaskTreeNode | undefined
     for (let depth = 5; depth >= 0; depth--) current = { id: `node-${depth}`, kind: depth % 3 === 0 ? "turn" : depth % 3 === 1 ? "step" : "tool", label: String(depth), status: "queued", children: current ? [current] : undefined }

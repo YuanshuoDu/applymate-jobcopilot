@@ -11,7 +11,8 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 
 function graph(rows: readonly GraphTaskRow[]): LoadedGraph {
-  const nodes = rows.map((task, nodeIndex) => ({ key: `private-node-${nodeIndex}`, templateId: task.taskType!, taskId: task.id }))
+  const nodes = rows.map((task, nodeIndex) => ({ key: `private-node-${nodeIndex}`,
+    templateId: task.role === "scout" && task.taskType === "job_discovery" ? "scout" : task.taskType!, taskId: task.id }))
   return { rootTaskId: "private-root-id", item: { id: taskGraphItemId("private-root-id"), revision: 7, content: {}, createdAt: new Date(0) },
     snapshot: { nodes } as unknown as TaskGraphSnapshot, state: { revision: 7 } as LoadedGraph["state"],
     tasks: new Map(rows.map(task => [task.id, task])) } as LoadedGraph
@@ -58,7 +59,8 @@ function selectedJobBatchFixture(options: { failedSlot?: number } = {}) {
     slots.push(failed
       ? { slotId: catalog.slotId, jobId: `private-job-${index + 1}`, status: "failed", writerTaskId, reviewerTaskId }
       : { slotId: catalog.slotId, jobId: `private-job-${index + 1}`, status: "completed", writerTaskId, reviewerTaskId,
-        evidence: { artifactRef, reviewReceipt: { taskId: reviewerTaskId, artifactId: artifactRef.artifactId,
+        evidence: { artifactRef, artifactVersion: { ...artifactRef, artifactType: "cover_letter" as const, taskId: writerTaskId, previousHash: null },
+          reviewReceipt: { taskId: reviewerTaskId, artifactId: artifactRef.artifactId,
           version: artifactRef.version, contentHash: artifactRef.contentHash, sourceDigest: artifactRef.sourceDigest,
           currentSourceDigest: artifactRef.sourceDigest, status: "passed", reviewHash } } })
   }
@@ -139,7 +141,7 @@ describe("TaskGraph final source manifest", () => {
     expect(manifest?.sources.map(source => source.nodeIndex)).toEqual([1, 3])
   })
 
-  it("emits v3 artifact proofs only for exact completed canonical cover-letter members", () => {
+  it("emits v4 artifact proofs only for exact completed canonical cover-letter members", () => {
     const artifactRef = { artifactId: "private-letter", version: 4, contentHash: digest("a"), sourceDigest: digest("b") }
     const writer = { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef }
     const reviewer = { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
@@ -154,7 +156,7 @@ describe("TaskGraph final source manifest", () => {
       { key: "lookalike", templateId: "custom_cover_letter_writer", taskId: "private-lookalike-task" },
     ]))!
     const manifest = buildTaskGraphFinalSourceManifest(binding, "private-final-item")
-    if (!manifest || manifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v3") throw new Error("Expected a v3 source manifest")
+    if (!manifest || manifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v4") throw new Error("Expected a v4 source manifest")
     const sources = manifest.sources
     expect(manifest.historicalNodeIndices).toEqual([])
     expect(sources.slice(0, 2).map(source => source.artifactVersionProof)).toEqual([
@@ -170,7 +172,7 @@ describe("TaskGraph final source manifest", () => {
   it("binds batch proofs to each completed catalog slot and preserves job artifact separation", () => {
     const { binding, artifactRefs } = selectedJobBatchFixture()
     const manifest = buildTaskGraphFinalSourceManifest(binding, "private-final-item")
-    if (!manifest || manifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v3") throw new Error("Expected a v3 batch source manifest")
+    if (!manifest || manifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v4") throw new Error("Expected a v4 batch source manifest")
     const proofs = manifest.sources.filter(source => Object.hasOwn(source, "artifactVersionProof"))
     expect(manifest.historicalNodeIndices).toEqual([])
     expect(proofs).toHaveLength(4)
@@ -185,9 +187,51 @@ describe("TaskGraph final source manifest", () => {
 
     const { binding: partial } = selectedJobBatchFixture({ failedSlot: 1 })
     const partialManifest = buildTaskGraphFinalSourceManifest(partial, "private-final-item")
-    if (!partialManifest || partialManifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v3") throw new Error("Expected a v3 partial batch manifest")
+    if (!partialManifest || partialManifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v4") throw new Error("Expected a v4 partial batch manifest")
     expect(partialManifest.sources.filter(source => Object.hasOwn(source, "artifactVersionProof"))).toHaveLength(2)
     expect(partialManifest.sources.filter(source => source.nodeIndex >= 2).every(source => !Object.hasOwn(source, "artifactVersionProof"))).toBe(true)
+  })
+
+  it("emits v3 retired indices separately from historical and current sources", () => {
+    const interrupted = { ...task("private-retired-scout", "scout", "job_discovery", scoutResult), status: "interrupted" as const, attemptCount: 2 }
+    const binding = buildTaskGraphFinalSummaryBinding(graph([
+      task("private-old-scout", "scout", "scout", scoutResult), interrupted,
+      task("private-current-analyst", "analyst", "analyst", analystResult),
+    ]), new Set([0]), new Map([["private-node-1", { nodeKey: "private-node-1", taskId: "private-retired-scout", attempt: 2,
+      interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "private-retirement-event", lifecycleEventId: "private-ack-event" }]]))!
+    const manifest = buildTaskGraphFinalSourceManifest(binding, "private-final-item")
+
+    expect(manifest).toEqual({ schemaVersion: "agent-harness.v2.task-graph-sources.v3", graphRevision: 7,
+      historicalNodeIndices: [0], retiredNodeIndices: [1], sources: [
+        { sourceKey: expect.stringMatching(/^src_[A-Za-z0-9_-]{43}$/), nodeIndex: 2, role: "analyst", taskStatus: "completed", resultState: "valid", roleResultStatus: "completed" },
+      ] })
+    expect(Object.keys(manifest ?? {}).sort()).toEqual(["graphRevision", "historicalNodeIndices", "retiredNodeIndices", "schemaVersion", "sources"])
+    expect(JSON.stringify(manifest)).not.toMatch(/private-root-id|private-retired-scout|private-retirement-event|private-ack-event|PRIVATE_TEXT/)
+  })
+
+  it("preserves retired indices alongside a current Writer artifact proof", () => {
+    const retired = { ...task("retired-scout", "scout", "job_discovery", scoutResult), status: "interrupted" as const, attemptCount: 2 }
+    const artifactRef = { artifactId: "private-letter", version: 1, contentHash: digest("a"), sourceDigest: digest("b") }
+    const writer = task("current-writer", "writer", "cover_letter_draft",
+      { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef })
+    const binding = buildTaskGraphFinalSummaryBinding(graphWithNodes([retired, writer], [
+      { key: "retired", templateId: "scout", taskId: retired.id },
+      { key: "writer", templateId: "cover_letter_writer", taskId: writer.id },
+    ]), new Set(), new Map([["retired", { nodeKey: "retired", taskId: retired.id, attempt: 2,
+      interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "retirement", lifecycleEventId: "ack" }]]))!
+    const manifest = buildTaskGraphFinalSourceManifest(binding, "private-final-item")
+    expect(manifest).toMatchObject({ schemaVersion: "agent-harness.v2.task-graph-sources.v4",
+      retiredNodeIndices: [0], historicalNodeIndices: [], sources: [{ nodeIndex: 1, artifactVersionProof: expect.stringMatching(/^avp_/) }] })
+  })
+
+  it("rejects a retired-only binding without current business evidence", () => {
+    const interrupted = { ...task("private-retired-scout", "scout", "job_discovery", scoutResult), status: "interrupted" as const, attemptCount: 2 }
+    const binding = buildTaskGraphFinalSummaryBinding(graph([interrupted]), new Set(), new Map([[
+      "private-node-0", { nodeKey: "private-node-0", taskId: "private-retired-scout", attempt: 2,
+        interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "private-retirement-event", lifecycleEventId: "private-ack-event" },
+    ]]))!
+    expect(() => buildTaskGraphFinalSourceManifest(binding, "private-final-item"))
+      .toThrow("task_graph_final_source_retirement_without_current_source")
   })
 
   it("keeps the existing eight-member manifest bound when historical members are present", () => {

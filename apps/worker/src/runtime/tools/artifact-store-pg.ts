@@ -1,6 +1,7 @@
-import type { Pool } from "pg"
+import type { Pool, PoolClient } from "pg"
 import { hashArtifactContent } from "../subagents/artifact-adapters.js"
 import { createAgentArtifactRepository, AgentArtifactRepositoryError, type AgentArtifactRevisionReviewRead, type AgentArtifactRow, type AgentArtifactVersionRow, type AgentArtifactReviewRow, type AgentArtifactReviewWrite, type AgentArtifactSourceDigestReader } from "../../db/agent-artifact-repo.js"
+import { artifactTaskLeaseIsLive, withArtifactTransaction } from "../../db/agent-artifact-repo-helpers.js"
 import { ArtifactToolError, type ArtifactBaseInput, type ArtifactToolRecord, type ArtifactToolStore, type ArtifactToolDraftInput, type ArtifactToolRevisionContext, type ArtifactToolScope, type ArtifactVersionRef } from "./artifact-tools.js"
 
 function isUniqueViolation(error: unknown): boolean { return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "23505") }
@@ -16,7 +17,11 @@ function toRecord(row: AgentArtifactRow): ArtifactToolRecord {
 
 export class PgArtifactToolStore implements ArtifactToolStore {
   private readonly repository
-  constructor(pool: Pool, private readonly readCurrentSourceDigest?: AgentArtifactSourceDigestReader) {
+  constructor(
+    private readonly pool: Pool,
+    private readonly readCurrentSourceDigest?: AgentArtifactSourceDigestReader,
+    private readonly assertCurrentDraftMaterial?: (client: Pick<PoolClient, "query">, userId: string, jobId: string) => Promise<boolean>,
+  ) {
     this.repository = createAgentArtifactRepository(pool)
   }
 
@@ -41,13 +46,30 @@ export class PgArtifactToolStore implements ArtifactToolStore {
     const id = `cover-letter:${hashArtifactContent({ userId: scope.userId, jobId: scope.jobId }).slice(7)}`
     const previous = await this.read(scope.userId, id)
     try {
-      return await this.repository.saveDraft({
+      const write = {
         id, userId: scope.userId, jobId: scope.jobId, artifactType: "cover_letter", sessionId: scope.sessionId,
         content: input.content, hash: hashArtifactContent(input.content), constraintHash: hashArtifactContent(input.constraints),
         provenanceRefs: [...scope.evidenceRefs], evidenceRefs: [...scope.evidenceRefs], baseId: base.id, baseHash: base.hash,
         previousHash: previous?.hash ?? null, sourceDigest: scope.sourceDigest, taskId: scope.taskId, toolCallId: scope.toolCallId,
         requestHash: input.requestHash, taskFence: scope.taskFence, expectedPreviousHash: input.expectedPreviousHash,
         expectedPreviousVersion: input.expectedPreviousVersion,
+      }
+      if (!this.assertCurrentDraftMaterial) return await this.repository.saveDraft(write)
+      return await withArtifactTransaction(this.pool, scope.userId, async client => {
+        const version = await this.repository.saveDraft(write, client)
+        const job = await client.query<{ id: string }>(
+          `SELECT "id" FROM "Job" WHERE "id" = $1 AND "userId" = $2 FOR SHARE`, [scope.jobId, scope.userId],
+        )
+        if (job.rows.length !== 1 || job.rows[0]?.id !== scope.jobId) {
+          throw new ArtifactToolError("stale_source", "Selected-job material is unavailable before draft commit.")
+        }
+        if (!await this.assertCurrentDraftMaterial!(client, scope.userId, scope.jobId)) {
+          throw new ArtifactToolError("stale_source", "Selected-job material changed before draft commit.")
+        }
+        if (!await artifactTaskLeaseIsLive(client, scope.taskFence)) {
+          throw new ArtifactToolError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
+        }
+        return version
       })
     } catch (error: unknown) { return mapError(error) }
   }

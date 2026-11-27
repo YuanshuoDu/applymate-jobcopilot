@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/lib/i18n'
 import { TASK_GRAPH_SOURCES_SCHEMA_VERSION, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
-  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, parseFinalTaskGraphSourceManifest } from '@/lib/agent/session/final-task-graph-source-manifest'
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4, parseFinalTaskGraphSourceManifest } from '@/lib/agent/session/final-task-graph-source-manifest'
 import { FinalTaskGraphSources, finalTaskGraphSourceDetailUrl, loadFinalTaskGraphSourceDetail,
   artifactViewerKey, coverLetterVersionLabel, parseFinalTaskGraphSourceDetailResponse,
   requestMatchesIdentity, viewableSourceArtifactRef } from './FinalTaskGraphSources'
@@ -32,7 +32,7 @@ const coveredReviewer = {
   roleResultStatus: 'completed', artifactVersionProof,
 }
 const v3Manifest = {
-  schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, graphRevision: 4, historicalNodeIndices: [],
+  schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4, graphRevision: 4, historicalNodeIndices: [], retiredNodeIndices: [],
   sources: [coveredSource, unprovenWriter, coveredReviewer],
 }
 

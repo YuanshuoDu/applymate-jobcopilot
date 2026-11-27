@@ -98,7 +98,7 @@ describe('final TaskGraph source detail API', () => {
     const artifactVersionProof = `avp_${createHash('sha256').update(preimage).digest('hex')}`
     mocks.finalItemFindFirst.mockResolvedValueOnce({
       id: itemId, sessionId, turnId, taskId: rootTaskId, type: 'agent_message', status: 'completed', phase: 'final_answer',
-      content: { taskGraphSources: { schemaVersion: 'agent-harness.v2.task-graph-sources.v3', graphRevision: 4, historicalNodeIndices: [], sources: [
+      content: { taskGraphSources: { schemaVersion: 'agent-harness.v2.task-graph-sources.v4', graphRevision: 4, historicalNodeIndices: [], retiredNodeIndices: [], sources: [
         { sourceKey, nodeIndex: 0, role: 'writer', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed', artifactVersionProof },
       ] } },
     })
@@ -144,7 +144,7 @@ describe('final TaskGraph source detail API', () => {
       ])]) {
       mocks.finalItemFindFirst.mockResolvedValueOnce({
         id: itemId, sessionId, turnId, taskId: rootTaskId, type: 'agent_message', status: 'completed', phase: 'final_answer',
-        content: { taskGraphSources: { schemaVersion: 'agent-harness.v2.task-graph-sources.v3', graphRevision: 4, historicalNodeIndices: [], sources: [
+        content: { taskGraphSources: { schemaVersion: 'agent-harness.v2.task-graph-sources.v4', graphRevision: 4, historicalNodeIndices: [], retiredNodeIndices: [], sources: [
           { sourceKey, nodeIndex: 0, role: 'writer', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'completed', artifactVersionProof },
         ] } },
       })

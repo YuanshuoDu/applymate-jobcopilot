@@ -7,7 +7,7 @@ import { finalTaskGraphArtifactProofInput, parsePlanLedger, parseTaskGraphSnapsh
 import { redactStreamEventPayload } from '../apps/web/src/lib/agent/session/stream-redaction'
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, projectFinalTaskGraphSourceDetail } from '../apps/web/src/lib/agent/session/final-task-graph-source-detail'
 import { finalTaskGraphSourceArtifactCandidate, verifiedFinalTaskGraphSourceArtifactRef } from '../apps/web/src/lib/agent/session/final-task-graph-source-artifact'
-import { TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 } from '../apps/web/src/lib/agent/session/final-task-graph-source-manifest'
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4 } from '../apps/web/src/lib/agent/session/final-task-graph-source-manifest'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '../apps/web/src/lib/task-graph-plan-labels'
 import { buildGroundedTaskGraphFinalResponse } from '../apps/worker/src/runtime/subagents/task-graph-final-response.js'
 import { reduceTaskGraphFinalSummary } from '../apps/worker/src/runtime/subagents/task-graph-final-summary.js'
@@ -791,9 +791,10 @@ function mountedFinalTaskGraphSourceFixture(sessionId: string, turnId: string) {
     artifactVersionProof: `avp_${createHash('sha256').update(proofInput, 'utf8').digest('hex')}`,
   } as const
   const taskGraphSources = {
-    schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3,
+    schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4,
     graphRevision,
     historicalNodeIndices: [],
+    retiredNodeIndices: [],
     sources: [source],
   }
   const finalItem = {

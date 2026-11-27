@@ -168,7 +168,7 @@ describe("deterministic finalizer", () => {
     const binding = coverLetterGraphBinding(), groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
     const terminal = boundTerminal(binding, groundedResponse)
     const manifest = terminal.finalContent.taskGraphSources
-    if (!manifest || manifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v3") throw new Error("Expected a v3 final source manifest")
+    if (!manifest || manifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v4") throw new Error("Expected a v4 final source manifest")
     expect(manifest.sources[0]?.artifactVersionProof).toMatch(/^avp_[a-f0-9]{64}$/)
     const tampered = { ...terminal.finalContent, taskGraphSources: { ...manifest,
       sources: manifest.sources.map((source, index) => index === 0 ? { ...source, artifactVersionProof: `avp_${"0".repeat(64)}` } : source) } }
