@@ -15702,6 +15702,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       persistedGraphUnique: null, persistedGraphRevisionMatches: null, retirementToolAvailable: null,
       seattleTaskMatchesOriginalLease: null, seattleLeaseStillLive: null, noSeattleDescendants: null, seattleHeld: null,
     }
+    let replacementListDiagnostic: {
+      projectedIdChanged: boolean; rawMatchCount: "zero" | "one" | "multiple"; projectedMatchCount: "zero" | "one" | "multiple"
+      rawStatus: string; projectedStatus: string; databaseStatus: string; databaseLeasePresent: boolean | null
+      databaseLeaseLive: boolean | null; databaseReadFailed: boolean
+    } | null = null
     let originalSeattleLease: { id: string; status: string; role: string; attemptCount: number; leaseOwner: string | null;
       leaseExpiresAt: Date | null; leaseSegmentStartedAt: Date | null; interruptRequestedAt: Date | null } | null = null
     let releaseSeattle!: () => void
@@ -15855,6 +15860,42 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (!dublinHeld || !listedTasks.some(task => task?.taskId === replacement.taskId && task?.status === "running")
               || persistedGraph.rows.length !== 1 || typeof revision !== "number"
               || revision !== persistedGraph.rows[0]?.revision) {
+              const countClass = (count: number) => count === 0 ? "zero" as const : count === 1 ? "one" as const : "multiple" as const
+              const statusClass = (value: unknown) => typeof value === "string" && ["queued", "running", "retrying", "waiting",
+                "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"].includes(value) ? value : "missing_or_other"
+              const projectedId = redactSensitiveText(replacement.taskId)
+              const rawMatches = listedTasks.filter(task => task?.taskId === replacement.taskId)
+              const projectedMatches = listedTasks.filter(task => task?.taskId === projectedId)
+              let databaseStatus = "missing_or_other", databaseLeasePresent: boolean | null = null, databaseLeaseLive: boolean | null = null
+              let databaseReadFailed = false
+              let diagnosticTimer: ReturnType<typeof setTimeout> | undefined
+              try {
+                // Bound both the pool wait and SQL execution; the read is diagnostic only.
+                const config: QueryConfig<unknown[]> & { query_timeout: number } = {
+                  text: `SELECT task."status", task."leaseOwner", task."leaseExpiresAt" > clock_timestamp() AS "leaseLive"
+                   FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+                   JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+                   WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+                     AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4
+                     AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
+                  values: [replacement.taskId, value.sessionId, value.turnId, rootTaskId, value.userId], query_timeout: 1_000,
+                }
+                const current = await Promise.race([
+                  pool!.query<{ status: string; leaseOwner: string | null; leaseLive: boolean | null }, unknown[]>(config),
+                  new Promise<never>((_, reject) => { diagnosticTimer = setTimeout(() => reject(new Error("diagnostic_timeout")), 1_000) }),
+                ])
+                if (current.rows.length === 1) {
+                  databaseStatus = statusClass(current.rows[0]?.status)
+                  databaseLeasePresent = typeof current.rows[0]?.leaseOwner === "string" && current.rows[0]!.leaseOwner!.length > 0
+                  databaseLeaseLive = current.rows[0]?.leaseLive === true
+                }
+              } catch { databaseReadFailed = true }
+              finally { if (diagnosticTimer) clearTimeout(diagnosticTimer) }
+              replacementListDiagnostic = { projectedIdChanged: projectedId !== replacement.taskId,
+                rawMatchCount: countClass(rawMatches.length), projectedMatchCount: countClass(projectedMatches.length),
+                rawStatus: statusClass(rawMatches.length === 1 ? rawMatches[0]?.status : undefined),
+                projectedStatus: statusClass(projectedMatches.length === 1 ? projectedMatches[0]?.status : undefined),
+                databaseStatus, databaseLeasePresent, databaseLeaseLive, databaseReadFailed }
               throw new Error("Fresh Root list did not match the held replacement and current graph revision")
             }
             preRetirementListMatched = true
@@ -16084,7 +16125,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           && event.causationId === retirementCall?.stepId && event.hasOutbox === false
           && receipt.attempt === originalSeattleLease?.attemptCount
           && receipt.graphRevision === retirementExpectedRevision && receipt.replacementTaskId === replacementTaskId),
-        preRetirementGuards,
+        preRetirementGuards, replacementListDiagnostic,
       }
     }
     const waitForPostReplanBoundary = async (rootTaskId: string) => {
