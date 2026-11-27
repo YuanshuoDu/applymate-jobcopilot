@@ -3,15 +3,20 @@ import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { SessionPauseRequestedError, OPEN_SESSION, SESSION_WORK_ADMISSION } from "../session-gate.js"
 import { buildTurnQuestionScheduledChoiceBinding, createTurnScheduledPrepareChoiceContent, scheduledAnalyzeCheckpointEvidence, TurnQuestionStoreError,
-  turnScheduledPrepareChoiceWaitId, type TurnQuestionIntentEnvelope } from "./turn-question-contract.js"
+  TurnQuestionSteeringRefreshCommittedError, TurnQuestionSteeringRefreshRequiredError, turnScheduledPrepareChoiceWaitId,
+  type TurnQuestionIntentEnvelope } from "./turn-question-contract.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
 import { questionId, questionItemId, type TurnQuestionPool } from "./turn-question-store-guards.js"
 import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
+import { retirePreparedQuestionForSteering } from "./turn-question-store-steering-refresh.js"
 import { readTurnQuestionPlanningWait } from "./turn-question-planning-history.js"
 import type { TurnQuestionPlanningReceipt } from "./turn-question-planning-contract.js"
 import { issueNativeQuestionControlReceipt } from "./native-question-attestation.js"
 
-vi.mock("./turn-question-planning-store.js", () => ({ prepareTurnQuestionPlanningObservation: vi.fn(), appendTurnQuestionPlanningObservation: vi.fn() }))
+vi.mock("./turn-question-planning-store.js", () => ({
+  prepareTurnQuestionPlanningObservation: vi.fn(), appendTurnQuestionPlanningObservation: vi.fn(),
+}))
+vi.mock("./turn-question-store-steering-refresh.js", () => ({ retirePreparedQuestionForSteering: vi.fn() }))
 vi.mock("./turn-question-planning-history.js", () => ({ readTurnQuestionPlanningWait: vi.fn() }))
 
 const now = new Date("2026-10-06T10:00:00.000Z")
@@ -118,6 +123,7 @@ type FixtureOptions = {
 function fixture(options: FixtureOptions = {}): Fixture {
   vi.mocked(prepareTurnQuestionPlanningObservation).mockReset().mockResolvedValue(null)
   vi.mocked(appendTurnQuestionPlanningObservation).mockReset().mockResolvedValue(undefined)
+  vi.mocked(retirePreparedQuestionForSteering).mockReset().mockResolvedValue(undefined)
   vi.mocked(readTurnQuestionPlanningWait).mockReset().mockResolvedValue(null)
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   let sequence = 0
@@ -279,6 +285,17 @@ describe("PostgreSQL native question store", () => {
     expect(vi.mocked(prepareTurnQuestionPlanningObservation).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(appendTurnQuestionPlanningObservation).mock.invocationCallOrder[0]!)
     expect(observation).toBeGreaterThan(Math.max(questionInsert, turnWait, itemStarted))
     expect(appendTurnQuestionPlanningObservation).toHaveBeenCalledWith(f.client, prepared, owner.userId)
+  })
+
+  it("retires a stale prepared question atomically and returns a refresh receipt", async () => {
+    const f = fixture()
+    vi.mocked(prepareTurnQuestionPlanningObservation).mockRejectedValue(new TurnQuestionSteeringRefreshRequiredError())
+    await expect(f.store.waitForQuestion({ owner, stepId, toolCallId, now })).rejects.toBeInstanceOf(TurnQuestionSteeringRefreshCommittedError)
+    expect(retirePreparedQuestionForSteering).toHaveBeenCalledWith(f.client, expect.objectContaining({ owner, stepId, toolCallId,
+      callItemId: "call-item-1", resultItemId: "result-item-1", usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 }, now }))
+    expect(f.calls.some(call => call.sql.includes("'question'") || call.sql.includes('UPDATE "agent_turns" SET "status"'))).toBe(false)
+    expect(f.calls.findIndex(call => call.sql === "COMMIT")).toBeGreaterThan(-1)
+    expect(f.calls.some(call => call.sql === "ROLLBACK")).toBe(false)
   })
 
   it("rolls the complete question wait back when appending its planning observation fails", async () => {

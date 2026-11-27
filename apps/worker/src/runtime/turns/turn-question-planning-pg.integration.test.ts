@@ -18,6 +18,7 @@ import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } fro
 import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { claimTurnLease } from "./lease.js"
+import { TurnQuestionSteeringRefreshCommittedError } from "./turn-question-contract.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
 import { questionId, questionItemId, type TurnQuestionPool } from "./turn-question-store-guards.js"
 import type { TurnQuestionPlanningReadOwner, TurnQuestionPlanningWaitRef } from "./turn-question-planning-contract.js"
@@ -706,8 +707,8 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       eventSequence: before.rows[0]?.eventSequence, stepStatus: "streaming", questionCount: 0, eventCount: 0, outboxCount: 0, privateCount: 0 })
   })
 
-  it("serializes Session-locked accepted steering on either side of the wait capture", async () => {
-    const beforeFixture = await seedFixture(admin!, { name: "steer queued before wait" })
+  it("refreshes a stale question when steering wins the Session lock, and commits the wait when it wins", async () => {
+    const beforeFixture = await seedFixture(admin!, { name: "steer accepted after Step context" })
     const beforePool = runtimePool(writer!, `clarification_wait_after_accept_${beforeFixture.turnId}`)
     await stageAndCompleteQuestion(beforePool, beforeFixture)
     const beforeLock = await beginSessionBlocker(beforeFixture)
@@ -720,16 +721,39 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     try {
       acceptBefore = acceptSteer(beforeFixture, acceptFirstName, beforeSteerId)
       await waitForLockWait(acceptFirstName, beforeLock.pid)
-      waitAfterAccept = createPgTurnQuestionStore(runtimePool(writer!, waitAfterName))
-        .waitForQuestion({ owner: beforeFixture.owner, stepId: beforeFixture.stepId, toolCallId: beforeFixture.callId, now: new Date() })
+      waitAfterAccept = expect(createPgTurnQuestionStore(runtimePool(writer!, waitAfterName))
+        .waitForQuestion({ owner: beforeFixture.owner, stepId: beforeFixture.stepId, toolCallId: beforeFixture.callId, now: new Date() }))
+        .rejects.toBeInstanceOf(TurnQuestionSteeringRefreshCommittedError)
       await waitForLockWait(waitAfterName)
       await beforeLock.client.query("COMMIT")
       releasedBefore = true
       await Promise.all([acceptBefore, waitAfterAccept])
-      const beforeReceipt = await planningEvent(admin!, beforeFixture, questionId(beforeFixture.owner, beforeFixture.stepId, beforeFixture.callId))
-      expect(beforeReceipt.payload.pendingSteers).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: beforeSteerId, status: "accepted" }),
-      ]))
+      const refreshed = await admin!.query<{ turnStatus: string; stepStatus: string; stepErrorCode: string; inputTokens: number; outputTokens: number; estimatedCostUsd: string;
+        questionCount: number; planningCount: number; refreshEvents: number }>(`SELECT turn."status" AS "turnStatus", step."status" AS "stepStatus", step."errorCode" AS "stepErrorCode",
+        step."inputTokens", step."outputTokens", step."estimatedCostUsd",
+        (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = turn."sessionId" AND "turnId" = turn."id" AND "type" = 'question') AS "questionCount",
+        (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = turn."sessionId" AND "turnId" = turn."id" AND "type" = $2) AS "planningCount",
+        (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = turn."sessionId" AND "turnId" = turn."id"
+          AND "idempotencyKey" LIKE $3) AS "refreshEvents"
+        FROM "agent_turns" AS turn JOIN "agent_steps" AS step ON step."sessionId" = turn."sessionId" AND step."turnId" = turn."id"
+        WHERE turn."id" = $1 AND step."id" = $4`, [beforeFixture.turnId, PRIVATE_EVENT,
+        `turn:${beforeFixture.turnId}:event:question-steering-refresh:%`, beforeFixture.stepId])
+      expect(refreshed.rows).toEqual([{ turnStatus: "in_progress", stepStatus: "failed", stepErrorCode: "steering_changed_before_question_wait",
+        inputTokens: 31, outputTokens: 9, estimatedCostUsd: "0.004", questionCount: 0, planningCount: 0, refreshEvents: 4 }])
+      const invalidated = await admin!.query<{ type: string; status: string | null; errorCode: string | null; output: unknown }>(`SELECT item."type",
+        item."content"->>'status' AS "status", item."content"->>'errorCode' AS "errorCode", item."content"->'output' AS "output"
+        FROM "agent_items" AS item WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."stepId" = $3
+          AND item."type" IN ('tool_call', 'tool_result') ORDER BY item."type"`,
+      [beforeFixture.sessionId, beforeFixture.turnId, beforeFixture.stepId])
+      expect(invalidated.rows).toEqual([
+        { type: "tool_call", status: "failed", errorCode: "steering_changed_before_question_wait", output: null },
+        { type: "tool_result", status: null, errorCode: "steering_changed_before_question_wait", output: null },
+      ])
+      await expect(createPgTurnQuestionStore(beforePool).readPendingQuestion({ owner: beforeFixture.owner, now: new Date() })).resolves.toEqual({ status: "none" })
+      const input = await admin!.query<{ status: string; acceptedSequence: string }>(`SELECT "status", "acceptedSequence" FROM "agent_inputs" WHERE "id" = $1`, [beforeSteerId])
+      expect(input.rows).toHaveLength(1)
+      expect(input.rows[0]?.status).toBe("accepted")
+      expect(BigInt(input.rows[0]!.acceptedSequence)).toBeGreaterThan(beforeFixture.inputCursor)
     } finally {
       if (!releasedBefore) await beforeLock.client.query("ROLLBACK").catch(() => undefined)
       if (acceptBefore || waitAfterAccept) await Promise.allSettled([...(acceptBefore ? [acceptBefore] : []), ...(waitAfterAccept ? [waitAfterAccept] : [])])

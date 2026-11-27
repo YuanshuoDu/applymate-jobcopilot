@@ -4,6 +4,7 @@ import { readSteeringReconciliationState } from "../subagents/steering-reconcili
 import { steeringReconciliationId, steeringReconciliationSequence, type SteeringReconciliationScope } from "../subagents/steering-reconciliation-contract.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertQuestionOwner, questionId, questionItemId } from "./turn-question-store-guards.js"
+import { TurnQuestionSteeringRefreshRequiredError } from "./turn-question-contract.js"
 import {
   parseTurnQuestionPlanningReceipt, turnQuestionPlanningEventKey, TURN_QUESTION_PLANNING_EVENT_TYPE,
   TURN_QUESTION_PLANNING_SCHEMA_VERSION, type TurnQuestionPlanningReceipt,
@@ -11,6 +12,7 @@ import {
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
+
 export type TurnQuestionPlanningObservationInput = Readonly<{
   owner: TurnExecutionOwnerFence
   stepId: string
@@ -76,6 +78,9 @@ export async function prepareTurnQuestionPlanningObservation(client: Queryable, 
   if (stepResult.rows.length !== 1 || !step || step.taskId !== input.owner.rootTaskId || step.status !== "streaming"
     || Number(step.attempt) !== attempt || cursor === null || cursor !== state.decisionInputThroughSequence || !ids) {
     throw new Error("question_planning_checkpoint_invalid")
+  }
+  if (state.unresolvedInputs.some(pending => pending.acceptedSequence > cursor)) {
+    throw new TurnQuestionSteeringRefreshRequiredError()
   }
   const receipt = parseTurnQuestionPlanningReceipt({
     schemaVersion: TURN_QUESTION_PLANNING_SCHEMA_VERSION,

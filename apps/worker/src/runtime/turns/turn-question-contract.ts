@@ -68,6 +68,22 @@ export class TurnQuestionStoreError extends Error {
   }
 }
 
+export class TurnQuestionSteeringRefreshRequiredError extends Error {
+  readonly code = "steering_changed_before_question_wait"
+  constructor() {
+    super("Accepted steering changed after the question model context was built")
+    this.name = "TurnQuestionSteeringRefreshRequiredError"
+  }
+}
+
+export class TurnQuestionSteeringRefreshCommittedError extends Error {
+  readonly code = "steering_changed_before_question_wait"
+  constructor() {
+    super("Accepted steering was preserved; reload the Turn before replanning")
+    this.name = "TurnQuestionSteeringRefreshCommittedError"
+  }
+}
+
 export type TurnQuestionRecovery =
   | { readonly status: "none" }
   | { readonly status: "replayable"; readonly stepId: string; readonly toolCallId: string; readonly callItemId: string; readonly intent: TurnQuestionIntentEnvelope }

@@ -1,15 +1,20 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { createTurnScheduledPrepareChoiceContent, isTurnQuestionUsage, parseTurnScheduledPrepareChoiceItem, TurnQuestionStoreError,
+  TurnQuestionSteeringRefreshCommittedError, TurnQuestionSteeringRefreshRequiredError,
   type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionScheduledChoiceReadInput, type TurnQuestionScheduledChoiceRecovery, type TurnQuestionStore, type TurnQuestionUsageInput, type TurnQuestionWaitInput, type TurnQuestionWaitReceipt } from "./turn-question-contract.js"
 import { admitQuestionWork, assertQuestionOwner, assertQuestionUsage, completedQuestionResult, lockQuestionStep, persistedUsage, questionConflict, questionId, questionItemId, withQuestionTransaction, type TurnQuestionPool, type TurnQuestionQueryClient, type TurnQuestionStepRow } from "./turn-question-store-guards.js"
 import { appendQuestionStartedEvents, appendScheduledChoiceWaitEvents, loadScheduledChoiceBinding, OrphanPauseUsageRecoveredError, recoverPausedOrphanUsage } from "./turn-question-store-events.js"
 import { toRepositoryJson } from "./turn-engine-types.js"
 import { cancelPausedQuestion, recoverPausedPartialQuestion } from "./turn-question-store-cancellation.js"
 import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
+import { retirePreparedQuestionForSteering } from "./turn-question-store-steering-refresh.js"
+import type { TurnQuestionPlanningReceipt } from "./turn-question-planning-contract.js"
 import { readTurnQuestionPlanningWait } from "./turn-question-planning-history.js"
 import { readScheduledGateChoice, waitForScheduledGateChoice } from "./turn-question-gate-choice-store.js"
 import { readPendingQuestion, recoverIncompleteQuestionCall } from "./turn-question-store-recovery.js"
 type Row = Record<string, unknown>
+type QuestionWaitTransactionResult = { readonly kind: "receipt"; readonly receipt: TurnQuestionWaitReceipt }
+  | { readonly kind: "steering-refresh" }
 function record(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const proto = Object.getPrototypeOf(value)
@@ -145,7 +150,7 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
       if (hasGateBinding) throw questionConflict("Gate binding on native tool question")
       if (!input.stepId.trim() || !toolCallId.trim() || !Number.isFinite(input.now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Question call scope is invalid")
       const questionInput = { ...input, toolCallId }
-      return withQuestionTransaction(pool, input.owner, async (client, turn) => {
+      const result = await withQuestionTransaction(pool, input.owner, async (client, turn): Promise<QuestionWaitTransactionResult> => {
         const receipt = await completedQuestionResult(client, input.owner, input.stepId, toolCallId)
         const id = questionId(input.owner, input.stepId, toolCallId)
         const existing = await readQuestionItem(client, questionInput, id, receipt.intent)
@@ -159,15 +164,25 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
         if (existing?.status === "waiting") {
           const { step } = await usageFromStep(client, input.owner, input.stepId, ["waiting_for_user"])
           if (turn.status !== "waiting_for_user" || step.status !== "waiting_for_user") throw questionConflict(`question wait ${id} state`)
-          return waitReceipt("waiting_for_user", "replayed", input, id, Number(turn.revision))
+          return { kind: "receipt", receipt: waitReceipt("waiting_for_user", "replayed", input, id, Number(turn.revision)) }
         }
         if (existing?.status === "answered") {
           await usageFromStep(client, input.owner, input.stepId, ["waiting_for_user"])
           if (turn.status !== "in_progress") throw questionConflict(`answered question ${id} Turn state`)
-          return waitReceipt("answered", "replayed", input, id, Number(turn.revision))
+          return { kind: "receipt", receipt: waitReceipt("answered", "replayed", input, id, Number(turn.revision)) }
         }
-        const planningObservation = turn.status === "in_progress"
-          ? await prepareTurnQuestionPlanningObservation(client, { owner: input.owner, ...planningWait }) : null
+        let planningObservation: TurnQuestionPlanningReceipt | null
+        try {
+          planningObservation = turn.status === "in_progress"
+            ? await prepareTurnQuestionPlanningObservation(client, { owner: input.owner, ...planningWait }) : null
+        } catch (error: unknown) {
+          if (!(error instanceof TurnQuestionSteeringRefreshRequiredError) || turn.status !== "in_progress") throw error
+          const { step, usage } = await usageFromStep(client, input.owner, input.stepId)
+          if (step.status !== "streaming") throw questionConflict(`prepared step ${input.stepId} steering refresh state`)
+          await retirePreparedQuestionForSteering(client, { owner: input.owner, stepId: input.stepId, toolCallId,
+            callItemId: receipt.callItemId, resultItemId: receipt.resultItemId, usage, now: input.now })
+          return { kind: "steering-refresh" }
+        }
         const { step, usage } = await usageFromStep(client, input.owner, input.stepId)
         if (turn.status !== "in_progress" || step.status !== "streaming") throw new TurnQuestionStoreError("question_not_current", "Prepared question is no longer active")
         await admitQuestionWork(client, input.owner)
@@ -188,8 +203,10 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
           [input.owner.sessionId, input.owner.turnId, input.stepId, input.owner.taskId])
         await appendQuestionStartedEvents(client, { owner: input.owner, stepId: input.stepId, itemId, questionId: id, toolCallId, toolCallCount: Number(calls.rows[0]?.count ?? 0) })
         if (planningObservation) await appendTurnQuestionPlanningObservation(client, planningObservation, input.owner.userId)
-        return waitReceipt("waiting_for_user", "created", questionInput, id, Number(updated.rows[0].revision))
+        return { kind: "receipt", receipt: waitReceipt("waiting_for_user", "created", questionInput, id, Number(updated.rows[0].revision)) }
       })
+      if (result.kind === "steering-refresh") throw new TurnQuestionSteeringRefreshCommittedError()
+      return result.receipt
     },
     async readPendingQuestion(input): Promise<TurnQuestionRecovery> {
       assertQuestionOwner(input.owner)
