@@ -9,7 +9,7 @@ import { createWorkerToolRuntime } from "../tools/index.js"
 import { InMemoryToolLifecycleSink } from "../tools/lifecycle.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { TurnExecutionEventWriter, executeToolWithItems } from "../turns/turn-execution-events.js"
-import type { TurnExecutionOptions } from "../turns/turn-execution-types.js"
+import type { TurnExecutionOptions, TurnExecutionStore } from "../turns/turn-execution-types.js"
 import { claimTurnLease, type TurnLease } from "../turns/lease.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { reconcileDurableWaits } from "./durable-wait-resolver.js"
@@ -98,6 +98,20 @@ function makePolicy(): PolicyEngine {
   ] } })
 }
 
+/**
+ * Production TurnEngine.bindStore adapts the persisted owner-based store to
+ * the shared execution loop's identity-based store. These focused fixture
+ * calls use executeToolWithItems directly, so keep the same owner forwarding
+ * for the exact store operations that writer needs.
+ */
+function bindToolExecutionStore(store: ReturnType<typeof createPgTurnEngineStore>): TurnExecutionOptions["store"] {
+  return {
+    createItem: ({ identity, ...input }) => store.createItem({ ...input, owner: identity }),
+    updateItem: ({ identity, ...input }) => store.updateItem({ ...input, owner: identity }),
+    appendEvent: ({ identity, ...input }) => store.appendEvent({ ...input, owner: identity }),
+  } as TurnExecutionStore
+}
+
 function toolOptions(input: {
   identity: ExecutionOwnerFence
   store: ReturnType<typeof createPgTurnEngineStore>
@@ -111,7 +125,7 @@ function toolOptions(input: {
     goal: "Check saved job sponsorship evidence",
     snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
     contextBuilder: { build: async () => ({}) as never },
-    store: input.store,
+    store: bindToolExecutionStore(input.store),
     model: {} as never,
     tools: [],
     actorRole: input.actorRole,
