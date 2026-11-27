@@ -40,6 +40,15 @@ describe("TaskGraph canonical verification receipt validation", () => {
     expect(() => validateTaskGraphVerificationItems([pair()[0]!], scope)).toThrow("task_graph_verification_pair_invalid")
   })
 
+  it("rejects same-ordinal and later receipts when an exclusive history boundary is supplied", () => {
+    const bounded = { ...scope, exclusiveBeforeOrdinal: 1 }
+    expect(() => validateTaskGraphVerificationItems(pair().map(item => ({ ...item, ordinal: 1 })), bounded))
+      .toThrow("task_graph_verification_item_invalid")
+    expect(() => validateTaskGraphVerificationItems(pair().map(item => ({ ...item, ordinal: 2 })), bounded))
+      .toThrow("task_graph_verification_item_invalid")
+    expect(validateTaskGraphVerificationItems(pair().map(item => ({ ...item, ordinal: 0 })), bounded)).toHaveLength(2)
+  })
+
   it("projects only complete recognized read outputs and keeps stable receipt digests", () => {
     const items = validateTaskGraphVerificationItems(pair(), scope)
     const outcomes = new Map([["call-1", "completed" as const]])

@@ -18,6 +18,12 @@ export type TaskGraphVerificationReceipts = Readonly<{
 
 /** Reconstruct exact-attempt tool receipts and completed read observations under the caller's transaction. */
 export async function loadTaskGraphVerificationReceipts(client: Queryable, scope: TaskGraphVerificationScope): Promise<TaskGraphVerificationReceipts> {
+  if (scope.exclusiveBeforeOrdinal !== undefined
+    && (!Number.isSafeInteger(scope.exclusiveBeforeOrdinal) || scope.exclusiveBeforeOrdinal < 0)) {
+    throw new Error("task_graph_verification_ordinal_scope_invalid")
+  }
+  const ordinalFilter = scope.exclusiveBeforeOrdinal === undefined ? "" : `\n      AND step."ordinal" < $8`
+  const ordinalValues = scope.exclusiveBeforeOrdinal === undefined ? [] : [scope.exclusiveBeforeOrdinal]
   const itemResult = await client.query(`SELECT item."id", item."sessionId", item."turnId", item."taskId", item."stepId",
       item."type", item."status", item."revision", item."content", step."id" AS "joinedStepId", step."status" AS "stepStatus",
       step."attempt" AS "attempt", step."ordinal" AS "ordinal", task."rootTaskId" AS "rootTaskId", turn."rootTaskId" AS "turnRootTaskId"
@@ -30,9 +36,9 @@ export async function loadTaskGraphVerificationReceipts(client: Queryable, scope
     WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND task."rootTaskId" = $4 AND turn."rootTaskId" = $4
       AND (($1 = $4 AND $5 = $4 AND task."id" = $4 AND task."parentTaskId" IS NULL) OR task."parentTaskId" = $5)
       AND session."userId" = $6 AND turn."userId" = $6
-      AND step."attempt" = $7 AND item."type" IN ('tool_call', 'tool_result')
+      AND step."attempt" = $7 AND item."type" IN ('tool_call', 'tool_result')${ordinalFilter}
     ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_ITEMS + 1}`,
-  [scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId, scope.attemptCount])
+  [scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId, scope.attemptCount, ...ordinalValues])
   if (itemResult.rows.length > MAX_ITEMS) throw new Error("task_graph_verification_item_limit")
   const items = validateTaskGraphVerificationItems(itemResult.rows, scope)
   const callIds = items.filter(item => item.type === "tool_call").map(item => String(item.id))

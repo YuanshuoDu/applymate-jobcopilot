@@ -63,7 +63,7 @@ export async function requestSponsorshipReview(pool: Pool, native: NativeCoordin
     }
     const receipts = await loadTaskGraphVerificationReceipts(client, {
       userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
-      parentTaskId: scope.rootTaskId, taskId: scope.rootTaskId, attemptCount: attempt,
+      parentTaskId: scope.rootTaskId, taskId: scope.rootTaskId, attemptCount: attempt, exclusiveBeforeOrdinal: ordinal,
     })
     const matched = await selectedSponsorshipWaitTargets(client, receipts, {
       userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
