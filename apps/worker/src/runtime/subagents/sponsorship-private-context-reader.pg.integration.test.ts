@@ -33,7 +33,7 @@ import { createCanonicalTurnTerminalGuard } from "../canonical-turn-native-verif
 import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } from "../turns/turn-execution-completion-gate.js"
 import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { readPrivateSponsorshipContext } from "./sponsorship-private-context-reader.js"
+import { readPrivateSponsorshipContext, type SponsorshipPrivateContextReadDiagnosticStage } from "./sponsorship-private-context-reader.js"
 import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { defaultSubagentPolicy, type PgSubagentPool, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -538,8 +538,13 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     const readerInput = { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, taskId: root.id, rootTaskId: root.id,
       rootAttemptCount: Number(currentRoot.rows[0]?.attemptCount), turnLeaseOwner: currentRootLease.ownerId,
       turnLeaseVersion: currentRootLease.leaseVersion, stepId: currentStep.id }
-    const context = await readPrivateSponsorshipContext(db, readerInput, restored.snapshot.toolObservations)
+    const sourceReadStages: SponsorshipPrivateContextReadDiagnosticStage[] = []
+    const context = await readPrivateSponsorshipContext(db, readerInput, restored.snapshot.toolObservations,
+      stage => sourceReadStages.push(stage))
     const expectedCount = mode === "all" ? 2 : 1
+    if (!context || context.length !== expectedCount) {
+      console.error(`sponsorship-private-context-reader source diagnostic stages: ${sourceReadStages.slice(0, 16).join(",")}`)
+    }
     expect(context).toHaveLength(expectedCount)
     expect(context?.map(entry => entry.jobId).sort()).toEqual(mode === "all" ? [...value.jobIds].sort() : [value.jobIds[0]])
     const expectedSourceCanary = mode === "any" ? "PRIVATE-SPONSORSHIP-REVIEW-CANARY" : SOURCE_CANARY
@@ -644,10 +649,14 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
         const privateReviewStep = await engine.startStep({ owner: executionOwnerFence({ kind: "turn", taskId: root.id, lease: currentRootLease }),
           stepId: `p3-sponsorship-review-private-context-${value.suffix}`, ordinal: 3, attempt: 1,
           inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+        const reviewReadStages: SponsorshipPrivateContextReadDiagnosticStage[] = []
         const reviewContext = await readPrivateSponsorshipContext(db, { userId: value.userId, sessionId: value.sessionId,
           turnId: value.turnId, taskId: root.id, rootTaskId: root.id, rootAttemptCount: currentRootAttempt,
           turnLeaseOwner: currentRootLease.ownerId, turnLeaseVersion: currentRootLease.leaseVersion, stepId: privateReviewStep.id },
-        reviewerRestored.snapshot.toolObservations)
+        reviewerRestored.snapshot.toolObservations, stage => reviewReadStages.push(stage))
+        if (!reviewContext || reviewContext.length !== 1) {
+          console.error(`sponsorship-private-context-reader diagnostic stages: ${reviewReadStages.slice(0, 16).join(",")}`)
+        }
         expect(reviewContext).toHaveLength(1)
         expect(reviewContext?.[0]).toMatchObject({ jobId: value.jobIds[0], observation: {
           status: "explicit", claim: { kind: "work_visa_sponsorship", polarity: "available", countryCode: "IE" },
