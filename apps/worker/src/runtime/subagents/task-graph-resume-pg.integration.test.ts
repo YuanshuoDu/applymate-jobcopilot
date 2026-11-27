@@ -875,6 +875,17 @@ const TASK_GRAPH_DIAGNOSTIC_PROPOSAL_NODE_KEYS = new Set(["source", "summary", "
 const TASK_DIAGNOSTIC_STATUSES = new Set([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
 ])
+const SUPERSEDED_SCOUT_FIXTURE_ADAPTER_STAGES = new Set([
+  "not_started", "stream_entered", "initial_plan", "initial_wait", "replacement_plan",
+  "refresh_before_retirement", "retire_superseded_scout", "post_revise_wait",
+  "refresh_after_retirement_wait", "final_after_retirement_refresh", "unexpected_graph_state",
+])
+const SUPERSEDED_SCOUT_FIXTURE_FAILURE_CODES = new Set([
+  "none", "replacement_not_held", "replacement_task_identity_mismatch", "replacement_list_mismatch",
+  "replacement_graph_mismatch", "wait_call_mismatch", "wait_receipt_mismatch", "wait_outcome_missing",
+  "wait_target_mismatch", "wait_outcome_other", "wait_status_mismatch", "terminal_list_mismatch",
+  "unexpected_graph_state",
+])
 const EVENT_DIAGNOSTIC_STATUSES = new Set([
   ...TURN_DIAGNOSTIC_STATUSES, ...ITEM_DIAGNOSTIC_STATUSES, ...WAIT_DIAGNOSTIC_STATUSES,
   ...TASK_DIAGNOSTIC_STATUSES, ...STEP_DIAGNOSTIC_STATUSES,
@@ -14923,12 +14934,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootToolsAtRevise: string[] = [], rootToolsAtRetirement: string[] = []
     let initialGraphRevision: number | undefined, reviseExpectedRevision: number | undefined, retirementExpectedRevision: number | undefined
     let rootTaskId = "", replacementTaskId: string | undefined
+    let dublinModelTaskId: string | null = null
     let scoutSearchCalls = 0, seattleHeld = false, dublinHeld = false
     let adapterStage = "not_started", proofKind = "not_read", requestHasConfirmation = false, requestHasDublin = false
+    let adapterFailureCode = "none"
     let preRetirementGuards: {
       acceptedPlanMatchesReplacement: boolean | null
       replacementHeld: boolean | null
+      replacementModelTaskMatchesPlan: boolean | null
       replacementListedRunning: boolean | null
+      replacementDbRowCount: number | null
+      replacementDbStatus: string | null
+      replacementListRowCount: number | null
+      replacementListStatus: string | null
       persistedGraphUnique: boolean | null
       persistedGraphRevisionMatches: boolean | null
       retirementToolAvailable: boolean | null
@@ -14937,7 +14955,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       noSeattleDescendants: boolean | null
       seattleHeld: boolean | null
     } = {
-      acceptedPlanMatchesReplacement: null, replacementHeld: null, replacementListedRunning: null,
+      acceptedPlanMatchesReplacement: null, replacementHeld: null, replacementModelTaskMatchesPlan: null,
+      replacementListedRunning: null, replacementDbRowCount: null, replacementDbStatus: null,
+      replacementListRowCount: null, replacementListStatus: null,
       persistedGraphUnique: null, persistedGraphRevisionMatches: null, retirementToolAvailable: null,
       seattleTaskMatchesOriginalLease: null, seattleLeaseStillLive: null, noSeattleDescendants: null, seattleHeld: null,
     }
@@ -14955,7 +14975,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const replacementHeld = async () => {
       const deadline = Date.now() + 25_000
       while (Date.now() < deadline && !dublinHeld) await new Promise(resolve => setTimeout(resolve, 25))
-      if (!dublinHeld) throw new Error("Dublin replacement Scout did not reach its held post-search execution")
+      if (!dublinHeld) {
+        adapterFailureCode = "replacement_not_held"
+        throw new Error("Dublin replacement Scout did not reach its held post-search execution")
+      }
     }
     const settleSeattle = async () => {
       const deadline = Date.now() + 30_000
@@ -15077,6 +15100,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             const listing = record(latestToolResult(request, postPlanListCallId))
             const listedTasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
+            const listedReplacementRows = listedTasks.filter(task => task?.taskId === replacement.taskId)
+            const listedReplacement = listedReplacementRows[0]
+            const replacementRows = await pool!.query<{ status: string }>(
+              `SELECT task."status" FROM "sub_agent_tasks" AS task
+               JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+               JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+               WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+                 AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND turn."rootTaskId" = $4
+                 AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
+              [replacement.taskId, value.sessionId, value.turnId, rootTaskId, value.userId])
+            preRetirementGuards.replacementModelTaskMatchesPlan = dublinModelTaskId === replacement.taskId
+            preRetirementGuards.replacementDbRowCount = Math.min(2, replacementRows.rows.length)
+            preRetirementGuards.replacementDbStatus = replacementRows.rows.length === 1
+              ? diagnosticEnum(replacementRows.rows[0]?.status, TASK_DIAGNOSTIC_STATUSES) ?? "other"
+              : replacementRows.rows.length === 0 ? "missing" : "ambiguous"
+            preRetirementGuards.replacementListRowCount = Math.min(2, listedReplacementRows.length)
+            preRetirementGuards.replacementListStatus = listedReplacement
+              ? diagnosticEnum(listedReplacement.status, TASK_DIAGNOSTIC_STATUSES) ?? "other" : "missing"
             const persistedGraph = await pool!.query<{ revision: number }>(
               `SELECT item."revision" FROM "agent_items" AS item
                JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
@@ -15094,6 +15135,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (!dublinHeld || !listedTasks.some(task => task?.taskId === replacement.taskId && task?.status === "running")
               || persistedGraph.rows.length !== 1 || typeof revision !== "number"
               || revision !== persistedGraph.rows[0]?.revision) {
+              adapterFailureCode = !dublinHeld ? "replacement_not_held"
+                : dublinModelTaskId !== replacement.taskId ? "replacement_task_identity_mismatch"
+                  : !preRetirementGuards.replacementListedRunning ? "replacement_list_mismatch"
+                    : "replacement_graph_mismatch"
               throw new Error("Fresh Root list did not match the held replacement and current graph revision")
             }
             preRetirementListMatched = true
@@ -15164,7 +15209,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
           if (postReviseWaitIssued) {
             const taskIds = [seattleTaskId, ...(typeof replacement?.taskId === "string" ? [replacement.taskId] : [])]
-            const outcome = repairWaitOutcomeFromRequest(request, postReviseWaitCallId, taskIds)
+            let outcome: RecordValue
+            try {
+              outcome = repairWaitOutcomeFromRequest(request, postReviseWaitCallId, taskIds)
+            } catch (error: unknown) {
+              const message = error instanceof Error ? error.message : ""
+              adapterFailureCode = message === "Repair wait call did not match the accepted plan task IDs" ? "wait_call_mismatch"
+                : message === "Repair wait receipt did not match the accepted plan task IDs" ? "wait_receipt_mismatch"
+                  : message === "Repair wait did not expose its exact resolved wait outcome" ? "wait_outcome_missing"
+                    : message === "Resolved repair wait did not cover the exact accepted plan task IDs" ? "wait_target_mismatch"
+                      : "wait_outcome_other"
+              throw new Error("Retirement wait result failed fixture validation")
+            }
             const taskStatuses = new Map<string, string>()
             for (const rawTask of Array.isArray(outcome.tasks) ? outcome.tasks : []) {
               const task = record(rawTask)
@@ -15175,6 +15231,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const replacementTaskId = typeof replacement?.taskId === "string" ? replacement.taskId : null
             if (taskStatuses.get(seattleTaskId) !== "interrupted" || !replacementTaskId
               || taskStatuses.get(replacementTaskId) !== "completed") {
+              adapterFailureCode = "wait_status_mismatch"
               throw new Error("Retirement wait did not prove both the interrupted target and completed replacement")
             }
             if (!postReviseListIssued) {
@@ -15189,6 +15246,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const listedTasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
             if (!listedTasks.some(task => task?.taskId === seattleTaskId && task?.status === "interrupted")
               || !listedTasks.some(task => task?.taskId === replacementTaskId && task?.status === "completed")) {
+              adapterFailureCode = "terminal_list_mismatch"
               throw new Error("agent.list did not refresh the exact retirement acknowledgement")
             }
             yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final",
@@ -15197,6 +15255,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             return
           }
           adapterStage = "unexpected_graph_state"
+          adapterFailureCode = "unexpected_graph_state"
           throw new Error(`Typed location fixture state: ${JSON.stringify({ nodeCount: nodes.length,
             hasSeattle: !!seattle, hasReplacement: !!replacement, proofKind, requestHasConfirmation, requestHasDublin,
             initialWaitIssued, reviseAttempted, retirementAttempted, postReviseWaitIssued, postReviseListIssued })}`)
@@ -15227,6 +15286,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               request.signal.addEventListener("abort", () => reject(new Error("Seattle Scout fixture was interrupted")), { once: true })
             })])
           } else {
+            dublinModelTaskId = task.id
             dublinHeld = true
             if (request.signal.aborted) throw new Error("Dublin Scout fixture was interrupted")
             await Promise.race([releaseDublinGate, new Promise<never>((_resolve, reject) => {
@@ -15346,8 +15406,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                AND item."content"->>'toolCallId' = $4 AND turn."userId" = $5 AND turn."rootTaskId" = $3`,
             [value.sessionId, value.turnId, rootTaskId, reviseCallId, value.userId])
           const boundary = await readSafeBoundary(rootTaskId)
-          throw new Error("Root stopped before post-revise wait: " + JSON.stringify({ stage: adapterStage, proofKind,
-            requestHasConfirmation, requestHasDublin, turnStatus: turn.rows[0].status,
+          throw new Error("Root stopped before post-revise wait: " + JSON.stringify({
+            stage: diagnosticEnum(adapterStage, SUPERSEDED_SCOUT_FIXTURE_ADAPTER_STAGES) ?? "other",
+            failureCode: diagnosticEnum(adapterFailureCode, SUPERSEDED_SCOUT_FIXTURE_FAILURE_CODES) ?? "other",
+            proofKind, requestHasConfirmation, requestHasDublin, turnStatus: diagnosticEnum(turn.rows[0].status, TURN_DIAGNOSTIC_STATUSES) ?? "other",
             reviseCode: boundedCode(result.rows[0]?.code), boundary }))
         }
         await new Promise(resolve => setTimeout(resolve, 25))
@@ -15435,8 +15497,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForPostReplanBoundary(rootTaskId)
       await waitForPostReplanReady(rootTaskId)
       await reconcileDurableWaits(pool!, { ownerId: `p3-1240-retirement-wake-${value.suffix}` })
-      await waitForTurnStatus(pool!, value.turnId, "completed", 60_000, postReviseWaitCallId,
-        [reviseCallId, retireCallId, postReviseListCallId])
+      try {
+        await waitForTurnStatus(pool!, value.turnId, "completed", 60_000, postReviseWaitCallId,
+          [reviseCallId, retireCallId, postReviseListCallId])
+      } catch (error: unknown) {
+        throw new Error(`Retirement fixture wait failed; diagnostic=${JSON.stringify({
+          waitFailure: waitForTurnStatusFailureDiagnostic(error),
+          adapterStage: diagnosticEnum(adapterStage, SUPERSEDED_SCOUT_FIXTURE_ADAPTER_STAGES) ?? "other",
+          adapterFailureCode: diagnosticEnum(adapterFailureCode, SUPERSEDED_SCOUT_FIXTURE_FAILURE_CODES) ?? "other",
+          preRetirementGuards,
+        })}`)
+      }
 
       const checkpoint = await pool!.connect()
       try {
