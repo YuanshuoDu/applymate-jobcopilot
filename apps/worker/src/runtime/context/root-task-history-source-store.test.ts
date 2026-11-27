@@ -488,6 +488,12 @@ describe("Root history source scan", () => {
       expect(query.values, entry.label).toEqual(entry.values)
       const terminalWindow = query.sql.slice(query.sql.indexOf("WITH terminal_window"), query.sql.indexOf("), roots"))
       expect(terminalWindow, entry.label).toContain(`${entry.parameter}::jsonb IS NULL`)
+      const graphExists = terminalWindow.indexOf('graph_item."type" = \'task_graph\'')
+      expect(graphExists, entry.label).toBeGreaterThanOrEqual(0)
+      expect(graphExists, entry.label).toBeLessThan(terminalWindow.indexOf(entry.limit))
+      expect(terminalWindow, entry.label).toContain('graph_item."id" = (\'task-graph-\' || encode(sha256(convert_to(turn."rootTaskId", \'UTF8\')), \'hex\'))')
+      expect(terminalWindow, entry.label).toContain('graph_item."sessionId" = turn."sessionId" AND graph_item."turnId" = turn."id"')
+      expect(terminalWindow, entry.label).toContain('graph_turn."userId" = $2 AND graph_session."userId" = $2')
       expect(terminalWindow.indexOf("scheduledAutomationSnapshot"), entry.label).toBeLessThan(terminalWindow.indexOf(entry.limit))
     }
   })

@@ -13,6 +13,18 @@ export type RootTaskHistoryCrossSessionCursor = Readonly<{
 
 const MAX_PAGE_SIZE = 64
 
+/** Necessary graph-item identity for all production history consumers; loadTaskGraph still validates its contents. */
+export const ROOT_TASK_HISTORY_EXACT_GRAPH_EXISTS_SQL = `EXISTS (
+  SELECT 1 FROM "agent_items" AS graph_item
+  JOIN "agent_turns" AS graph_turn ON graph_turn."id" = graph_item."turnId"
+    AND graph_turn."sessionId" = graph_item."sessionId"
+  JOIN "agent_sessions" AS graph_session ON graph_session."id" = graph_item."sessionId"
+  WHERE graph_item."id" = ('task-graph-' || encode(sha256(convert_to(turn."rootTaskId", 'UTF8')), 'hex'))
+    AND graph_item."sessionId" = turn."sessionId" AND graph_item."turnId" = turn."id"
+    AND graph_item."taskId" = turn."rootTaskId" AND graph_item."type" = 'task_graph'
+    AND graph_turn."userId" = $2 AND graph_session."userId" = $2
+)`
+
 function validIntent(json: string): string {
   return `(jsonb_typeof(${json}) = 'object' AND ${json} ?& ARRAY['kind','version']
     AND (${json} - 'kind' - 'version') = '{}'::jsonb
@@ -109,6 +121,7 @@ function buildCrossSessionWindow(input: RootTaskHistoryCrossSessionWindowInput, 
         AND event."taskId" = turn."rootTaskId" AND turn."userId" = $2
         AND turn."status" IN ('completed', 'failed', 'interrupted') AND task."status" = turn."status"
         AND task."parentTaskId" IS NULL AND task."role" = 'orchestrator' AND task."taskType" = 'root'
+        AND ${ROOT_TASK_HISTORY_EXACT_GRAPH_EXISTS_SQL}
         AND event."type" = CASE turn."status" WHEN 'completed' THEN 'turn.completed'
           WHEN 'failed' THEN 'turn.failed' WHEN 'interrupted' THEN 'turn.interrupted' END
         AND NOT (turn."input" ? 'selectedJobPreparation')

@@ -323,6 +323,7 @@ type Source = Readonly<{
   }>[]
   failureChildren?: readonly Readonly<{ key: string; templateId: string; role: string; taskType: string; failureReason: string }>[]
   turnSource?: string; turnExecutionMode?: "canonical_task_graph"; terminalCreatedAt?: Date
+  persistTaskGraph?: boolean
   searchFootprint?: Readonly<{ role: string; location: string; atsSource: "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio" }>
 }>
 
@@ -759,10 +760,16 @@ async function insertSource(source: Source): Promise<void> {
       child.goal, JSON.stringify(child.successCriteria), JSON.stringify(child.allowedActions), JSON.stringify(child.expectedOutputSchema),
       child.result === null ? null : JSON.stringify(child.result), child.failureReason])
   }
-  await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
-    VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-      ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-  [taskGraphItemId(source.rootTaskId), source.sessionId, source.turnId, source.rootTaskId, JSON.stringify(graph), source.finalItemId])
+  if (source.persistTaskGraph === false) {
+    await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [source.finalItemId, source.sessionId, source.turnId, source.rootTaskId])
+  } else {
+    await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+        ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [taskGraphItemId(source.rootTaskId), source.sessionId, source.turnId, source.rootTaskId, JSON.stringify(graph), source.finalItemId])
+  }
   const startSequence = source.startSequence * SOURCE_SEQUENCE_STRIDE
   const duplicateStepReceipt = source.stepReceipt === "duplicate"
   const itemStartedOffset = duplicateStepReceipt ? 3 : 2
@@ -1050,6 +1057,38 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       streamingTerminalStep.turnId, failedTerminalStep.turnId, missingStepReceipt.turnId, mismatchedStepReceipt.turnId,
       duplicateStepReceipt.turnId].includes(item.sourceTurnId))).toBe(false)
   })
+
+  it("filters roots without their exact TaskGraph item before the raw and graph-load bounds", async () => {
+    const graphless: Source[] = Array.from({ length: 8 }, (_, index): Source => ({
+      turnId: `root-history-graphless-turn-${index}-${suffix}`,
+      rootTaskId: `root-history-graphless-root-${index}-${suffix}`,
+      childId: `root-history-graphless-child-${index}-${suffix}`,
+      finalItemId: `root-history-graphless-final-${index}-${suffix}`,
+      sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria },
+      startSequence: 1_000 + index * 8, persistTaskGraph: false,
+    }))
+    try {
+      for (const source of graphless) await insertSource(source)
+
+      const pageTurnIds: string[] = [], graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values, rows) => {
+        if (sql.includes("WITH terminal_window AS MATERIALIZED (")) {
+          pageTurnIds.push(...queryRecords(rows).filter(row => row.isPageWatermark === false && typeof row.turnId === "string")
+            .map(row => row.turnId as string))
+        }
+        if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date() }
+      const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
+
+      expect(pageTurnIds.some(turnId => graphless.some(source => source.turnId === turnId))).toBe(false)
+      expect(graphLoads).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+    } finally {
+      await deleteSourceFixtures(graphless)
+    }
+  }, 60_000)
 
   it("advances an empty strict-validation page and finds valid same-session history after 64 raw rows", async () => {
     const invalidSources = strictInvalidStepReceiptSources("page-invalid-first-window", 64, 400)

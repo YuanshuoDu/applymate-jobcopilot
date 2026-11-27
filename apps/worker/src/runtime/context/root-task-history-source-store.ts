@@ -5,6 +5,7 @@ import { parseRootTaskHistoryChronologyXid8, readRootTaskHistoryChronologyWitnes
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION } from "./objective-history-projection.js"
 import { scheduledAutomationHistoryCompatibilitySql } from "../subagents/scheduled-automation-snapshot.js"
 import { buildRootTaskHistoryCrossSessionWindow, buildRootTaskHistoryFootprintCrossSessionWindow,
+  ROOT_TASK_HISTORY_EXACT_GRAPH_EXISTS_SQL,
   type RootTaskHistoryCrossSessionCursor } from "./root-task-history-source-window.js"
 import { parseRootTaskHistoryPage, scanRootTaskHistoryPages, validateRootTaskHistoryCandidate, validateRootTaskHistoryFootprintCandidate,
   buildRootTaskHistorySameSessionPageWindow,
@@ -47,6 +48,7 @@ async function readCandidateWindowPage(client: Client, input: RootTaskHistoryFen
     FROM "agent_events" AS event
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
     WHERE event."sessionId" = $1 AND event."sequence" < $4::bigint
+      AND turn."userId" = $2 AND ${ROOT_TASK_HISTORY_EXACT_GRAPH_EXISTS_SQL}
       AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted') AND ${compatibility}
       /* ROOT_HISTORY_CURSOR */
       ORDER BY event."sequence" DESC, event."turnId"::text COLLATE "C" DESC, event."id"::text COLLATE "C" DESC`
@@ -58,6 +60,7 @@ async function readCandidateWindowPage(client: Client, input: RootTaskHistoryFen
       WHERE turn."sessionId" = $1 AND turn."userId" = $2 AND turn."id" <> $3
         AND turn."terminalEventSequence" < $4::bigint AND turn."objectiveDigest" = $5
         AND turn."objectiveIndexSemanticsVersion" = $6
+        AND ${ROOT_TASK_HISTORY_EXACT_GRAPH_EXISTS_SQL}
         AND ${compatibility}
       /* ROOT_HISTORY_CURSOR */
       ORDER BY turn."terminalEventSequence" DESC, turn."id"::text COLLATE "C" DESC`
