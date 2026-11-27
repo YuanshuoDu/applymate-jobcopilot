@@ -20,7 +20,7 @@ import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { readPrivateSponsorshipContext } from "./sponsorship-private-context-reader.js"
+import { readPrivateSponsorshipContext, type SponsorshipPrivateContextReadDiagnosticStage } from "./sponsorship-private-context-reader.js"
 import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { defaultSubagentPolicy, type PgSubagentPool, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -515,10 +515,14 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
         const privateReviewStep = await engine.startStep({ owner: executionOwnerFence({ kind: "turn", taskId: root.id, lease: currentRootLease }),
           stepId: `p3-sponsorship-review-private-context-${value.suffix}`, ordinal: 3, attempt: 1,
           inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+        const reviewReadStages: SponsorshipPrivateContextReadDiagnosticStage[] = []
         const reviewContext = await readPrivateSponsorshipContext(db, { userId: value.userId, sessionId: value.sessionId,
           turnId: value.turnId, taskId: root.id, rootTaskId: root.id, rootAttemptCount: currentRootAttempt,
           turnLeaseOwner: currentRootLease.ownerId, turnLeaseVersion: currentRootLease.leaseVersion, stepId: privateReviewStep.id },
-        reviewerRestored.snapshot.toolObservations)
+        reviewerRestored.snapshot.toolObservations, stage => reviewReadStages.push(stage))
+        if (!reviewContext || reviewContext.length !== 1) {
+          console.error(`sponsorship-private-context-reader diagnostic stages: ${reviewReadStages.slice(0, 16).join(",")}`)
+        }
         expect(reviewContext).toHaveLength(1)
         expect(reviewContext?.[0]).toMatchObject({ jobId: value.jobIds[0], observation: {
           status: "explicit", claim: { kind: "work_visa_sponsorship", polarity: "available", countryCode: "IE" },
