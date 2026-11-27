@@ -10,6 +10,7 @@ vi.mock('@/lib/i18n', async importOriginal => ({
 
 import { ChildWorkerAttachView, childFollowUpTarget, postChildTaskFollowUp, taskTimelineItems } from './ChildWorkerAttachView'
 import type { ChildWorkerTask } from './ChildWorkerAttachView'
+import { childWorkerFailureText, projectChildWorkerFailure } from './child-worker-failure'
 import type { TimelineItem } from './timeline-reducer'
 
 const child: ChildWorkerTask = {
@@ -96,14 +97,59 @@ describe('ChildWorkerAttachView', () => {
     expect(markup).not.toContain('sha256:')
   })
 
-  it('shows only allowlisted failure codes and hides freeform or code-shaped error text', () => {
-    const safe = renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-1" task={{ ...child, status: 'failed', failureReason: 'task_graph_verification_unverified' }} items={[]} onClose={vi.fn()} onConflict={vi.fn()} />)
-    expect(safe).toContain('Failure summary')
-    expect(safe).toContain('task_graph_verification_unverified')
+  it('shows shared localized explanations for confirmed failed child categories', () => {
+    const reasons = [
+      'task_graph_child_deadline_exceeded', 'task_graph_verification_failed', 'task_graph_verification_unverified',
+      'writer_dependency_unavailable', 'child_resume_unavailable',
+    ]
+    const render = (reason: string, lang: string) => {
+      language.value = lang
+      const markup = renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-1" task={{ ...child, status: 'failed', failureReason: reason }} items={[]} onClose={vi.fn()} onConflict={vi.fn()} />)
+      language.value = 'en'
+      return markup
+    }
+    const english = reasons.map(reason => {
+      const failure = projectChildWorkerFailure('failed', reason)
+      expect(failure).toBeDefined()
+      const markup = render(reason, 'en')
+      expect(markup).toContain(htmlText(childWorkerFailureText(failure!, 'en')))
+      expect(markup).not.toContain(reason)
+      return childWorkerFailureText(failure!, 'en')
+    })
+    const chinese = reasons.map(reason => {
+      const failure = projectChildWorkerFailure('failed', reason)
+      const markup = render(reason, 'zh')
+      expect(markup).toContain(htmlText(childWorkerFailureText(failure!, 'zh')))
+      expect(markup).not.toContain(reason)
+      return childWorkerFailureText(failure!, 'zh')
+    })
+    expect(english[0]).not.toBe(english[1])
+    expect(english[1]).not.toBe(english[2])
+    expect(english[3]).not.toBe(english[4])
+    expect(chinese[0]).not.toBe(chinese[1])
+    expect(chinese[1]).not.toBe(chinese[2])
+    expect(chinese[3]).not.toBe(chinese[4])
+  })
+
+  it('uses generic safe detail for unknown failures without leaking the reason', () => {
     for (const reason of ['Alice Doe failed at https://private.example/error', 'alice_doe_failed', 'sk_live_12345678901234567890']) {
-      const unsafe = renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-1" task={{ ...child, status: 'failed', failureReason: reason }} items={[]} onClose={vi.fn()} onConflict={vi.fn()} />)
-      expect(unsafe).toContain('Failure details hidden for privacy')
-      expect(unsafe).not.toContain(reason)
+      const markup = renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-1" task={{ ...child, status: 'failed', failureReason: reason }} items={[]} onClose={vi.fn()} onConflict={vi.fn()} />)
+      expect(markup).toContain('Failure details are unavailable')
+      expect(markup).not.toContain(reason)
+    }
+  })
+
+  it('hides failure details for stale, nonfailed, foreign, or malformed child selections', () => {
+    const invalid = [
+      { ...child, status: 'running' }, { ...child, status: 'completed' }, { ...child, status: 'cancelled' },
+      { ...child, status: 'interrupted' }, { ...child, sessionId: 'session-2' }, { ...child, rootTaskId: null },
+      { ...child, parentTaskId: null }, { ...child, parentTaskId: child.id },
+    ]
+    for (const task of invalid) {
+      const markup = renderToStaticMarkup(<ChildWorkerAttachView sessionId="session-1" task={{ ...task, failureReason: 'task_graph_child_deadline_exceeded' }} items={[]} onClose={vi.fn()} onConflict={vi.fn()} />)
+      expect(markup).not.toContain('Failure summary')
+      expect(markup).not.toContain('task_graph_child_deadline_exceeded')
+      expect(markup).not.toContain('deadline')
     }
   })
 
@@ -291,3 +337,8 @@ describe('ChildWorkerAttachView', () => {
     expect(JSON.stringify(projected.map(entry => entry.content))).not.toMatch(/tc_[0-9a-f]{64}/)
   })
 })
+
+function htmlText(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;').replaceAll("'", '&#x27;')
+}
