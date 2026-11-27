@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 import { Pool } from "pg"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION } from "@jobcopilot/shared"
 import type { HarnessModelRequest, ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-model"
 
@@ -19,6 +20,18 @@ import { reconcileDurableWaits } from "./durable-wait-resolver.js"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
+import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
+import { bindSponsorshipFinalAnswer, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
+import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
+import { readSponsorshipFinalAnswerWithClient } from "./sponsorship-final-answer-reader.js"
+import { buildGroundedTaskGraphFinalResponse } from "./task-graph-final-response.js"
+import { formatTaskGraphFinalSummary } from "./task-graph-final-summary-format.js"
+import { buildTaskGraphFinalSourceManifest } from "./task-graph-final-source-manifest.js"
+import { createCanonicalTurnTerminalGuard } from "../canonical-turn-native-verification-runtime.js"
+import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } from "../turns/turn-execution-completion-gate.js"
+import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { readPrivateSponsorshipContext } from "./sponsorship-private-context-reader.js"
 import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "./native-verification-contract.js"
@@ -78,7 +91,8 @@ async function seed(pool: Pool, value: Fixture): Promise<void> {
     ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
     VALUES ($1, $2, $3, 'queued', 'user', $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, CURRENT_TIMESTAMP)`, [
     value.turnId, value.sessionId, value.userId,
-    JSON.stringify({ goal: "Check saved job sponsorship evidence" }), JSON.stringify(MODEL),
+    JSON.stringify({ goal: "Check saved job sponsorship evidence", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      sponsorshipTargetCountry: { schemaVersion: OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, countryCode: "IE" } }), JSON.stringify(MODEL),
     JSON.stringify({ version: "policy.v1", rules: [] }), JSON.stringify({ limits: { maxSteps: 12, maxToolCalls: 24 } }),
   ])
   for (let index = 0; index < value.jobIds.length; index += 1) {
@@ -174,7 +188,7 @@ async function finishScout(input: {
   jobId: string
   candidateIndex: number
 }): Promise<void> {
-  const evidenceId = `fixture-job-evidence-${input.candidateIndex}`
+  const evidenceId = `read:job:${input.jobId}`
   const result = {
     status: "completed", stepCount: 1, toolCallCount: 1,
     structuredResult: {
@@ -187,6 +201,111 @@ async function finishScout(input: {
   const finished = await input.tasks.finish({ taskId: input.child.id, sessionId: input.child.sessionId,
     ownerId: input.child.ownerId, attemptCount: input.child.attemptCount, status: "completed", result, now: new Date() })
   if (finished !== "completed") throw new Error(`Fixture Scout ${input.candidateIndex + 1} did not finish`)
+}
+
+async function persistCompletedScoutVerificationReports(pool: Pool, input: Readonly<{
+  userId: string; sessionId: string; turnId: string; rootTaskId: string
+}>): Promise<void> {
+  const client = await pool.connect()
+  let open = false
+  try {
+    await client.query("BEGIN")
+    open = true
+    await client.query("SELECT set_config('app.user_id', $1, true)", [input.userId])
+    const graphScope = { userId: input.userId, sessionId: input.sessionId, turnId: input.turnId,
+      rootTaskId: input.rootTaskId, parentTaskId: input.rootTaskId }
+    const loaded = await loadTaskGraph(client, graphScope, true)
+    if (!loaded.snapshot || !loaded.item) throw new Error("Fixture TaskGraph source was not persisted")
+    for (const node of loaded.snapshot.nodes) {
+      const task = loaded.tasks.get(node.taskId)
+      const envelope = task?.result && typeof task.result === "object" && !Array.isArray(task.result)
+        ? task.result as Record<string, unknown> : undefined
+      if (!task || !envelope || !Object.hasOwn(envelope, "structuredResult") || task.status !== "completed"
+        || !Number.isSafeInteger(task.attemptCount) || !task.attemptCount) throw new Error("Fixture Scout result was not completed")
+      const verified = await verifyCompletedTaskGraphNodeEvidence(client, {
+        scope: { ...graphScope, taskId: node.taskId, attemptCount: task.attemptCount },
+        snapshot: loaded.snapshot, node, structuredResult: envelope.structuredResult,
+      })
+      if (!verified.verified || verified.report.status !== "passed") {
+        throw new Error(`Fixture TaskGraph evidence did not verify: ${verified.report.reasonCode}`)
+      }
+      const stored = await client.query(`UPDATE "sub_agent_tasks" SET "result" = jsonb_set("result", '{taskGraphVerificationReport}', $1::jsonb, true), "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "rootTaskId" = $5 AND "parentTaskId" = $5
+          AND "role" = 'scout' AND "taskType" = 'job_discovery' AND "status" = 'completed' AND "attemptCount" = $6
+          AND "result"->>'status' = 'completed'`, [JSON.stringify(verified.report), node.taskId, input.sessionId,
+        input.turnId, input.rootTaskId, task.attemptCount])
+      if (stored.rowCount !== 1) throw new Error("Fixture verification report lost its completed Scout fence")
+    }
+    await client.query("COMMIT")
+    open = false
+  } catch (error) {
+    if (open) await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
+async function commitGroundedFinalAnswer(input: Readonly<{
+  pool: Pool
+  engine: ReturnType<typeof createPgTurnEngineStore>
+  identity: ExecutionOwnerFence
+  lease: TurnLease
+  scope: Parameters<typeof readSponsorshipFinalAnswerWithClient>[1]["scope"]
+  rootAttemptCount: number
+  stepId: string
+  stepCount: number
+  toolCallCount: number
+  binding: TaskGraphFinalSummaryBinding
+  nativeVerificationPassed: boolean
+  expectSourceDriftBlocked?: boolean
+}>): Promise<Readonly<{ committed: boolean; response: string; finalItemId: string; terminalAnswerRead: boolean; terminalAnswerAvailable: boolean }>> {
+  if (input.identity.kind !== "turn" || input.identity.taskId !== input.identity.rootTaskId) {
+    throw new Error("Fixture final answer requires the exact Root Turn identity")
+  }
+  const finalItemId = `p3-sponsorship-final-${randomUUID()}`
+  const responseText = buildGroundedTaskGraphFinalResponse(input.binding)
+  const summary = formatTaskGraphFinalSummary(input.binding.summary)
+  const final = { schemaVersion: "agent-harness.v2.final", response: responseText, summary }
+  const sources = buildTaskGraphFinalSourceManifest(input.binding, finalItemId)
+  const finalContent = { text: responseText, final, ...(sources ? { taskGraphSources: sources } : {}) }
+  const response = JSON.stringify(final)
+  await input.engine.updateStep({ owner: input.identity, stepId: input.stepId, status: "completed", finishReason: "stop",
+    errorCode: null, inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0.001, now: new Date() })
+  await input.engine.appendEvent({ owner: input.identity, id: randomUUID(), itemId: null, type: "step.completed",
+    correlationId: input.stepId, causationId: null, idempotencyKey: `turn:${input.identity.turnId}:event:step-completed:${input.stepId}`,
+    payload: { stepId: input.stepId, status: "completed", taskId: input.identity.taskId } })
+  let terminalAnswerRead = false
+  let terminalAnswerAvailable = false
+  const guard = createCanonicalTurnTerminalGuard({
+    enabled: true,
+    // The PG witness exercises sponsorship/source and TaskGraph gates. Native
+    // semantic completion is an independent prerequisite; this fixture marks
+    // its result explicitly rather than pretending the sponsorship test proves it.
+    nativeVerification: { checkTerminal: async () => ({ nativeVerificationPassed: input.nativeVerificationPassed }) } as never,
+    checkRootGraph: async (client, nativeVerificationPassed, admission) =>
+      checkTaskGraphTerminalVerification(client, input.lease, input.identity.rootTaskId, nativeVerificationPassed, true, admission),
+    readSponsorshipFinalAnswer: async (client, stepId, graphBinding, targetCountryCode) => {
+      terminalAnswerRead = true
+      const answer = await readSponsorshipFinalAnswerWithClient(client, { scope: { ...input.scope, stepId }, rootAttemptCount: input.rootAttemptCount,
+        targetCountryCode, graphBinding, expectedStepStatus: "completed" })
+      terminalAnswerAvailable = answer !== undefined
+      return answer
+    },
+  })
+  if (!guard) throw new Error("Fixture sponsorship terminal guard was unavailable")
+  const terminalInput = { owner: input.identity, stepId: input.stepId, finalItemId, finalContent,
+    stepCount: input.stepCount, toolCallCount: input.toolCallCount,
+    usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0.001 }, response, now: new Date(),
+    [TASK_GRAPH_FINAL_SUMMARY_BINDING]: input.binding }
+  try {
+    await commitTurnTerminal(input.pool, terminalInput as never, guard)
+    return { committed: true, response: responseText, finalItemId, terminalAnswerRead, terminalAnswerAvailable }
+  } catch (error) {
+    if (!input.expectSourceDriftBlocked) throw error
+    expect(error).toMatchObject({ name: "TaskGraphVerificationRecovery", blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+    expect(terminalAnswerRead).toBe(true)
+    expect(terminalAnswerAvailable).toBe(false)
+    return { committed: false, response: responseText, finalItemId, terminalAnswerRead, terminalAnswerAvailable }
+  }
 }
 
 async function executeSponsorshipAuditor(pool: Pool, input: Readonly<{ taskId: string; sessionId: string; rootTaskId: string }>): Promise<{
@@ -274,10 +393,6 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     const value = fixture()
     await seed(db, value)
     if (mode === "any") {
-      await db.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
-        goal: "Check saved job sponsorship evidence", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
-        sponsorshipTargetCountry: { schemaVersion: OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, countryCode: "IE" },
-      })])
       await db.query(`UPDATE "Job" SET "description" = $3, "url" = $4, "updatedAt" = CURRENT_TIMESTAMP
         WHERE "id" = $1 AND "userId" = $2`, [value.jobIds[0], value.userId,
         "For this Backend Engineer role in Ireland, work visa sponsorship is available. PRIVATE-SPONSORSHIP-REVIEW-CANARY.",
@@ -291,19 +406,34 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
       toolPolicySnapshot: { version: "policy.v1", rules: [] }, budgetSnapshot: { limits: { maxSteps: 12, maxToolCalls: 24 } } })
     const tasks = new PgSubagentTaskStore(db, 300_000)
     const policy = defaultSubagentPolicy()
+    const engine = createPgTurnEngineStore(db)
+    const rootIdentity = executionOwnerFence({ kind: "turn", taskId: root.id, lease: turnLease })
+    const rootWaitStep = await engine.startStep({ owner: rootIdentity, stepId: `p3-sponsorship-private-root-wait-${value.suffix}`,
+      ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+    const graph = await createPgTaskGraphCommandPort(db).appendAndSchedule({
+      scope: { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: root.id, parentTaskId: root.id,
+        stepId: rootWaitStep.id, turnLeaseOwner: turnLease.ownerId, turnLeaseVersion: turnLease.leaseVersion,
+        parentLeaseOwner: root.leaseOwner!, parentAttemptCount: root.attemptCount },
+      proposal: { expectedRevision: 0, nodes: value.jobIds.map((_, index) => ({
+        key: `scout-${index + 1}`, templateId: "scout", goal: `Inspect fixture listing ${index + 1}`,
+        successCriteria: ["Return the current saved listing as a structured candidate."], dependsOn: [],
+        verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+          criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }] },
+      })) },
+      templates: TASK_GRAPH_TEMPLATES,
+    })
+    expect(graph.nodes).toHaveLength(value.jobIds.length)
     const childLeases: SubagentLease[] = []
     for (let index = 0; index < value.jobIds.length; index += 1) {
-      const child = await tasks.create({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
-        parentTaskId: root.id, role: "scout", taskType: "job_discovery", goal: `Inspect fixture listing ${index + 1}`,
-        allowedActions: ["jobs.get"], context: {}, expectedOutputSchema: {}, policy })
+      const graphNode = graph.nodes[index]
+      if (!graphNode) throw new Error(`Fixture TaskGraph Scout ${index + 1} was not scheduled`)
       const ownerId = `p3-sponsorship-private-child-owner-${value.suffix}-${index}`
-      const claimed = await tasks.claim({ taskId: child.id, sessionId: value.sessionId, ownerId, policy, now: new Date() })
+      const claimed = await tasks.claim({ taskId: graphNode.taskId, sessionId: value.sessionId, ownerId, policy, now: new Date() })
       if (!claimed) throw new Error(`Fixture Scout ${index + 1} did not acquire a lease`)
       const childLease = subagentLease(claimed, ownerId)
       childLeases.push(childLease)
     }
 
-    const engine = createPgTurnEngineStore(db)
     const lifecycleSink = new InMemoryToolLifecycleSink()
     let currentRootLease: TurnLease = turnLease
     const childLeaseById = new Map(childLeases.map(lease => [lease.id, lease]))
@@ -334,9 +464,6 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
         inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: new Date() })
     }
 
-    const rootIdentity = executionOwnerFence({ kind: "turn", taskId: root.id, lease: turnLease })
-    const rootWaitStep = await engine.startStep({ owner: rootIdentity, stepId: `p3-sponsorship-private-root-wait-${value.suffix}`,
-      ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
     const durable = createPgDurableWaitPort(db)
     const waitIdKey = `p3-sponsorship-private-wait-${value.suffix}`
     let allPartialRaceApplied = false
@@ -387,6 +514,8 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     expect(resolver.woken).toBe(1)
     // any resolves on A; B can complete afterward without joining the matched set.
     if (mode === "any") await finishScout({ tasks, child: childLeases[1]!, jobId: value.jobIds[1], candidateIndex: 1 })
+    await persistCompletedScoutVerificationReports(db, { userId: value.userId, sessionId: value.sessionId,
+      turnId: value.turnId, rootTaskId: root.id })
 
     currentRootLease = await claimTurnLease(db, { turnId: value.turnId, sessionId: value.sessionId,
       ownerId: `p3-sponsorship-private-resume-${value.suffix}` }, new Date(), 300_000)
@@ -510,6 +639,69 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
           sourceContext: { sourceUrl: "https://jobs.example.test/role-1", trustBoundary: "untrusted_saved_job_listing",
             descriptionExcerpt: expect.stringContaining("PRIVATE-SPONSORSHIP-REVIEW-CANARY") },
         } })
+
+        const finalScope = { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+          rootTaskId: root.id, parentTaskId: root.id, stepId: privateReviewStep.id,
+          turnLeaseOwner: currentRootLease.ownerId, turnLeaseVersion: currentRootLease.leaseVersion,
+          parentLeaseOwner: currentRootLease.ownerId, parentAttemptCount: currentRootAttempt }
+        const finalClient = await db.connect()
+        const tracedSql: string[] = []
+        let graphBinding: TaskGraphFinalSummaryBinding | undefined
+        let candidateBinding: Awaited<ReturnType<typeof readSponsorshipFinalAnswerWithClient>> | undefined
+        try {
+          await finalClient.query("BEGIN")
+          await finalClient.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
+          const graphGate = await checkTaskGraphTerminalVerification(finalClient, currentRootLease, root.id, true, true)
+          if (!graphGate.ok) throw new Error("Fixture final answer TaskGraph verification failed")
+          graphBinding = graphGate[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+          if (!graphBinding) throw new Error("Fixture final answer requires the production TaskGraph completion binding")
+          const traced = { query: (sql: string, values?: readonly unknown[]) => {
+            tracedSql.push(sql)
+            return finalClient.query(sql, values as never)
+          } }
+          candidateBinding = await readSponsorshipFinalAnswerWithClient(traced as never, { scope: finalScope,
+            rootAttemptCount: currentRootAttempt, targetCountryCode: "IE", graphBinding, expectedStepStatus: "streaming" })
+          expect(candidateBinding?.outcomes).toHaveLength(1)
+          const rootLockIndex = tracedSql.findIndex(sql => sql.includes('task."leaseOwner" = $6') && sql.includes("FOR UPDATE OF task"))
+          const reviewerLockIndex = tracedSql.findIndex(sql => sql.includes('task."role" = \'auditor\'') && sql.includes("FOR UPDATE OF task"))
+          const sourceTaskLockIndex = tracedSql.findIndex(sql => sql.includes('task."role" = \'scout\'') && sql.includes("FOR SHARE OF task"))
+          const jobLockIndex = tracedSql.findIndex(sql => sql.includes('FROM "Job"') && sql.includes("FOR SHARE"))
+          expect(rootLockIndex).toBeGreaterThanOrEqual(0)
+          expect(reviewerLockIndex).toBeGreaterThan(rootLockIndex)
+          expect(sourceTaskLockIndex).toBeGreaterThan(reviewerLockIndex)
+          expect(jobLockIndex).toBeGreaterThan(sourceTaskLockIndex)
+
+          const wrongOwner = await readSponsorshipFinalAnswerWithClient(traced as never, { scope: {
+            ...finalScope, turnLeaseOwner: "foreign-sponsorship-owner", parentLeaseOwner: "foreign-sponsorship-owner",
+          }, rootAttemptCount: currentRootAttempt, targetCountryCode: "IE", graphBinding, expectedStepStatus: "streaming" })
+          expect(wrongOwner).toBeUndefined()
+          const wrongAttempt = await readSponsorshipFinalAnswerWithClient(traced as never, { scope: finalScope,
+            rootAttemptCount: currentRootAttempt + 1, targetCountryCode: "IE", graphBinding, expectedStepStatus: "streaming" })
+          expect(wrongAttempt).toBeUndefined()
+
+          const competing = await db.connect()
+          let lockError: unknown
+          try {
+            await competing.query("BEGIN")
+            await competing.query("SET LOCAL lock_timeout = '150ms'")
+            await competing.query(`UPDATE "Job" SET "description" = "description" WHERE "id" = $1 AND "userId" = $2`,
+              [value.jobIds[0], value.userId])
+          } catch (error) { lockError = error }
+          finally {
+            await competing.query("ROLLBACK").catch(() => undefined)
+            competing.release()
+          }
+          expect((lockError as { code?: unknown } | undefined)?.code).toBe("55P03")
+          await finalClient.query("COMMIT")
+        } catch (error) {
+          await finalClient.query("ROLLBACK").catch(() => undefined)
+          throw error
+        } finally { finalClient.release() }
+        if (!graphBinding) throw new Error("Fixture final answer TaskGraph binding was not retained")
+        const reviewedFinalBinding = bindSponsorshipFinalAnswer(graphBinding, candidateBinding)
+        expect(reviewedFinalBinding).not.toBeNull()
+        if (!reviewedFinalBinding) throw new Error("Fixture could not bind the current reviewed source to its graph")
+
         const oldCitation = reviewContext?.[0]?.observation.status === "explicit" ? reviewContext[0].observation.citation.quote : ""
         expect(oldCitation).toContain("PRIVATE-SPONSORSHIP-REVIEW-CANARY")
         await db.query(`UPDATE "Job" SET "description" = 'Listing changed after the sponsorship review completed.', "updatedAt" = CURRENT_TIMESTAMP
@@ -523,6 +715,22 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
           ? [entry.observation.citation.quote] : [])
         expect(postDriftCitations).toEqual([])
         expect(JSON.stringify(afterReviewDrift ?? [])).not.toContain(oldCitation)
+
+        const staleTerminal = await commitGroundedFinalAnswer({ pool: db, engine, identity: resumedIdentity,
+          lease: currentRootLease, scope: finalScope, rootAttemptCount: currentRootAttempt,
+          stepId: privateReviewStep.id, stepCount: 4, toolCallCount: 4,
+          binding: reviewedFinalBinding, nativeVerificationPassed: true, expectSourceDriftBlocked: true })
+        expect(staleTerminal.committed).toBe(false)
+        expect(staleTerminal.terminalAnswerRead).toBe(true)
+        expect(staleTerminal.terminalAnswerAvailable).toBe(false)
+        expect(staleTerminal.response).toContain("listing explicitly states that work visa sponsorship is available")
+        const afterRejectedCommit = await db.query<{ status: string; finalResponse: string | null }>(
+          `SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+          [value.turnId, value.sessionId, value.userId])
+        expect(afterRejectedCommit.rows).toEqual([{ status: "in_progress", finalResponse: null }])
+        const rejectedFinalItem = await db.query(`SELECT 1 FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2`,
+          [staleTerminal.finalItemId, value.sessionId])
+        expect(rejectedFinalItem.rows).toHaveLength(0)
       } finally { await reviewManager.shutdown() }
     }
 
@@ -562,5 +770,53 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     const publicWaitLifecycle = lifecycleSink.events.filter(event => event.item.type === "tool_result" && event.item.toolCallId === rootCallId)
     expect(JSON.stringify(publicWaitLifecycle)).not.toContain(SOURCE_CANARY)
     expect(JSON.stringify(publicWaitLifecycle)).not.toContain("sourceContext")
+
+    if (mode === "all") {
+      const rootAttemptCount = Number(currentRoot.rows[0]?.attemptCount)
+      const finalScope = { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        rootTaskId: root.id, parentTaskId: root.id, stepId: currentStep.id,
+        turnLeaseOwner: currentRootLease.ownerId, turnLeaseVersion: currentRootLease.leaseVersion,
+        parentLeaseOwner: currentRootLease.ownerId, parentAttemptCount: rootAttemptCount }
+      const finalClient = await db.connect()
+      let graphBinding: TaskGraphFinalSummaryBinding | undefined
+      let currentAnswer: Awaited<ReturnType<typeof readSponsorshipFinalAnswerWithClient>> | undefined
+      try {
+        await finalClient.query("BEGIN")
+        await finalClient.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
+        const graphGate = await checkTaskGraphTerminalVerification(finalClient, currentRootLease, root.id, false, true)
+        if (!graphGate.ok) throw new Error("Fixture no-review TaskGraph verification failed")
+        graphBinding = graphGate[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+        if (!graphBinding) throw new Error("Fixture no-review answer requires the production TaskGraph completion binding")
+        currentAnswer = await readSponsorshipFinalAnswerWithClient(finalClient, { scope: finalScope,
+          rootAttemptCount, targetCountryCode: "IE", graphBinding, expectedStepStatus: "streaming" })
+        await finalClient.query("COMMIT")
+      } catch (error) {
+        await finalClient.query("ROLLBACK").catch(() => undefined)
+        throw error
+      } finally { finalClient.release() }
+      if (!graphBinding) throw new Error("Fixture no-review TaskGraph binding was not retained")
+      expect(currentAnswer?.outcomes).toEqual([])
+      const noReviewBinding = bindSponsorshipFinalAnswer(graphBinding, currentAnswer)
+      expect(noReviewBinding).not.toBeNull()
+      if (!noReviewBinding) throw new Error("Fixture did not bind the no-review outcome")
+      const noReviewText = buildGroundedTaskGraphFinalResponse(noReviewBinding)
+      expect(noReviewText).toMatch(/Search results: 2 unique jobs/)
+      expect(noReviewText).toContain("Sponsorship assessment for Ireland: no current completed listing review was available, so availability is unknown.")
+      expect(noReviewText).toContain("An absent review is not evidence that sponsorship is unavailable.")
+      expect(noReviewText).not.toContain(SOURCE_CANARY)
+
+      const completed = await commitGroundedFinalAnswer({ pool: db, engine, identity: resumedIdentity,
+        lease: currentRootLease, scope: finalScope, rootAttemptCount, stepId: currentStep.id,
+        stepCount: 2, toolCallCount: 2, binding: noReviewBinding, nativeVerificationPassed: false })
+      expect(completed.committed).toBe(true)
+      expect(completed.terminalAnswerRead).toBe(true)
+      expect(completed.terminalAnswerAvailable).toBe(true)
+      expect(completed.response).toBe(noReviewText)
+      const terminalTurn = await db.query<{ status: string; finalResponse: string | null }>(
+        `SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+        [value.turnId, value.sessionId, value.userId])
+      expect(terminalTurn.rows[0]?.status).toBe("completed")
+      expect(terminalTurn.rows[0]?.finalResponse).toContain("availability is unknown")
+    }
   })
 })
