@@ -408,6 +408,10 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     const policy = defaultSubagentPolicy()
     const engine = createPgTurnEngineStore(db)
     const rootIdentity = executionOwnerFence({ kind: "turn", taskId: root.id, lease: turnLease })
+    await engine.appendEvent({ owner: rootIdentity, id: `p3-sponsorship-private-turn-started-${value.suffix}`, itemId: null,
+      type: "turn.started", correlationId: value.turnId, causationId: null,
+      idempotencyKey: `turn:${value.turnId}:event:turn-started`,
+      payload: { goal: "Check saved job sponsorship evidence", taskId: root.id, rootTaskId: root.id } })
     const rootWaitStep = await engine.startStep({ owner: rootIdentity, stepId: `p3-sponsorship-private-root-wait-${value.suffix}`,
       ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
     const graph = await createPgTaskGraphCommandPort(db).appendAndSchedule({
@@ -651,6 +655,7 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
           allowedActions: ["agent.wait", "jobs.get", "agent.review_sponsorship"], modelProfileSnapshot: MODEL,
           toolPolicySnapshot: { version: "policy.v1", rules: [] }, budgetSnapshot: { limits: { maxSteps: 12, maxToolCalls: 24 } } })
         expect(reviewerResumedRoot.id).toBe(root.id)
+        const reviewerResumedIdentity = executionOwnerFence({ kind: "turn", taskId: root.id, lease: currentRootLease })
         const reviewerRestored = await loadCanonicalTurnState(db, currentRootLease, new Date(), { consumeWaitOutcomes: true })
         const privateReviewStep = await engine.startStep({ owner: executionOwnerFence({ kind: "turn", taskId: root.id, lease: currentRootLease }),
           stepId: `p3-sponsorship-review-private-context-${value.suffix}`, ordinal: 3, attempt: 1,
@@ -754,7 +759,7 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
         expect(postDriftCitations).toEqual([])
         expect(JSON.stringify(afterReviewDrift ?? [])).not.toContain(oldCitation)
 
-        const staleTerminal = await commitGroundedFinalAnswer({ pool: db, engine, identity: resumedIdentity,
+        const staleTerminal = await commitGroundedFinalAnswer({ pool: db, engine, identity: reviewerResumedIdentity,
           lease: currentRootLease, scope: finalScope, rootAttemptCount: currentRootAttempt,
           stepId: privateReviewStep.id, stepCount: 4, toolCallCount: 4,
           binding: reviewedFinalBinding, nativeVerificationPassed: true, expectSourceDriftBlocked: true })
