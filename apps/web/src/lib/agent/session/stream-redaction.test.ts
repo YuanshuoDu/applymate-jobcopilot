@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { TASK_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { projectFinalAnswerContent } from "./final-answer-evidence-projection"
 import { canonicalTaskGraphSourceKey } from "./final-task-graph-source-detail"
-import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from "./final-task-graph-source-manifest"
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4 } from "./final-task-graph-source-manifest"
 
 import { isPrivateNativeVerificationEventType, redactStreamEventPayload, redactStreamString, redactStreamValue } from "./stream-redaction"
 
@@ -366,6 +366,21 @@ describe("agent stream redaction", () => {
       ...payload.content, taskGraphSources: { ...manifest, sources: [{ ...source, sourceKey: `src_${"A".repeat(43)}` }] },
     } }, { ...identity, itemId: "final-item" })
     expect(malformed).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer" } })
+  })
+
+  it("preserves a V3 opaque artifact-version proof without exposing artifact identity", () => {
+    const source = { sourceKey: canonicalTaskGraphSourceKey("final-item", 3, 0), nodeIndex: 0,
+      role: "writer", taskStatus: "completed", resultState: "valid", roleResultStatus: "completed",
+      artifactVersionProof: `avp_${"a".repeat(64)}` }
+    const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4, graphRevision: 3,
+      historicalNodeIndices: [], retiredNodeIndices: [], sources: [source] }
+    const payload = { itemId: "final-item", status: "completed", content: {
+      text: "Safe answer", final: { response: "Safe answer" }, taskGraphSources: manifest,
+      artifactId: "PRIVATE_ARTIFACT_ID", contentHash: `sha256:${"b".repeat(64)}`,
+    } }
+    const projected = redactStreamEventPayload("item.completed", payload, { ...identity, itemId: "final-item" })
+    expect(projected).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer", taskGraphSources: manifest } })
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_ARTIFACT_ID|contentHash|sourceDigest|jobId|taskId/)
   })
 
   it("redacts nested credential, resume, and raw payload keys", () => {
