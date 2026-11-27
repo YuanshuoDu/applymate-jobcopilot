@@ -249,6 +249,39 @@ describe("TaskGraph PostgreSQL state loading", () => {
     expect(taskQueries[0]?.sql).not.toMatch(/task\."context",/)
   })
 
+  it("selects persisted child deadlines and one statement timestamp without requiring deadline fields in old fixtures", async () => {
+    const deadline = "2026-11-23T12:30:00.000Z", observedAt = "2026-11-23T12:00:00.000Z"
+    const current = fakeClient({ taskRows: [validTaskRow({ absoluteDeadlineAtUtc: deadline, deadlineObservedAtUtc: observedAt })] })
+    const loaded = await loadTaskGraph(current.client, identity, false, { includeActiveChildDeadlines: true })
+    expect(loaded.tasks.get("child-1")).toMatchObject({ absoluteDeadlineAt: deadline, deadlineObservedAt: observedAt })
+    const select = current.calls.find(call => call.sql.startsWith('SELECT task."id", task."status"'))?.sql ?? ""
+    expect(select).toContain("to_jsonb(task)->>'absoluteDeadlineAt'")
+    expect(select).toContain("((to_jsonb(task)->>'absoluteDeadlineAt')::timestamptz) AT TIME ZONE 'UTC'")
+    expect(select).not.toContain('task."absoluteDeadlineAt"')
+    expect(select.match(/statement_timestamp\(\)/g)).toHaveLength(1)
+    expect(select).toContain("statement_timestamp() AT TIME ZONE 'UTC'")
+    expect(select).toContain("AS \"absoluteDeadlineAtUtc\"")
+    expect(select).toContain("AS \"deadlineObservedAtUtc\"")
+
+    const older = fakeClient({ taskRows: [validTaskRow()] })
+    const olderLoaded = await loadTaskGraph(older.client, identity, false, { includeActiveChildDeadlines: true })
+    expect(olderLoaded.tasks.get("child-1")).not.toHaveProperty("absoluteDeadlineAt")
+    expect(olderLoaded.tasks.get("child-1")).not.toHaveProperty("deadlineObservedAt")
+  })
+
+  it("does not read child deadline columns or a volatile clock for ordinary graph reads", async () => {
+    const fake = fakeClient({ taskRows: [validTaskRow({ absoluteDeadlineAtUtc: "2026-11-23T12:30:00.000Z",
+      deadlineObservedAtUtc: "2026-11-23T12:00:00.000Z" })] })
+    const loaded = await loadTaskGraph(fake.client, identity)
+    const task = loaded.tasks.get("child-1")
+    const select = fake.calls.find(call => call.sql.startsWith('SELECT task."id", task."status"'))?.sql ?? ""
+
+    expect(task).not.toHaveProperty("absoluteDeadlineAt")
+    expect(task).not.toHaveProperty("deadlineObservedAt")
+    expect(select).not.toContain("absoluteDeadlineAt")
+    expect(select).not.toContain("statement_timestamp()")
+  })
+
   it("allows a null generic report only for a strict fixed scheduled Gate envelope", () => {
     const prepareResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "prepare-1", attemptCount: 1,
       snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs: [{ jobId: "job-1", status: "prepared" }], materials: [] }

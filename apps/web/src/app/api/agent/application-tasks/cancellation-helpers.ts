@@ -11,7 +11,7 @@ type FillTurnBinding = {
 }
 
 type StoppedFill = FillTurnBinding & { status: string; checkpoint: string | null }
-type ReplayCandidate = FillTurnBinding & { id: string }
+type ReplayCandidate = FillTurnBinding & { id: string; workerTaskId: string | null }
 
 export function hasBoundFillTurn(task: FillTurnBinding, userId: string): boolean {
   return Boolean(task.sessionId && task.fillTurnId && task.fillTurnSessionId === task.sessionId && task.fillTurnUserId === userId)
@@ -45,6 +45,7 @@ export async function lockStoppedFillReplay(
       AND "fillTurnId" = ${task.fillTurnId}
       AND "fillTurnSessionId" = ${task.fillTurnSessionId}
       AND "fillTurnUserId" = ${task.fillTurnUserId}
+      AND "workerTaskId" IS NOT DISTINCT FROM ${task.workerTaskId}
       AND "status" = ${"cancelled"}
       AND "checkpoint" = ${"turn_stopped_before_submit"}
     FOR UPDATE

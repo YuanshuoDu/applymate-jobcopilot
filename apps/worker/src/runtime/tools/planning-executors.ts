@@ -3,20 +3,14 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-graph.js"
 import {
-  TaskGraphProposalInputSchema,
-  buildTaskGraphProposalInputSchema,
-  normalizeTaskGraphPlanningNodes,
-  parseTaskGraphPlanningReplacementModes,
-  type TaskGraphProposalInput,
+  TaskGraphProposalInputSchema, buildTaskGraphProposalInputSchema, normalizeTaskGraphPlanningNodes,
+  parseTaskGraphPlanningReplacementModes, type TaskGraphProposalInput,
 } from "./task-graph-planning-input.js"
 import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
 import type { TaskGraphObjectiveCoverageRejection } from "../planning/task-graph-objective-coverage.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
-import type {
-  TaskGraphCommandPort,
-  TaskGraphScheduleReceipt,
-  TaskGraphTaskTemplate,
-} from "../subagents/task-graph-command-port.js"
+import type { TaskGraphCommandPort, TaskGraphScheduleReceipt, TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
+import { selectedJobBatchProposalAccepted, type SelectedJobBatchSlot } from "../subagents/selected-job-batch-plan.js"
 import { normalizeRootPlanCriteria } from "../subagents/root-plan-criteria.js"
 
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
@@ -29,16 +23,25 @@ export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
   commandPort: TaskGraphCommandPort
   templates: Readonly<Record<string, TaskGraphTaskTemplate>>
   verificationRequirements?: RootTaskVerificationRequirementsResolution
+  selectedJobBatchSlots?: readonly SelectedJobBatchSlot[]
 }>
 
 export type PlanningRegistrationOptions = ReconciliationFenceOptions & Readonly<{
   commandPort?: TaskGraphCommandPort
   templates?: Readonly<Record<string, TaskGraphTaskTemplate>>
   verificationRequirements?: RootTaskVerificationRequirementsResolution
+  selectedJobBatchSlots?: readonly SelectedJobBatchSlot[]
 }>
 export type TaskGraphToolRegistry = Readonly<{ register?(definition: RuntimeToolDefinition): void }>
 const MAX_PROPOSAL_BYTES = TASK_GRAPH_LIMITS.maxProposalBytes
 const MIN_CONTINUATION_STEPS = 2
+const SELECTED_JOB_BATCH_PLAN_ERROR = "selected_job_batch_plan_invalid"
+
+function selectedJobBatchPlanError(): ToolExecutionError {
+  return new ToolExecutionError(SELECTED_JOB_BATCH_PLAN_ERROR,
+    "Use one initial independent Writer and same-slot Reviewer pair for every selected Job.",
+    { code: SELECTED_JOB_BATCH_PLAN_ERROR })
+}
 
 const Id = Type.String({ minLength: 1, maxLength: 256 })
 const TaskStatusSchema = Type.Union([
@@ -107,6 +110,9 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     && templates.some(([id, template]) => id === "cover_letter_reviewer" && template.role === "reviewer")
     ? " Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. For a selected-job cover letter, plan one cover_letter_writer first. If its completed Reviewer dependency reports needs_revision, you may append exactly one cover_letter_writer directly after that Reviewer in a later plan; do not loop or reuse that review for a second successful revision. A fresh review is required after the revision. Root decides whether to plan this follow-up; the Worker does not schedule it automatically."
     : ""
+  const selectedJobBatchGuidance = options.selectedJobBatchSlots
+    ? " For a selected-job batch, submit every server-listed slot's Writer and same-slot Reviewer together in the initial revision-zero plan. If a Reviewer reports needs_revision, refresh the owner-scoped current graph and exact review evidence, then append at most one same-slot correction Writer directly after its original Reviewer and a fresh Reviewer directly after that Writer. Wait for the new pair and reverify the latest artifact and review. Batch plans accept only those complete per-Job pairs; do not add other work or use generic replacement modes. If capacity or budget cannot fit the pair, report the review as unresolved."
+    : ""
   const postGateTemplatesAvailable = templates.some(([id]) => id === "scheduled.application.execute")
     && templates.some(([id]) => id === "scheduled.post_gate_audit")
   const execute: RuntimeToolDefinition["execute"] = async (context, value) => {
@@ -136,6 +142,11 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     }
     if (input.nodes.some(node => redactSensitiveText(node.key) !== node.key)) {
       throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
+    }
+    if (options.selectedJobBatchSlots) {
+      const disallowedMode = modes.replaceUnstarted !== undefined || modes.replaceBranch !== undefined
+        || modes.replaceOperationalFailure !== undefined || input.expectedRevision > 0 && input.rootSuccessCriteria !== undefined
+      if (!selectedJobBatchProposalAccepted(input.nodes, input.expectedRevision, disallowedMode, options.selectedJobBatchSlots)) throw selectedJobBatchPlanError()
     }
     const reconciliation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
     const operation = {
@@ -209,7 +220,7 @@ A distinct replan uses a fresh model Step with the current graph and agenda revi
 TaskGraph maxNodes is an eight-node limit on the current graph snapshot, including retained terminal nodes, not a lifetime task-creation cap; it is separate from active-child maxFanOut. At most seven Scout nodes plus one Analyst fit before counting any other retained nodes, so leave capacity for the rest of the graph. Read current owner-scoped task_graph_current.nodeCapacity: remaining is current-snapshot space; ordinaryRemaining is the ordinary-addition budget while reserveActive is true. Existing cumulative Root execution usage and reservations remain in force; canceled work never refunds consumed usage.
 Before the first accepted typed repair, preserve one global final current-snapshot slot for a valid failed-target criterion repair. A proposal containing that exact repair may use the reserve in any node order but must fit remaining; the server validates the current failed target and unresolved criteria. An accepted repair consumes the reserve even while queued or if it later fails; it does not pass a criterion or promise another retry. Refresh current state and use remaining honestly; do not spend the reserve with agent.spawn or agent.followup.
 If agent.plan returns task_graph_repair_conflict, inspect or refresh the current owner-scoped graph. If an overlapping repair is active, wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits; if none is active, correct the rejected batch so each target/criterion has only one proposed attempt. An active repair is not evidence of success.
-Wait for children, inspect their evidence, then replan or complete the goal. After the verified scheduled Gate returns, inspect its exact approved job IDs with agent.list and call agent.plan once with one to three Execute nodes carrying exact, disjoint packageRefs that cover every approved job, followed by exactly one required post-Gate Audit depending on every Execute. If Gate approved no jobs, create one Execute with packageRefs:[] and the required Audit. Do not use agent.spawn or agent.followup for this continuation; wait for Execute and Audit, then verify their terminal results before completing. Registered templates:
+Wait for children, inspect their evidence, then replan or complete the goal. After the verified scheduled Gate returns, inspect its exact approved job IDs with agent.list and call agent.plan once with one to three Execute nodes carrying exact, disjoint packageRefs that cover every approved job, followed by exactly one required post-Gate Audit depending on every Execute. If Gate approved no jobs, create one Execute with packageRefs:[] and the required Audit. Do not use agent.spawn or agent.followup for this continuation; wait for Execute and Audit, then verify their terminal results before completing.${selectedJobBatchGuidance} Registered templates:
 ${templateCatalog}`,
     capabilities: ["coordination"],
     inputSchema: buildTaskGraphProposalInputSchema(templateIdSchema, templates),

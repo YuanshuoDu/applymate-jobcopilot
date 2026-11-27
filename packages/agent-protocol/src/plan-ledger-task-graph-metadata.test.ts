@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
 
+import { SELECTED_JOB_BATCH_TEMPLATE_CATALOG } from "./selected-job-batch-templates.js"
+import { projectPlanLedger, TASK_GRAPH_SCHEMA_VERSION } from "./plan-ledger.js"
 import { parsePersistedTaskGraphNode, validTaskGraphResultEnvelopeKeys } from "./plan-ledger-task-graph-metadata.js"
 
 const base = {
@@ -61,6 +63,43 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
     expect(repaired).not.toHaveProperty("repairOf")
     expect(legacy).toEqual(base)
     expect(specialized).toMatchObject({ templateId: "cover_letter_writer" })
+  })
+
+  it("projects two persisted batch pairs through the public ledger without leaking template metadata", () => {
+    const nodes = SELECTED_JOB_BATCH_TEMPLATE_CATALOG.slice(0, 2).flatMap((entry, index) => {
+      const writer = `writer-${index + 1}`, reviewer = `reviewer-${index + 1}`
+      return [
+        { key: writer, templateId: entry.writerTemplateId, goal: "Create a draft", successCriteria: ["Persist draft"],
+          dependsOn: [], depth: 1, taskId: `task-${writer}`, verificationDisposition: "specialized" },
+        { key: reviewer, templateId: entry.reviewerTemplateId, goal: "Review the draft", successCriteria: ["Persist review"],
+          dependsOn: [writer], depth: 2, taskId: `task-${reviewer}`, verificationDisposition: "specialized" },
+      ]
+    })
+    const ledger = projectPlanLedger({
+      sessionId: "session-1", revision: 1, rootTaskId: "root-1",
+      graph: { schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes },
+      tasks: nodes.map(node => ({ id: node.taskId, sessionId: "session-1", status: "queued", goal: node.goal, updatedAt: "2026-11-22T00:00:00.000Z" })),
+    })
+
+    expect(ledger?.nodes.map(node => [node.key, node.dependencies.map(dependency => dependency.key)])).toEqual([
+      ["writer-1", []], ["reviewer-1", ["writer-1"]], ["writer-2", []], ["reviewer-2", ["writer-2"]],
+    ])
+    expect(JSON.stringify(ledger)).not.toMatch(/cover_letter_(writer|reviewer)_slot|verificationDisposition|jobId/)
+  })
+
+  it("only accepts exact catalog batch templates on the specialized projection path", () => {
+    for (const entry of SELECTED_JOB_BATCH_TEMPLATE_CATALOG) {
+      for (const templateId of [entry.writerTemplateId, entry.reviewerTemplateId]) {
+        expect(parsePersistedTaskGraphNode({ ...base, templateId, verificationDisposition: "specialized" }))
+          .toMatchObject({ templateId })
+        expect(parsePersistedTaskGraphNode({ ...base, templateId, verificationDisposition: "typed", verification }))
+          .toBeNull()
+      }
+    }
+    for (const templateId of ["cover_letter_writer_slot_0", "cover_letter_writer_slot_5", "cover_letter_reviewer_slot_01",
+      "cover_letter_reviewer_slot_5", "cover_letter_writer_slot_1_extra"]) {
+      expect(parsePersistedTaskGraphNode({ ...base, templateId, verificationDisposition: "specialized" })).toBeNull()
+    }
   })
 
   it("projects valid persisted native spawn and followup metadata without exposing provenance", () => {
@@ -229,6 +268,50 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
         evidenceDigest: null, resultDigest: null, dependencyBindings: [dependencyBinding],
       },
     })).toBe(false)
+  })
+
+  it("accepts all three typed multi-Scout selector forms and strips their private metadata", () => {
+    const analyst = {
+      ...base, key: "analyst", templateId: "analyst", dependsOn: ["scout-z", "scout-a", "scout-m"],
+      verificationDisposition: "typed",
+      verification: {
+        schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "analyst",
+        criteria: [
+          { id: "union-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-z", "scout-a"] } },
+          { id: "union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-m"], minimumPercent: 75 } },
+          { id: "each-source", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-m", "scout-z"], minimumPercent: 100 } },
+        ],
+      },
+    }
+    const projected = parsePersistedTaskGraphNode(analyst)
+    expect(projected).toEqual({
+      key: "analyst", templateId: "analyst", goal: analyst.goal, successCriteria: analyst.successCriteria,
+      dependsOn: analyst.dependsOn, depth: analyst.depth, taskId: analyst.taskId,
+    })
+    expect(JSON.stringify(projected)).not.toMatch(/verification|findings_from_scout_union|minimumPercent/)
+
+    const invalid = [
+      { ...analyst, verification: { ...analyst.verification, role: "scout" } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "duplicate", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-z", "scout-z"] } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "too-few", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-z"] } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "low", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-z", "scout-a"], minimumPercent: 0 } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "high", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-z", "scout-a"], minimumPercent: 101 } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "fraction", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-z", "scout-a"], minimumPercent: 75.5 } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "extra", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-z", "scout-a"], extra: true } },
+      ] } },
+    ]
+    for (const node of invalid) expect(parsePersistedTaskGraphNode(node)).toBeNull()
   })
 
   it("accepts Worker repair identifier order and partial criterion sets without deciding their lineage", () => {

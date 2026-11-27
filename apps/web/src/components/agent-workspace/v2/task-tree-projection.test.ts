@@ -65,6 +65,27 @@ describe('projectSupervisorTree', () => {
     expect(nodes[0]?.itemId).toBe('item-1')
   })
 
+  it('classifies only same-session failed paginated children without their Turn', () => {
+    const paginated = task('paged-child', { turnId: 'older-turn', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'scout', taskType: 'scout', status: 'failed', failureReason: 'task_graph_child_deadline_exceeded' })
+    const foreign = task('foreign-paged', { sessionId: 'session-2', turnId: 'older-turn', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'scout', taskType: 'scout', status: 'failed', failureReason: 'task_graph_child_deadline_exceeded' })
+    const unknown = task('unknown-paged', { turnId: 'older-turn', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'scout', taskType: 'scout', status: 'failed', failureReason: 'private provider failure' })
+    const active = task('active-paged', { turnId: 'older-turn', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'scout', taskType: 'scout', status: 'running', failureReason: 'task_graph_child_deadline_exceeded' })
+    const find = (nodes: TaskTreeNode[], id: string) => nodes.find(node => node.id === `task:${id}`)
+
+    const nodes = projectSupervisorTree({ turns: [], items: [], tasks: [paginated, foreign, unknown, active], expectedSessionId: 'session-1' })
+    expect(find(nodes, paginated.id)).toMatchObject({ childFailure: 'deadline_exceeded' })
+    for (const id of [foreign.id, unknown.id, active.id]) {
+      expect(find(nodes, id)).not.toHaveProperty('childFailure')
+      expect(find(nodes, id)).not.toHaveProperty('detail')
+    }
+    expect(JSON.stringify(nodes)).not.toContain('private provider failure')
+    expect(find(projectSupervisorTree({ turns: [], items: [], tasks: [paginated] }), paginated.id)).not.toHaveProperty('childFailure')
+  })
+
   it('marks a tool result available from the redacted output summary shape', () => {
     const nodes = projectSupervisorTree({
       turns: [turn()],
@@ -85,6 +106,88 @@ describe('projectSupervisorTree', () => {
     })
 
     expect(nodes[0]?.children?.[0]).toMatchObject({ kind: 'task', itemId: 'task-evidence', resultAvailable: true })
+  })
+
+  it('projects fixed failure categories for children while preserving root detail and hiding unknown child text', () => {
+    const nodes = projectSupervisorTree({ turns: [turn()], items: [], tasks: [
+      task('root-1', { rootTaskId: 'root-1', role: 'orchestrator', taskType: 'root', status: 'failed', failureReason: 'legacy root detail' }),
+      task('mislabelled-root', { rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'orchestrator', taskType: 'root',
+        status: 'failed', failureReason: 'private parent-bearing root reason' }),
+      task('deadline-child', { rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'task_graph_child_deadline_exceeded' }),
+      task('verification-child', { rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'task_graph_verification_unverified' }),
+      task('verification-failed-child', { rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'task_graph_verification_failed' }),
+      task('dependency-child', { rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'task_graph_dependency_scope_mismatch' }),
+      task('recovery-child', { rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'child_resume_evidence_unavailable' }),
+      task('unknown-child', { rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'private provider failure' }),
+      task('foreign-child', { sessionId: 'session-2', rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'task_graph_child_deadline_exceeded' }),
+      task('malformed-child', { rootTaskId: 'root-1', parentTaskId: 'malformed-child', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'private malformed reason' }),
+      task('root-alias-child', { rootTaskId: 'root-alias-child', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'private root alias reason' }),
+      task('missing-root-child', { rootTaskId: null, parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'failed', failureReason: 'private missing root reason' }),
+      task('not-failed-child', { rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout',
+        status: 'running', failureReason: 'task_graph_child_deadline_exceeded' }),
+      task('legacy-task', { turnId: null, role: 'scout', taskType: 'scout', status: 'failed', failureReason: 'legacy task detail' }),
+    ] })
+    const findNode = (id: string, entries: readonly TaskTreeNode[] = nodes): TaskTreeNode | undefined => {
+      for (const node of entries) {
+        if (node.id === id) return node
+        const nested = findNode(id, node.children ?? [])
+        if (nested) return nested
+      }
+      return undefined
+    }
+    const root = findNode('task:root-1')
+    const mislabelledRoot = findNode('task:mislabelled-root')
+    const deadline = findNode('task:deadline-child')
+    const verification = findNode('task:verification-child')
+    const verificationFailed = findNode('task:verification-failed-child')
+    const dependency = findNode('task:dependency-child')
+    const recovery = findNode('task:recovery-child')
+    const unknown = findNode('task:unknown-child')
+    const foreign = findNode('task:foreign-child')
+    const malformed = findNode('task:malformed-child')
+    const rootAlias = findNode('task:root-alias-child')
+    const missingRoot = findNode('task:missing-root-child')
+    const notFailed = findNode('task:not-failed-child')
+    const legacy = findNode('task:legacy-task')
+
+    expect(root).toMatchObject({ detail: 'legacy root detail' })
+    expect(root).not.toHaveProperty('childFailure')
+    expect(mislabelledRoot).not.toHaveProperty('childFailure')
+    expect(mislabelledRoot).not.toHaveProperty('detail')
+    expect(deadline).toMatchObject({ childFailure: 'deadline_exceeded' })
+    expect(deadline).not.toHaveProperty('detail')
+    expect(verification).toMatchObject({ childFailure: 'verification_unverified' })
+    expect(verificationFailed).toMatchObject({ childFailure: 'verification_failed' })
+    expect(dependency).toMatchObject({ childFailure: 'dependency_unavailable_or_incompatible' })
+    expect(recovery).toMatchObject({ childFailure: 'recovery_unavailable' })
+    expect(unknown).not.toHaveProperty('childFailure')
+    expect(unknown).not.toHaveProperty('detail')
+    expect(foreign).not.toHaveProperty('childFailure')
+    expect(foreign).not.toHaveProperty('detail')
+    expect(malformed).not.toHaveProperty('childFailure')
+    expect(malformed).not.toHaveProperty('detail')
+    expect(rootAlias).not.toHaveProperty('childFailure')
+    expect(rootAlias).not.toHaveProperty('detail')
+    expect(missingRoot).not.toHaveProperty('childFailure')
+    expect(missingRoot).not.toHaveProperty('detail')
+    expect(notFailed).not.toHaveProperty('childFailure')
+    expect(notFailed).not.toHaveProperty('detail')
+    expect(legacy).toMatchObject({ detail: 'legacy task detail' })
+    expect(JSON.stringify(nodes)).not.toContain('private provider failure')
+    expect(JSON.stringify(nodes)).not.toContain('private parent-bearing root reason')
+    expect(JSON.stringify(nodes)).not.toContain('private malformed reason')
+    expect(JSON.stringify(nodes)).not.toContain('private root alias reason')
+    expect(JSON.stringify(nodes)).not.toContain('private missing root reason')
   })
 
   it('bounds malformed cyclic task parents without dropping their records', () => {

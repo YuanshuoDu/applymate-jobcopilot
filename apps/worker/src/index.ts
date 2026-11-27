@@ -36,6 +36,7 @@ async function main() {
     cloakPoolModule,
     deadLetterModule,
     canonicalRuntimeModule,
+    canonicalModelRoutingModule,
     aiUsageBridgeModule,
     productionBootstrapModule,
     productionChildRuntimeModule,
@@ -52,6 +53,7 @@ async function main() {
     import("./cloak/pool.js"),
     import("./queue/dead-letter.js"),
     import("./runtime/canonical-turn-runtime.js"),
+    import("./runtime/canonical-agent-model-routing.js"),
     import("./queue/ai-usage-bridge.js"),
     import("./queue/production-bootstrap.js"),
     import("./runtime/subagents/production-child-runtime.js"),
@@ -144,11 +146,8 @@ async function main() {
         console.log("[worker] Agent run router started");
       },
     }, {
-      createOptionalProductionChildExecutor: productionChildRuntimeModule.createOptionalProductionChildExecutor,
-      createCanonicalTurnRuntime: (runtimePool, options) => canonicalRuntimeModule.createCanonicalTurnRuntime(runtimePool, {
-        ...options,
-        ...taskGraphRuntimeOptions(taskGraphCommandPort),
-      }),
+      ...canonicalModelRoutingModule.bindProductionModelFactories(
+        productionChildRuntimeModule, canonicalRuntimeModule, () => taskGraphRuntimeOptions(taskGraphCommandPort)),
       createWorkerUsageAuthorizer: aiUsageBridgeModule.createWorkerUsageAuthorizer,
       createCanonicalExecutionProjection,
       createCanonicalSessionProjection,

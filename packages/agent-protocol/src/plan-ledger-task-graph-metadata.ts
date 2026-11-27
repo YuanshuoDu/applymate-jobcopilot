@@ -1,6 +1,6 @@
 import type { TaskGraphSnapshotNode } from "./plan-ledger.js"
+import { isSelectedJobBatchTemplateId } from "./selected-job-batch-templates.js"
 import { isStrictNativeTaskGraphNode } from "./plan-ledger-native-metadata.js"
-
 const BASE_KEYS = "dependsOn,depth,goal,key,successCriteria,taskId,templateId"
 const DISPOSITION_KEYS = BASE_KEYS + ",verificationDisposition"
 const VERIFICATION_KEYS = BASE_KEYS + ",verification,verificationDisposition"
@@ -16,7 +16,6 @@ const REPORT_REASONS = new Set([
   "role_mismatch", "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous",
   "result_invalid", "result_ambiguous", "result_evidence_unbound", "repair_target_unresolved",
 ])
-
 function record(value: unknown): value is Record<string, unknown> {
   try {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false
@@ -24,7 +23,6 @@ function record(value: unknown): value is Record<string, unknown> {
     return (prototype === Object.prototype || prototype === null) && Reflect.ownKeys(value).every(key => typeof key === "string")
   } catch { return false }
 }
-
 function exact(value: Record<string, unknown>, keys: string): boolean {
   return Reflect.ownKeys(value).sort().join(",") === keys
 }
@@ -32,24 +30,50 @@ function exactNodeKeys(value: Record<string, unknown>, keys: string): boolean {
   return exact(value, keys) || Object.hasOwn(value, "registeredScoutEnvelope")
     && Reflect.ownKeys(value).filter(key => key !== "registeredScoutEnvelope").sort().join(",") === keys
 }
-
 function dense(value: unknown, min: number, max: number): value is unknown[] {
   if (!Array.isArray(value) || value.length < min || value.length > max || Reflect.ownKeys(value).length !== value.length + 1) return false
   return Array.from({ length: value.length }, (_, index) => String(index)).every(key => Object.hasOwn(value, key))
 }
-
+function unionSelectorList(value: unknown): string[] | null {
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return null
+    const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<string, PropertyDescriptor>, length = descriptors.length?.value
+    if (!Number.isSafeInteger(length) || Number(length) < 2 || Number(length) > 8 || Reflect.ownKeys(value).length !== Number(length) + 1) return null
+    const selectors: string[] = []
+    for (let index = 0; index < Number(length); index++) {
+      const descriptor = descriptors[String(index)]
+      if (!descriptor || !("value" in descriptor) || descriptor.enumerable !== true || !boundedId(descriptor.value)) return null
+      selectors.push(descriptor.value)
+    }
+    return new Set(selectors).size === selectors.length ? selectors : null
+  } catch { return null }
+}
+function unionSelectors(value: unknown): string[] | null | undefined {
+  if (!record(value)) return undefined
+  const descriptor = Object.getOwnPropertyDescriptor(value, "kind")
+  const kind = descriptor && "value" in descriptor && typeof descriptor.value === "string" ? descriptor.value : undefined
+  if (kind !== "findings_from_scout_union" && kind !== "findings_cover_scout_candidate_union_gte"
+    && kind !== "findings_cover_each_scout_candidates_gte") return undefined
+  const row = strictObject(value, kind === "findings_from_scout_union" ? "dependencyNodeKeys,kind" : "dependencyNodeKeys,kind,minimumPercent")
+  if (!row) return null
+  const selectors = unionSelectorList(row.dependencyNodeKeys)
+  return selectors && (kind === "findings_from_scout_union"
+    || Number.isSafeInteger(row.minimumPercent) && Number(row.minimumPercent) >= 1 && Number(row.minimumPercent) <= 100) ? selectors : null
+}
 function boundedId(value: unknown, max = 128): value is string {
   return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= max
 }
-
 function stableIds(value: unknown, minimum: number, maximum: number): value is string[] {
   return dense(value, minimum, maximum) && value.every(id => typeof id === "string" && CRITERION_ID.test(id))
     && new Set(value).size === value.length
 }
-
 function check(value: unknown, role: "scout" | "analyst"): boolean {
-  if (!record(value) || typeof value.kind !== "string") return false
-  const kind = value.kind
+  if (!record(value)) return false
+  const kindDescriptor = Object.getOwnPropertyDescriptor(value, "kind")
+  if (!kindDescriptor || !("value" in kindDescriptor) || typeof kindDescriptor.value !== "string") return false
+  const kind = kindDescriptor.value
+  const union = unionSelectors(value)
+  if (union !== undefined) return role === "analyst" && union !== null
   if (kind === "candidate_count_gte" && role === "scout" || kind === "finding_count_gte" && role === "analyst"
     || kind === "evidence_count_gte") {
     return exact(value, "kind,minimum") && positive(value.minimum)
@@ -68,7 +92,44 @@ function check(value: unknown, role: "scout" | "analyst"): boolean {
     && positive(value.minimumFindings) && typeof value.minimumScore === "number" && Number.isFinite(value.minimumScore)
     && value.minimumScore >= 0 && value.minimumScore <= 10 && (value.aggregation === "any" || value.aggregation === "all")
 }
-
+function strictObject(value: unknown, keys: string): Record<string, unknown> | null {
+  try {
+    if (!record(value) || !exact(value, keys)) return null
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    return keys.split(",").every(key => {
+      const descriptor = descriptors[key]
+      return Boolean(descriptor && "value" in descriptor && descriptor.enumerable === true)
+    }) ? value : null
+  } catch { return null }
+}
+export function readPersistedTaskGraphVerificationSelectors(value: unknown): { role: "scout" | "analyst"; dependencyNodeKeys: readonly string[] } | null | undefined {
+  try {
+    const template = record(value) && Object.getOwnPropertyDescriptor(value, "templateId")
+    if (!template) return undefined
+    if (!("value" in template)) return null
+    if (template.value !== "scout" && template.value !== "analyst") return undefined
+    const templateRole = template.value as "scout" | "analyst"
+    const rawVerification = Object.getOwnPropertyDescriptor(value, "verification")
+    if (!rawVerification) return undefined
+    const verification = strictObject("value" in rawVerification ? rawVerification.value : null, "criteria,role,schemaVersion")
+    if (!verification || verification.role !== templateRole || verification.schemaVersion !== VERIFICATION_VERSION) return null
+    if (!Array.isArray(verification.criteria) || verification.criteria.length < 1 || verification.criteria.length > 8
+      || Reflect.ownKeys(verification.criteria).length !== verification.criteria.length + 1) return null
+    const selectors: string[] = []
+    for (let index = 0; index < verification.criteria.length; index++) {
+      const criterionDescriptor = Object.getOwnPropertyDescriptor(verification.criteria, String(index))
+      if (!criterionDescriptor || !("value" in criterionDescriptor) || criterionDescriptor.enumerable !== true) return null
+      const criterionRow = strictObject(criterionDescriptor.value, "check,id")
+      if (!criterionRow) return null
+      const union = unionSelectors(criterionRow.check)
+      if (union === null) return null
+      if (union) selectors.push(...union)
+    }
+    const disposition = Object.getOwnPropertyDescriptor(value, "verificationDisposition")
+    if (!disposition || !("value" in disposition) || disposition.value !== "typed") return selectors.length ? null : undefined
+    return { role: verification.role as "scout" | "analyst", dependencyNodeKeys: selectors }
+  } catch { return null }
+}
 function positive(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= 50
 }
@@ -121,7 +182,8 @@ export function parsePersistedTaskGraphNode(value: unknown): TaskGraphSnapshotNo
     const disposition = shape === "base" ? (hasVerification ? "typed" : "legacy_unverified") : value.verificationDisposition
     if (disposition !== "typed" && disposition !== "legacy_unverified" && disposition !== "specialized") return null
     if (disposition === "typed" ? !hasVerification || !verification(value.verification, value.templateId) : hasVerification) return null
-    if (disposition === "specialized" && value.templateId !== "cover_letter_writer" && value.templateId !== "cover_letter_reviewer") return null
+    if (disposition === "specialized" && value.templateId !== "cover_letter_writer" && value.templateId !== "cover_letter_reviewer"
+      && !isSelectedJobBatchTemplateId(value.templateId)) return null
     if (shape === "repair" && (disposition !== "typed" || !repairOf(value.repairOf))) return null
     return {
       key: value.key as string, templateId: value.templateId as string, goal: value.goal as string,

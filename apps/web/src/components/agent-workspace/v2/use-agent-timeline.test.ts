@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { createTimelineState, timelineReducer } from './timeline-reducer'
 import { timelineItemsForSession, type AgentTimelineSnapshot } from './use-agent-timeline'
 import { createApprovalLedgerState, selectApprovalLedgerProjection } from './approval-ledger-view'
+import { projectSessionPauseBlocker } from './session-pause-blocker-projection'
 
 describe('timeline session projection', () => {
   it('discards state from a previous session before rendering a switch', () => {
@@ -36,6 +37,27 @@ describe('timeline session projection', () => {
     expect(delta.lifecycleRevision).toBe(1)
   })
 
+  it('keeps ordered pause evidence in the session timeline for a closed blocker projection', () => {
+    const sessionId = 'session-a'
+    const turnId = 'turn-a'
+    const requestId = `evt_${'a'.repeat(64)}`
+    const pauseRequested = {
+      schemaVersion: 'agent-harness.v2', id: requestId, sessionId, turnId, itemId: null, taskId: null,
+      type: 'session.pause_requested', actor: 'user', sequence: '5',
+      payload: { turnId, expectedRevision: 7, requestedAt: '2026-11-23T10:00:00.000Z' },
+    }
+    const pauseBlocked = {
+      schemaVersion: 'agent-harness.v2', id: `evt_${'b'.repeat(64)}`, sessionId, turnId, itemId: null, taskId: `root-${turnId}`,
+      type: 'session.pause_blocked', actor: 'orchestrator', sequence: '6',
+      causationId: requestId, payload: { pauseRequestEventId: 'raw-internal-pause-request', blockers: ['streaming_step'] },
+    }
+    const withRequest = timelineReducer(createTimelineState(sessionId), { type: 'event', event: pauseRequested })
+    const state = timelineReducer(withRequest, { type: 'event', event: pauseBlocked })
+
+    expect(state.events.map(event => event.id)).toEqual([requestId, `evt_${'b'.repeat(64)}`])
+    expect(projectSessionPauseBlocker(state.events, sessionId)).toEqual({ turnId, reasons: ['step'] })
+  })
+
   it('exposes the latest legal agenda on the timeline snapshot shape', () => {
     const state = timelineReducer(createTimelineState('session-a'), {
       type: 'event', event: {
@@ -53,6 +75,7 @@ describe('timeline session projection', () => {
     const snapshot: AgentTimelineSnapshot = {
       sessionId: 'session-a', items: [], lastEventId: state.lastEventId, lifecycleRevision: state.lifecycleRevision,
       cognitiveAgenda: state.cognitiveAgenda.latest, cognitiveAgendas: state.cognitiveAgenda.scoped,
+      pauseBlocker: null,
       approvalLedger: selectApprovalLedgerProjection(createApprovalLedgerState('session-a')),
       connection: 'idle', restoring: false, error: null,
     }

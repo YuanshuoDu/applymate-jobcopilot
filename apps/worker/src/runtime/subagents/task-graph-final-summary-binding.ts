@@ -1,13 +1,17 @@
 import { reduceTaskGraphFinalSummary, type TaskGraphFinalSummary } from "./task-graph-final-summary.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
+import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { validateRoleResult } from "./role-results.js"
 import type { SubagentTaskStatus } from "./types.js"
-import { validateTaskGraphFollowUpBinding } from "./task-graph-follow-up-validation.js"
+import { normalizeResolvedRepairTaskIds } from "./task-graph-final-summary-repair-binding.js"
+export { readResolvedRepairTaskIds } from "./task-graph-final-summary-repair-binding.js"
+import { hasSelectedJobBatchMembers, readBoundSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import type { SelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 
 export const TASK_GRAPH_FINAL_SUMMARY_BINDING: unique symbol = Symbol("task_graph_final_summary_binding")
 
-export type TaskGraphFinalSummaryMember = Readonly<{
+type TaskGraphFinalSummaryMemberBase = Readonly<{
   nodeIndex: number
   nodeKey: string
   templateId: string
@@ -15,9 +19,20 @@ export type TaskGraphFinalSummaryMember = Readonly<{
   role: string
   taskType: string
   taskStatus: SubagentTaskStatus
-  kind: "business" | "internal_control" | "historical"
 }>
-type CurrentTaskGraphFinalSummaryMember = TaskGraphFinalSummaryMember & Readonly<{ kind: "business" | "internal_control" }>
+export type TaskGraphRetiredScoutProof = Readonly<{
+  nodeKey: string
+  taskId: string
+  attempt: number
+  interruptRequestedAt: string
+  receiptEventId: string
+  lifecycleEventId: string
+}>
+export type TaskGraphFinalSummaryMember = TaskGraphFinalSummaryMemberBase & (
+  | Readonly<{ kind: "business" | "internal_control" | "historical" }>
+  | Readonly<{ kind: "retired"; retirement: Omit<TaskGraphRetiredScoutProof, "nodeKey" | "taskId"> }>
+)
+type CurrentTaskGraphFinalSummaryMember = TaskGraphFinalSummaryMemberBase & Readonly<{ kind: "business" | "internal_control" }>
 
 export type TaskGraphFinalSummaryBinding = Readonly<{
   /** Required on bindings produced by this module; optional only for legacy internal carriers, which cannot emit a manifest. */
@@ -26,6 +41,7 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
   graphRevision: number
   members?: readonly TaskGraphFinalSummaryMember[]
   resolvedRepairTaskIds?: readonly string[]
+  selectedJobBatchFinalOutcome?: SelectedJobBatchFinalOutcome
   summary: TaskGraphFinalSummary
 }>
 
@@ -33,11 +49,17 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
 export function buildTaskGraphFinalSummaryBinding(
   loaded: LoadedGraph,
   historicalNodeIndices?: ReadonlySet<number>,
-  resolvedRepairTaskIds?: ReadonlySet<string>,
+  resolvedRepairTaskIdsOrRetiredScouts?: ReadonlySet<string> | ReadonlyMap<string, TaskGraphRetiredScoutProof>,
+  retiredScouts?: ReadonlyMap<string, TaskGraphRetiredScoutProof>,
 ): TaskGraphFinalSummaryBinding | null {
+  const thirdArgumentIsRetirementMap = isRetiredScoutMap(resolvedRepairTaskIdsOrRetiredScouts)
+  const resolvedRepairTaskIds = thirdArgumentIsRetirementMap ? undefined : resolvedRepairTaskIdsOrRetiredScouts as ReadonlySet<string> | undefined
+  const retirementSelection = thirdArgumentIsRetirementMap ? resolvedRepairTaskIdsOrRetiredScouts : retiredScouts
   const selectedHistory = selectedIndices(historicalNodeIndices)
+  const selectedRetirements = selectedRetiredScouts(retirementSelection)
   if (!loaded.item) {
     if (selectedHistory.length > 0) throw new Error("task_graph_final_summary_historical_selection_invalid")
+    if (selectedRetirements.length > 0) throw new Error("task_graph_final_summary_retired_selection_invalid")
     if (loaded.snapshot || loaded.state || loaded.tasks.size > 0) throw new Error("task_graph_final_summary_graph_invalid")
     return null
   }
@@ -46,8 +68,12 @@ export function buildTaskGraphFinalSummaryBinding(
     || !Number.isSafeInteger(loaded.item.revision) || loaded.item.revision < 1) {
     throw new Error("task_graph_final_summary_graph_invalid")
   }
+  if (selectedRetirements.some(proof => !loaded.snapshot!.nodes.some(node => node.key === proof.nodeKey))) {
+    throw new Error("task_graph_final_summary_retired_selection_invalid")
+  }
 
   const seenTasks = new Set<string>()
+  const memberByKey = new Map(selectedRetirements.map(proof => [proof.nodeKey, proof] as const))
   const members = loaded.snapshot.nodes.map((snapshotNode, nodeIndex): TaskGraphFinalSummaryMember => {
     const task = loaded.tasks.get(snapshotNode.taskId)
     if (!task || task.id !== snapshotNode.taskId || !nonEmpty(snapshotNode.key) || !nonEmpty(snapshotNode.templateId)
@@ -56,9 +82,16 @@ export function buildTaskGraphFinalSummaryBinding(
     }
     if (seenTasks.has(task.id)) throw new Error("task_graph_final_summary_task_identity_conflict")
     seenTasks.add(task.id)
-    return { nodeIndex, nodeKey: snapshotNode.key, templateId: snapshotNode.templateId, taskId: task.id, role: task.role,
+    const member: CurrentTaskGraphFinalSummaryMember = { nodeIndex, nodeKey: snapshotNode.key, templateId: snapshotNode.templateId, taskId: task.id, role: task.role,
       taskType: task.taskType, taskStatus: task.status,
       kind: isNativeVerificationControl(task.role, task.taskType) ? "internal_control" : "business" }
+    const proof = memberByKey.get(snapshotNode.key)
+    if (!proof) return member
+    if (!validRetiredScout(proof, snapshotNode, task)) throw new Error("task_graph_final_summary_retired_selection_invalid")
+    return { ...member, kind: "retired", retirement: {
+      attempt: proof.attempt, interruptRequestedAt: proof.interruptRequestedAt,
+      receiptEventId: proof.receiptEventId, lifecycleEventId: proof.lifecycleEventId,
+    } }
   })
   for (const nodeIndex of selectedHistory) {
     const member = members[nodeIndex]
@@ -67,11 +100,14 @@ export function buildTaskGraphFinalSummaryBinding(
       throw new Error("task_graph_final_summary_historical_selection_invalid")
     }
   }
+  if (selectedRetirements.some(proof => selectedHistory.includes(members.find(member => member.nodeKey === proof.nodeKey)?.nodeIndex ?? -1))) {
+    throw new Error("task_graph_final_summary_retired_selection_invalid")
+  }
   const boundMembers = members.map(member => selectedHistory.includes(member.nodeIndex) ? { ...member, kind: "historical" as const } : member)
   if (selectedHistory.length > 0 && !boundMembers.some(member => member.kind === "business")) {
     throw new Error("task_graph_final_summary_historical_selection_invalid")
   }
-  const nodes = boundMembers.filter((member): member is CurrentTaskGraphFinalSummaryMember => member.kind !== "historical").map(member => {
+  const nodes = boundMembers.filter((member): member is CurrentTaskGraphFinalSummaryMember => member.kind === "business" || member.kind === "internal_control").map(member => {
     const task = loaded.tasks.get(member.taskId)!
     const nested = persistedStructuredResult(task.result)
     return {
@@ -90,33 +126,23 @@ export function buildTaskGraphFinalSummaryBinding(
     ...(resolved ? { resolvedRepairTaskIds: resolved } : {}), summary }
 }
 
-/** Reads only bounded failed business members confirmed by this private binding. */
-export function readResolvedRepairTaskIds(value: unknown): ReadonlySet<string> {
-  try {
-    const binding = record(value)
-    if (!binding || !Object.hasOwn(binding, "resolvedRepairTaskIds")) return new Set()
-    const { resolvedRepairTaskIds: ids, ...legacyBinding } = binding
-    const facts = validateTaskGraphFollowUpBinding(legacyBinding), rows = dense(ids, TASK_GRAPH_LIMITS.maxPersistedNodes)
-    if (!facts || !rows?.length) return new Set()
-    const result = new Set<string>()
-    let previous = ""
-    for (const id of rows) {
-      if (!safeTaskId(id) || id <= previous || facts.outcomes.get(id)?.taskStatus !== "failed") return new Set()
-      result.add(id); previous = id
-    }
-    return result
-  } catch { return new Set() }
-}
-
 /** Compares the exact current graph revision and all deterministic reducer facts. */
 export function sameTaskGraphFinalSummaryBinding(
   left: TaskGraphFinalSummaryBinding | null | undefined,
   right: TaskGraphFinalSummaryBinding | null | undefined,
 ): boolean {
   try {
-    if (!left || !right || left.rootTaskId !== right.rootTaskId || left.graphItemId !== right.graphItemId
+    if (!left || !right) return false
+    const leftHasBatch = hasSelectedJobBatchMembers(left), rightHasBatch = hasSelectedJobBatchMembers(right)
+    if (leftHasBatch !== rightHasBatch) return false
+    const leftBatch = left.selectedJobBatchFinalOutcome, rightBatch = right.selectedJobBatchFinalOutcome
+    if (leftHasBatch) {
+      if (!readBoundSelectedJobBatchFinalOutcome(left) || !readBoundSelectedJobBatchFinalOutcome(right)) return false
+    } else if (leftBatch !== undefined || rightBatch !== undefined) return false
+    if (left.rootTaskId !== right.rootTaskId || left.graphItemId !== right.graphItemId
       || JSON.stringify(left.members) !== JSON.stringify(right.members) || left.graphRevision !== right.graphRevision
       || JSON.stringify(left.resolvedRepairTaskIds) !== JSON.stringify(right.resolvedRepairTaskIds)
+      || JSON.stringify(leftBatch) !== JSON.stringify(rightBatch)
       || left.summary.graphRevision !== left.graphRevision || right.summary.graphRevision !== right.graphRevision) return false
     return JSON.stringify(left.summary) === JSON.stringify(right.summary)
   }
@@ -124,37 +150,7 @@ export function sameTaskGraphFinalSummaryBinding(
 }
 
 const TASK_STATUSES = new Set<SubagentTaskStatus>(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
-const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/
 function nonEmpty(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
-
-function normalizeResolvedRepairTaskIds(value: ReadonlySet<string> | undefined, members: readonly TaskGraphFinalSummaryMember[], summary: TaskGraphFinalSummary): readonly string[] | undefined {
-  if (value === undefined) return undefined
-  try {
-    if (!value || typeof value !== "object" || typeof value[Symbol.iterator] !== "function") return undefined
-    const failed = new Set(summary.taskOutcomes.filter(outcome => outcome.taskStatus === "failed").map(outcome => outcome.taskId))
-    const business = new Set(members.filter(member => member.kind === "business" && member.taskStatus === "failed").map(member => member.taskId))
-    const ids = new Set<string>()
-    let visited = 0
-    for (const id of value) {
-      if (++visited > TASK_GRAPH_LIMITS.maxPersistedNodes) return undefined
-      if (safeTaskId(id) && business.has(id) && failed.has(id)) ids.add(id)
-    }
-    return ids.size ? [...ids].sort(compareText) : undefined
-  } catch { return undefined }
-}
-
-function dense(value: unknown, maximum: number): unknown[] | null {
-  if (!Array.isArray(value) || value.length > maximum || Reflect.ownKeys(value).length !== value.length + 1) return null
-  return Reflect.ownKeys(value).every(key => key === "length" || typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < value.length) ? value : null
-}
-
-function record(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null
-  try { return Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null ? value as Record<string, unknown> : null } catch { return null }
-}
-
-function safeTaskId(value: unknown): value is string { return typeof value === "string" && SAFE_IDENTIFIER.test(value) }
-function compareText(left: string, right: string): number { return left < right ? -1 : left > right ? 1 : 0 }
 function isNativeVerificationControl(role: string, taskType: string): boolean {
   return role === "auditor" && taskType === "native_verification"
 }
@@ -177,6 +173,38 @@ function selectedIndices(value?: ReadonlySet<number>): number[] {
     }
     return indices
   } catch { throw new Error("task_graph_final_summary_historical_selection_invalid") }
+}
+
+function selectedRetiredScouts(value?: ReadonlyMap<string, TaskGraphRetiredScoutProof>): TaskGraphRetiredScoutProof[] {
+  if (value === undefined) return []
+  try {
+    if (!value || typeof value[Symbol.iterator] !== "function") throw new Error()
+    const result: TaskGraphRetiredScoutProof[] = [], seen = new Set<string>()
+    for (const [key, proof] of value) {
+      if (result.length >= TASK_GRAPH_LIMITS.maxPersistedNodes || !proof || key !== proof.nodeKey || seen.has(key)
+        || Object.keys(proof).sort().join(",") !== "attempt,interruptRequestedAt,lifecycleEventId,nodeKey,receiptEventId,taskId"
+        || !nonEmpty(key) || !nonEmpty(proof.taskId) || !nonEmpty(proof.receiptEventId) || !nonEmpty(proof.lifecycleEventId)
+        || !Number.isSafeInteger(proof.attempt) || proof.attempt < 1 || !canonicalTimestamp(proof.interruptRequestedAt)) throw new Error()
+      seen.add(key)
+      result.push(proof)
+    }
+    return result
+  } catch { throw new Error("task_graph_final_summary_retired_selection_invalid") }
+}
+
+function isRetiredScoutMap(value: unknown): value is ReadonlyMap<string, TaskGraphRetiredScoutProof> {
+  return Boolean(value && typeof value === "object" && typeof (value as ReadonlyMap<string, TaskGraphRetiredScoutProof>).get === "function")
+}
+
+function validRetiredScout(proof: TaskGraphRetiredScoutProof, node: Pick<StoredTaskGraphNode, "key" | "templateId">, task: GraphTaskRow): boolean {
+  return node.templateId === "scout" && proof.nodeKey === node.key && proof.taskId === task.id && task.role === "scout"
+    && task.taskType === "job_discovery" && task.status === "interrupted"
+    && task.attemptCount === proof.attempt
+}
+
+function canonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return false
+  try { return new Date(value).toISOString() === value } catch { return false }
 }
 
 function isHistoricalScoutAnalyst(member: TaskGraphFinalSummaryMember, task: GraphTaskRow): boolean {

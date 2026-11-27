@@ -7,6 +7,8 @@ import type { TaskGraphCurrentNode, TaskGraphCurrentState } from "../subagents/t
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "../subagents/task-graph-child-deadline.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "../subagents/child-discovery-attempt.js"
+import { DISCOVERY_QUERY_FOOTPRINT_SCHEMA_VERSION } from "../subagents/child-discovery-query-footprint.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { buildTaskGraphRecoveryInstruction } from "./task-graph-recovery-guidance.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
@@ -117,6 +119,10 @@ function replaceGraphNode(context: StepContext, index: number, node: unknown): S
   return { ...context, blocks }
 }
 
+function replaceGraphContent(context: StepContext, content: unknown): StepContext {
+  return { ...context, blocks: context.blocks.map(block => block.id === `observation:${CURRENT_GRAPH_ID}` ? { ...block, content: content as StepContext["blocks"][number]["content"] } : block) }
+}
+
 function repairNode(status: "queued" | "failed" | "cancelled"): TaskGraphCurrentNode {
   return { key: "repair-attempt", taskId: "repair-private", templateId: "scout", goal: "private repair goal",
     successCriteria: ["Repair evidence"], dependsOn: [], status, readiness: status === "queued" ? "active" : "terminal",
@@ -146,14 +152,24 @@ function contextFor(input: {
   duplicateMarker?: boolean
   spoofMarker?: boolean
   feedback?: string
+  rootSuccessCriteria?: readonly string[]
+  sourceIntent?: unknown
+  planningFacts?: TaskGraphCurrentState["planningFacts"]
+  discoveryTurnEligibility?: TaskGraphCurrentState["discoveryTurnEligibility"]
 } = {}): StepContext {
   const revision = input.graphRevision ?? REVISION
   const seed = applyCompletionRecovery({ system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
     "step-denied", tagTaskGraphRepairRecovery(input.feedback ?? FEEDBACK, input.markerRevision ?? REVISION))
     .system[0]!
-  const withGraph = mergeTaskGraphCurrentObservation({ ...seedSnapshot(seed), taskGraphRevision: revision }, {
+  const state = {
     revision, nodes: input.nodes ?? [sourceNode()],
-  })
+    ...(input.rootSuccessCriteria === undefined ? {} : { rootSuccessCriteria: input.rootSuccessCriteria }),
+    ...(input.sourceIntent === undefined ? {} : { sourceIntent: input.sourceIntent }),
+    ...(input.planningFacts === undefined ? {} : { planningFacts: input.planningFacts }),
+    ...(input.discoveryTurnEligibility === undefined ? {} : { discoveryTurnEligibility: input.discoveryTurnEligibility }),
+  }
+  const withGraph = mergeTaskGraphCurrentObservation({ ...seedSnapshot(seed), taskGraphRevision: revision },
+    state as TaskGraphCurrentState & { sourceIntent?: unknown })
   let system = [...withGraph.system]
   if (input.duplicateMarker) system.push({ ...system[0]! })
   const systemBlocks = system.map(item => ({ id: `system:${item.id}`, layer: "system" as const, role: "instruction" as const,
@@ -314,6 +330,84 @@ describe("TaskGraph recovery guidance", () => {
     const categoryContext = contextFor({ nodes: [ordinaryFailedNode("selected_job_context_unavailable")] })
     const withoutMarker = { ...categoryContext, blocks: categoryContext.blocks.filter(block => !block.id.startsWith("system:completion-recovery:task-graph:")) }
     expect(buildTaskGraphRecoveryInstruction(withoutMarker, tools, ROOT_ID)).toBeNull()
+  })
+
+  it("keeps exact criterion recovery guidance through the canonical additive current-graph projection", () => {
+    const health = {
+      schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+      attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+      candidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false,
+    }
+    const footprint = { schemaVersion: DISCOVERY_QUERY_FOOTPRINT_SCHEMA_VERSION, availability: "available", calls: [{
+      criteria: { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], hasCursor: false },
+      outcome: "completed", requestCount: 1, observedCandidateCount: 0, providerFailures: 0,
+      materializationFailures: 0, hasMore: false,
+    }] } as const
+    const scout = { ...sourceNode(), discoveryAttemptHealth: health, discoveryQueryFootprint: footprint }
+    const artifactRef = { artifactId: "artifact-current", version: 1, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+    const reviewer = (key: string, taskId: string, reviewStatus: "passed" | "rejected"): TaskGraphCurrentNode => ({
+      key, taskId, templateId: "cover_letter_reviewer", goal: "Unrelated reviewer task", successCriteria: [], dependsOn: [],
+      status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+        role: "reviewer", status: "completed", artifactRef, reviewStatus, reviewHash: `sha256:${"c".repeat(64)}` },
+    })
+    const currentContext = contextFor({
+      nodes: [scout, reviewer("review-a", "review-task-a", "passed"), reviewer("review-b", "review-task-b", "rejected")],
+      rootSuccessCriteria: ["UNRELATED_ROOT_CRITERION_SENTINEL"],
+      sourceIntent: [{ nodeKey: "research", goal: "UNRELATED_SOURCE_INTENT_SENTINEL", successCriteria: ["UNRELATED_SOURCE_CRITERION_SENTINEL"], inputRelation: "covers_current_inputs" }],
+      planningFacts: {
+        graphRevision: REVISION,
+        counts: Object.fromEntries(["discoveredJobs", "analyzedJobs", "prepareJobs", "artifactReferences", "reviewOutcomes"]
+          .map(key => [key, { knownCount: 0, coverage: "complete" }])) as NonNullable<TaskGraphCurrentState["planningFacts"]>["counts"],
+        scoutOverlap: { coverage: "unavailable", scouts: [{ key: "research", taskStatus: "failed", resultStatus: null,
+          resultCoverage: "unavailable", reportedCount: null, sharedCount: null }] },
+      },
+      discoveryTurnEligibility: "ordinary",
+    })
+    const currentGraph = currentContext.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)?.content as Record<string, unknown>
+    const currentScout = (currentGraph.nodes as Array<Record<string, unknown>>)[0]!
+    const baselineRequest = requestFor(contextFor({ nodes: [sourceNode()] }))
+    const request = requestFor(currentContext)
+    const recovery = recoveryMessage(request)
+    const recoveryText = recovery?.content.flatMap(part => part.type === "text" ? [part.text] : []).join(" ") ?? ""
+
+    expect(currentGraph.rootSuccessCriteria).toEqual(["UNRELATED_ROOT_CRITERION_SENTINEL"])
+    expect(currentGraph.sourceIntent).toMatchObject([{ nodeKey: "research", goal: "UNRELATED_SOURCE_INTENT_SENTINEL" }])
+    expect(currentGraph.taskReportedScoutOverlap).toMatchObject({ coverage: "unavailable", scouts: [{ key: "research" }] })
+    expect(currentGraph.reviewConflicts).toMatchObject([{ outcomes: [{ taskId: "review-task-a" }, { taskId: "review-task-b" }] }])
+    expect(currentScout.discoveryAttemptHealth).toEqual(health)
+    expect(currentScout.discoveryQueryFootprint).toEqual(footprint)
+    expect(recovery).toBeDefined()
+    expect(recovery).toEqual(recoveryMessage(baselineRequest))
+    expect(request.messages).toContainEqual(recovery)
+    expect(recoveryText).toContain("node 1, criterion 1 failed for reason criterion_not_met")
+    expect(recoveryText).toContain("agent.plan may evaluate one typed repair under its current expectedRevision 5 contract")
+    expect(recoveryText).not.toMatch(/UNRELATED_|review-task-|taskReportedScoutOverlap|discoveryQueryFootprint|artifact-current|Software Engineer|Dublin/)
+  })
+
+  it("accepts only own canonical graph metadata and rejects unknown or accessor fields", () => {
+    const context = contextFor({
+      rootSuccessCriteria: ["Preserve evidence"],
+      sourceIntent: [{ nodeKey: "research", goal: "Find current evidence", successCriteria: ["Return citations"], inputRelation: "unknown" }],
+    })
+    const graphBlock = context.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)!
+    const graph = graphBlock.content as Record<string, unknown>
+    expect(buildTaskGraphRecoveryInstruction(context, RECOVERY_TOOLS, ROOT_ID)).not.toBeNull()
+
+    const unknown = replaceGraphContent(context, { ...graph, privateRecoveryPrompt: "PRIVATE_UNRELATED_GUIDANCE" })
+    expect(buildTaskGraphRecoveryInstruction(unknown, RECOVERY_TOOLS, ROOT_ID)).toBeNull()
+
+    let getterCalled = false
+    const accessor = { ...graph }
+    Object.defineProperty(accessor, "rootSuccessCriteria", {
+      enumerable: true, get: () => { getterCalled = true; return ["Preserve evidence"] },
+    })
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphContent(context, accessor), RECOVERY_TOOLS, ROOT_ID)).toBeNull()
+    expect(getterCalled).toBe(false)
+
+    const inherited = Object.assign(Object.create({ sourceIntent: graph.sourceIntent }),
+      Object.fromEntries(Object.entries(graph).filter(([key]) => key !== "sourceIntent")))
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphContent(context, inherited), RECOVERY_TOOLS, ROOT_ID)).toBeNull()
   })
 
   it("preserves only canonical Scout or Analyst resume failures beside matching typed-denial guidance", () => {

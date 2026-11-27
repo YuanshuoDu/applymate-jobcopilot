@@ -10,9 +10,10 @@ type NodeFixture = Readonly<{
 const latest = { resultingRevision: 5, stepId: "user-revise", inputThroughSequence: 10n }
 function loaded(nodes: readonly NodeFixture[], revision = 6): LoadedGraph {
   const snapshotNodes = nodes.map(node => ({ key: node.key, taskId: node.taskId, templateId: node.role, dependsOn: node.dependsOn ?? [],
+    verificationDisposition: "typed", verification: { role: node.role },
     ...(node.repairOf ? { repairOf: node.repairOf } : {}) }))
   const tasks = new Map(nodes.map(node => [node.taskId, { id: node.taskId, role: node.role, taskType: node.role === "scout" ? "job_discovery" : "job_analysis",
-    status: node.status ?? "completed", failureReason: node.failureReason ?? null, result: { structuredResult: { role: node.role } } }]))
+    status: node.status ?? "completed", attemptCount: 1, failureReason: node.failureReason ?? null, result: { structuredResult: { role: node.role } } }]))
   return { rootTaskId: "root", item: { id: "graph", revision, content: {}, createdAt: new Date(0) }, snapshot: { nodes: snapshotNodes },
     state: null, tasks, sourceInputCheckpointByNodeKey: new Map(nodes.map(node => [node.key,
       node.checkpoint === null ? null : { inputThroughSequence: node.checkpoint }])),
@@ -44,6 +45,30 @@ describe("TaskGraph completion applicability", () => {
     const result = taskGraphCompletionApplicability(graphValue, latest, 6,
       ids("old-scout-task", "scout-task", "analyst-task"), new Set(["old-scout"]))
     expect(result).toEqual({ kind: "applicable", historicalNodeIndices: new Set() })
+  })
+
+  it("excludes only a separately retired interrupted Scout without calling it verified or historical", () => {
+    const result = taskGraphCompletionApplicability(loaded([
+      { key: "retired-scout", taskId: "retired-task", role: "scout", checkpoint: 9n, relation: "predates_current_inputs", status: "interrupted" },
+      { key: "current-scout", taskId: "current-task", role: "scout", checkpoint: 10n, relation: "covers_current_inputs" },
+      { key: "analyst", taskId: "analyst-task", role: "analyst", checkpoint: 10n, relation: "covers_current_inputs" },
+    ]), latest, 6, ids("current-task", "analyst-task"), new Set(), ids("retired-scout"))
+    expect(result).toEqual({ kind: "applicable", historicalNodeIndices: new Set() })
+  })
+
+  it("rejects retirement membership without an interrupted typed Scout or when current work depends on it", () => {
+    const retired = loaded([
+      { key: "retired-scout", taskId: "retired-task", role: "scout", checkpoint: 9n, relation: "predates_current_inputs", status: "interrupted" },
+      { key: "current-scout", taskId: "current-task", role: "scout", checkpoint: 10n, relation: "covers_current_inputs" },
+      { key: "analyst", taskId: "analyst-task", role: "analyst", checkpoint: 10n, relation: "covers_current_inputs" },
+    ])
+    expect(taskGraphCompletionApplicability(retired, latest, 6, ids("current-task", "analyst-task"), new Set(), ids("missing")))
+      .toEqual({ kind: "replan" })
+    expect(taskGraphCompletionApplicability(loaded([
+      { key: "retired-scout", taskId: "retired-task", role: "scout", checkpoint: 9n, relation: "predates_current_inputs" },
+      { key: "current-scout", taskId: "current-task", role: "scout", checkpoint: 10n, relation: "covers_current_inputs" },
+      { key: "analyst", taskId: "analyst-task", role: "analyst", checkpoint: 10n, relation: "covers_current_inputs", dependsOn: ["retired-scout"] },
+    ]), latest, 6, ids("current-task", "analyst-task"), new Set(), ids("retired-scout"))).toEqual({ kind: "replan" })
   })
 
   it("requests replanning when excluded historical role has no current verified result", () => {

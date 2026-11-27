@@ -13,6 +13,8 @@ import type { TranscriptAction } from './TranscriptSpecialBlocks'
 import { ensureActionReceipt } from './approval-receipt-client'
 import { createReadOnlySessionProjection, projectTimelineItems } from './v2/session-projection'
 import type { AgentUnifiedStreamProps, ComposerJobsResponse } from './AgentUnifiedStream.types'
+import { AgentTurnComposerProvider, useAgentTurnComposerContext } from './agent-turn-commands'
+import { selectedSessionAppliedSteeringMarkers } from './agent-applied-steer-status'
 
 export function AgentUnifiedStream({
   log, running, summary, applyQueue, waitingQuestion,
@@ -20,6 +22,17 @@ export function AgentUnifiedStream({
   resetVersion, resumeSessionId, timeline, conversationTitle, conversationSubtitle, onAnswerQuestion, onAnswerOrchestrator, onApplied, onSessionRecorded,
 }: AgentUnifiedStreamProps) {
   const { t } = useI18n()
+  const turnComposer = useAgentTurnComposerContext()
+  const turnComposerForStream = turnComposer ? {
+    ...turnComposer,
+    appliedSteeringMarkers: selectedSessionAppliedSteeringMarkers({
+      selectedSessionId: resumeSessionId ?? null,
+      composerSessionId: turnComposer.sessionId,
+      timelineSessionId: timeline.sessionId,
+      restoring: timeline.restoring,
+      applied: timeline.steeringMarkers?.applied,
+    }),
+  } : null
   const streamEndRef = useRef<HTMLDivElement>(null)
   const streamScrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -175,29 +188,31 @@ export function AgentUnifiedStream({
         onFollowStateChange={following => { shouldFollowScrollRef.current = following }}
       />
 
-      <AgentUnifiedStreamComposer
-        waitingForAnswer={!!waitingQuestion && !autonomousMode}
-        chatInput={chatInput}
-        setChatInput={setChatInput}
-        chatLoading={chatLoading}
-        setChatLoading={setChatLoading}
-        addMenuOpen={addMenuOpen}
-        setAddMenuOpen={setAddMenuOpen}
-        attachedFiles={attachedFiles}
-        setAttachedFiles={setAttachedFiles}
-        composerJobs={composerJobs}
-        composerResumes={composerResumes}
-        inputRef={inputRef}
-        fileInputRef={fileInputRef}
-        chatRequestRef={chatRequestRef}
-        chatRequestVersionRef={chatRequestVersionRef}
-        shouldFollowScrollRef={shouldFollowScrollRef}
-        liveBlocks={liveBlocks}
-        resumeSessionId={resumeSessionId}
-        timelineRestoring={timeline.restoring}
-        setRevealThinkingVersion={setRevealThinkingVersion}
-        onSessionRecorded={onSessionRecorded}
-      />
+      <AgentTurnComposerProvider value={turnComposerForStream}>
+        <AgentUnifiedStreamComposer
+          waitingForAnswer={!!waitingQuestion && !autonomousMode}
+          chatInput={chatInput}
+          setChatInput={setChatInput}
+          chatLoading={chatLoading}
+          setChatLoading={setChatLoading}
+          addMenuOpen={addMenuOpen}
+          setAddMenuOpen={setAddMenuOpen}
+          attachedFiles={attachedFiles}
+          setAttachedFiles={setAttachedFiles}
+          composerJobs={composerJobs}
+          composerResumes={composerResumes}
+          inputRef={inputRef}
+          fileInputRef={fileInputRef}
+          chatRequestRef={chatRequestRef}
+          chatRequestVersionRef={chatRequestVersionRef}
+          shouldFollowScrollRef={shouldFollowScrollRef}
+          liveBlocks={liveBlocks}
+          resumeSessionId={resumeSessionId}
+          timelineRestoring={timeline.restoring}
+          setRevealThinkingVersion={setRevealThinkingVersion}
+          onSessionRecorded={onSessionRecorded}
+        />
+      </AgentTurnComposerProvider>
     </div>
   )
 }

@@ -44,6 +44,7 @@ export interface TimelineEvent {
   actor: string
   sequence: string | null
   payload: unknown
+  causationId?: string | null
   createdAt?: string
   kind?: 'delta' | 'snapshot'
   baseRevision?: number
