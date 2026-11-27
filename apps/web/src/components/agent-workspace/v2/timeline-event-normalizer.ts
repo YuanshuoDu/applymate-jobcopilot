@@ -6,6 +6,8 @@ import { STEERING_MARKER_EVENT_TYPE } from './timeline-steering-markers'
 import { integer, isRecord, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
 import type { TimelineEvent, TimelineItem, TimelineItemSource } from './timeline-reducer'
 
+const PUBLIC_EVENT_ID = /^evt_[a-f0-9]{64}$/
+
 export function normalizeTimelineItem(value: unknown, source: TimelineItemSource = 'replay'): TimelineItem | null {
   if (!isRecord(value) || typeof value.id !== 'string' || typeof value.sessionId !== 'string' ||
     typeof value.turnId !== 'string' || typeof value.type !== 'string' ||
@@ -37,12 +39,14 @@ export function normalizeTimelineEvent(value: unknown): TimelineEvent | null {
   const kind = rawKind === 'delta' || rawKind === 'snapshot' ? rawKind : undefined
   const rawSequence = value.sequence
   if (rawSequence !== null && rawSequence !== undefined && sequence(rawSequence) === null) return null
+  const pauseTransition = value.type === 'session.pause_blocked' || value.type === 'session.paused'
   return {
     schemaVersion: typeof value.schemaVersion === 'string' ? value.schemaVersion : AGENT_STREAM_SCHEMA_VERSION,
     id: value.id, sessionId: value.sessionId, turnId: value.turnId,
     itemId: stringOrNull(value.itemId), taskId: stringOrNull(value.taskId), type: value.type,
     actor: typeof value.actor === 'string' ? value.actor : 'system', sequence: sequence(rawSequence),
     payload: value.payload ?? null, createdAt: timestamp(value.createdAt) ?? undefined, kind,
+    ...(pauseTransition ? { causationId: typeof value.causationId === 'string' && PUBLIC_EVENT_ID.test(value.causationId) ? value.causationId : null } : {}),
     baseRevision: numberOrUndefined(value.baseRevision), revision: numberOrUndefined(value.revision),
   }
 }
