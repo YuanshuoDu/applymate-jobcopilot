@@ -311,7 +311,6 @@ describe("agent artifact repository", () => {
     live = true
     head = { ...head, version: 3, hash: "hash-v3" }
     await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
-    await expect(repository.readRevisionReview({ ...exactInput, allowOwnCorrectionSuccessor: true })).resolves.toBeNull()
     resumeRows = [{
       artifactId: expected.artifactId, version: 3, userId: expected.userId, sessionId: expected.sessionId, jobId: expected.jobId,
       artifactType: "cover_letter", contentHash: "hash-v3", sourceDigest: expected.sourceDigest, previousHash: expected.contentHash,
@@ -328,7 +327,6 @@ describe("agent artifact repository", () => {
       resultArtifactRef: { artifactId: expected.artifactId, version: 3, contentHash: "hash-v3", sourceDigest: expected.sourceDigest },
     }]
     await expect(repository.readRevisionReview(exactInput)).resolves.toMatchObject({ id: "review-row" })
-    await expect(repository.readRevisionReview({ ...exactInput, allowOwnCorrectionSuccessor: true })).resolves.toMatchObject({ id: "review-row" })
     expect(values.find(call => call.sql.includes('FROM "agent_artifact_version" AS version_row'))?.params).toEqual([
       expected.taskFence.taskId, expected.userId, expected.sessionId, expected.taskFence.turnId, expected.taskFence.rootTaskId,
       expected.taskFence.parentTaskId, expected.taskFence.leaseOwner, expected.taskFence.attemptCount, expected.jobId,
@@ -336,7 +334,6 @@ describe("agent artifact repository", () => {
     ])
     resumeRows = [{ ...resumeRows[0]!, previousHash: "foreign-predecessor" }]
     await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
-    await expect(repository.readRevisionReview({ ...exactInput, allowOwnCorrectionSuccessor: true })).resolves.toBeNull()
     head = { ...head, version: 2, hash: "hash-a" }
     resumeRows = []
     reviewRows = []

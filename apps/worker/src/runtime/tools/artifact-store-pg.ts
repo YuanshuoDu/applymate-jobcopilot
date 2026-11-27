@@ -21,7 +21,6 @@ export class PgArtifactToolStore implements ArtifactToolStore {
     private readonly pool: Pool,
     private readonly readCurrentSourceDigest?: AgentArtifactSourceDigestReader,
     private readonly assertCurrentDraftMaterial?: (client: Pick<PoolClient, "query">, userId: string, jobId: string) => Promise<boolean>,
-    private readonly allowOwnCorrectionSuccessor = false,
   ) {
     this.repository = createAgentArtifactRepository(pool)
   }
@@ -87,7 +86,6 @@ export class PgArtifactToolStore implements ArtifactToolStore {
       contentHash: revision.artifactRef.contentHash, sourceDigest: revision.artifactRef.sourceDigest,
       currentSourceDigest: revision.currentSourceDigest, dependencyTaskId: revision.dependencyTaskId,
       reviewHash: revision.reviewHash, readCurrentSourceDigest: this.readCurrentSourceDigest,
-      ...(this.allowOwnCorrectionSuccessor ? { allowOwnCorrectionSuccessor: true as const } : {}),
     }
     try { return await this.repository.readRevisionReview(input) } catch (error: unknown) { return mapError(error) }
   }

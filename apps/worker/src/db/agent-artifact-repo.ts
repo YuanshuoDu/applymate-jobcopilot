@@ -18,7 +18,6 @@ export type AgentArtifactRevisionReviewRead = Readonly<{
   userId: string; sessionId: string; jobId: string; artifactId: string; version: number; contentHash: string
   sourceDigest: string; currentSourceDigest: string; dependencyTaskId: string; reviewHash: string; taskFence: AgentArtifactTaskFence
   readCurrentSourceDigest: AgentArtifactSourceDigestReader
-  allowOwnCorrectionSuccessor?: true
 }>
 
 export type AgentArtifactDraftHead = Readonly<{

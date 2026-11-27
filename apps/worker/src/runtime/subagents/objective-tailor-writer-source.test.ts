@@ -208,7 +208,6 @@ describe("Objective tailor child source", () => {
     const result = await loadObjectiveTailorChildSource(client as never, scope, loaded, lease)
     expect(result?.context).toBe(source)
     expect(result?.assertCurrentDraftMaterial).toBeTypeOf("function")
-    expect(result?.allowOwnCorrectionSuccessor).toBe(true)
     expect(await result!.assertCurrentDraftMaterial!(client as never, scope.userId, jobId)).toBe(true)
     mocks.readMaterial.mockResolvedValue(`sha256:${"9".repeat(64)}`)
     await expect(result!.assertCurrentDraftMaterial!(client as never, scope.userId, jobId)).resolves.toBe(false)

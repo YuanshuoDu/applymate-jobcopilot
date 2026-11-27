@@ -75,8 +75,6 @@ async function loadWaveChildSource(client: Queryable, scope: GraphIdentityScope,
   const source = await loadVerifiedJobSource(client, scope.userId, jobId, witness.candidate.materialDigest)
   if (!source) return undefined
   if (lease.role === "reviewer") return { context: source }
-  if (correction) return { context: source, assertCurrentDraftMaterial: materialRechecker(scope.userId, jobId, witness.candidate.materialDigest),
-    allowOwnCorrectionSuccessor: true }
   return { context: source, assertCurrentDraftMaterial: materialRechecker(scope.userId, jobId, witness.candidate.materialDigest) }
 }
 

@@ -175,13 +175,11 @@ describe("PgArtifactToolStore immutable persistence", () => {
       content: "corrected draft", constraints: {}, requestHash: hashArtifactContent("corrected draft"),
       expectedPreviousVersion: version.version, expectedPreviousHash: version.contentHash })
     expect(corrected).toMatchObject({ artifactId: version.artifactId, version: version.version + 1, previousHash: version.contentHash })
-    const recoveryStore = new PgArtifactToolStore(pool as unknown as Pool, readCurrentSourceDigest, undefined, true)
-    await expect(recoveryStore.readRevisionReview(correctionScope, revision)).resolves.toMatchObject({ id: review.id, status: "needs_revision" })
     await expect(store.readRevisionReview(correctionScope, revision)).resolves.toBeNull()
-    await expect(recoveryStore.readRevisionReview(scopeFor("other-correction-writer", "other-write-call"), revision)).resolves.toBeNull()
+    await expect(store.readRevisionReview(scopeFor("other-correction-writer", "other-write-call"), revision)).resolves.toBeNull()
 
     pool.fence.interruptRequestedAt = new Date()
-    await expect(recoveryStore.readRevisionReview(correctionScope, revision)).resolves.toBeNull()
+    await expect(store.readRevisionReview(correctionScope, revision)).resolves.toBeNull()
   })
 
   it("rejects ambiguous review receipts and a review whose artifact head has advanced", async () => {
