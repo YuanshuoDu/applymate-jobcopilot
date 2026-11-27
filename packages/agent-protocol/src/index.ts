@@ -38,8 +38,27 @@ export {
 export type { ObjectiveLocationSteerReceipt, ObjectiveLocationSteerRequest } from './objective-location-steer.js'
 export { AgentTurnSchema, TurnSourceSchema, TurnStatusSchema } from './turn.js'
 export type { AgentTurn, TurnSource, TurnStatus } from './turn.js'
-export { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema } from './turn-intent.js'
+export { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, TurnIntentSchema } from './turn-intent.js'
 export type { TurnIntent } from './turn-intent.js'
+export {
+  VERIFIED_SHORTLIST_SELECTION_SCHEMA,
+  VerifiedShortlistSelectionBindingSchema,
+  VerifiedShortlistSourceIdentitySchema,
+  parseVerifiedShortlistJobIds,
+  parseVerifiedShortlistSelectionBinding,
+  parseVerifiedShortlistSourceIdentity,
+  sameVerifiedShortlistSelectionBinding,
+} from './verified-shortlist-selection.js'
+export type { VerifiedShortlistSelectionBinding, VerifiedShortlistSourceIdentity } from './verified-shortlist-selection.js'
+export { parseSelectedJobBatchGraph } from './selected-job-batch-graph.js'
+export type { SelectedJobBatchGraphNode, SelectedJobBatchGraphPair, SelectedJobBatchGraphSlot } from './selected-job-batch-graph.js'
+export {
+  isSelectedJobBatchTemplateId,
+  SELECTED_JOB_BATCH_SLOT_IDS,
+  SELECTED_JOB_BATCH_TEMPLATE_CATALOG,
+  selectedJobBatchTemplatesForSlot,
+} from './selected-job-batch-templates.js'
+export type { SelectedJobBatchSlotId, SelectedJobBatchTemplateEntry, SelectedJobBatchTemplateId } from './selected-job-batch-templates.js'
 export { AgentStepSchema, AgentStepUsageSchema, StepStatusSchema } from './step.js'
 export type { AgentStep, AgentStepUsage, StepStatus } from './step.js'
 export {

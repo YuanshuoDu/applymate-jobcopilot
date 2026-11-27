@@ -8,6 +8,10 @@ import type { CognitiveAgendaView } from './cognitive-agenda-view'
 import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineConnection, type TimelineItem, type TimelineState } from './timeline-reducer'
 import type { TimelineCognitiveAgendaEntry } from './timeline-cognitive-agenda'
 import type { TimelineSteeringMarkerState } from './timeline-steering-markers'
+import { projectSessionPauseBlocker } from './session-pause-blocker-projection'
+import type { SessionPauseBlocker } from './session-pause-blocker-projection'
+
+export type { SessionPauseBlocker, SessionPauseBlockerReason } from './session-pause-blocker-projection'
 
 export type AgentCognitiveAgendaSnapshot = CognitiveAgendaView & {
   readonly steeringMarkers?: TimelineSteeringMarkerState
@@ -20,6 +24,7 @@ export interface AgentTimelineSnapshot {
   readonly lifecycleRevision: number
   readonly cognitiveAgenda: AgentCognitiveAgendaSnapshot | null
   readonly cognitiveAgendas: readonly TimelineCognitiveAgendaEntry[]
+  readonly pauseBlocker?: SessionPauseBlocker | null
   readonly approvalLedger: ReturnType<typeof selectApprovalLedgerProjection>
   readonly steeringMarkers?: TimelineSteeringMarkerState
   readonly connection: TimelineConnection
@@ -73,6 +78,8 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
 
   const items = useMemo(() => timelineItemsForSession(state, sessionId), [state, sessionId])
   const sessionMatches = Boolean(sessionId && state.sessionId === sessionId)
+  const pauseBlocker = useMemo(() => sessionMatches ? projectSessionPauseBlocker(state.events, sessionId) : null,
+    [state.events, sessionMatches, sessionId])
   const cognitiveAgenda = sessionMatches && state.cognitiveAgenda.latest
     ? { ...state.cognitiveAgenda.latest, steeringMarkers: state.steeringMarkers }
     : null
@@ -83,10 +90,11 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
     lifecycleRevision: sessionMatches ? state.lifecycleRevision : 0,
     cognitiveAgenda,
     cognitiveAgendas: sessionMatches ? state.cognitiveAgenda.scoped : [],
+    pauseBlocker,
     approvalLedger: sessionMatches ? selectApprovalLedgerProjection(state.approvalLedger) : { sessionId: sessionId ?? 'draft', approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0 },
     steeringMarkers: sessionMatches ? state.steeringMarkers : { observed: [], applied: [], active: [], observedCount: 0, appliedCount: 0, activeCount: 0 },
     connection: sessionMatches ? state.connection : 'idle',
     restoring: sessionMatches ? restoring : Boolean(sessionId),
     error: sessionMatches ? error : null,
-  }), [sessionId, items, sessionMatches, state.lastEventId, state.connection, state.steeringMarkers, state.cognitiveAgenda.scoped, state.approvalLedger, cognitiveAgenda, restoring, error])
+  }), [sessionId, items, sessionMatches, state.lastEventId, state.connection, state.steeringMarkers, state.cognitiveAgenda.scoped, state.approvalLedger, cognitiveAgenda, pauseBlocker, restoring, error])
 }

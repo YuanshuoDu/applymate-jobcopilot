@@ -1,11 +1,11 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider, translate } from '@/lib/i18n'
 
 import { CognitiveAgendaCard } from './cognitive-agenda-card'
-import { parseCognitiveAgendaReceipt, type CognitiveAgendaReceiptScope } from './cognitive-agenda-view'
+import { parseCognitiveAgendaReceipt, type CognitiveAgendaObjectiveProgressRow, type CognitiveAgendaReceiptScope } from './cognitive-agenda-view'
 import type { TimelineCognitiveAgendaEntry } from './timeline-cognitive-agenda'
 
 const scope: CognitiveAgendaReceiptScope = { sessionId: 'session-1', turnId: 'turn-1', taskId: 'task-1', stepId: 'step-1' }
@@ -49,6 +49,7 @@ describe('CognitiveAgendaCard', () => {
     expect(html).not.toContain('Completion checks:')
     expect(html).toContain('Active steering: 7')
     expect(html).toContain('New steering: 9')
+    expect(html).not.toContain('data-agent-objective-progress="true"')
   })
 
   it('renders localized numeric revisions for the current agenda and hides null revisions', () => {
@@ -81,6 +82,51 @@ describe('CognitiveAgendaCard', () => {
     expect(html).toContain('Active: 2')
     expect(html).toContain('Applied: 1')
     expect(html).not.toContain('steer:')
+  })
+
+  it('renders bounded safe objective progress, a validated status change, and advisory reported pass', () => {
+    const rows: CognitiveAgendaObjectiveProgressRow[] = [
+      { kind: 'candidate_count_gte', status: 'active', minimum: 3 },
+      { kind: 'finding_count_gte', status: 'reported_passed', minimum: 2, beforeStatus: 'active' },
+      { kind: 'candidate_location_in', status: 'unverified', id: 'candidate-secret', location: 'PRIVATE_LOCATION', narrative: 'location-secret' } as unknown as CognitiveAgendaObjectiveProgressRow,
+    ]
+    const html = renderToStaticMarkup(<I18nProvider><CognitiveAgendaCard agenda={{ ...agenda(), objectiveProgress: rows }} /></I18nProvider>)
+
+    expect(html).toContain('data-agent-objective-progress="true"')
+    expect(html).toContain('Objective progress')
+    expect(html).toContain('Candidate jobs (≥ 3)')
+    expect(html).toContain('Job findings (≥ 2)')
+    expect(html).toContain('In progress</span><span aria-hidden="true">→</span><strong>Reported passed (advisory)</strong>')
+    expect(html).toContain('Location requirement')
+    expect(html).toContain('Unverified')
+    expect(html).not.toContain('candidate-secret')
+    expect(html).not.toContain('PRIVATE_LOCATION')
+    expect(html).not.toContain('location-secret')
+  })
+
+  it('shows at most eight safe rows and uses the active locale for progress copy', () => {
+    const rows = Array.from({ length: 9 }, (_, index): CognitiveAgendaObjectiveProgressRow => ({
+      kind: 'candidate_count_gte', status: 'unknown', minimum: index + 1,
+    }))
+    const progressHtml = renderToStaticMarkup(<I18nProvider><CognitiveAgendaCard agenda={{ ...agenda(), objectiveProgress: rows }} /></I18nProvider>)
+    expect(progressHtml).toContain('Candidate jobs (≥ 8)')
+    expect(progressHtml).not.toContain('Candidate jobs (≥ 9)')
+    expect(progressHtml.match(/role="listitem"/g)).toHaveLength(8)
+
+    vi.stubGlobal('window', {})
+    vi.stubGlobal('localStorage', { getItem: () => 'zh' })
+    try {
+      const chineseHtml = renderToStaticMarkup(<I18nProvider><CognitiveAgendaCard agenda={{ ...agenda(), objectiveProgress: [
+        { kind: 'candidate_location_in', status: 'reported_passed' },
+        { kind: 'candidate_count_gte', status: 'unknown', minimum: 2 },
+      ] }} /></I18nProvider>)
+      expect(chineseHtml).toContain('目标进度')
+      expect(chineseHtml).toContain('地点要求')
+      expect(chineseHtml).toContain('候选职位数 (≥ 2)')
+      expect(chineseHtml).toContain('报告为已满足（仅供参考）')
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('renders translated bounded root and child agenda summaries from safe task labels', () => {

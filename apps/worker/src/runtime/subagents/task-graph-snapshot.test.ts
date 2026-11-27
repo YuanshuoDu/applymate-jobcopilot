@@ -427,6 +427,35 @@ describe("parseTaskGraphSnapshot", () => {
     }]))).toThrow("task_graph_snapshot_verification_invalid")
   })
 
+  it("round-trips exact two-Job batch templates and rejects noncatalog or typed variants", () => {
+    const nodes = [
+      { ...storedNode("writer-a"), templateId: "cover_letter_writer_slot_1", depth: 1 },
+      { ...storedNode("reviewer-a", ["writer-a"]), templateId: "cover_letter_reviewer_slot_1", depth: 2 },
+      { ...storedNode("writer-b"), templateId: "cover_letter_writer_slot_2", depth: 1 },
+      { ...storedNode("reviewer-b", ["writer-b"]), templateId: "cover_letter_reviewer_slot_2", depth: 2 },
+    ].map(node => ({ ...node, status: "queued" as const }))
+    const taskIds = new Map(nodes.map(node => [node.key, node.taskId] as const))
+    const state: TaskGraphState = { revision: 1, nodes, appliedEvents: [] }
+    const written = taskGraphSnapshot(state, taskIds)
+    const restored = parseTaskGraphSnapshot(canonicalTaskGraphJson(written))
+
+    expect(restored.nodes.map(node => [node.templateId, node.verificationDisposition])).toEqual([
+      ["cover_letter_writer_slot_1", "specialized"], ["cover_letter_reviewer_slot_1", "specialized"],
+      ["cover_letter_writer_slot_2", "specialized"], ["cover_letter_reviewer_slot_2", "specialized"],
+    ])
+    expect(restored).toEqual(written)
+    for (const templateId of ["cover_letter_writer_slot_0", "cover_letter_writer_slot_5", "cover_letter_reviewer_slot_5",
+      "cover_letter_writer_slot_01", "cover_letter_writer_slot_1_extra"]) {
+      expect(() => parseTaskGraphSnapshot(snapshotWithNodes([{
+        ...storedNode("invalid"), templateId, verificationDisposition: "specialized",
+      }]))).toThrow("task_graph_snapshot_verification_disposition_invalid")
+    }
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([{
+      ...storedNode("typed"), templateId: "cover_letter_writer_slot_1", verification: analystVerification,
+      verificationDisposition: "typed",
+    }]))).toThrow("task_graph_snapshot_verification_invalid")
+  })
+
   it("round-trips repair lineage without rewriting its target or marking it passed", () => {
     const target = {
       ...storedNode("target"), verification: scoutVerification, verificationDisposition: "typed", registeredScoutEnvelope,
