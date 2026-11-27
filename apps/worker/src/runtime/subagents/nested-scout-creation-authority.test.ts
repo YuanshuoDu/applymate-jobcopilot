@@ -45,10 +45,24 @@ describe("nested Scout creation authority", () => {
     expect(hasUnsupportedNestedScoutBudgetLimits({ limits: { maxSteps: 4, maxToolCalls: 8 } })).toBe(false)
   })
 
-  it("uses canonical effective-limit parsing for malformed values and null wrapper fallback", () => {
-    expect(hasUnsupportedNestedScoutBudgetLimits({ limits: {
-      maxInputTokens: "100", maxOutputTokens: -1, maxCostUsd: Number.POSITIVE_INFINITY,
-    } })).toBe(false)
+  it("rejects malformed recognized limits while preserving flat and null-wrapper formats", () => {
+    for (const snapshot of [
+      { limits: { maxSteps: "4" } },
+      { limits: { maxToolCalls: -1 } },
+      { limits: { maxInputTokens: "100" } },
+      { limits: { maxOutputTokens: -1 } },
+      { limits: { maxCostUsd: null } },
+      { limits: { maxCostUsd: Number.POSITIVE_INFINITY } },
+      { limits: [] },
+      { limits: "invalid" },
+      "invalid",
+    ]) expect(hasUnsupportedNestedScoutBudgetLimits(snapshot)).toBe(true)
+
     expect(hasUnsupportedNestedScoutBudgetLimits({ limits: null, maxCostUsd: 0 })).toBe(true)
+    expect(hasUnsupportedNestedScoutBudgetLimits({ maxSteps: 4, maxToolCalls: 8, subagentPolicy: { maxDepth: 2 } })).toBe(false)
+    expect(hasUnsupportedNestedScoutBudgetLimits({ limits: null, maxSteps: 4, maxToolCalls: 8,
+      subagentPolicy: { maxDepth: 2 } })).toBe(false)
+    expect(hasUnsupportedNestedScoutBudgetLimits({ limits: { maxSteps: 4, maxToolCalls: 8, extra: 9 },
+      subagentPolicy: { maxDepth: 2 } })).toBe(false)
   })
 })

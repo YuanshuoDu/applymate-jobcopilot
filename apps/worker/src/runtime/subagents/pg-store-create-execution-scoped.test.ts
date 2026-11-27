@@ -178,7 +178,12 @@ describe("lease-scoped atomic subagent creation", () => {
     expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
-  it("uses canonical parsing for malformed cap values and allows an exact no-cap nested replay", async () => {
+  it.each([
+    ["malformed shared step cap", { limits: { maxSteps: "32" } }],
+    ["malformed unsupported token cap", { limits: { maxInputTokens: "100" } }],
+    ["malformed limits container", { limits: [] }],
+    ["flat legacy unsupported cost cap", { limits: null, maxCostUsd: 0 }],
+  ] as const)("rejects %s before an exact replay or any child/outbox writes", async (_label, budgetSnapshot) => {
     const replayTask = {
       id: "child-existing", userId: fence.userId, sessionId: fence.sessionId, turnId: fence.turnId,
       rootTaskId: fence.rootTaskId, parentTaskId: fence.id, path: "/root-1/parent-1/child-existing", depth: 2,
@@ -186,12 +191,26 @@ describe("lease-scoped atomic subagent creation", () => {
       maxAttempts: 2, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
       budgetSnapshot: {}, toolPolicySnapshot: {},
     }
-    const malformed = fixture({ nested: true, root: { budgetSnapshot: { limits: {
-      maxInputTokens: "100", maxOutputTokens: -1, maxCostUsd: null,
-    } } }, existing: { taskId: "child-existing" }, replayTask })
-    await expect(createSubagentWithSpawnFromLease(malformed.pool, nestedInput)).resolves.toMatchObject({ duplicate: true })
-    expect(malformed.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(true)
+    const malformed = fixture({ nested: true, root: { budgetSnapshot }, existing: { taskId: "child-existing" }, replayTask })
+    await expect(createSubagentWithSpawnFromLease(malformed.pool, nestedInput)).rejects.toBeInstanceOf(NestedScoutBudgetPolicyError)
+    expect(malformed.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(false)
     expect(malformed.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(malformed.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("allows an exact no-cap replay with legacy flat shared step/tool limits", async () => {
+    const replayTask = {
+      id: "child-existing", userId: fence.userId, sessionId: fence.sessionId, turnId: fence.turnId,
+      rootTaskId: fence.rootTaskId, parentTaskId: fence.id, path: "/root-1/parent-1/child-existing", depth: 2,
+      role: "scout", taskType: "job_discovery", status: "queued", goal: nestedInput.goal, attemptCount: 0,
+      maxAttempts: 2, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
+      budgetSnapshot: {}, toolPolicySnapshot: {},
+    }
+    const state = fixture({ nested: true, root: { budgetSnapshot: { limits: null, maxSteps: 32, maxToolCalls: 16,
+      subagentPolicy: { maxDepth: 2 } } }, existing: { taskId: "child-existing" }, replayTask })
+    await expect(createSubagentWithSpawnFromLease(state.pool, nestedInput)).resolves.toMatchObject({ duplicate: true })
+    expect(state.calls.some(([sql]) => sql.startsWith('SELECT "payload" FROM "agent_outbox"'))).toBe(true)
+    expect(state.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
   })
 
   it("fails closed when the locked root row has no budget snapshot field", async () => {

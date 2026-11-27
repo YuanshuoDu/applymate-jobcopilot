@@ -1,7 +1,6 @@
 import { NESTED_SCOUT_PROFILE_MARKER, nestedScoutPlainRecord, nestedScoutStringArray } from "./nested-scout-profile.js"
 import { nestedScoutTaskScopeStateFromContext } from "./nested-scout-tools.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { limits as canonicalTurnLimits } from "../canonical-turn-config.js"
 
 export type NestedScoutCreationAuthority = "parent_template" | "child_execution"
 export const NESTED_SCOUT_PROTECTED_ACTIONS = ["scout.delegate", "scout.results"] as const
@@ -32,8 +31,23 @@ export function filterNestedScoutProtectedActions(value: unknown): string[] {
 
 /** These root limits have no shared tree ledger, so nested Scout admission must not discard them. */
 export function hasUnsupportedNestedScoutBudgetLimits(value: unknown): boolean {
-  const limits = canonicalTurnLimits(value)
-  return limits !== undefined && UNSUPPORTED_NESTED_LIMITS.some(key => limits[key] !== undefined)
+  if (value === undefined || value === null) return false
+  if (typeof value !== "object" || Array.isArray(value)) return true
+  const snapshot = value as Record<string, unknown>
+  const rawLimits = snapshot.limits
+  // `limits: null` and a flat snapshot are both persisted legacy formats.
+  const source = rawLimits == null ? snapshot
+    : typeof rawLimits === "object" && !Array.isArray(rawLimits) ? rawLimits as Record<string, unknown> : undefined
+  if (!source) return true
+
+  const recognized = ["maxSteps", "maxToolCalls", ...UNSUPPORTED_NESTED_LIMITS] as const
+  for (const key of recognized) {
+    if (!Object.hasOwn(source, key)) continue
+    const limit = source[key]
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0) return true
+    if (UNSUPPORTED_NESTED_LIMITS.includes(key as typeof UNSUPPORTED_NESTED_LIMITS[number])) return true
+  }
+  return false
 }
 
 export function isNestedScoutCreationAuthorityValid(authority: unknown, task: NestedScoutCreationTaskShape): authority is NestedScoutCreationAuthority {
