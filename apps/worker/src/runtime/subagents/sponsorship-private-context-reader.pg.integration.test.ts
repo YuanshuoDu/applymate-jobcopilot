@@ -465,17 +465,33 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
         expect(executed.requests[0]?.tools).toEqual([])
         expect(JSON.stringify(executed.requests[0]?.messages)).toContain("PRIVATE-SPONSORSHIP-REVIEW-CANARY")
 
-        const reviewerRows = await db.query<{ status: string; failureReason: string | null; result: unknown; qualityGateResult: unknown }>(
-          `SELECT "status", "failureReason", "result", "qualityGateResult" FROM "sub_agent_tasks"
+        const reviewerRows = await db.query<{ status: string; failureReason: string | null; result: unknown; qualityGateResult: unknown;
+          context: unknown; expectedOutputSchema: unknown }>(
+          `SELECT "status", "failureReason", "result", "qualityGateResult", "context", "expectedOutputSchema" FROM "sub_agent_tasks"
            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
              AND "role" = 'auditor' AND "taskType" = 'native_verification'`, [review.taskId, value.sessionId, value.turnId, root.id])
         expect(reviewerRows.rows).toHaveLength(1)
         const reviewerRow = reviewerRows.rows[0]!
         expect(reviewerRow).toMatchObject({ status: "completed", failureReason: null,
           result: { status: "completed", toolCallCount: 0 } })
-        expect(reviewerRow.qualityGateResult).toMatchObject({ disposition: "passed", criteria: [
-          { criterionId: "criterion-1", disposition: "passed" }, { criterionId: "criterion-2", disposition: "failed" },
-        ] })
+        const reviewerControl = parseNativeVerificationControl(reviewerRow.expectedOutputSchema)
+        const reviewerPacket = reviewerControl ? parseNativeVerificationPacket(reviewerRow.context, reviewerControl) : null
+        const citedSource = reviewerPacket?.evidence.find(item => {
+          if (item.kind !== "saved_job_listing_description_segment") return false
+          try {
+            const summary = JSON.parse(item.summary) as { quote?: unknown }
+            return typeof summary.quote === "string" && summary.quote.includes("Backend Engineer")
+              && summary.quote.includes("Ireland") && summary.quote.includes("sponsorship is available")
+          } catch { return false }
+        })
+        expect(citedSource?.referenceId).toMatch(/^sponsorship-citation:[a-f0-9]{32}$/)
+        const qualityGate = reviewerRow.qualityGateResult as { disposition?: unknown; criteria?: unknown }
+        expect(qualityGate.disposition).toBe("failed")
+        expect(qualityGate.criteria).toEqual([
+          { criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion",
+            evidenceReferenceIds: [citedSource!.referenceId] },
+          { criterionId: "criterion-2", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: [] },
+        ])
         const reviewPublicRows = await db.query<{ type: string; payload: unknown }>(`SELECT "type", "payload" FROM "agent_events"
           WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" IN ($3, $4)`
         , [value.sessionId, value.turnId, root.id, review.taskId])
