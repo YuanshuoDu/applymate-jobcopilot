@@ -38,7 +38,7 @@ describe("Objective application submit result event", () => {
       return { kind: "current", value: await work(test.client) }
     })
     const written = await module()
-    await expect(written.recordObjectiveApplicationSubmitResult(input({}, test.execution))).resolves.toBe(73)
+    await expect(written.recordObjectiveApplicationSubmitResult(input({}, test.execution))).resolves.toEqual({ kind: "recorded", resultId: 73 })
     expect(mocks.insertResult).toHaveBeenCalledWith(test.client, expect.objectContaining({ status: "submitted", flowUsed: "application.submit" }))
     expect(test.resultEvent).toMatchObject({ id: resultEventId(test.execution), type: "objective_application_submit_result_recorded", actor: "worker" })
     await expect(written.readObjectiveApplicationSubmitResultWithClient(test.client, test.execution)).resolves.toMatchObject({
@@ -52,9 +52,9 @@ describe("Objective application submit result event", () => {
     mocks.fence.mockImplementation(async (_pool: Pool, _identity: unknown, _phase: string, work: (client: PoolClient) => Promise<number>) =>
       ({ kind: "current", value: await work(test.client) }))
     const written = await module()
-    await expect(written.recordObjectiveApplicationSubmitResult(input({}, test.execution))).resolves.toBe(73)
+    await expect(written.recordObjectiveApplicationSubmitResult(input({}, test.execution))).resolves.toEqual({ kind: "recorded", resultId: 73 })
     mocks.insertResult.mockClear()
-    await expect(written.recordObjectiveApplicationSubmitResult(input({}, test.execution))).resolves.toBe(73)
+    await expect(written.recordObjectiveApplicationSubmitResult(input({}, test.execution))).resolves.toEqual({ kind: "recorded", resultId: 73 })
     expect(mocks.insertResult).not.toHaveBeenCalled()
   })
 
@@ -66,8 +66,15 @@ describe("Objective application submit result event", () => {
     ["missing confirmation", { confirmationId: null }],
   ])("does not write a positive result for %s", async (_label, change) => {
     const written = await module()
-    await expect(written.recordObjectiveApplicationSubmitResult(input(change))).resolves.toBeNull()
+    await expect(written.recordObjectiveApplicationSubmitResult(input(change))).resolves.toEqual({ kind: "invalid" })
     expect(mocks.fence).not.toHaveBeenCalled()
+    expect(mocks.insertResult).not.toHaveBeenCalled()
+  })
+
+  it("distinguishes an exact-fence successor from a current invalid result", async () => {
+    mocks.fence.mockResolvedValueOnce({ kind: "superseded" })
+    const written = await module()
+    await expect(written.recordObjectiveApplicationSubmitResult(input())).resolves.toEqual({ kind: "superseded" })
     expect(mocks.insertResult).not.toHaveBeenCalled()
   })
 
@@ -76,21 +83,21 @@ describe("Objective application submit result event", () => {
     mocks.fence.mockImplementation(async (_pool: Pool, _identity: unknown, _phase: string, work: (client: PoolClient) => Promise<number>) =>
       ({ kind: "current", value: await work(changedReceipt.client) }))
     let written = await module()
-    await expect(written.recordObjectiveApplicationSubmitResult(input({}, changedReceipt.execution))).resolves.toBeNull()
+    await expect(written.recordObjectiveApplicationSubmitResult(input({}, changedReceipt.execution))).resolves.toEqual({ kind: "invalid" })
     expect(mocks.insertResult).not.toHaveBeenCalled()
 
     const stale = await fixture({ checkpoint: "browser_active" })
     mocks.fence.mockImplementation(async (_pool: Pool, _identity: unknown, _phase: string, work: (client: PoolClient) => Promise<number>) =>
       ({ kind: "current", value: await work(stale.client) }))
     written = await module()
-    await expect(written.recordObjectiveApplicationSubmitResult(input({}, stale.execution))).resolves.toBeNull()
+    await expect(written.recordObjectiveApplicationSubmitResult(input({}, stale.execution))).resolves.toEqual({ kind: "invalid" })
     expect(mocks.insertResult).not.toHaveBeenCalled()
 
     const duplicate = await fixture({ duplicateLogical: true })
     mocks.fence.mockImplementation(async (_pool: Pool, _identity: unknown, _phase: string, work: (client: PoolClient) => Promise<number>) =>
       ({ kind: "current", value: await work(duplicate.client) }))
     written = await module()
-    await expect(written.recordObjectiveApplicationSubmitResult(input({}, duplicate.execution))).resolves.toBeNull()
+    await expect(written.recordObjectiveApplicationSubmitResult(input({}, duplicate.execution))).resolves.toEqual({ kind: "invalid" })
     expect(mocks.insertResult).not.toHaveBeenCalled()
   })
 })

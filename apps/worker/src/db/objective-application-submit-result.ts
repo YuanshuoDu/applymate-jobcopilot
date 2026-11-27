@@ -30,11 +30,11 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
 export async function recordObjectiveApplicationSubmitResult(input: {
   pool: Pool; execution: Execution; runnerStatus: string; confirmationId: string | null; durationMs: number;
   requestStarted: boolean; requestContinued: boolean; fenceUnavailable: boolean;
-}): Promise<number | null> {
+}): Promise<{ readonly kind: "recorded"; readonly resultId: number } | { readonly kind: "invalid" | "superseded" }> {
   const { execution } = input
   if (!validExecution(execution) || input.runnerStatus !== "submitted" || !input.requestStarted || !input.requestContinued
     || input.fenceUnavailable || typeof input.confirmationId !== "string" || !ID.test(input.confirmationId)
-    || !Number.isSafeInteger(input.durationMs) || input.durationMs < 0) return null
+    || !Number.isSafeInteger(input.durationMs) || input.durationMs < 0) return { kind: "invalid" }
   const outcome = await withExactSubmissionWrite(input.pool, execution, "objective_submit_success_result", async client => {
     const prior = await readObjectiveApplicationSubmitResultWithClient(client, execution)
     if (prior) return prior.applyResultId
@@ -56,7 +56,8 @@ export async function recordObjectiveApplicationSubmitResult(input: {
     if (inserted.rowCount !== 1) throw new Error("Objective submit result event conflicted.")
     return result
   })
-  return outcome.kind === "current" ? outcome.value : null
+  if (outcome.kind === "superseded") return { kind: "superseded" }
+  return outcome.value === null ? { kind: "invalid" } : { kind: "recorded", resultId: outcome.value }
 }
 
 /** Reads a fully linked immutable result; settlement and terminality remain caller-owned checks. */

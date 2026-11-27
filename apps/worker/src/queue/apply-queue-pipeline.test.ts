@@ -60,7 +60,7 @@ const mocks = vi.hoisted(() => {
     checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
     withCloakContext: vi.fn(),
     insertApplyResult: vi.fn().mockResolvedValue(1),
-    recordObjectiveSubmitResult: vi.fn().mockResolvedValue(73),
+    recordObjectiveSubmitResult: vi.fn().mockResolvedValue({ kind: "recorded", resultId: 73 }),
     recordExecutionSettled: vi.fn().mockResolvedValue(true),
     query: vi.fn().mockResolvedValue({ rowCount: 1 }),
     outcomeQuery,
@@ -160,6 +160,12 @@ vi.mock("../cloak/captcha.js", () => ({
 vi.mock("../db/apply-results.js", () => ({
   insertApplyResult: mocks.insertApplyResult,
   getPool: vi.fn(() => ({ query: mocks.query, connect: vi.fn().mockResolvedValue(mocks.outcomeClient) })),
+}));
+vi.mock("../db/objective-submission-uncertain.js", () => ({
+  markExactStartedObjectiveSubmissionUncertain: async (pool: unknown, scope: { applicationTaskId: string }, message: string) => {
+    const result = await mocks.finishApplicationTask(pool, scope.applicationTaskId, "waiting_for_user", "submission_uncertain", message, "submit", scope);
+    return result === "superseded" ? "superseded" : "written";
+  },
 }));
 vi.mock("../db/objective-application-submit-result.js", async importOriginal => ({
   ...await importOriginal<typeof import("../db/objective-application-submit-result.js")>(),
@@ -314,7 +320,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.gotoCountAtToolExecution = null;
     mocks.outcomeQuery.mockClear();
     mocks.outcomeClient.release.mockClear();
-    mocks.recordObjectiveSubmitResult.mockReset().mockResolvedValue(73);
+    mocks.recordObjectiveSubmitResult.mockReset().mockResolvedValue({ kind: "recorded", resultId: 73 });
     mocks.recordExecutionSettled.mockReset().mockResolvedValue(true);
     mocks.workerHandler = undefined;
     mocks.workerEvents = {};
@@ -479,7 +485,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.fakePage.url.mockReturnValue(approvedUrl);
     mocks.objectiveMaterial = { approvedApplyUrl: approvedUrl, reviewedResumeContent: {}, reviewedCoverLetter: "Reviewed letter", confirmedAnswers: {} };
     mocks.acquireStartFence.mockResolvedValueOnce({ state: "uncertain", release: vi.fn().mockResolvedValue(undefined) });
-    mocks.recordObjectiveSubmitResult.mockResolvedValueOnce(null);
+    mocks.recordObjectiveSubmitResult.mockResolvedValueOnce({ kind: "superseded" });
     const frame = mocks.fakePage.mainFrame();
     mocks.fakePage.mainFrame.mockReturnValue(frame);
     mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
@@ -504,6 +510,77 @@ describe("apply-queue Phase 5 pipeline", () => {
       "submission_uncertain", expect.any(String), "submit", expect.anything());
     expect(mocks.updateJobForSubmission).not.toHaveBeenCalledWith(expect.anything(), expect.anything(),
       expect.objectContaining({ workflowState: "submitted" }), expect.anything());
+  }, 15_000);
+
+  it("aborts a hung Objective boundary commit before waiting for uncertain persistence", async () => {
+    const approvedUrl = "https://boards.greenhouse.io/acme/jobs/123";
+    const events: string[] = [];
+    let releaseCommit!: () => void;
+    let unlock!: () => void;
+    let releaseEntered!: () => void;
+    const releaseStarted = new Promise<void>(resolve => { releaseEntered = resolve; });
+    const commit = new Promise<void>(resolve => { releaseCommit = resolve; });
+    const lockReleased = new Promise<void>(resolve => { unlock = resolve; });
+    const release = vi.fn(() => { events.push("release"); releaseEntered(); return commit; });
+    const abort = vi.fn(() => { events.push("abort"); unlock(); });
+    const routeContinue = vi.fn().mockResolvedValue(undefined);
+    mocks.acquireStartFence.mockResolvedValueOnce({ state: "ready", release, abort });
+    mocks.fakeContext.close.mockImplementation(async () => { events.push("close"); });
+    mocks.finishApplicationTask.mockImplementation(async (_pool, _task, status, checkpoint) => {
+      if (status === "waiting_for_user" && checkpoint === "submission_uncertain") {
+        events.push("uncertain-wait");
+        await lockReleased;
+        events.push("uncertain-written");
+      }
+      return undefined;
+    });
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.loadTaskContext.mockResolvedValueOnce({ applyUrl: approvedUrl, persona: { fullName: "Ada Lovelace" },
+      coverLetterText: null, jobTitle: "Engineer", jobCompany: "Example", jobKeywords: "typescript",
+      confirmedAnswers: {}, resumeTempPath: undefined });
+    mocks.detectFlow.mockReturnValue("greenhouse");
+    mocks.fakePage.url.mockReturnValue(approvedUrl);
+    mocks.objectiveMaterial = { approvedApplyUrl: approvedUrl, reviewedResumeContent: {}, reviewedCoverLetter: "Reviewed letter", confirmedAnswers: {} };
+    const frame = mocks.fakePage.mainFrame();
+    mocks.fakePage.mainFrame.mockReturnValue(frame);
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: {
+      task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      observation: { arm: (intent: { url: string; method: string }) => boolean };
+    }) => {
+      const intent = { url: `${approvedUrl}/application`, method: "POST" };
+      await input.task.beforeSubmit?.(intent);
+      expect(input.observation.arm(intent)).toBe(true);
+      const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
+      vi.useFakeTimers();
+      await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
+        frame: () => frame, isNavigationRequest: () => true }), continue: routeContinue,
+        abort: vi.fn().mockResolvedValue(undefined), fallback: vi.fn().mockResolvedValue(undefined) });
+      return { status: "submitted", durationMs: 7 };
+    });
+    try {
+      let completed = false;
+      const job = runApplyJob().then(() => { completed = true; });
+      await releaseStarted;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(completed).toBe(true);
+      await job;
+      expect(routeContinue).toHaveBeenCalledOnce();
+      expect(release).toHaveBeenCalledOnce();
+      expect(abort).toHaveBeenCalledOnce();
+      expect(events.indexOf("close")).toBeGreaterThanOrEqual(0);
+      expect(events.indexOf("close")).toBeLessThan(events.indexOf("abort"));
+      expect(events.indexOf("abort")).toBeLessThan(events.indexOf("uncertain-written"));
+      expect(mocks.finishApplicationTask.mock.calls.filter(([, , status, checkpoint]) => status === "waiting_for_user" && checkpoint === "submission_uncertain")).toHaveLength(1);
+      expect(mocks.recordObjectiveSubmitResult).not.toHaveBeenCalled();
+      expect(mocks.recordExecutionSettled).not.toHaveBeenCalled();
+      expect(mocks.updateJobForSubmission).not.toHaveBeenCalledWith(expect.anything(), expect.anything(),
+        expect.objectContaining({ status: "applied", workflowState: "submitted" }), expect.anything());
+      releaseCommit();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mocks.recordObjectiveSubmitResult).not.toHaveBeenCalled();
+      expect(mocks.recordExecutionSettled).not.toHaveBeenCalled();
+      expect(routeContinue).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
   }, 15_000);
 
   it("keeps a stopped Objective request uncertain when its marker already committed", async () => {

@@ -1,13 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createApplicationSubmissionRouteHandler, loadApprovedTurnScope } from "./application-submission-route-gate.js";
+import { createApplyJobFinalization } from "./apply-job-finalization.js";
 import { createObjectiveSubmissionRouteLifecycle } from "./objective-submission-route-lifecycle.js";
 import type { ApplyJobRunContext } from "./apply-job-runner.js";
 import type { Page, Frame, Route } from "playwright-core";
 
-const mocks = vi.hoisted(() => ({ inspectSubmission: vi.fn(), pool: { connect: vi.fn() }, turn: vi.fn(), fence: vi.fn() }));
+const mocks = vi.hoisted(() => ({ inspectSubmission: vi.fn(), pool: { connect: vi.fn() }, turn: vi.fn(), fence: vi.fn(), finish: vi.fn() }));
 vi.mock("../db/apply-results.js", () => ({ getPool: vi.fn(() => mocks.pool) }));
 vi.mock("../db/reviewed-application-submit-request-fence.js", () => ({
   readSubmissionTurnState: mocks.turn, withReviewedApplicationSubmitRequestFence: mocks.fence,
+}));
+vi.mock("../db/application-task-state.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../db/application-task-state.js")>();
+  return { ...original, finishApplicationTask: mocks.finish };
+});
+vi.mock("../db/objective-submission-uncertain.js", () => ({
+  markExactStartedObjectiveSubmissionUncertain: async (pool: unknown, scope: { applicationTaskId: string }, message: string) => {
+    const result = await mocks.finish(pool, scope.applicationTaskId, "waiting_for_user", "submission_uncertain", message, "submit", scope);
+    return result === "superseded" ? "superseded" : "written";
+  },
 }));
 vi.mock("../runtime/approval/pg-store.js", () => ({
   createPgApprovalStore: vi.fn(() => ({ inspectSubmission: mocks.inspectSubmission })),
@@ -150,6 +161,88 @@ describe("Objective request with the real submission fence", () => {
     expect(s.clients[0]!.release).toHaveBeenCalledOnce();
   });
 
+  it("bounds a stuck COMMIT with the real lifecycle even when the query never settles after client destruction", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = setup();
+      let unlock!: () => void;
+      let commitStarted!: () => void;
+      const unlocked = new Promise<void>(resolve => { unlock = resolve; });
+      const enteredCommit = new Promise<void>(resolve => { commitStarted = resolve; });
+      mocks.finish.mockReset().mockImplementation(async () => { s.events.push("uncertain-wait"); await unlocked; s.events.push("uncertain-written"); return "updated"; });
+      Object.assign(s.context.state, {
+        activePageCloseRef: { current: null }, activeSubmissionContextClose: () => { s.events.push("close"); return Promise.resolve(); },
+        activeSubmissionContextClosePromise: null, submissionFenceOwner: null, submissionFenceAbortAttempted: false,
+        submissionFenceRelease: null, submissionUncertainWrite: null, submissionSuperseded: false,
+      });
+      s.context.lifecycle = createApplyJobFinalization(s.context);
+      const work = createApplicationSubmissionRouteHandler(s.context, s.page, s.intent, s.frame, new Set())(s.route);
+      await s.enteredContinue;
+      s.clients[1]!.query.mockImplementation(async (sql: string) => {
+        if (sql === "COMMIT") { s.events.push("boundary:COMMIT"); commitStarted(); return new Promise(() => undefined); }
+        throw new Error("Unexpected test query");
+      });
+      s.clients[1]!.release.mockImplementation((error: unknown) => { s.events.push("boundary:release"); if (error) unlock(); });
+      s.resolveContinue();
+      await enteredCommit;
+      let complete = false;
+      void work.then(() => { complete = true; });
+      await vi.advanceTimersByTimeAsync(8_001);
+      expect(complete).toBe(true);
+      await work;
+      expect(s.events.indexOf("close")).toBeLessThan(s.events.indexOf("boundary:release"));
+      expect(s.events.indexOf("boundary:release")).toBeLessThan(s.events.indexOf("uncertain-written"));
+      expect(s.clients[1]!.release).toHaveBeenCalledOnce();
+      expect(s.clients[1]!.release).toHaveBeenCalledWith(expect.any(Error));
+      expect(mocks.finish).toHaveBeenCalledOnce();
+      expect(s.context.state.submissionRequestForwarded).toBe(false);
+      expect(s.observation.forward).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("aborts a stuck Stop rollback after the marker with the real lifecycle and never continues", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = setup();
+      let unlock!: () => void;
+      const unlocked = new Promise<void>(resolve => { unlock = resolve; });
+      mocks.finish.mockReset().mockImplementation(async () => { s.events.push("uncertain-wait"); await unlocked; s.events.push("uncertain-written"); return "updated"; });
+      Object.assign(s.context.state, {
+        activePageCloseRef: { current: null }, activeSubmissionContextClose: () => { s.events.push("close"); return Promise.resolve(); },
+        activeSubmissionContextClosePromise: null, submissionFenceOwner: null, submissionFenceAbortAttempted: false,
+        submissionFenceRelease: null, submissionUncertainWrite: null, submissionSuperseded: false,
+      });
+      s.context.lifecycle = createApplyJobFinalization(s.context);
+      mocks.fence.mockImplementation(async (_client: unknown, actual: unknown, phase: string, expected: unknown, work: () => Promise<unknown>) => {
+        expect(actual).toEqual(scope);
+        expect(expected).toEqual(phase === "marker" ? undefined : { kind: "objective", source: objectiveSource });
+        const value = await work();
+        if (phase === "boundary") {
+          s.clients[1]!.query.mockImplementation(async (sql: string) => {
+            if (sql === "ROLLBACK") { s.events.push("boundary:ROLLBACK"); return new Promise(() => undefined); }
+            throw new Error("Unexpected test query");
+          });
+          s.clients[1]!.release.mockImplementation((error: unknown) => { s.events.push("boundary:release"); if (error) unlock(); });
+          s.context.state.stopController.abort(new Error("Stop"));
+        }
+        return { kind: "current", value, sourceTurnId: null, objectiveSource };
+      });
+      const work = createApplicationSubmissionRouteHandler(s.context, s.page, s.intent, s.frame, new Set())(s.route);
+      let complete = false;
+      void work.then(() => { complete = true; });
+      await vi.advanceTimersByTimeAsync(8_001);
+      expect(complete).toBe(true);
+      await work;
+      expect(s.route.continue).not.toHaveBeenCalled();
+      expect(s.events.indexOf("close")).toBeLessThan(s.events.indexOf("boundary:release"));
+      expect(s.events.indexOf("boundary:release")).toBeLessThan(s.events.indexOf("uncertain-written"));
+      expect(s.clients[1]!.release).toHaveBeenCalledOnce();
+      expect(s.clients[1]!.release).toHaveBeenCalledWith(expect.any(Error));
+      expect(mocks.finish).toHaveBeenCalledOnce();
+      expect(s.context.state.submissionRequestForwarded).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
   it.each(["reject", "timeout"] as const)("closes before releasing and keeps %s acknowledgement uncertain", async mode => {
     vi.useFakeTimers();
     try {
@@ -160,8 +253,10 @@ describe("Objective request with the real submission fence", () => {
       else await vi.advanceTimersByTimeAsync(8_001);
       await work;
       expect(s.events.indexOf("close")).toBeGreaterThanOrEqual(0);
-      expect(s.events.indexOf("close")).toBeLessThan(s.events.indexOf("boundary:COMMIT"));
+      expect(s.events.indexOf("close")).toBeLessThan(s.events.indexOf("boundary:release"));
+      expect(s.events).not.toContain("boundary:COMMIT");
       expect(s.clients[1]!.release).toHaveBeenCalledOnce();
+      expect(s.clients[1]!.release).toHaveBeenCalledWith(expect.any(Error));
       expect(s.markUncertain).toHaveBeenCalledOnce();
       expect(s.context.state.submissionAcknowledgementUncertain).toBe(true);
       expect(s.context.state.submissionRequestForwarded).toBe(false);

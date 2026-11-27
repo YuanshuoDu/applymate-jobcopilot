@@ -296,6 +296,19 @@ describe("application submission Stop probe", () => {
     expect(clients.every(client => client.release.mock.calls.length === 1)).toBe(true);
   });
 
+  it.each([null, "source-turn-1"] as const)("keeps a %s boundary superseded after marker commit uncertain", async sourceTurnId => {
+    const { pool, clients } = fakePool();
+    requestFence
+      .mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+        kind: "current", value: await work(), sourceTurnId,
+      }))
+      .mockResolvedValueOnce({ kind: "superseded" });
+    const fence = await acquireApplicationSubmissionStartFence(pool, scope);
+    expect(fence).toMatchObject({ state: "uncertain", markerCommitted: true });
+    expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT");
+    expect(clients[1]?.release).toHaveBeenCalledOnce();
+  });
+
   it("keeps an Objective boundary superseded after marker commit uncertain", async () => {
     const { pool, clients } = fakePool();
     requestFence

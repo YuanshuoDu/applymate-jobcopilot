@@ -59,6 +59,23 @@ export async function finishApplicationTask(
   pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
   operation: "fill" | "submit", identity?: ApplicationSubmitIdentity, options?: { preserveRunnableSession?: true },
 ): Promise<"current" | "superseded"> {
+  return finishApplicationTaskInternal(pool, taskId, status, checkpoint, error, operation, identity, options, false);
+}
+
+/** Uses the caller's existing transaction; never checks out a second connection. */
+export async function finishApplicationTaskWithClient(
+  client: PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
+  identity: ApplicationSubmitIdentity, options?: { preserveRunnableSession?: true },
+): Promise<"current" | "superseded"> {
+  if (taskId !== identity.applicationTaskId) throw new Error("Submit task does not match the fenced application identity.");
+  return finishApplicationTaskInternal(client, taskId, status, checkpoint, error, "submit", identity, options, true);
+}
+
+async function finishApplicationTaskInternal(
+  pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
+  operation: "fill" | "submit", identity: ApplicationSubmitIdentity | undefined,
+  options: { preserveRunnableSession?: true } | undefined, callerOwnedClient: boolean,
+): Promise<"current" | "superseded"> {
   if (operation === "submit" && !identity) throw new Error("Submit task results require an exact application attempt identity.");
   const write = async (client: Pick<PoolClient, "query">): Promise<void> => {
     const transitioned = await client.query<{ sessionId: string | null }>(
@@ -93,7 +110,7 @@ export async function finishApplicationTask(
     return "current";
   }
   const attempt = identity!;
-  const outcome = typeof (pool as Pool).connect === "function"
+  const outcome = !callerOwnedClient && typeof (pool as Pool).connect === "function"
     ? await withExactSubmissionWrite(pool as Pool, attempt, "finish_application_task", client => write(client))
     : await withExactSubmissionClientWrite(pool as PoolClient, attempt, "finish_application_task", () => write(pool as PoolClient));
   return outcome.kind;

@@ -63,11 +63,9 @@ export async function persistApplyJobOutcome(
   const submissionUncertain = state.submissionRequestStarted && harnessResult.status !== "submitted";
   if (submissionUncertain) {
     if (!state.applicationTaskFinalized) {
-      if (await finishApplicationTask(
-        getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain",
-        harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE, "submit", submissionIdentity!,
-      ) === "superseded") { state.submissionSuperseded = true; return; }
-      state.applicationTaskFinalized = true;
+      const marked = await context.lifecycle!.markSubmissionUncertain(harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE);
+      if (marked === "superseded") { state.submissionSuperseded = true; return; }
+      if (marked !== "written") return;
     }
     if (state.objectiveMode) await waitForObjectiveCleanup(context.lifecycle!.closeActiveSubmissionContext());
     else await context.lifecycle?.closeActiveSubmissionContext();
@@ -98,21 +96,25 @@ export async function persistApplyJobOutcome(
   state.objectiveResultCorrelationRequired = objectiveSuccess;
   state.resultWriteStarted = true;
   try {
-    const resultId = objectiveSuccess
-      ? await recordObjectiveApplicationSubmitResult({
-          pool: getPool(), execution: { ...submissionIdentity!, workerTaskId: context.workerTaskId, executionId: context.executionId },
-          runnerStatus: "submitted", confirmationId: state.objectiveRunnerConfirmationId, durationMs: Date.now() - context.startedAt,
-          requestStarted: state.submissionRequestStarted, requestContinued: state.submissionRequestForwarded,
-          fenceUnavailable: state.submissionFenceUnavailable || state.submissionAcknowledgementUncertain,
-        })
-      : await insertApplyResult({
-          userId, jobId, status: harnessResult.status as InsertApplyResult["status"],
-          mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow,
-          error: harnessResult.error ?? null, durationMs: Date.now() - context.startedAt,
-          submissionIdentity: submissionIdentity!,
-        });
-    if (resultId === null) { state.submissionSuperseded = true; return; }
-    if (objectiveSuccess) state.objectiveResultLinkCommitted = true;
+    if (objectiveSuccess) {
+      const result = await recordObjectiveApplicationSubmitResult({
+        pool: getPool(), execution: { ...submissionIdentity!, workerTaskId: context.workerTaskId, executionId: context.executionId },
+        runnerStatus: "submitted", confirmationId: state.objectiveRunnerConfirmationId, durationMs: Date.now() - context.startedAt,
+        requestStarted: state.submissionRequestStarted, requestContinued: state.submissionRequestForwarded,
+        fenceUnavailable: state.submissionFenceUnavailable || state.submissionAcknowledgementUncertain,
+      });
+      if (result.kind === "superseded") { state.submissionSuperseded = true; return; }
+      if (result.kind !== "recorded") throw new Error("Objective submission result could not be verified.");
+      state.objectiveResultLinkCommitted = true;
+    } else {
+      const resultId = await insertApplyResult({
+        userId, jobId, status: harnessResult.status as InsertApplyResult["status"],
+        mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow,
+        error: harnessResult.error ?? null, durationMs: Date.now() - context.startedAt,
+        submissionIdentity: submissionIdentity!,
+      });
+      if (resultId === null) { state.submissionSuperseded = true; return; }
+    }
     state.resultWritten = true;
   } catch (error: unknown) {
     state.resultWriteStarted = false;

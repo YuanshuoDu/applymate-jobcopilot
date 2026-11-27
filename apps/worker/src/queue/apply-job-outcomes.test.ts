@@ -58,7 +58,7 @@ describe("Objective submission outcome", () => {
 
   it("records only the exact Objective receipt before marking the task submitted", async () => {
     vi.clearAllMocks();
-    mocks.recordObjective.mockResolvedValueOnce("result");
+    mocks.recordObjective.mockResolvedValueOnce({ kind: "recorded", resultId: 73 });
     mocks.updateJob.mockResolvedValueOnce({ kind: "current" });
     mocks.finishTask.mockResolvedValueOnce("updated");
     mocks.notifyEmail.mockResolvedValue(undefined);
@@ -73,6 +73,28 @@ describe("Objective submission outcome", () => {
     expect(context.state.objectiveResultLinkCommitted).toBe(true);
     expect(mocks.finishTask).toHaveBeenCalledWith(expect.anything(), "task", "submitted", "submission_verified",
       null, "submit", context.submissionIdentity, { preserveRunnableSession: true });
+  });
+
+  it("treats current-invalid as uncertain instead of silently calling it superseded", async () => {
+    vi.clearAllMocks();
+    mocks.recordObjective.mockResolvedValueOnce({ kind: "invalid" });
+    const { context, result } = scenario();
+    await expect(persistApplyJobOutcome(context, {} as Page, result)).rejects.toThrow("Objective submission result could not be verified.");
+    expect(context.state.objectiveResultCorrelationRequired).toBe(true);
+    expect(context.state.submissionSuperseded).toBe(false);
+    expect(mocks.insert).not.toHaveBeenCalled();
+    expect(mocks.updateJob).not.toHaveBeenCalled();
+  });
+
+  it("leaves a truly superseded result untouched", async () => {
+    vi.clearAllMocks();
+    mocks.recordObjective.mockResolvedValueOnce({ kind: "superseded" });
+    const { context, result } = scenario();
+    await persistApplyJobOutcome(context, {} as Page, result);
+    expect(context.state.submissionSuperseded).toBe(true);
+    expect(mocks.insert).not.toHaveBeenCalled();
+    expect(mocks.updateJob).not.toHaveBeenCalled();
+    expect(mocks.finishTask).not.toHaveBeenCalled();
   });
 
   it("never falls back to a generic success when the exact receipt write fails", async () => {

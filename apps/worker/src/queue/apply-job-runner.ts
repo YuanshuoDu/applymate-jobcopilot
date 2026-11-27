@@ -57,6 +57,7 @@ export type ApplyJobRunState = {
   submissionTaskInactive: boolean;
   pendingSubmissionFence: ApplicationSubmissionStartFence | null;
   submissionFenceOwner: ApplicationSubmissionStartFence | null;
+  submissionFenceAbortAttempted: boolean;
   submissionFenceTimer: ReturnType<typeof setTimeout> | null;
   activePageCloseRef: { current: (() => Promise<void>) | null };
   submissionFenceRelease: Promise<void> | null;
@@ -144,6 +145,7 @@ export function createApplyJobProcessor(dependencies: { isQueuePaused(): Promise
       submissionTaskInactive: false,
       pendingSubmissionFence: null,
       submissionFenceOwner: null,
+      submissionFenceAbortAttempted: false,
       submissionFenceTimer: null,
       activePageCloseRef: { current: null },
       submissionFenceRelease: null,

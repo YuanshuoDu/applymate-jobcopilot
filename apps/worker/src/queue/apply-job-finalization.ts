@@ -1,4 +1,5 @@
 import { unlinkSync } from "node:fs";
+import { markExactStartedObjectiveSubmissionUncertain } from "../db/objective-submission-uncertain.js";
 import { getPool, insertApplyResult } from "../db/apply-results.js";
 import * as legacyFillOutcomes from "./legacy-apply-outcomes.js";
 import { finishApplicationTask, USER_TAKEOVER_CHECKPOINT } from "../db/application-task-state.js";
@@ -73,11 +74,14 @@ export function createApplyJobFinalization(context: ApplyJobRunContext): ApplyJo
     if (state.submissionSuperseded) return Promise.resolve("superseded");
     if (state.submissionUncertainWrite) return state.submissionUncertainWrite;
     if (!context.payload.applicationTaskId || !context.submissionIdentity) return Promise.resolve("failed");
-    const write = finishApplicationTask(
-      getPool(), context.payload.applicationTaskId, "waiting_for_user", "submission_uncertain",
-      message, "submit", context.submissionIdentity,
-    ).then((result): SubmissionUncertainTaskWrite => {
+    if (state.objectiveMode && state.submissionExecutionStartAttempted && !state.approvedTurnScope) return Promise.resolve("failed");
+    const writeRequest = state.objectiveMode && state.submissionExecutionStartAttempted && state.approvedTurnScope
+      ? markExactStartedObjectiveSubmissionUncertain(getPool(), state.approvedTurnScope, message)
+      : finishApplicationTask(getPool(), context.payload.applicationTaskId, "waiting_for_user", "submission_uncertain",
+          message, "submit", context.submissionIdentity);
+    const write = writeRequest.then((result): SubmissionUncertainTaskWrite => {
       if (result === "superseded") { state.submissionSuperseded = true; return "superseded"; }
+      if (result === "unverified") return "failed";
       state.applicationTaskFinalized = true;
       return "written";
     }).catch((error: unknown): SubmissionUncertainTaskWrite => {
@@ -150,7 +154,9 @@ export async function handleApplyJobFailure(context: ApplyJobRunContext, error: 
     return false;
   }
   if (mayHaveOpenedBrowser && applicationTaskId && !state.applicationTaskFinalized) {
-    if (await context.lifecycle?.markSubmissionUncertain(safeMessage) === "superseded") return false;
+    const uncertainty = await context.lifecycle?.markSubmissionUncertain(safeMessage);
+    if (uncertainty === "superseded") return false;
+    if (state.objectiveMode && state.submissionExecutionStartAttempted && uncertainty !== "written") return false;
     if (state.activeSubmissionContextClose && state.objectiveMode) await waitForObjectiveCleanup(context.lifecycle!.closeActiveSubmissionContext());
     else if (state.activeSubmissionContextClose) await context.lifecycle?.closeActiveSubmissionContext();
     else await context.lifecycle?.closeActivePage();
@@ -190,7 +196,8 @@ export async function handleApplyJobFailure(context: ApplyJobRunContext, error: 
       if (jobWrite.kind === "superseded") { state.submissionSuperseded = true; return false; }
     }
   }
-  if (applicationTaskId && (!stoppedBeforeRequest || state.submissionClaimed) && !state.applicationTaskFinalized) {
+  if (applicationTaskId && (!stoppedBeforeRequest || state.submissionClaimed) && !state.applicationTaskFinalized
+    && !(state.objectiveMode && state.submissionExecutionStartAttempted)) {
     const taskWrite = await finishApplicationTask(
       getPool(), applicationTaskId,
       mayHaveOpenedBrowser || state.browserAttemptStarted ? "waiting_for_user" : "failed",
@@ -298,7 +305,10 @@ async function finalizeObjectiveApplyJob(context: ApplyJobRunContext): Promise<v
   if (!fenceReleaseConfirmed) {
     state.submissionFenceUnavailable = true;
     void lifecycle.closeActiveSubmissionContext();
-    state.submissionFenceOwner?.abort?.();
+    if (state.submissionFenceOwner && !state.submissionFenceAbortAttempted) {
+      state.submissionFenceAbortAttempted = true;
+      state.submissionFenceOwner.abort?.();
+    }
   }
   if (routeMayHaveStarted || !fenceReleaseConfirmed) {
     await waitForObjectiveCleanup(lifecycle.markSubmissionUncertain(UNCONFIRMED_SUBMISSION_MESSAGE));

@@ -3,7 +3,6 @@ import { getPool } from "../db/apply-results.js";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import type { ApplicationSubmissionStartScope } from "../db/application-task-state.js";
 import type { ApplicationSubmitIdentity } from "./application-submit-fence.js";
-import { finishApplicationTask } from "../db/application-task-state.js";
 import { UNCONFIRMED_SUBMISSION_MESSAGE } from "../db/submission-guard.js";
 import { acquireApplicationSubmissionStartFence } from "../runtime/interrupt/application-submission-probe.js";
 import { matchesSubmissionRequest, type SubmissionRequestIntent } from "../flows/submission-intent.js";
@@ -153,14 +152,8 @@ export function createApplicationSubmissionRouteHandler(
           await context.lifecycle!.releaseSubmissionFence(false).catch((releaseError: unknown) => {
             console.warn("[apply-worker] Could not release ambiguous submission start fence:", releaseError instanceof Error ? releaseError.message : String(releaseError));
           });
-          try {
-            if (await finishApplicationTask(
-              getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain",
-              UNCONFIRMED_SUBMISSION_MESSAGE, "submit", context.submissionIdentity!,
-            ) === "superseded") state.submissionSuperseded = true;
-            state.applicationTaskFinalized = true;
-          } catch (stateError: unknown) {
-            console.warn("[apply-worker] Could not persist ambiguous submission start state:", stateError instanceof Error ? stateError.message : String(stateError));
+          if (await context.lifecycle!.markSubmissionUncertain(UNCONFIRMED_SUBMISSION_MESSAGE) === "superseded") {
+            state.submissionSuperseded = true;
           }
           return;
         }
@@ -178,7 +171,9 @@ export function createApplicationSubmissionRouteHandler(
           state.submissionFenceUnavailable = true;
           observation?.reject("not_forwarded");
           await route.abort("failed").catch(() => undefined);
-          await context.lifecycle!.releaseSubmissionFence(false);
+          const rollback = context.lifecycle!.releaseSubmissionFence(false);
+          if (state.objectiveMode) await waitForRouteContinuationAcknowledgement(rollback, state.stopController.signal);
+          else await rollback;
           if (await context.lifecycle!.markSubmissionUncertain(UNCONFIRMED_SUBMISSION_MESSAGE) === "superseded") state.submissionSuperseded = true;
           return;
         }
@@ -186,14 +181,23 @@ export function createApplicationSubmissionRouteHandler(
         continuationAttempted = true;
         const continuation = route.continue();
         await waitForRouteContinuationAcknowledgement(continuation, state.stopController.signal);
-        await context.lifecycle!.releaseSubmissionFence(true);
+        const release = context.lifecycle!.releaseSubmissionFence(true);
+        if (state.objectiveMode) await waitForRouteContinuationAcknowledgement(release, state.stopController.signal);
+        else await release;
         state.submissionRequestForwarded = true;
         if (state.objectiveMode && !observation?.forward(request)) state.submissionFenceUnavailable = true;
       } catch (error: unknown) {
         state.submissionFenceUnavailable = true;
-        if (continuationAttempted) {
+        const objectiveMarkerUncertain = state.objectiveMode && state.submissionRequestStarted;
+        if (continuationAttempted || objectiveMarkerUncertain) {
           state.submissionAcknowledgementUncertain = true;
           void context.lifecycle!.closeActiveSubmissionContext();
+          // Never let a stuck transaction retain the fence while uncertain persistence waits on it.
+          const ownedFence = state.submissionFenceOwner ?? state.pendingSubmissionFence;
+          if (state.objectiveMode && ownedFence && !state.submissionFenceAbortAttempted) {
+            state.submissionFenceAbortAttempted = true;
+            ownedFence.abort?.();
+          }
         }
         console.warn(
           continuationAttempted
@@ -209,12 +213,12 @@ export function createApplicationSubmissionRouteHandler(
             console.warn("[apply-worker] Could not release submission request fence:", releaseError instanceof Error ? releaseError.message : String(releaseError));
           });
         }
-        if (continuationAttempted && applicationTaskId && !state.applicationTaskFinalized) {
+        if ((continuationAttempted || objectiveMarkerUncertain) && applicationTaskId && !state.applicationTaskFinalized) {
           if (await context.lifecycle!.markSubmissionUncertain(UNCONFIRMED_SUBMISSION_MESSAGE) === "superseded") {
             state.submissionSuperseded = true;
           }
         }
-        if (!continuationAttempted) void context.lifecycle!.closeActivePage().catch(() => undefined);
+        if (!continuationAttempted && !objectiveMarkerUncertain) void context.lifecycle!.closeActivePage().catch(() => undefined);
       } finally {
         if (state.pendingSubmissionFence) {
           await context.lifecycle!.releaseSubmissionFence(continuationAttempted).catch((error: unknown) => {

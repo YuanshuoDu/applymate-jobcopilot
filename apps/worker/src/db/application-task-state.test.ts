@@ -43,6 +43,7 @@ import {
   completeFillForReview,
   claimApplicationTask,
   finishApplicationTask,
+  finishApplicationTaskWithClient,
   needsUserTakeover,
   USER_TAKEOVER_CHECKPOINT,
   isUserActive,
@@ -57,6 +58,36 @@ function testPool() {
 }
 
 describe("finishApplicationTask", () => {
+  it("uses the supplied transaction client even when it has a connect method", async () => {
+    vi.clearAllMocks();
+    const query = vi.fn().mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rows: [{ status: "waiting_for_user" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    const client = { query, connect: vi.fn(), release: vi.fn() } as unknown as PoolClient;
+
+    await expect(finishApplicationTaskWithClient(client, "task_1", "waiting_for_user", "submission_uncertain",
+      "uncertain", submissionIdentity)).resolves.toBe("current");
+
+    expect(exactSubmissionClientWrite).toHaveBeenCalledWith(client, submissionIdentity, "finish_application_task", expect.any(Function));
+    expect(exactSubmissionWrite).not.toHaveBeenCalled();
+    expect(client.connect).not.toHaveBeenCalled();
+    expect(client.release).not.toHaveBeenCalled();
+    expect(query.mock.calls.every(([sql]) => sql !== "BEGIN" && sql !== "COMMIT")).toBe(true);
+    expect(query.mock.calls[0]?.[0]).toContain("UPDATE application_tasks");
+    expect(query).toHaveBeenCalledTimes(4);
+  });
+
+  it("rejects a caller-owned write targeting a different application task", async () => {
+    vi.clearAllMocks();
+    const query = vi.fn();
+    const client = { query, connect: vi.fn() } as unknown as PoolClient;
+    await expect(finishApplicationTaskWithClient(client, "other-task", "waiting_for_user", "submission_uncertain",
+      "uncertain", submissionIdentity)).rejects.toThrow("Submit task does not match the fenced application identity.");
+    expect(query).not.toHaveBeenCalled();
+    expect(exactSubmissionClientWrite).not.toHaveBeenCalled();
+  });
+
   it("keeps the exact confirmed Objective Fill Session runnable for its canonical terminal commit", async () => {
     const { pool, query } = testPool();
     query.mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
