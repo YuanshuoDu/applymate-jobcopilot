@@ -16,7 +16,17 @@ function binding(outcome: unknown = privateOutcome): TaskGraphFinalSummaryBindin
     rootTaskId: "root-private", graphItemId: taskGraphItemId("root-private"), graphRevision: 7,
     members: ["scout", "analyst"].map((role, nodeIndex) => ({ nodeIndex, nodeKey: `source-${nodeIndex}`, templateId: role,
       role, taskType: role, taskId: `task-private-${nodeIndex}`, taskStatus: "completed", kind: "business" as const })),
-    summary: { graphRevision: 7 }, objectiveTailorFinalOutcome: outcome,
+    summary: {
+      graphRevision: 7,
+      taskOutcomes: ["scout", "analyst"].map((role, index) => ({ taskId: `task-private-${index}`, role,
+        taskStatus: "completed", resultState: "valid", roleResultStatus: "completed" })),
+      discoveredJobs: [], analyzedJobs: [], prepareResults: [], artifactReferences: [], reviewOutcomes: [],
+      counts: {
+        discoveredJobs: { coverage: "complete", knownCount: 0 }, analyzedJobs: { coverage: "complete", knownCount: 0 },
+        prepareJobs: { coverage: "not_requested", knownCount: null }, artifactReferences: { coverage: "not_requested", knownCount: null },
+        reviewOutcomes: { coverage: "not_requested", knownCount: null },
+      },
+    }, objectiveTailorFinalOutcome: outcome,
   } as unknown as TaskGraphFinalSummaryBinding
 }
 function ordinaryBinding(): TaskGraphFinalSummaryBinding {
@@ -35,6 +45,24 @@ describe("objective-tailor-final-sidecar", () => {
   it("distinguishes ordinary absence from a malformed marked proof", () => {
     expect(readObjectiveTailorFinalOutcomeSidecar(undefined)).toEqual({ status: "absent" })
     expect(readObjectiveTailorFinalOutcomeSidecar(binding({ ...privateOutcome, unknown: true }))).toEqual({ status: "invalid" })
+  })
+
+  it("rejects incomplete summaries and forged retired Scout proof", () => {
+    const source = binding()
+    expect(readObjectiveTailorFinalOutcomeSidecar({ ...source, summary: { graphRevision: 7 } })).toEqual({ status: "invalid" })
+    const retired = {
+      ...source,
+      members: source.members!.map((member, index) => index === 0 ? { ...member, taskType: "job_discovery",
+        taskStatus: "interrupted", kind: "retired", retirement: { attempt: 1, interruptRequestedAt: "2026-11-19T10:00:00.000Z",
+          receiptEventId: "receipt", lifecycleEventId: "lifecycle" } } : member),
+      summary: { ...source.summary, taskOutcomes: source.summary.taskOutcomes.slice(1), counts: { ...source.summary.counts,
+        discoveredJobs: { coverage: "not_requested", knownCount: null } } },
+    }
+    expect(readObjectiveTailorFinalOutcomeSidecar(retired).status).toBe("ready")
+    const forged = { ...retired, members: retired.members.map((member, index) => index === 0
+      ? { ...member, retirement: { attempt: 0, interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "receipt", lifecycleEventId: "lifecycle" } }
+      : member) }
+    expect(readObjectiveTailorFinalOutcomeSidecar(forged)).toEqual({ status: "invalid" })
   })
 
   it("matches only the exact public projection and fails closed on an injected sidecar", () => {
