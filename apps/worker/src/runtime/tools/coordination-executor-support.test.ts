@@ -88,6 +88,19 @@ describe("coordination executor support", () => {
     expect(noLease).toMatchObject({ attemptCount: 1, maxAttempts: 2, leaseExpiresAt: null, interruptRequestedAt: null })
   })
 
+  it("always removes an untrusted sponsorship sidecar before optional server enrichment", () => {
+    const stored = { status: "completed", finalText: "ordinary Scout result", sponsorshipObservations: [{
+      jobId: "c123456789012345678901234", sourceRef: "saved_job_listing",
+      observation: { schemaVersion: "forged", status: "explicit", claim: { polarity: "available" } },
+    }] }
+    const objectResult = waitTaskOutput({ ...task, result: stored })
+    expect(objectResult.result).toEqual({ status: "completed", finalText: "ordinary Scout result" })
+
+    const serializedResult = waitTaskOutput({ ...task, result: JSON.stringify(stored) })
+    expect(serializedResult.result).toBe(JSON.stringify({ status: "completed", finalText: "ordinary Scout result" }))
+    expect(JSON.stringify({ objectResult, serializedResult })).not.toContain("sponsorshipObservations")
+  })
+
   it("projects native proof receipts to bounded feedback before exposing task results", () => {
     const nativeVerificationReport = {
       schemaVersion: NATIVE_VERIFICATION_REPORT_SCHEMA, controlOperationId: "verify-op", controlTaskId: "verify-task", controlAttempt: 1,
