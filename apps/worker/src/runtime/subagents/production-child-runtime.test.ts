@@ -17,6 +17,8 @@ import { InMemoryArtifactToolStore, type ArtifactToolDraftInput } from "../tools
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient } from "./selected-job-artifact-context.js"
+import { makeScheduledDraftCandidateWitnessV2 } from "./scheduled-draft-candidate-witness.js"
+import { scheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
 import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { buildInteractiveDiscoveryShortlist, requireCurrentOwnerJobs } from "../interactive-discovery-persistence.js"
 import { restoreToolCallState } from "../turns/persisted-tool-call-state.js"
@@ -30,7 +32,7 @@ import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE
   SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
 import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 
-const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown }))
+const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown, draftMaterialAssertion: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
   execute: vi.fn(async (_input: { pool: unknown; lease: unknown }) => ({
     status: "completed" as const, result: { status: "filled_for_user_review" },
@@ -40,6 +42,7 @@ const scheduledGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const scheduledAuditRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const scheduledPostGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const selectedJobSourceCanary = "APPLYMATE_TRANSIENT_SELECTED_JOB_CANARY"
+const scheduledWriterJobId = "c123456789012345678901234"
 vi.mock("./application-fill-for-review.js", () => ({ executeApplicationFillForReview: applicationFillExecutorMock.execute }))
 vi.mock("./scheduled-gate-child-runtime.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-gate-child-runtime.js")>(),
@@ -62,6 +65,14 @@ vi.mock("../tools/artifact-tools.js", async importOriginal => {
       return artifactStoreMock.current as import("../tools/artifact-tools.js").ArtifactToolStore
     },
   }
+})
+vi.mock("../tools/artifact-store-pg.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../tools/artifact-store-pg.js")>()
+  function fixtureStore(...args: unknown[]) {
+    artifactStoreMock.draftMaterialAssertion = args[2]
+    return artifactStoreMock.current
+  }
+  return { ...actual, PgArtifactToolStore: fixtureStore as unknown as typeof actual.PgArtifactToolStore }
 })
 
 afterEach(() => {
@@ -267,7 +278,7 @@ function selectedJobPool(persistedWriterReview?: PersistedWriterReviewGraphFixtu
     release: vi.fn(),
   } : undefined
   return {
-    query, graphQueries, transactionQueries, tenantScopeUserIds,
+    job, query, graphQueries, transactionQueries, tenantScopeUserIds,
     ...(client ? { connect: async () => client } : {}),
   }
 }
@@ -293,6 +304,12 @@ function legacyInitialWriterPool() {
   return { ...base, connect: async () => client, graphQueries, transactionQueries, tenantScopeUserIds }
 }
 
+function scheduledInitialWriterPool(writerTaskId: string) {
+  const pool = initialWriterPool(writerTaskId)
+  pool.job.id = scheduledWriterJobId
+  return pool
+}
+
 const emptyMailboxReader: ChildMailboxReader = { listPendingMessages: async () => [] }
 
 function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPreparation: { jobId: "job-1" } }): SubagentLease {
@@ -305,6 +322,18 @@ function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPr
     context, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role },
     toolPolicySnapshot: {},
   }
+}
+
+function scheduledDraftCandidateWitness(jobMaterialDigest: string, jobId = "job-1") {
+  const digest = "a".repeat(64)
+  return makeScheduledDraftCandidateWitnessV2({
+    graphRevision: 3, graphDigest: digest, stableStatusDigest: digest, newlyProposedNodeKeys: [],
+    candidate: { jobId, score: 8 }, sourceAnalystKeys: ["analyst-1"],
+    analysts: [{ nodeKey: "analyst-1", taskId: "analyst-task", attemptCount: 1, resultDigest: digest,
+      evidenceDigest: digest, reportDigest: digest, scouts: [{ nodeKey: "scout-1", taskId: "scout-task", attemptCount: 1,
+        nodeDigest: digest, resultDigest: digest, evidenceDigest: digest, reportDigest: digest }] }],
+    jobMaterialDigest,
+  })
 }
 
 function privateDraftPolicySnapshot(outcome: "deny" | "require_approval" | "require_user_input") {
@@ -355,6 +384,7 @@ function selectedJobExecutor(input: {
   readonly resumeLoader?: (lease: SubagentLease) => Promise<ChildAttemptResume | undefined>
 }) {
   artifactStoreMock.current = input.artifactStore
+  artifactStoreMock.draftMaterialAssertion = null
   const pool = input.pool ?? selectedJobPool()
   const executor = createOptionalProductionChildExecutor({
     enabled: true, pool: pool as never, turnStore: input.persistence.engineStore, treeBudget: budget(),
@@ -1480,6 +1510,83 @@ describe("production child runtime", () => {
     expect(emittedTool(requests[0]!, "cover_letter.draft")).toBe(true)
     expect(emittedTool(requests[0]!, "artifact.version.read")).toBe(false)
     assertNoExternalTools(requests[0]!)
+  })
+
+  it("admits a scheduled V2 Writer when its loaded Job matches the persisted material witness", async () => {
+    const body = "A scheduled cover-letter draft from the witnessed current Job source."
+    const pool = scheduledInitialWriterPool("scheduled-v2-writer")
+    const selected = await loadSelectedJobArtifactContext(pool as never, "user-1", scheduledWriterJobId)
+    const jobSource = selected.transientSources.find(source => source.sourceRef === `job:${scheduledWriterJobId}`)
+    const materialDigest = scheduledDraftJobMaterialDigest(jobSource?.content)
+    if (!materialDigest) throw new Error("fixture selected Job material was not digestible")
+    const preparation = selected.preparation
+    const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: scheduledWriterJobId }).slice(7)}`
+    const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: scheduledWriterJobId })
+    const artifactRef = {
+      artifactId: `cover-letter:${hashArtifactContent({ userId: "user-1", jobId: scheduledWriterJobId }).slice(7)}`,
+      version: 1, contentHash: hashArtifactContent(body), sourceDigest: preparation.sourceDigest,
+    }
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "scheduled-draft", name: "cover_letter.draft", arguments: {
+            baseArtifactId, baseHash, content: body, constraints: { maxWords: 160 },
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const artifacts = new InMemoryArtifactToolStore(), draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence: recordingStore(), model, pool, mailboxReader: emptyMailboxReader })
+    const context = {
+      selectedJobPreparation: { jobId: scheduledWriterJobId }, scheduledDraftCandidateMode: true,
+      scheduledDraftCandidateWitness: scheduledDraftCandidateWitness(materialDigest, scheduledWriterJobId),
+      taskGraphDependencyResults: { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [] },
+    }
+
+    await expect(executor({ lease: { ...jobTask("writer", context), id: "scheduled-v2-writer" } })).resolves.toMatchObject({ status: "completed" })
+    expect(requests).toHaveLength(2)
+    expect(draftSpy).toHaveBeenCalledOnce()
+    expect(artifactStoreMock.draftMaterialAssertion).toBeTypeOf("function")
+  })
+
+  it("denies scheduled V2 material drift before resolving a base, writing a draft, or invoking the model", async () => {
+    const pool = scheduledInitialWriterPool("scheduled-v2-drifted-writer")
+    const selected = await loadSelectedJobArtifactContext(pool as never, "user-1", scheduledWriterJobId)
+    const jobSource = selected.transientSources.find(source => source.sourceRef === `job:${scheduledWriterJobId}`)
+    const materialDigest = scheduledDraftJobMaterialDigest(jobSource?.content)
+    if (!materialDigest) throw new Error("fixture selected Job material was not digestible")
+    pool.job.description = "The current Job changed after candidate admission."
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        yield { type: "text_delta", text: "unexpected Writer invocation" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const artifacts = new InMemoryArtifactToolStore()
+    const baseSpy = vi.spyOn(artifacts, "registerBase"), draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence: recordingStore(), model, pool, mailboxReader: emptyMailboxReader })
+    const context = {
+      selectedJobPreparation: { jobId: scheduledWriterJobId }, scheduledDraftCandidateMode: true,
+      scheduledDraftCandidateWitness: scheduledDraftCandidateWitness(materialDigest, scheduledWriterJobId),
+      taskGraphDependencyResults: { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [] },
+    }
+
+    await expect(executor({ lease: { ...jobTask("writer", context), id: "scheduled-v2-drifted-writer" } })).resolves.toMatchObject({
+      status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal",
+    })
+    expect(requests).toHaveLength(0)
+    expect(baseSpy).not.toHaveBeenCalled()
+    expect(draftSpy).not.toHaveBeenCalled()
   })
 
   it("does not treat graph-derived non-Reviewer context as legacy when the graph item is absent", async () => {
