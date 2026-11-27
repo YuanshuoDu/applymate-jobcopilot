@@ -6,6 +6,7 @@ const COORDINATION_WRITE_TOOL_NAMES = [
   "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "agent.ask_user",
 ]
 const COORDINATION_READ_TOOL_NAMES = ["list_subagents", "agent.list"]
+const TASK_GRAPH_SCOUT_RETIREMENT_TOOL_NAMES = ["agent.retire_superseded_scout"]
 
 const FALLBACK_POLICY: PolicySnapshot = {
   version: "policy.v1",
@@ -27,6 +28,12 @@ const FALLBACK_POLICY: PolicySnapshot = {
       outcome: "allow", reasonCode: "server_task_graph_planning_gate", reason: "The server enabled scoped task graph planning",
     },
     {
+      id: "canonical-root-task-graph-scout-retirement",
+      roles: ["orchestrator"], tools: TASK_GRAPH_SCOUT_RETIREMENT_TOOL_NAMES, risks: ["internal_write"], domains: ["coordination"],
+      requiredCapabilities: ["coordination", "canManageChildren"],
+      outcome: "allow", reasonCode: "server_task_graph_scout_retirement_gate", reason: "The server enabled exact scoped Scout retirement",
+    },
+    {
       id: "canonical-root-read",
       roles: ["orchestrator"], risks: ["read"],
       outcome: "allow", reasonCode: "safe_read_baseline", reason: "Read-only tools use the canonical safe baseline",
@@ -34,11 +41,12 @@ const FALLBACK_POLICY: PolicySnapshot = {
   ],
 }
 
-function fallbackPolicy(coordinationEnabled: boolean, planningExecutionEnabled: boolean): PolicySnapshot {
+function fallbackPolicy(coordinationEnabled: boolean, planningExecutionEnabled: boolean, scoutRetirementEnabled: boolean): PolicySnapshot {
   const enabled = new Set([
     "canonical-root-read",
     ...(coordinationEnabled ? ["canonical-root-coordination", "canonical-root-coordination-read"] : []),
     ...(coordinationEnabled && planningExecutionEnabled ? ["canonical-root-task-graph-plan"] : []),
+    ...(coordinationEnabled && planningExecutionEnabled && scoutRetirementEnabled ? ["canonical-root-task-graph-scout-retirement"] : []),
   ])
   return { ...FALLBACK_POLICY, rules: FALLBACK_POLICY.rules.filter(rule => enabled.has(rule.id)) }
 }
@@ -50,9 +58,12 @@ function missingSnapshot(value: unknown): boolean {
   return keys.length === 0 || !keys.some(key => key === "version" || key === "rules")
 }
 
-export function createCanonicalPolicy(value: unknown, coordinationEnabled = false, planningExecutionEnabled = false): PolicyEngine {
+export function createCanonicalPolicy(
+  value: unknown, coordinationEnabled = false, planningExecutionEnabled = false, scoutRetirementEnabled = false,
+): PolicyEngine {
   if (missingSnapshot(value)) {
-    return new PolicyEngine(coordinationEnabled ? { snapshot: fallbackPolicy(coordinationEnabled, planningExecutionEnabled) } : {})
+    return new PolicyEngine(coordinationEnabled
+      ? { snapshot: fallbackPolicy(coordinationEnabled, planningExecutionEnabled, scoutRetirementEnabled) } : {})
   }
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("canonical_policy_snapshot_invalid")
   return new PolicyEngine({ snapshot: value as unknown as PolicySnapshot })

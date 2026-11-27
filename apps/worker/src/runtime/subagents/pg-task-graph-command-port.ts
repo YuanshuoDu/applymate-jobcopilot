@@ -28,6 +28,7 @@ import { appendScheduledPostGatePlan as appendScheduledPostGatePlanCommand,
   readScheduledPostGatePlanningContext as readScheduledPostGatePlanningContextCommand,
   verifyScheduledPostGateCompletion as verifyScheduledPostGateCompletionCommand } from "./pg-scheduled-post-gate-plan.js"
 import { hasPersistedPlanReceipt, scheduleTaskGraph } from "./pg-task-graph-command-port-schedule.js"
+import { requestSupersededScoutRetirement as requestSupersededScoutRetirementCommand } from "./task-graph-pg-scout-retirement.js"
 type Row = Record<string, unknown>
 type LoadedCurrentGraph = Awaited<ReturnType<typeof loadTaskGraph>> & Readonly<{ rootSuccessCriteria?: readonly string[] }>
 export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCommandPort {
@@ -72,6 +73,7 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async appendAndScheduleWithReconciliation(input, operation) {
       return transaction(pool, client => scheduleTaskGraph(client, input, operation))
     },
+    async requestSupersededScoutRetirement(input) { return requestSupersededScoutRetirementCommand(pool, input) },
     async reconcileSteering(operation) {
       if (operation.decision !== "keep") throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Keep reconciliation scope is invalid")
       return transaction(pool, async client => {

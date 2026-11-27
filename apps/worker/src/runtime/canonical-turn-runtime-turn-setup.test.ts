@@ -30,6 +30,9 @@ import { TASK_GRAPH_TEMPLATES } from "./subagents/task-graph-templates.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./turns/task-graph-terminal-assessment.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT } from "./turns/turn-execution-types.js"
 import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
+import type { AgentTreeManager } from "./subagents/manager.js"
+import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
+import { registerTaskGraphSupersededScoutRetirementTool } from "./tools/task-graph-retire-superseded-scout.js"
 
 const owner = {
   kind: "turn" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1",
@@ -78,6 +81,22 @@ describe("canonical interactive discovery store composition", () => {
     const expected = [...initial, ...TASK_GRAPH_TEMPLATES.prepare.allowedActions.filter(action => !initial.includes(action))]
     expect(addScheduledPrepareActions([...initial], { source: "automation", automationRunMode: "scheduled" }, true)).toEqual(expected)
     expect(addScheduledPrepareActions(["jobs.search"], { source: "automation", automationRunMode: "scheduled" }, false)).toEqual(["jobs.search"])
+  })
+
+  it("registers the exact Scout retirement action only for Objective TaskGraph with the optional port", () => {
+    const names: string[] = []
+    const registry = { register: (definition: { name: string }) => names.push(definition.name) }
+    const options = {
+      commandPort: { requestSupersededScoutRetirement: vi.fn() } as unknown as TaskGraphCommandPort,
+      manager: { signalTaskSubtree: vi.fn() } as unknown as AgentTreeManager,
+      turnLeaseOwner: "turn-owner", turnLeaseVersion: 2, parentLeaseOwner: "root-owner", parentAttemptCount: () => 1,
+    }
+
+    expect(registerTaskGraphSupersededScoutRetirementTool(registry, false, options)).toBe(false)
+    expect(registerTaskGraphSupersededScoutRetirementTool(registry, true,
+      { ...options, commandPort: {} as TaskGraphCommandPort })).toBe(false)
+    expect(registerTaskGraphSupersededScoutRetirementTool(registry, true, options)).toBe(true)
+    expect(names).toEqual(["agent.retire_superseded_scout"])
   })
 
   it("forwards the atomic transaction client into the TaskGraph checkpoint read", async () => {

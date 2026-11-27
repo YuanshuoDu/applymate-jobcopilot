@@ -2,6 +2,7 @@ import { projectFinalAnswerDisplayContent, type FinalAnswerDisplayContent } from
 
 export const TASK_GRAPH_SOURCES_SCHEMA_VERSION = 'agent-harness.v2.task-graph-sources.v1' as const
 export const TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 = 'agent-harness.v2.task-graph-sources.v2' as const
+export const TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 = 'agent-harness.v2.task-graph-sources.v3' as const
 
 export const TASK_GRAPH_SOURCE_ROLES = ['scout', 'analyst', 'writer', 'reviewer', 'prepare', 'unsupported'] as const
 export const TASK_GRAPH_SOURCE_TASK_STATUSES = ['queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed'] as const
@@ -31,7 +32,14 @@ export type FinalTaskGraphSourceManifestV2 = Readonly<{
   sources: readonly FinalTaskGraphSource[]
   historicalNodeIndices: readonly number[]
 }>
-export type FinalTaskGraphSourceManifest = FinalTaskGraphSourceManifestV1 | FinalTaskGraphSourceManifestV2
+export type FinalTaskGraphSourceManifestV3 = Readonly<{
+  schemaVersion: typeof TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3
+  graphRevision: number
+  sources: readonly FinalTaskGraphSource[]
+  historicalNodeIndices: readonly number[]
+  retiredNodeIndices: readonly number[]
+}>
+export type FinalTaskGraphSourceManifest = FinalTaskGraphSourceManifestV1 | FinalTaskGraphSourceManifestV2 | FinalTaskGraphSourceManifestV3
 
 export type FinalAnswerWithTaskGraphSources = FinalAnswerDisplayContent & Readonly<{ taskGraphSources?: FinalTaskGraphSourceManifest }>
 
@@ -63,13 +71,15 @@ export function parseFinalTaskGraphSourceManifest(value: unknown): FinalTaskGrap
   if (!row) return null
   const v1Shape = exactKeys(row, ['graphRevision', 'schemaVersion', 'sources'])
   const v2Shape = !v1Shape && exactKeys(row, ['graphRevision', 'historicalNodeIndices', 'schemaVersion', 'sources'])
-  if (!v1Shape && !v2Shape) return null
+  const v3Shape = !v1Shape && !v2Shape && exactKeys(row, ['graphRevision', 'historicalNodeIndices', 'retiredNodeIndices', 'schemaVersion', 'sources'])
+  if (!v1Shape && !v2Shape && !v3Shape) return null
   const schemaVersion = row.schemaVersion
-  if (v1Shape ? schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION : schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2) return null
+  if (v1Shape ? schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION
+    : v2Shape ? schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 : schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3) return null
 
   const graphRevision = row.graphRevision
-  const sourceRows = row.sources
-  if (!integer(graphRevision, 1, Number.MAX_SAFE_INTEGER) || !dense(sourceRows, 1, 8)) return null
+  const sourceRows = v3Shape ? denseData(row.sources, 1, 8) : dense(row.sources, 1, 8) ? row.sources : null
+  if (!integer(graphRevision, 1, Number.MAX_SAFE_INTEGER) || !sourceRows) return null
 
   const sources: FinalTaskGraphSource[] = []
   const keys = new Set<string>(), indexes = new Set<number>()
@@ -97,16 +107,29 @@ export function parseFinalTaskGraphSourceManifest(value: unknown): FinalTaskGrap
 
   if (v1Shape) return { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision, sources }
 
-  const historicalRows = denseData(row.historicalNodeIndices, 1, 8)
+  const historicalRows = denseData(row.historicalNodeIndices, v3Shape ? 0 : 1, 8)
   if (!historicalRows || sourceRows.length + historicalRows.length > 8) return null
   const historicalNodeIndices: number[] = []
   previousIndex = -1
   for (const nodeIndex of historicalRows) {
     if (!integer(nodeIndex, 0, 7) || nodeIndex <= previousIndex || indexes.has(nodeIndex)) return null
     previousIndex = nodeIndex
+    indexes.add(nodeIndex)
     historicalNodeIndices.push(nodeIndex)
   }
-  return { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, graphRevision, sources, historicalNodeIndices }
+  if (v2Shape) return { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, graphRevision, sources, historicalNodeIndices }
+
+  const retiredRows = denseData(row.retiredNodeIndices, 1, 8)
+  if (!retiredRows || sourceRows.length + historicalRows.length + retiredRows.length > 8) return null
+  const retiredNodeIndices: number[] = []
+  previousIndex = -1
+  for (const nodeIndex of retiredRows) {
+    if (!integer(nodeIndex, 0, 7) || nodeIndex <= previousIndex || indexes.has(nodeIndex)) return null
+    previousIndex = nodeIndex
+    indexes.add(nodeIndex)
+    retiredNodeIndices.push(nodeIndex)
+  }
+  return { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, graphRevision, sources, historicalNodeIndices, retiredNodeIndices }
 }
 
 /** Keeps the strict final-answer DTO and adds only the bounded public sidecar. */

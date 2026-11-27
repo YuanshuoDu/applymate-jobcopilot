@@ -23,6 +23,7 @@ import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPage
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
 import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, TaskGraphScheduledAuditResumeInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof, ScheduledAuditResumeContext } from "./scheduled-audit-contract.js"
 import type { ScheduledPostGatePlanningContext, TaskGraphScheduledPostGatePlanInput, TaskGraphScheduledPostGatePlanReadInput, ScheduledPostGateCompletionProof, ScheduledPostGateScheduleReceipt } from "./scheduled-post-gate-contract.js"
+import type { TaskGraphScoutRetirementInput, TaskGraphScoutRetirementResult } from "./task-graph-scout-retirement-contract.js"
 export type { TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphScheduleNode, TaskGraphScheduleReceipt, TaskGraphScheduledPrepareReceipt, TaskGraphTaskTemplate } from "./task-graph-schedule-input.js"
 import type {
   ScheduledAnalyzeCheckpointHandoff,
@@ -244,4 +245,6 @@ export type TaskGraphCommandPort = Readonly<{
   readHistoricalDiscoveryPage?(scope: TaskGraphExecutionScope, request: TaskGraphHistoricalDiscoveryPageRequest): Promise<TaskGraphHistoricalDiscoveryPage>
   /** Reads bounded unverified canonical IDs from a failed ordinary Scout under the same owner fence. */
   readCurrentDiscoveryRecoveryPage?(scope: TaskGraphReadScope, request: TaskGraphDiscoveryRecoveryPageRequest): Promise<TaskGraphDiscoveryRecoveryPage>
+  /** Private exact-leaf request only; model registration waits for terminal proof integration. */
+  requestSupersededScoutRetirement?(input: TaskGraphScoutRetirementInput): Promise<TaskGraphScoutRetirementResult>
 }>

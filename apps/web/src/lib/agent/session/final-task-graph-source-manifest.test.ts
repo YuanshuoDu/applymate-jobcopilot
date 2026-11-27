@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 
 import { isCanonicalTaskGraphSourceManifestWeb, parseFinalTaskGraphSourceManifest, TASK_GRAPH_SOURCES_SCHEMA_VERSION,
-  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 } from './final-task-graph-source-manifest'
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 } from './final-task-graph-source-manifest'
 
 const key = (letter: string) => `src_${letter.repeat(43)}`
 const valid = {
@@ -44,6 +44,33 @@ describe('parseFinalTaskGraphSourceManifest', () => {
     for (const value of cases) expect(parseFinalTaskGraphSourceManifest(value)).toBeNull()
   })
 
+  it('parses v3 retired indices with optional history and permits a retirement-only manifest', () => {
+    const v3 = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, graphRevision: 4,
+      sources: [{ ...valid.sources[1]!, nodeIndex: 2 }], historicalNodeIndices: [0], retiredNodeIndices: [1] }
+    expect(parseFinalTaskGraphSourceManifest(v3)).toEqual(v3)
+    expect(parseFinalTaskGraphSourceManifest({ ...v3, historicalNodeIndices: [] })).toEqual({ ...v3, historicalNodeIndices: [] })
+    const retirementOnly = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, graphRevision: 4,
+      sources: [], historicalNodeIndices: [], retiredNodeIndices: [0] }
+    expect(parseFinalTaskGraphSourceManifest(retirementOnly)).toBeNull()
+
+    const cases = [
+      { ...v3, extra: true },
+      { ...v3, schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 },
+      { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, graphRevision: 4, sources: [], historicalNodeIndices: [] },
+      { ...v3, retiredNodeIndices: [] },
+      { ...v3, retiredNodeIndices: [1, 1] },
+      { ...v3, sources: [] },
+      { ...v3, retiredNodeIndices: [2, 1] },
+      { ...v3, retiredNodeIndices: [8] },
+      { ...v3, retiredNodeIndices: [2] },
+      { ...v3, historicalNodeIndices: [1], retiredNodeIndices: [1] },
+      { ...v3, historicalNodeIndices: [2] },
+      { ...v3, sources: [{ ...v3.sources[0]!, nodeIndex: 1 }] },
+      { ...v3, sources: [{ ...v3.sources[0]!, nodeIndex: 1 }, { ...v3.sources[0]!, nodeIndex: 2, sourceKey: key('C') }] },
+    ]
+    for (const value of cases) expect(parseFinalTaskGraphSourceManifest(value)).toBeNull()
+  })
+
   it('rejects accessor-backed fields before invoking them', () => {
     let invoked = false
     const accessorManifest = { ...valid }
@@ -65,6 +92,12 @@ describe('parseFinalTaskGraphSourceManifest', () => {
     Object.defineProperty(historicalNodeIndices, '0', { enumerable: true, get: () => { invoked = true; return 1 } })
     expect(parseFinalTaskGraphSourceManifest({ ...valid, schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
       historicalNodeIndices })).toBeNull()
+    expect(invoked).toBe(false)
+
+    const retiredNodeIndices = new Array(1)
+    Object.defineProperty(retiredNodeIndices, '0', { enumerable: true, get: () => { invoked = true; return 1 } })
+    expect(parseFinalTaskGraphSourceManifest({ schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, graphRevision: 4,
+      sources: [], historicalNodeIndices: [], retiredNodeIndices })).toBeNull()
     expect(invoked).toBe(false)
   })
 
@@ -109,6 +142,10 @@ describe('parseFinalTaskGraphSourceManifest', () => {
       schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, historicalNodeIndices: [1],
       sources: valid.sources.map(source => ({ ...source, sourceKey: workerKey(source.nodeIndex) })) })!
     expect(await isCanonicalTaskGraphSourceManifestWeb(finalItemId, v2Manifest)).toBe(true)
+    const v3Manifest = parseFinalTaskGraphSourceManifest({ schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3,
+      graphRevision: valid.graphRevision, historicalNodeIndices: [], retiredNodeIndices: [1],
+      sources: valid.sources.map((source, index) => ({ ...source, nodeIndex: index + 2, sourceKey: workerKey(index + 2) })) })!
+    expect(await isCanonicalTaskGraphSourceManifestWeb(finalItemId, v3Manifest)).toBe(true)
     expect(await isCanonicalTaskGraphSourceManifestWeb('other-item', manifest)).toBe(false)
 
     const crypto = globalThis.crypto
