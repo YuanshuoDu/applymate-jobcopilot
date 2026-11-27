@@ -1,6 +1,6 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared/agent-location-normalization"
-import { OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, parseObjectiveSponsorshipTargetCountry, type ObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared"
+import { OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, parseObjectiveSponsorshipTargetCountry, type ObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared/objective-sponsorship-target-country"
 import type { ObjectiveVerificationRequirements } from "@/lib/agent/control-plane/commands/types"
 
 export interface ObjectiveContextDraft {
