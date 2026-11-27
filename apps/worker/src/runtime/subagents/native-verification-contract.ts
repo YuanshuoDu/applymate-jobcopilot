@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { Buffer } from "node:buffer"
+import { isIso3166Alpha2CountryCode } from "@jobcopilot/shared"
 
 export const NATIVE_VERIFICATION_CONTROL_SCHEMA = "agent-harness.v2.native-verifier-control.v1" as const
 export const NATIVE_VERIFICATION_PACKET_SCHEMA = "agent-harness.v2.native-verifier-packet.v1" as const
@@ -14,6 +15,9 @@ export const NATIVE_VERIFICATION_PACKET_CONTEXT_KEY = "nativeVerificationPacket"
 export type NativeVerificationTargetBinding =
   | { readonly kind: "child"; readonly nodeId: string; readonly nativeOperationId: string; readonly fingerprint: string; readonly taskId: string; readonly attempt: number; readonly resultDigest: string }
   | { readonly kind: "root_goal"; readonly candidateDigest: string; readonly childBindingSetDigest: string }
+  | { readonly kind: "sponsorship_source"; readonly jobId: string; readonly scoutTaskId: string; readonly scoutAttempt: number;
+      readonly scoutResultDigest: string; readonly sourceReceiptDigest: string; readonly materialDigest: string;
+      readonly roleDigest: string; readonly targetCountryCode: string; readonly rootAttemptCount: number; readonly sourceBindingDigest: string }
 
 export type NativeVerificationOwnerBinding = {
   readonly userId: string
@@ -39,6 +43,7 @@ export type NativeVerificationEvidence = { readonly referenceId: string; readonl
 export type NativeVerificationPacketTarget =
   | { readonly kind: "child"; readonly taskId: string; readonly attempt: number; readonly resultDigest: string; readonly referenceId: string; readonly resultText: string }
   | { readonly kind: "root_goal"; readonly candidateDigest: string; readonly referenceId: string; readonly candidateText: string }
+  | { readonly kind: "sponsorship_source"; readonly sourceBindingDigest: string; readonly sourceTextDigest: string; readonly referenceId: string; readonly sourceText: string }
 export type NativeVerificationPacket = {
   readonly schemaVersion: typeof NATIVE_VERIFICATION_PACKET_SCHEMA | typeof NATIVE_VERIFICATION_PACKET_SCHEMA_V2
   readonly controlOperationId: string
@@ -77,6 +82,7 @@ export type NativeVerificationReport = {
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const DIGEST = /^[a-f0-9]{64}$/
+const SPONSORSHIP_DIGEST = /^sha256:[a-f0-9]{64}$/
 const MAX_CANONICAL_BYTES = NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES
 const MAX_CANONICAL_NODES = 10_000
 const MAX_CANONICAL_DEPTH = 64
@@ -127,6 +133,17 @@ function parseTarget(value: unknown): NativeVerificationTargetBinding | null {
   if (target.kind === "root_goal") {
     const parsed = exact(target, ["kind", "candidateDigest", "childBindingSetDigest"])
     if (!parsed || !digest(parsed.candidateDigest) || !digest(parsed.childBindingSetDigest)) return null
+    return parsed as NativeVerificationTargetBinding
+  }
+  if (target.kind === "sponsorship_source") {
+    const parsed = exact(target, ["kind", "jobId", "scoutTaskId", "scoutAttempt", "scoutResultDigest", "sourceReceiptDigest", "materialDigest", "roleDigest", "targetCountryCode", "rootAttemptCount", "sourceBindingDigest"])
+    if (!parsed || !id(parsed.jobId) || !id(parsed.scoutTaskId) || !attempt(parsed.scoutAttempt)
+      || typeof parsed.scoutResultDigest !== "string" || !SPONSORSHIP_DIGEST.test(parsed.scoutResultDigest)
+      || typeof parsed.sourceReceiptDigest !== "string" || !SPONSORSHIP_DIGEST.test(parsed.sourceReceiptDigest)
+      || typeof parsed.materialDigest !== "string" || !SPONSORSHIP_DIGEST.test(parsed.materialDigest)
+      || typeof parsed.roleDigest !== "string" || !SPONSORSHIP_DIGEST.test(parsed.roleDigest)
+      || !isIso3166Alpha2CountryCode(parsed.targetCountryCode)
+      || !attempt(parsed.rootAttemptCount) || typeof parsed.sourceBindingDigest !== "string" || !SPONSORSHIP_DIGEST.test(parsed.sourceBindingDigest)) return null
     return parsed as NativeVerificationTargetBinding
   }
   return null

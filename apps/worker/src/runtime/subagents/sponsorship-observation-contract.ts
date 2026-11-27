@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
+import { isIso3166Alpha2CountryCode } from "@jobcopilot/shared"
 
 export const SPONSORSHIP_OBSERVATION_SCHEMA = "agent-harness.v2.job-sponsorship-observation.v1" as const
 export const SPONSORSHIP_OBSERVATION_PUBLIC_SCHEMA = "agent-harness.v2.job-sponsorship-observation-public.v1" as const
@@ -115,7 +116,6 @@ export type SponsorshipObservationExpectation = Readonly<{
 }>
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/
-const COUNTRY_CODE = /^[A-Z]{2}$/
 const SOURCE_CONTEXT_KEYS = "company,descriptionExcerpt,descriptionExcerptStartByte,location,role,source,sourceUrl"
 const BINDING_KEYS = "bindingDigest,materialDigest,roleDigest,sourceReceiptDigest,targetCountryCode"
 const REVIEW_KEYS = "bindingDigest,citationDigest,claimDigest,countryCode,disposition,materialDigest,reviewerResultDigest,reviewerTaskAttemptDigest,roleDigest,schemaVersion,sourceReceiptDigest"
@@ -151,7 +151,7 @@ function text(value: unknown, maxBytes: number, allowEmpty = false): value is st
 }
 
 function digest(value: unknown): value is Digest { return typeof value === "string" && DIGEST.test(value) }
-function country(value: unknown): value is CountryCode { return typeof value === "string" && COUNTRY_CODE.test(value) }
+function country(value: unknown): value is CountryCode { return isIso3166Alpha2CountryCode(value) }
 function optionalCountry(value: unknown): value is CountryCode | null { return value === null || country(value) }
 function safeOffset(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 
@@ -170,9 +170,12 @@ function normalizeSourceUrl(value: unknown): string | undefined {
   if (!text(value, 4096)) return undefined
   try {
     const parsed = new URL(value)
-    if ((parsed.protocol !== "https:" && parsed.protocol !== "http:") || parsed.username || parsed.password
-      || parsed.search || parsed.hash || value !== parsed.origin) return undefined
-    return parsed.origin
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return undefined
+    parsed.username = ""
+    parsed.password = ""
+    parsed.search = ""
+    parsed.hash = ""
+    return `${parsed.origin}${parsed.pathname}`
   } catch { return undefined }
 }
 

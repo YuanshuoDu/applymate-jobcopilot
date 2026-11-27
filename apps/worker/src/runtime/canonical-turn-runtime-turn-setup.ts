@@ -11,7 +11,7 @@ import { INTERACTIVE_DISCOVERY_INTENT, loadCanonicalTurnState, type CanonicalTur
 import { capabilities } from "./canonical-turn-config.js"
 import { createCanonicalTurnCoordination } from "./canonical-turn-coordination.js"
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
-import { resolveRootTaskVerificationRequirements } from "./context/root-task-objective.js"
+import { resolveRootTaskSponsorshipTargetCountry, resolveRootTaskVerificationRequirements } from "./context/root-task-objective.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
 import { canonicalSelectedJobBatchRuntimeAvailable, failCanonicalSelectedJobBatchUnavailable, prepareCanonicalSelectedJobBatchForTurn, type CanonicalSelectedJobBatchReady } from "./canonical-selected-job-batch-setup.js"
 import { loadSelectedJobPreparation } from "./selected-job-preparation.js"
@@ -181,6 +181,8 @@ export async function prepareCanonicalTurnSetup(input: {
   const coordination = input.coordinationEnabled ? {
     manager, store: new PgCoordinationStore(pool), wait: toolSafeDurableWaitPort(durableWaitPort),
     nativeCoordination: turnCoordination.nativeOptions, verificationRequirements, askUserEnabled: nativeQuestionWaitEnabled,
+    sponsorshipReviewEnabled: objectiveTaskGraphMode && graph.enabled && !selectedJobBatch
+      && resolveRootTaskSponsorshipTargetCountry(state.turnInput).status === "valid",
   } : undefined
   const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state })
     ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination,

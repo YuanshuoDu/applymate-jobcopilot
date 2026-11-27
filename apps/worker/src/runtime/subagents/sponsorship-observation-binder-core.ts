@@ -16,7 +16,9 @@ type Candidate = Readonly<{ jobId: string; source: string; url: string | null }>
 type Receipt = Readonly<{ call: Row; result: Row; callContent: Row; resultContent: Row; outcome: "completed" | "failed" }>
 export type SponsorshipObservationTask = Pick<CoordinationTaskView,
   "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "parentTaskId" | "role" | "taskType" | "status" | "attemptCount" | "context" | "result">
-export type BoundSponsorshipObservation = Readonly<{ jobId: string; observation: SponsorshipObservation }>
+export type BoundSponsorshipObservation = Readonly<{ jobId: string; observation: SponsorshipObservation;
+  /** Private verified source bytes for a server-owned Reviewer; never copied to public wait output. */
+  source?: Readonly<{ job: Row; scoutResultDigest: string; sourceReceiptDigest: string; materialDigest: string }> }>
 const MAX_EXCERPT_BYTES = 1024
 const MAX_CANDIDATES = 50
 
@@ -172,6 +174,7 @@ function observeCandidate(scope: TaskGraphVerificationScope, candidate: Candidat
 /** Caller owns the transaction, user context, and any broader Root lease fence. */
 export async function readSponsorshipTaskObservationsWithClient(
   client: Pick<pg.PoolClient, "query">, task: SponsorshipObservationTask,
+  options: Readonly<{ jobIds?: readonly string[] }> = {},
 ): Promise<readonly BoundSponsorshipObservation[] | undefined> {
   if (!isSponsorshipObservationTask(task)) return undefined
   const candidates = candidatesFrom(task.result)
@@ -186,6 +189,13 @@ export async function readSponsorshipTaskObservationsWithClient(
   [task.id, task.sessionId, task.turnId, task.rootTaskId, task.parentTaskId, task.userId, task.attemptCount])
   const row = record(result.rows[0]), durableCandidates = row && candidatesFrom({ structuredResult: record(row.result)?.structuredResult })
   if (!row || result.rows.length !== 1 || !durableCandidates || stableJson(durableCandidates) !== stableJson(candidates)) throw new Error("sponsorship_task_scope_invalid")
+  const selectedCandidates = options.jobIds === undefined ? candidates : (() => {
+    if (!Array.isArray(options.jobIds) || options.jobIds.length < 1 || new Set(options.jobIds).size !== options.jobIds.length
+      || options.jobIds.some(jobId => !isCanonicalJobId(jobId) || !candidates.some(candidate => candidate.jobId === jobId))) return null
+    const selected = new Set(options.jobIds)
+    return candidates.filter(candidate => selected.has(candidate.jobId))
+  })()
+  if (!selectedCandidates || selectedCandidates.length === 0) return undefined
   const count = await client.query(`SELECT COUNT(*) FILTER (WHERE item."type" = 'tool_call') AS "callCount", COUNT(*) FILTER (WHERE item."type" = 'tool_result') AS "resultCount"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
     JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId"
@@ -204,7 +214,7 @@ export async function readSponsorshipTaskObservationsWithClient(
   })
   const pairs = receipts ? receiptPairs(receipts, candidates) : new Map<string, Receipt[]>(), observations: BoundSponsorshipObservation[] = []
   const dataSource = createPostgresReadToolDataSource(client)
-  for (const candidate of candidates) {
+  for (const candidate of selectedCandidates) {
     const calls = pairs.get(candidate.jobId) ?? []
     let currentJob: Row | null | undefined, readFailed = false
     if (calls.length === 1 && calls[0]!.outcome === "completed" && record(calls[0]!.resultContent.output)?.job !== null) {
@@ -213,7 +223,14 @@ export async function readSponsorshipTaskObservationsWithClient(
     }
     const observation = observeCandidate(scope, candidate, calls, allCalls.length > 0, invalidJobsGet, currentJob, readFailed)
       ?? unavailable(scope, candidate, "invalid_receipt")
-    if (observation) observations.push({ jobId: candidate.jobId, observation })
+    if (observation) {
+      const verifiedSource = observation.status === "inconclusive" && currentJob && calls.length === 1
+        ? { job: currentJob, scoutResultDigest: sha(row.result), sourceReceiptDigest: receiptDigest(calls),
+          materialDigest: scheduledDraftJobMaterialDigest(currentJob) }
+        : undefined
+      observations.push({ jobId: candidate.jobId, observation,
+        ...(verifiedSource?.materialDigest ? { source: verifiedSource as NonNullable<BoundSponsorshipObservation["source"]> } : {}) })
+    }
   }
   return observations
 }

@@ -22,6 +22,7 @@ export type SponsorshipWaitObservation = Readonly<{
   readonly observation: SponsorshipObservationPublicFrame
   readonly guidance: "Use owner-scoped jobs.get for this Job. Sponsorship interpretation remains unverified without an independent same-role, same-country review bound to the exact source."
 }>
+export type SponsorshipReviewRequestResult = Readonly<{ taskId: string; status: string }>
 
 export type CoordinationMessage = {
   readonly id: string
@@ -174,6 +175,8 @@ export type CoordinationRuntimeOptions = {
   readonly verificationRequirements?: RootTaskVerificationRequirementsResolution
   /** Server-only revalidation for the model-facing, status-only Scout wait projection. */
   readonly sponsorshipObservationReader?: (task: CoordinationTaskView) => Promise<readonly SponsorshipWaitObservation[] | undefined>
+  /** Root-only server binder; source and target country are re-read privately from durable state. */
+  readonly sponsorshipReviewRequester?: (context: ToolExecutionContext, jobId: string) => Promise<SponsorshipReviewRequestResult>
 }
 
 export class CoordinationError extends ToolExecutionError {

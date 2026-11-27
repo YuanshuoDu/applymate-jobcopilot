@@ -16,6 +16,7 @@ const MAX_EVIDENCE_SUMMARY_BYTES = 8 * 1024
 const MAX_CRITERIA = 32
 const MAX_EVIDENCE = 32
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const SPONSORSHIP_DIGEST = /^sha256:[a-f0-9]{64}$/
 
 function record(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -49,6 +50,18 @@ function parseCriteria(value: unknown): NativeVerificationPacket["criteria"] | n
 function parseTarget(value: unknown, control: NativeVerificationControl): NativeVerificationPacket["target"] | null {
   const row = record(value)
   if (!row) return null
+  if (control.target.kind === "sponsorship_source") {
+    const target = exact(row, ["kind", "sourceBindingDigest", "sourceTextDigest", "referenceId", "sourceText"])
+    if (!target || target.kind !== "sponsorship_source" || target.sourceBindingDigest !== control.target.sourceBindingDigest
+      || typeof target.sourceTextDigest !== "string" || !SPONSORSHIP_DIGEST.test(target.sourceTextDigest)
+      || typeof target.referenceId !== "string" || !ID.test(target.referenceId) || !text(target.sourceText, MAX_TARGET_BYTES)) return null
+    try {
+      const source = JSON.parse(target.sourceText) as unknown
+      if (canonicalNativeVerificationJson(source) !== target.sourceText
+        || `sha256:${digestNativeVerificationValue(target.sourceText)}` !== target.sourceTextDigest) return null
+    } catch { return null }
+    return target as NativeVerificationPacket["target"]
+  }
   if (control.target.kind === "child") {
     const target = exact(row, ["kind", "taskId", "attempt", "resultDigest", "referenceId", "resultText"])
     if (!target || target.kind !== "child" || target.taskId !== control.target.taskId || target.attempt !== control.target.attempt

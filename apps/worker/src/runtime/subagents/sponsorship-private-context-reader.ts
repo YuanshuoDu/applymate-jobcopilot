@@ -5,6 +5,8 @@ import { readSponsorshipTaskObservationsWithClient, sponsorshipCandidateJobIds, 
 import { loadTaskGraphVerificationReceipts } from "./task-graph-pg-verification-receipts.js"
 import { lockTaskGraphScope } from "./task-graph-pg-state.js"
 import { selectedSponsorshipWaitTargets } from "./sponsorship-private-context-wait.js"
+import { resolveRootTaskSponsorshipTargetCountry } from "../context/root-task-objective.js"
+import { readCurrentSponsorshipReviewWithClient } from "./sponsorship-review-current-reader.js"
 
 type Row = Record<string, unknown>
 type Pool = Pick<pg.Pool, "connect">
@@ -86,6 +88,26 @@ export async function readPrivateSponsorshipContext(pool: Pool, input: Sponsorsh
       attempt, previousOrdinal: ordinal - 1,
     }, waitProjections)
     if (!matchedTargets) { await client.query("COMMIT"); transactionOpen = false; return undefined }
+    if (matchedTargets.some(target => target.role === "auditor")) {
+      if (matchedTargets.length !== 1 || matchedTargets[0]?.role !== "auditor" || matchedTargets[0].status !== "completed") {
+        await client.query("COMMIT"); transactionOpen = false; return undefined
+      }
+      const turn = await client.query(`SELECT turn."input" FROM "agent_turns" AS turn
+        JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $4
+          AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6 AND session."userId" = $3 FOR SHARE OF turn`,
+      [input.turnId, input.sessionId, input.userId, input.rootTaskId, input.turnLeaseOwner, input.turnLeaseVersion])
+      const country = resolveRootTaskSponsorshipTargetCountry(row(turn.rows[0])?.input)
+      const review = turn.rows.length === 1 && country.status === "valid"
+        ? await readCurrentSponsorshipReviewWithClient(client, { scope: { userId: input.userId, sessionId: input.sessionId,
+          turnId: input.turnId, rootTaskId: input.rootTaskId, parentTaskId: input.rootTaskId,
+          turnLeaseOwner: input.turnLeaseOwner, turnLeaseVersion: input.turnLeaseVersion,
+          parentLeaseOwner: input.turnLeaseOwner, parentAttemptCount: input.rootAttemptCount },
+        reviewerTaskId: matchedTargets[0].taskId, rootAttemptCount: input.rootAttemptCount,
+        targetCountryCode: country.sponsorshipTargetCountry.countryCode }) : undefined
+      await client.query("COMMIT"); transactionOpen = false
+      return review ? [review] : undefined
+    }
     const taskIds = matchedTargets.map(target => target.taskId)
     const children = await client.query(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId",
         task."role", task."taskType", task."status", task."attemptCount", task."context", task."result"

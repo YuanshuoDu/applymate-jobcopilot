@@ -143,4 +143,22 @@ describe("parent finish with descendants", () => {
     expect(mocks.hasActiveSubagentDescendants).not.toHaveBeenCalled()
     expect(mocks.interruptMatchingInSession).not.toHaveBeenCalled()
   })
+
+  it("stores sponsorship Reviewer prose only in the private proof column and strips it from task result", async () => {
+    const canary = "PRIVATE-SPONSORSHIP-CITATION-CANARY"
+    const task = { ...liveTask, role: "auditor", taskType: "native_verification",
+      expectedOutputSchema: { schemaVersion: "agent-harness.v2.native-verifier-control.v1", target: { kind: "sponsorship_source" } },
+      context: {}, qualityGateResult: null }
+    const db = fakePool([task])
+
+    await expect(finishSubagentTask(db.pool, input({ result: { status: "completed", stepCount: 1, toolCallCount: 0,
+      nativeVerificationReport: { citation: canary } } }))).resolves.toBe("failed")
+
+    const update = db.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))
+    expect(update?.[0]).toContain('"qualityGateResult" = CASE')
+    expect(JSON.parse(String(update?.[1]?.[3]))).toEqual({ status: "failed", stepCount: 1, toolCallCount: 0 })
+    expect(JSON.stringify(update?.[1]?.[3])).not.toContain(canary)
+    expect(update?.[1]?.[11]).toBeNull()
+    expect(JSON.stringify(db.calls.filter(([sql]) => sql.includes("agent_events") || sql.includes("agent_outbox")))).not.toContain(canary)
+  })
 })

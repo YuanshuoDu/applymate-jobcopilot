@@ -192,13 +192,14 @@ async function consumedReadyTargets(client: Queryable, scope: Scope, wait: Selec
   const matchedAreTerminal = matched.every(id => TERMINAL.has(String(taskById.get(id)?.status ?? "")))
   if (taskById.size !== targets.length || !matchedAreTerminal || wait.input.mode === "all" && !sameIds(matched, targets)) return undefined
   const selected = matched.map(id => ({ taskId: id, status: String(taskById.get(id)!.status), role: String(taskById.get(id)!.role) }))
-  if (!projectionMatches(projections, String(saved.waitId), String(saved.mode), targets, matched, [...taskById.values()])) return undefined
+  if (projections.length > 0 && !projectionMatches(projections, String(saved.waitId), String(saved.mode), targets, matched, [...taskById.values()])) return undefined
   return selected
 }
 
 /** Resolves only an exact inline ready receipt or its matching consumed Root wait projection. */
 export async function selectedSponsorshipWaitTargets(
   client: Queryable, receipts: TaskGraphVerificationReceipts, scope: Scope, projections: readonly Projection[] = [],
+  options: Readonly<{ allowDurableConsumedResultWithoutProjection?: boolean }> = {},
 ): Promise<readonly WaitTarget[] | undefined> {
   const wait = selectedWait(receipts, scope.previousOrdinal)
   if (!wait || Number(wait.input.timeoutMs) < 1 || Number(wait.input.timeoutMs) > 30_000) return undefined
@@ -207,6 +208,9 @@ export async function selectedSponsorshipWaitTargets(
   if (!call || call.taskId !== scope.rootTaskId || Number(call.attempt) !== scope.attempt
     || !text(call.stepId) || call.stepId !== wait.stepId) return undefined
   if (wait.output.status === "ready") return readyInlineTargets(wait)
-  if (wait.output.status === "waiting") return consumedReadyTargets(client, scope, wait, projections)
+  if (wait.output.status === "waiting") {
+    if (!projections.length && options.allowDurableConsumedResultWithoutProjection !== true) return undefined
+    return consumedReadyTargets(client, scope, wait, projections)
+  }
   return undefined
 }

@@ -123,7 +123,7 @@ async function seed(): Promise<void> {
 }
 
 type JudgeDiagnostic = Readonly<{
-  targetKind: "child" | "root_goal"
+  targetKind: "child" | "root_goal" | "sponsorship_source"
   goalMatch: boolean
   criteriaMatch: boolean
   candidatePositive: boolean
@@ -150,7 +150,8 @@ function reportFor(
   recordDiagnostic?: (value: JudgeDiagnostic) => void,
   expectedFailedChildTaskId?: string,
 ) {
-  const targetText = packet.target.kind === "child" ? packet.target.resultText : packet.target.candidateText
+  const targetText = packet.target.kind === "child" ? packet.target.resultText
+    : packet.target.kind === "root_goal" ? packet.target.candidateText : packet.target.sourceText
   const requirements = packet.criteria.map(item => item.requirement)
   const goalMatch = [childGoal, followupChildGoal, unrelatedChildGoal, goal].includes(packet.goal)
   const criteriaMatch = (packet.goal === unrelatedChildGoal && requirements.length === 1 && requirements[0] === unrelatedChildCriteria[0])

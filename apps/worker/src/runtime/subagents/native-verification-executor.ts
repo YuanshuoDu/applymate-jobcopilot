@@ -51,7 +51,9 @@ function fail(reason: string): SubagentExecutionResult {
 function modelView(packet: NativeVerificationPacket): Record<string, unknown> {
   const target = packet.target.kind === "child"
     ? { kind: packet.target.kind, referenceId: packet.target.referenceId, resultText: packet.target.resultText }
-    : { kind: packet.target.kind, referenceId: packet.target.referenceId, candidateText: packet.target.candidateText }
+    : packet.target.kind === "root_goal"
+      ? { kind: packet.target.kind, referenceId: packet.target.referenceId, candidateText: packet.target.candidateText }
+      : { kind: packet.target.kind, referenceId: packet.target.referenceId, sourceText: packet.target.sourceText }
   return { goal: packet.goal, criteria: packet.criteria, target, evidence: packet.evidence }
 }
 
