@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   root-history-pg:
-    name: All 14 Root history cases on disposable PostgreSQL
+    name: All 15 Root history cases on disposable PostgreSQL
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
@@ -58,7 +58,7 @@ jobs:
         env:
           NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm turbo build --filter=@jobcopilot/worker
-      - name: Verify all 14 Root history cases on disposable PostgreSQL
+      - name: Verify all 15 Root history cases on disposable PostgreSQL
         env:
           CI: "true"
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
@@ -87,6 +87,7 @@ jobs:
           const expected = [
             "projects only bounded prior same-tenant objective Scout criteria through PostgreSQL",
             "returns same-user/session Roots with the exact canonical objective and a distinct source Root ID",
+            "filters roots without their exact TaskGraph item before the raw and graph-load bounds",
             "advances an empty strict-validation page and finds valid same-session history after 64 raw rows",
             "exhausts the same-session raw budget without starving the independent cross-session lane",
             "uses UTF-8 C-collation order for same-xid cross-session cursor pages",
@@ -108,16 +109,16 @@ jobs:
             && results.length === expected.length
             && expected.every(title => results.filter(result => result.file === file && result.title === title
               && result.status === "passed").length === 1)
-          const exactCounts = report.numTotalTests === 14 && report.numPassedTests === 14
+          const exactCounts = report.numTotalTests === expected.length && report.numPassedTests === expected.length
             && report.numFailedTests === 0 && report.numPendingTests === 0 && report.numTodoTests === 0
           if (!exactCases || !exactCounts) {
-            console.error("Root history PostgreSQL acceptance did not execute and pass exactly all 14 named cases.")
+            console.error(`Root history PostgreSQL acceptance did not execute and pass exactly all ${expected.length} named cases.`)
             console.error(JSON.stringify({ total: report.numTotalTests, passed: report.numPassedTests,
               failed: report.numFailedTests, pending: report.numPendingTests, todo: report.numTodoTests,
               statuses: results.map(({ title, status }) => ({ title, status })) }))
             process.exit(1)
           }
-          console.log("Verified all 14 named Root history PostgreSQL cases passed with no skips.")
+          console.log(`Verified all ${expected.length} named Root history PostgreSQL cases passed with no skips.`)
           NODE
       - name: Preserve structured PostgreSQL test report
         if: always()
