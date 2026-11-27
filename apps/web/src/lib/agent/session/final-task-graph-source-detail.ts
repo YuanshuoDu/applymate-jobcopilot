@@ -9,6 +9,7 @@ import {
 import {
   parseFinalTaskGraphSourceManifest,
   TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3,
   TASK_GRAPH_SOURCE_ROLES,
   TASK_GRAPH_SOURCE_TASK_STATUSES,
   type FinalTaskGraphSource,
@@ -109,6 +110,7 @@ export function projectFinalTaskGraphSourceDetail(input: {
 
   if (!isCanonicalTaskGraphSourceManifest(input.finalItemId, manifest)) return null
   const historicalNodeIndices = manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2
+    || manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3
     ? new Set(manifest.historicalNodeIndices) : new Set<number>()
   for (const nodeIndex of historicalNodeIndices) {
     const historicalNode = snapshot.nodes[nodeIndex]
@@ -117,11 +119,19 @@ export function projectFinalTaskGraphSourceDetail(input: {
       || (historicalTask.role !== 'scout' && historicalTask.role !== 'analyst')
       || historicalNode.templateId !== historicalTask.role) return null
   }
+  const retiredNodeIndices = manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3
+    ? new Set(manifest.retiredNodeIndices) : new Set<number>()
+  for (const nodeIndex of retiredNodeIndices) {
+    const retiredNode = snapshot.nodes[nodeIndex]
+    const retiredTask = retiredNode && taskById.get(retiredNode.taskId)
+    if (!retiredNode || !retiredTask || retiredNode.templateId !== 'scout' || retiredTask.role !== 'scout'
+      || retiredTask.taskType !== 'job_discovery' || retiredTask.status !== 'interrupted') return null
+  }
   const businessNodes = snapshot.nodes.flatMap((node, nodeIndex) => {
     const task = taskById.get(node.taskId)!
     return task.role === 'auditor' && task.taskType === 'native_verification' ? [] : [{ node, nodeIndex, task }]
   })
-  const sourcedNodes = businessNodes.filter(member => !historicalNodeIndices.has(member.nodeIndex))
+  const sourcedNodes = businessNodes.filter(member => !historicalNodeIndices.has(member.nodeIndex) && !retiredNodeIndices.has(member.nodeIndex))
   if (manifest.sources.length !== sourcedNodes.length) return null
   for (const [index, member] of sourcedNodes.entries()) {
     const source = manifest.sources[index]!

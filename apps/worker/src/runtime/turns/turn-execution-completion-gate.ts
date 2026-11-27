@@ -5,11 +5,12 @@ import type { TurnLease } from "./lease.js"
 import { loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
 import { taskGraphItemId, type StoredTaskGraphNode } from "../subagents/task-graph-snapshot.js"
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
-import { buildTaskGraphDenialCheckpoint, gateReport, repairIds,
-  type GateReport, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import { buildTaskGraphDenialCheckpoint, gateReport, projectVerifiedCompletedTaskIds, repairIds, repairReportState, repairStatusFeedback,
+  type GateReport, type RepairFeedbackState, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_FEEDBACK,
   type SteeringReconciliationState } from "../subagents/steering-reconciliation-contract.js"
-import { readSteeringReconciliationState } from "../subagents/steering-reconciliation-read.js"
+import { readSteeringReconciliationState, readSteeringReconciliationStateForTerminal } from "../subagents/steering-reconciliation-read.js"
+import type { SessionTerminalAdmission } from "../session-gate.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
@@ -17,30 +18,16 @@ import { buildCurrentTaskGraphFinalSummaryBinding, hasObjectiveTailorWaveMarker 
 import { readTaskGraphConfirmedLocationSteer } from "../subagents/task-graph-confirmed-location-steer.js"
 import { resolveTaskGraphConfirmedLocationCompletion } from "./task-graph-confirmed-location-completion.js"
 import { taskGraphCompletionApplicability } from "./task-graph-completion-applicability.js"
+import { readTaskGraphRetiredScouts } from "./task-graph-retirement-completion.js"
 import { assertCompletionAllowed, TASK_GRAPH_FEEDBACK, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-terminal-decision.js"
 export { assertCompletionAllowed, TASK_GRAPH_VERIFICATION_BLOCKER }
+export { repairReportState }
 
 export function completionRecoverySnapshot(snapshot: StepContextSnapshot, stepId: string, feedback: string): StepContextSnapshot {
   return applyCompletionRecovery(snapshot, stepId, feedback)
 }
 type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion" | "result_applicability"
-type RepairFeedbackState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
 type GateFeedbackDetail = Readonly<{ nodeOrdinal: number; criterionOrdinal?: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; repairState?: RepairFeedbackState }>
-const ACTIVE_REPAIR_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
-const TERMINAL_REPAIR_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
-function repairStatusFeedback(status: string): RepairFeedbackState {
-  if (ACTIVE_REPAIR_STATUSES.has(status)) return "pending"
-  if (status === "failed") return "rejected"
-  if (TERMINAL_REPAIR_STATUSES.has(status)) return "terminal"
-  return "unavailable"
-}
-export function repairReportState(task: { status: string; result: unknown } | undefined): RepairFeedbackState {
-  if (!task) return "missing"
-  if (ACTIVE_REPAIR_STATUSES.has(task.status)) return "pending"
-  if (["completed", "interrupted", "cancelled", "closed"].includes(task.status)) return "terminal"
-  if (task.status === "failed" && Object.hasOwn(row(task.result), "taskGraphVerificationReport")) return "invalid_report"
-  return repairStatusFeedback(task.status)
-}
 function reportFeedback(node: StoredTaskGraphNode, report: GateReport, nodes: readonly StoredTaskGraphNode[], repairState?: RepairFeedbackState): GateFeedbackDetail[] {
   const nodeIndex = nodes.findIndex(candidate => candidate.taskId === node.taskId)
   if (nodeIndex < 0) return []
@@ -104,7 +91,7 @@ async function readPersistedTurnInput(client: pg.PoolClient, lease: TurnLease, r
   return result.rows.length === 1 ? { found: true, input: result.rows[0]?.input } : { found: false }
 }
 /** Rechecks durable reports against the current immutable graph inside the caller's transaction. */
-export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
+export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false, requireTaskGraph = false, terminalAdmission?: SessionTerminalAdmission): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   let graphRevision: number | null = null
   let denialCheckpoint: TaskGraphDenialCheckpoint | null = null
   const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => {
@@ -119,8 +106,8 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
     const hasRevisionHint = await hasReconciliationEventHint(client, lease, rootTaskId)
     const hasLocationHint = await hasConfirmedLocationEventHint(client, lease, rootTaskId)
     if (hasRevisionHint || hasLocationHint) {
-      reconciliationState = await readSteeringReconciliationState(client, { ...scope, turnLeaseOwner: lease.ownerId,
-        turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1 })
+      const reconciliationScope = { ...scope, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1 }
+      reconciliationState = terminalAdmission ? await readSteeringReconciliationStateForTerminal(client, reconciliationScope, terminalAdmission) : await readSteeringReconciliationState(client, reconciliationScope)
       if (reconciliationState.unresolvedInputs.length) return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
     }
     let confirmedLocation: Awaited<ReturnType<typeof readTaskGraphConfirmedLocationSteer>> | null = null
@@ -147,7 +134,10 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
     denialCheckpoint = buildTaskGraphDenialCheckpoint(loaded, rootTaskId)
     const { nodes } = loaded.snapshot, reports = new Map<string, GateReport>(), resolvedRepairTaskIds = new Set<string>()
     const resolvedTargetCriteria = new Map<string, ReadonlySet<string>>()
+    const retiredScouts = latestUserRevision ? await readTaskGraphRetiredScouts(client, scope, loaded, reconciliationState!) : new Map()
+    const retiredNodeKeys = new Set(retiredScouts.keys())
     for (const node of nodes) {
+      if (retiredNodeKeys.has(node.key)) continue
       if (node.verificationDisposition === "legacy_unverified" && !(nativeVerificationPassed && node.nativeDelegation)) return deny("legacy_unverified")
       if (node.verificationDisposition !== "typed") continue
       const task = loaded.tasks.get(node.taskId), report = gateReport(node, task?.result, task?.role ?? "")
@@ -164,6 +154,7 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
         : task.status !== "failed" || task.failureReason !== "task_graph_verification_" + report.status) return deny("verification_report", reportFeedback(node, report, nodes))
     }
     for (const target of nodes.filter(node => node.verificationDisposition === "typed" && !node.repairOf)) {
+      if (retiredNodeKeys.has(target.key)) continue
       const original = reports.get(target.taskId)!
       if (original.status === "passed") continue
       const counts = new Map<string, number>(), repairDetails: GateFeedbackDetail[] = []
@@ -201,28 +192,28 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
         return deny("repair_receipt", [...(targetReport ? reportFeedback(target, targetReport, nodes, "invalid_receipt") : []), ...reportFeedback(repair, report, nodes)])
       }
     }
-    const verifiedCompletedTaskIds = new Set([...reports].flatMap(([taskId, report]) => {
-      const task = loaded.tasks.get(taskId)
-      return report.status === "passed" && task?.status === "completed" && task.failureReason === null ? [taskId] : []
-    }))
+    const verifiedCompletedTaskIds = projectVerifiedCompletedTaskIds(reports, loaded.tasks)
     let historicalNodeIndices: ReadonlySet<number> = new Set()
     if (confirmedLocation?.kind === "confirmed") {
       const persisted = await readPersistedTurnInput(client, lease, rootTaskId)
       if (!persisted.found) return deny("result_applicability")
       const locationCompletion = await resolveTaskGraphConfirmedLocationCompletion({
         client, loaded, scope, reconciliation: reconciliationState!, confirmed: confirmedLocation,
-        persistedTurnInput: persisted.input, verifiedCompletedTaskIds,
+        persistedTurnInput: persisted.input, verifiedCompletedTaskIds, retiredNodeKeys,
       })
       if (locationCompletion.kind === "pending") return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
       if (locationCompletion.kind !== "applicable") return deny("result_applicability")
       historicalNodeIndices = locationCompletion.historicalNodeIndices
     }
     if (latestUserRevision && confirmedLocation?.kind !== "confirmed") {
-      const applicability = taskGraphCompletionApplicability(loaded, latestUserRevision, reconciliationState!.currentRevision, verifiedCompletedTaskIds)
+      const applicability = taskGraphCompletionApplicability(loaded, latestUserRevision, reconciliationState!.currentRevision,
+        verifiedCompletedTaskIds, undefined, retiredNodeKeys)
       if (applicability.kind === "replan") return deny("result_applicability")
       historicalNodeIndices = applicability.historicalNodeIndices
     }
-    const binding = await buildCurrentTaskGraphFinalSummaryBinding({ client, lease, rootTaskId, loaded, historicalNodeIndices, resolvedRepairTaskIds, buildOrdinary: buildTaskGraphFinalSummaryBinding })
+    const binding = await buildCurrentTaskGraphFinalSummaryBinding({ client, lease, rootTaskId, loaded, historicalNodeIndices, resolvedRepairTaskIds,
+      buildOrdinary: (graph, historical, resolved) => buildTaskGraphFinalSummaryBinding(graph, historical, resolved, retiredScouts) })
+    if (!binding && retiredScouts.size > 0) return deny("result_applicability")
     if (hasObjectiveTailorWaveMarker(loaded) && !binding) return deny()
     return binding ? { ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } : { ok: true }
   } catch { graphRevision = null; denialCheckpoint = null; return deny() }

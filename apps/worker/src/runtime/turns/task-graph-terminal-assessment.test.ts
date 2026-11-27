@@ -8,6 +8,8 @@ import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state
 import {
   buildTaskGraphDenialCheckpoint,
   parseTaskGraphDenialCheckpoint,
+  projectVerifiedCompletedTaskIds,
+  repairReportState,
   taskGraphTerminalVerificationDigest,
 } from "./task-graph-terminal-assessment.js"
 
@@ -17,6 +19,31 @@ const criteria = [
   { id: "criterion-a", check: { kind: "candidate_count_gte" as const, minimum: 1 } },
   { id: "criterion-b", check: { kind: "candidate_count_gte" as const, minimum: 2 } },
 ]
+
+describe("TaskGraph terminal assessment projections", () => {
+  it("projects only passed reports for completed tasks without failure reasons", () => {
+    const reports = new Map([
+      ["verified", { status: "passed" as const }], ["report-failed", { status: "failed" as const }],
+      ["report-unverified", { status: "unverified" as const }], ["missing-task", { status: "passed" as const }],
+    ])
+    const tasks = new Map([
+      ["verified", { status: "completed" as const, failureReason: null }],
+      ["report-failed", { status: "completed" as const, failureReason: null }],
+      ["report-unverified", { status: "completed" as const, failureReason: null }],
+      ["failed-task", { status: "completed" as const, failureReason: "provider_error" }],
+    ])
+
+    expect(projectVerifiedCompletedTaskIds(reports, tasks)).toEqual(new Set(["verified"]))
+  })
+
+  it("preserves bounded repair status feedback classification", () => {
+    expect(repairReportState(undefined)).toBe("missing")
+    expect(repairReportState({ status: "waiting_for_user", result: null })).toBe("pending")
+    expect(repairReportState({ status: "interrupted", result: null })).toBe("terminal")
+    expect(repairReportState({ status: "failed", result: { taskGraphVerificationReport: {} } })).toBe("invalid_report")
+    expect(repairReportState({ status: "future_status", result: null })).toBe("unavailable")
+  })
+})
 
 function result(summary: string, passed: boolean) {
   return {

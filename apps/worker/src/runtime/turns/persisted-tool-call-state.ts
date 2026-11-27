@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util"
 import type { PersistedToolCallRecovery, TurnEngineToolResult } from "./turn-engine-types.js"
+import { DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY, readDependencyWaitBatchRejection } from "./dependency-wait-batch-rejection.js"
 
 type Row = Record<string, unknown>
 type ToolObservation = { readonly id: string; readonly content: Record<string, unknown> }
@@ -181,15 +182,22 @@ export function restoreToolCallState(items: readonly Row[], events: readonly Row
   const calls = new Map<string, Row>()
   const results = new Map<string, Row>()
   for (const item of items) {
-    if (item.type !== "tool_call" && item.type !== "tool_result") continue
     const content = object(item.content)
+    if (item.type !== "tool_call" && Object.prototype.hasOwnProperty.call(content, DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY)) throw new Error("tool_result_replay_uncertain")
+    if (item.type !== "tool_call" && item.type !== "tool_result") continue
     const callId = content.toolCallId
+    if (item.type === "tool_call" && Object.prototype.hasOwnProperty.call(content, DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY) && typeof callId !== "string") throw new Error("tool_result_replay_uncertain")
     if (typeof callId !== "string") continue
     const map = item.type === "tool_call" ? calls : results
     if (map.has(callId)) throw new Error("tool_result_replay_uncertain")
     map.set(callId, item)
   }
   const finalByCall = finalResults(legacyDiagnosticEvents(events, calls, results), calls)
+  const markedResults = new Map<string, TurnEngineToolResult>()
+  for (const [callId, callItem] of calls) {
+    const result = readDependencyWaitBatchRejection({ callId, callItem, resultItem: results.get(callId), durableResult: finalByCall.get(callId)?.result })
+    if (result) markedResults.set(callId, result)
+  }
   const pending: PersistedToolCallRecovery[] = []
   const pendingIds = new Set<string>()
   for (const [callId, callItem] of calls) {
@@ -198,7 +206,7 @@ export function restoreToolCallState(items: readonly Row[], events: readonly Row
     if (!validStatus(callItem.status) || (resultItem && !validStatus(resultItem.status))) throw new Error("tool_result_replay_uncertain")
     if (resultItem && terminalStatus(callItem.status) && terminalStatus(resultItem.status) && callItem.status !== resultItem.status) throw new Error("tool_result_replay_uncertain")
     const durableReceipt = finalByCall.get(callId)
-    const durableResult = durableReceipt?.result
+    const durableResult = markedResults.get(callId) ?? durableReceipt?.result
     const persistedStatus = persistedOutcomeStatus(callItem, call, resultItem)
     if (durableResult && persistedStatus && durableResult.status !== persistedStatus) throw new Error("tool_result_replay_uncertain")
     if (durableReceipt && resultItem) assertResultItemMatchesEvent(durableReceipt, resultItem)

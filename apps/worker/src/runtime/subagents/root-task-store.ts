@@ -10,12 +10,13 @@ import { cleanupFailedRootTaskGraph } from "./task-graph-pg-root-failure-cleanup
 import { checkTaskGraphTerminalVerification } from "../turns/turn-execution-completion-gate.js"
 import { assertPlanningRootCanFinish } from "./pg-store-create.js"
 import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
+import type { SessionTerminalAdmission } from "../session-gate.js"
 export type RootTaskReconciliation = RootTaskTerminalReconciliation
 export type RootTaskFinishMetadata = Readonly<{ interactiveDiscoveryShortlist: InteractiveDiscoveryShortlistProjection }>
 export type RootTaskStore = {
   ensure(input: { lease: TurnLease; goal: string; modelProfileSnapshot?: unknown; toolPolicySnapshot?: unknown; budgetSnapshot?: unknown; allowedActions?: readonly string[]; now?: Date }): Promise<SubagentTaskRecord>
   reconcileTerminal?(input: { lease: TurnLease; now?: Date }): Promise<RootTaskReconciliation | null>
-  checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date; taskGraphVerification?: boolean; /** Server-only result from the independent native verifier; never tool/model supplied. */ nativeVerificationPassed?: boolean; client?: pg.PoolClient; requireTaskGraph?: boolean }): Promise<TurnEngineCompletionGateResult>
+  checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date; taskGraphVerification?: boolean; /** Server-only result from the independent native verifier; never tool/model supplied. */ nativeVerificationPassed?: boolean; client?: pg.PoolClient; requireTaskGraph?: boolean; terminalAdmission?: SessionTerminalAdmission }): Promise<TurnEngineCompletionGateResult>
   finish(input: { lease: TurnLease; rootTaskId: string; result: TurnEngineResult; metadata?: RootTaskFinishMetadata; now?: Date }): Promise<void>
 }
 type Row = Record<string, unknown>
@@ -166,7 +167,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         for (const row of descendants.rows) if (String(row.sessionId) !== input.lease.sessionId || String(row.turnId) !== input.lease.turnId || String(row.rootTaskId) !== input.rootTaskId || String(row.userId) !== input.lease.userId) throw new Error("root_task_fenced")
         const children = completionBlocker(descendants.rows)
         if (input.taskGraphVerification && (children.ok || descendants.rows.every(row => row.status === "waiting"))) {
-          const graph = await checkTaskGraphTerminalVerification(client, input.lease, input.rootTaskId, input.nativeVerificationPassed === true, input.requireTaskGraph === true)
+          const graph = await checkTaskGraphTerminalVerification(client, input.lease, input.rootTaskId, input.nativeVerificationPassed === true, input.requireTaskGraph === true, input.terminalAdmission)
           if (!graph.ok) return graph
           return children.ok ? graph : children
         }

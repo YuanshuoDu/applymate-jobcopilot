@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider, translate } from '@/lib/i18n'
+import type { SessionPauseBlocker } from './session-pause-blocker-projection'
 
 import {
   AgentSessionPauseResumeControl,
@@ -17,6 +18,22 @@ const activeTurn: AgentSessionControlTurn = { id: 'turn/1', revision: 7, status:
 
 function response(body: unknown, status = 202): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+function renderPauseControl(
+  sessionStatus: 'running' | 'pausing' | 'paused' | 'resuming',
+  pauseBlocker: SessionPauseBlocker | null,
+  lang: 'en' | 'zh' = 'en',
+): string {
+  vi.stubGlobal('window', {})
+  vi.stubGlobal('localStorage', { getItem: () => lang })
+  try {
+    return renderToStaticMarkup(
+      <I18nProvider><AgentSessionPauseResumeControl sessionId="session-1" sessionStatus={sessionStatus} activeTurn={activeTurn} pauseBlocker={pauseBlocker} onPause={vi.fn()} onResume={vi.fn()} /></I18nProvider>,
+    )
+  } finally {
+    vi.unstubAllGlobals()
+  }
 }
 
 describe('AgentSessionPauseResumeControl', () => {
@@ -36,6 +53,45 @@ describe('AgentSessionPauseResumeControl', () => {
     expect(render('pausing')).toContain('data-agent-session-durable-status="pausing"')
     expect(render('pausing')).not.toContain('<button')
     expect(render('resuming')).not.toContain('<button')
+  })
+
+  it('shows fixed bilingual blocker labels only for the matching pausing Turn', () => {
+    const blocker = {
+      turnId: activeTurn.id,
+      reasons: ['step', 'child_task', 'recovery', 'step'] as const,
+      taskId: 'private-task-42',
+      detail: 'private operation details',
+    }
+    const english = renderPauseControl('pausing', blocker)
+    expect(english).toContain('data-agent-session-pause-blockers="true"')
+    expect(english).toContain('Pause is waiting on')
+    expect(english).toContain('A step still needs to settle.')
+    expect(english).toContain('A child task is still active.')
+    expect(english).toContain('Waiting for the agent to confirm its state.')
+    expect(english.match(/A step still needs to settle\./g)).toHaveLength(1)
+    expect(english.indexOf('data-agent-session-pause-blockers')).toBeGreaterThan(english.indexOf('role="status"'))
+    expect(english).not.toContain('private-task-42')
+    expect(english).not.toContain('private operation details')
+    expect(english).not.toContain('child_task')
+
+    const chinese = renderPauseControl('pausing', blocker, 'zh')
+    expect(chinese).toContain('暂停仍在等待')
+    expect(chinese).toContain('仍有步骤需要完成。')
+    expect(chinese).toContain('子任务仍在运行。')
+    expect(chinese).toContain('正在等待 Agent 确认当前状态。')
+
+    for (const status of ['running', 'paused', 'resuming'] as const) {
+      expect(renderPauseControl(status, blocker)).not.toContain('data-agent-session-pause-blockers')
+    }
+    expect(renderPauseControl('pausing', { ...blocker, turnId: 'turn/stale' })).not.toContain('data-agent-session-pause-blockers')
+    expect(renderPauseControl('pausing', { ...blocker, reasons: [] })).not.toContain('data-agent-session-pause-blockers')
+    expect(renderPauseControl('pausing', null)).not.toContain('data-agent-session-pause-blockers')
+
+    const malformed = { turnId: activeTurn.id, reasons: ['step'] as const }
+    Object.defineProperty(malformed, 'reasons', { value: ['step', 'unexpected-private-value'] })
+    const malformedHtml = renderPauseControl('pausing', malformed)
+    expect(malformedHtml).not.toContain('unexpected-private-value')
+    expect(malformedHtml.match(/<li>/g)).toHaveLength(1)
   })
 
   it('keeps a message ID stable for retry of one action and rotates it when Turn revision changes', () => {

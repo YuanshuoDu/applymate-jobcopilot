@@ -68,6 +68,7 @@ function validAuthority(input: PendingScopeInput): boolean {
     || prepared?.decision !== "revise" || prepared.expectedRevision !== revision || prepared.resultingRevision !== revision + 1
     || !sameScope(prepared.scope, scope) || prepared.inputThroughSequence <= 0n || prepared.inputThroughSequence > MAX_SEQUENCE
     || confirmed?.kind !== "confirmed" || typeof confirmed.acceptedInputSequence !== "bigint"
+    || !validId(confirmed.acceptedInputId)
     || confirmed.acceptedInputSequence <= 0n || confirmed.acceptedInputSequence > prepared.inputThroughSequence
     || !state || state.currentRevision !== revision || state.agendaPlanRevision !== revision
     || state.decisionStepId !== scope.stepId || state.decisionStepAttempt !== 1
@@ -81,7 +82,7 @@ function validAuthority(input: PendingScopeInput): boolean {
   const pending = state.unresolvedInputs.length === 1 ? state.unresolvedInputs[0] : undefined
   return prepared.steerInputIds.length === 1 && pending?.status === "consumed"
     && pending.consumedByStepId === scope.stepId && pending.acceptedSequence === confirmed.acceptedInputSequence
-    && pending.id === prepared.steerInputIds[0]
+    && pending.id === prepared.steerInputIds[0] && pending.id === confirmed.acceptedInputId
 }
 
 function graphNodes(loaded: LoadedGraph, scope: TaskGraphExecutionScope): Array<{
@@ -110,11 +111,17 @@ function graphNodes(loaded: LoadedGraph, scope: TaskGraphExecutionScope): Array<
 }
 
 function ordinaryRunningScout(node: StoredTaskGraphNode, task: GraphTaskRow): boolean {
+  return task.status === "running" && Number.isSafeInteger(task.attemptCount) && task.attemptCount! > 0
+    && isOrdinaryRegisteredScout(node, task)
+}
+
+/** Exact registered Scout shape shared by planning and the private retirement proof. */
+export function isOrdinaryRegisteredScout(node: StoredTaskGraphNode, task: GraphTaskRow): boolean {
   const envelope = parseRegisteredScoutEnvelope(node.registeredScoutEnvelope)
   const contract = node.verification && validateTaskGraphVerificationContract(node.verification, "scout")
   return node.templateId === "scout" && node.verificationDisposition === "typed" && !node.repairOf && !node.nativeDelegation
-    && node.dependsOn.length === 0 && task.role === "scout" && task.taskType === "job_discovery" && task.status === "running"
-    && task.failureReason === null && Number.isSafeInteger(task.attemptCount) && task.attemptCount! > 0
+    && node.dependsOn.length === 0 && task.role === "scout" && task.taskType === "job_discovery"
+    && task.failureReason === null
     && task.contextIsObject === true && task.hasPrivateSelectionContext === false
     && REGISTERED_SCOUT_TEMPLATES.some(template => registeredScoutProfileMatches(template, envelope, task))
     && contract?.ok === true && contract.contract.role === "scout"

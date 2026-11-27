@@ -6,6 +6,7 @@ import { redactSensitiveText } from '@jobcopilot/shared/agent-redaction'
 import { useI18n } from '@/lib/i18n'
 
 import { HarnessTimeline } from './HarnessTimeline'
+import { childWorkerFailureText, projectChildWorkerFailure } from './child-worker-failure'
 import type { SupervisorTaskSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
 
@@ -119,8 +120,12 @@ export function ChildWorkerAttachView({ sessionId, task, items, onClose, onConfl
   const copy = localizedCopy(lang === 'zh')
   const createdAt = displayTimestamp(task.createdAt)
   const updatedAt = displayTimestamp(task.updatedAt)
-  const failureSummary = safeFailureSummary(task.failureReason)
-  const hasFailureReason = typeof task.failureReason === 'string' && task.failureReason.trim().length > 0
+  const hasFailureReason = validDisplayedChild(task, sessionId) && task.status === 'failed'
+    && typeof task.failureReason === 'string' && task.failureReason.trim().length > 0
+  const failure = hasFailureReason ? projectChildWorkerFailure(task.status, task.failureReason) : undefined
+  const failureSummary = failure
+    ? childWorkerFailureText(failure, lang)
+    : hasFailureReason ? copy.failureUnavailable : null
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!target || locked || busy || !text.trim()) return
@@ -148,7 +153,7 @@ export function ChildWorkerAttachView({ sessionId, task, items, onClose, onConfl
         <WorkerDetail label={copy.artifact} value={task.artifactRef ? copy.available : copy.unavailable} />
         {createdAt && <WorkerDetail label={copy.created} value={<time dateTime={createdAt.iso}>{createdAt.label}</time>} />}
         {updatedAt && <WorkerDetail label={copy.updated} value={<time dateTime={updatedAt.iso}>{updatedAt.label}</time>} />}
-        {hasFailureReason && <WorkerDetail label={copy.failureSummary} value={failureSummary ?? copy.failureHidden} />}
+        {hasFailureReason && <WorkerDetail label={copy.failureSummary} value={failureSummary} />}
       </dl>
     </div>
     {taskItems.length ? <HarnessTimeline items={taskItems} /> : <p role="status">{copy.noActivity}</p>}
@@ -166,7 +171,7 @@ function localizedCopy(chinese: boolean) {
   return chinese ? {
     activity: '所选工作线程活动', attempt: (count: number) => `尝试 ${count}`, attemptUnavailable: '尝试次数不可用', close: '关闭视图',
     details: '工作线程详情', goal: '目标', goalUnavailable: '目标不可用', status: '状态', result: '结果', artifact: '工件',
-    available: '可用', unavailable: '不可用', created: '创建时间', updated: '最近更新', failureSummary: '失败摘要', failureHidden: '出于隐私保护，详情已隐藏', unknownStatus: '未知',
+    available: '可用', unavailable: '不可用', created: '创建时间', updated: '最近更新', failureSummary: '失败摘要', failureUnavailable: '暂无可显示的失败详情', unknownStatus: '未知',
     queuedStatus: '排队中', runningStatus: '运行中', retryingStatus: '重试中', waitingStatus: '等待中', completedStatus: '已完成', failedStatus: '失败', interruptedStatus: '已中断', skippedStatus: '已跳过',
     noActivity: '此工作线程尚无活动记录。', label: '跟进消息', placeholder: '向当前显示的尝试发送跟进消息', sending: '正在发送…', send: '发送跟进消息',
     accepted: (count: number) => `已接受发送给第 ${count} 次尝试的跟进消息。`, conflictLocked: '此尝试已被拒绝，无法继续发送跟进消息。',
@@ -175,7 +180,7 @@ function localizedCopy(chinese: boolean) {
   } : {
     activity: 'Selected worker activity', attempt: (count: number) => `Attempt ${count}`, attemptUnavailable: 'Attempt unavailable', close: 'Close view',
     details: 'Worker details', goal: 'Goal', goalUnavailable: 'Goal unavailable', status: 'Status', result: 'Result', artifact: 'Artifact',
-    available: 'Available', unavailable: 'Unavailable', created: 'Created', updated: 'Updated', failureSummary: 'Failure summary', failureHidden: 'Failure details hidden for privacy', unknownStatus: 'Unknown',
+    available: 'Available', unavailable: 'Unavailable', created: 'Created', updated: 'Updated', failureSummary: 'Failure summary', failureUnavailable: 'Failure details are unavailable', unknownStatus: 'Unknown',
     queuedStatus: 'Queued', runningStatus: 'Running', retryingStatus: 'Retrying', waitingStatus: 'Waiting', completedStatus: 'Completed', failedStatus: 'Failed', interruptedStatus: 'Interrupted', skippedStatus: 'Skipped',
     noActivity: 'No activity recorded for this worker yet.', label: 'Follow-up message', placeholder: 'Send a follow-up to the displayed attempt', sending: 'Sending…', send: 'Send follow-up',
     accepted: (count: number) => `Follow-up accepted for attempt ${count}.`, conflictLocked: 'This attempt was rejected and is locked for follow-ups.',
@@ -185,33 +190,19 @@ function localizedCopy(chinese: boolean) {
 }
 
 type WorkerCopy = ReturnType<typeof localizedCopy>
-const SAFE_FAILURE_SUMMARIES = new Set([
-  'task_graph_verification_failed', 'task_graph_verification_unverified', 'task_graph_repair_target_unresolved',
-  'task_graph_child_deadline_exceeded', 'task_graph_dependency_scope_mismatch', 'no_progress',
-  'child_turn_missing', 'child_mailbox_continuation_unsupported', 'child_mailbox_continuation_unavailable',
-  'child_mailbox_continuation_checkpoint_unavailable', 'child_resume_unavailable', 'child_resume_evidence_unavailable',
-  'child_resume_wait_step_lineage', 'selected_job_context_unavailable', 'selected_job_sources_unavailable',
-  'selected_job_output_contract_unavailable', 'writer_dependency_unavailable', 'writer_review_revision_role_invalid',
-  'subagent_role_unknown', 'invalid_structured_result', 'native_verification_report_invalid',
-  'subagent_mailbox_input_unavailable', 'subagent_mailbox_no_progress', 'subagent_mailbox_continuation_limit',
-  'subagent_mailbox_continuation_failed',
-  'scheduled_gate_result_invalid', 'scheduled_gate_role_task_type_mismatch', 'scheduled_audit_handoff_retryable',
-  'application_fill_role_task_type_mismatch', 'application_fill_continuation_unsupported',
-])
-
 function displayAttempt(value: number | null | undefined, copy: WorkerCopy): string {
   return Number.isSafeInteger(value) && Number(value) > 0 ? copy.attempt(Number(value)) : copy.attemptUnavailable
+}
+
+function validDisplayedChild(task: ChildWorkerTask, sessionId: string): boolean {
+  return Boolean(sessionId && task.sessionId === sessionId && task.id && task.rootTaskId && task.parentTaskId
+    && task.id !== task.rootTaskId && task.id !== task.parentTaskId)
 }
 
 function boundedGoal(value: string): string {
   const goal = redactSensitiveText(typeof value === 'string' ? value.trim() : '')
   if (goal.length <= 280) return goal
   return `${goal.slice(0, 279).trimEnd()}…`
-}
-
-function safeFailureSummary(value: string | null | undefined): string | null {
-  const reason = typeof value === 'string' ? value.trim() : ''
-  return SAFE_FAILURE_SUMMARIES.has(reason) ? reason : null
 }
 
 function displayStatus(status: string, copy: WorkerCopy): string {

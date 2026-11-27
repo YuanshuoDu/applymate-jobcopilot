@@ -24,6 +24,7 @@ import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./tas
 import type { ObjectiveTailorCandidateCatalog } from "./objective-tailor-candidate.js"
 import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, TaskGraphScheduledAuditResumeInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof, ScheduledAuditResumeContext } from "./scheduled-audit-contract.js"
 import type { ScheduledPostGatePlanningContext, TaskGraphScheduledPostGatePlanInput, TaskGraphScheduledPostGatePlanReadInput, ScheduledPostGateCompletionProof, ScheduledPostGateScheduleReceipt } from "./scheduled-post-gate-contract.js"
+import type { TaskGraphScoutRetirementInput, TaskGraphScoutRetirementResult } from "./task-graph-scout-retirement-contract.js"
 export type { TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphScheduleNode, TaskGraphScheduleReceipt, TaskGraphScheduledPrepareReceipt, TaskGraphTaskTemplate } from "./task-graph-schedule-input.js"
 import type {
   ScheduledAnalyzeCheckpointHandoff,
@@ -189,6 +190,8 @@ export type TaskGraphCurrentNode = Readonly<{
 export type TaskGraphCurrentState = Readonly<{
   revision: number
   nodes: readonly TaskGraphCurrentNode[]
+  /** Private owner-read timing, projected as a separate advisory and never added to nodes. */
+  activeChildDeadlines?: Readonly<{ revision: number; observedAt: string; entries: readonly Readonly<{ nodeKey: string; deadlineAt: string }>[] }>
   rootSuccessCriteria?: readonly string[]
   planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
   objectiveTailor?: import("@jobcopilot/agent-protocol").ObjectiveTailorGraph
@@ -247,4 +250,6 @@ export type TaskGraphCommandPort = Readonly<{
   readHistoricalDiscoveryPage?(scope: TaskGraphExecutionScope, request: TaskGraphHistoricalDiscoveryPageRequest): Promise<TaskGraphHistoricalDiscoveryPage>
   /** Reads bounded unverified canonical IDs from a failed ordinary Scout under the same owner fence. */
   readCurrentDiscoveryRecoveryPage?(scope: TaskGraphReadScope, request: TaskGraphDiscoveryRecoveryPageRequest): Promise<TaskGraphDiscoveryRecoveryPage>
+  /** Private exact-leaf request only; model registration waits for terminal proof integration. */
+  requestSupersededScoutRetirement?(input: TaskGraphScoutRetirementInput): Promise<TaskGraphScoutRetirementResult>
 }>

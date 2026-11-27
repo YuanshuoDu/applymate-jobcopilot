@@ -4,7 +4,7 @@ import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protoco
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphState, parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { buildTaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
-import { buildCurrentTaskGraphFinalSummaryBinding, OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA, renderObjectiveTailorFinalOutcome } from "./objective-tailor-final-summary-binding.js"
+import { buildCurrentTaskGraphFinalSummaryBinding, OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA, readBoundObjectiveTailorFinalOutcome, renderObjectiveTailorFinalOutcome } from "./objective-tailor-final-summary-binding.js"
 import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection,
   objectiveTailorWavePairPlan } from "./objective-tailor-wave-witness.js"
 import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
@@ -110,6 +110,32 @@ describe("Objective Tailor final summary binding", () => {
       "Per-slot review: slot 1 ready, slot 2 needs revision, slot 3 needs revision, slot 4 needs revision, slot 5 needs revision, slot 6 needs revision, slot 7 needs revision, slot 8 needs revision.",
     ])
     expect(JSON.stringify(renderObjectiveTailorFinalOutcome(binding))).not.toMatch(/f47ac|writer-task|artifact|sha256|reviewHash/)
+  })
+
+  it("retains a proved retired Scout without counting it as Objective source evidence", () => {
+    const { loaded } = fixture()
+    const nodes = loaded.snapshot!.nodes.slice(0, 8)
+    const tasks = new Map(nodes.map(node => [node.taskId, loaded.tasks.get(node.taskId)!]))
+    tasks.set("scout-task-1", { ...tasks.get("scout-task-1")!, status: "interrupted", attemptCount: 2 })
+    const prefix = { ...loaded, snapshot: { ...loaded.snapshot!, nodes },
+      state: { ...loaded.state!, nodes: loaded.state!.nodes.slice(0, 8) }, tasks }
+    const retired = { nodeKey: "scout-1", taskId: "scout-task-1", attempt: 2,
+      interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "retire-event", lifecycleEventId: "ack-event" }
+    const base = buildTaskGraphFinalSummaryBinding(prefix, undefined, undefined, new Map([[retired.nodeKey, retired]]))!
+    const outcome = { schemaVersion: OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA, graphRevision: 24, rootAttemptCount: 2,
+      graphDigest: "a".repeat(64), sourceNodeCount: 8, sourceGraphDigest: "b".repeat(64), sourceStatusDigest: "c".repeat(64),
+      slots: [{ ordinal: 1, status: "ready" as const, evidenceDigest: "d".repeat(64) }] }
+    const binding = { ...base, objectiveTailorFinalOutcome: outcome }
+    expect(binding.members?.[0]?.kind).toBe("retired")
+    expect(binding.summary.taskOutcomes.some(item => item.taskId === retired.taskId)).toBe(false)
+    expect(readBoundObjectiveTailorFinalOutcome(binding)).toEqual(outcome)
+    const forged = { ...binding, members: binding.members!.map((member, index) => index === 0
+      ? { ...member, retirement: { attempt: 0, interruptRequestedAt: retired.interruptRequestedAt,
+        receiptEventId: retired.receiptEventId, lifecycleEventId: retired.lifecycleEventId } } : member) }
+    expect(readBoundObjectiveTailorFinalOutcome(forged)).toBeNull()
+    const leakedOutcome = { ...binding, summary: { ...binding.summary, taskOutcomes: [...binding.summary.taskOutcomes,
+      { ...binding.summary.taskOutcomes[0]!, taskId: retired.taskId, role: "scout", taskStatus: "interrupted" }] } }
+    expect(readBoundObjectiveTailorFinalOutcome(leakedOutcome)).toBeNull()
   })
 
   it("keeps ordinary unmarked summaries on the existing reducer path", async () => {

@@ -1,3 +1,5 @@
+import type { ChildWorkerFailure } from "./child-worker-failure"
+
 export type TaskNodeKind = "turn" | "step" | "tool" | "task"
 
 export type TaskTreeNode = {
@@ -7,6 +9,7 @@ export type TaskTreeNode = {
   readonly status: string
   readonly itemId?: string
   readonly detail?: string
+  readonly childFailure?: ChildWorkerFailure
   readonly resultAvailable?: boolean
   readonly children?: readonly TaskTreeNode[]
 }

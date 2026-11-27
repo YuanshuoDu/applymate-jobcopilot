@@ -2,11 +2,10 @@ import type { ModelContinuation } from "@jobcopilot/agent-model"
 import { createHash } from "node:crypto"
 import { createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { createProgressDetector, progressCheckpointFromStepContext } from "../progress.js"
-import { buildModelRequest } from "./turn-engine-messages.js"
-import { runAdmittedModelStep } from "./admitted-model-step.js"
-import { settleAndPersistModelUsage } from "./turn-execution-budget-overrun.js"
 import { normalizeProjectedToolCallIds, projectChildToolCallIdsForModelContext, scopeChildExecutionReceipts } from "./turn-tool-call-id-projection.js"
-import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
+import type { ModelStepResult } from "./turn-engine-model.js"
+import { prepareTurnExecutionModelRequest, runTurnExecutionModelStep } from "./turn-execution-model-step.js"
+import { schedulePlanSchemaRepair, withPlanSchemaRepairSnapshot } from "./turn-execution-plan-repair.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
@@ -24,7 +23,7 @@ import { executeTurnToolStep } from "./turn-execution-tool-step.js"
 import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
 import { applyVerifiedScheduledPostGateRecovery, isScheduledPostGateRecoveryBlock, retireScheduledPostGateRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { takeRecoveredScheduledPipelineCandidate } from "../subagents/scheduled-pipeline-candidate-store.js"
-import { prepareTurnFinalAnswerEvidenceRequest, resolveTurnFinalAnswerMarkers } from "./turn-execution-evidence.js"
+import { resolveTurnFinalAnswerMarkers } from "./turn-execution-evidence.js"
 import { completeTurnExecutionFinalAnswer, replayScheduledFinalAnswer } from "./turn-execution-final-answer.js"
 import { scheduledPipelineRecoveryStepMarker, withScheduledPipelineRecoveryStepProfile } from "../subagents/scheduled-pipeline-recovery-step.js"
 import { handleTurnExecutionStepError, matchedTaskGraphDenialCheckpoint, terminalizeTurnExecutionError, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminalization.js"
@@ -37,6 +36,8 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   let snapshot = options.snapshot, inputThroughSequence = options.resume?.inputThroughSequence ?? 0n, consumedInputIds: readonly string[] = options.resume?.consumedInputIds ?? []
   let steps = options.resume?.stepCount ?? 0, toolCalls = options.resume?.toolCallCount ?? 0
   let continuation: ModelContinuation | undefined, childToolReplayReceipts = options.childToolReplayReceipts ?? [], childWaitReplayReceipts = options.childWaitReplayReceipts ?? []
+  const canonicalRootTurn = options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId
+  let planSchemaRepair = canonicalRootTurn ? options.resume?.planSchemaRepair : undefined
   let recoveredCandidate = options.recoveredFinalCandidate, recoveredScheduledCandidate: ReturnType<typeof takeRecoveredScheduledPipelineCandidate> = undefined
   if (options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId && recoveredCandidate !== undefined) recoveredScheduledCandidate = takeRecoveredScheduledPipelineCandidate({ owner: options.identity, candidateText: recoveredCandidate })
   let steeringMarkerState = options.steeringMarkerState, priorAgendaReceipt = options.resume?.cognitiveAgendaReceipt; const seenCallIds = new Set<string>()
@@ -114,7 +115,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (options.identity.kind === "turn" && options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
         const toolCallProjection = options.identity.kind === "task" && options.identity.taskId !== options.identity.rootTaskId ? projectChildToolCallIdsForModelContext(snapshot, options.identity, step.id, childToolReplayReceipts, childWaitReplayReceipts) : undefined
         const context = await options.contextBuilder.build({
-          scope: options.scope, identity: options.identity, stepId: step.id, snapshot: toolCallProjection?.snapshot ?? snapshot,
+          scope: options.scope, identity: options.identity, stepId: step.id, snapshot: toolCallProjection?.snapshot ?? (canonicalRootTurn && planSchemaRepair?.retryPending ? withPlanSchemaRepairSnapshot(snapshot, step.id) : snapshot),
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
           rootContextInputId: options.rootContextInputId,
           taskId: options.identity.taskId,
@@ -147,29 +148,28 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         const goalChanged = previousGoalRevision !== undefined && previousGoalRevision !== receipt.goalRevision; if (goalChanged) snapshot = retireScheduledPostGateRecovery(snapshot)
         const requestContext = acceptedInput || goalChanged ? { ...context, blocks: context.blocks.filter(block => !isScheduledPostGateRecoveryBlock(block)) } : context
-        let request = buildModelRequest({
-          context: requestContext, model: options.model, tools: options.tools,
-          sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
-          taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
-          freshSteering: options.identity.kind === "turn" && freshSteering,
-          outputSchema: options.outputSchema, cognitiveAgendaReceipt: receipt, rootTaskId: options.identity.kind === "turn" ? options.identity.rootTaskId : undefined,
-        })
         if (freshSteering) recoveredCandidate = undefined
-        let answerEvidenceBindingMap: ReturnType<typeof prepareTurnFinalAnswerEvidenceRequest>["bindingMap"] = null
+        let answerEvidenceBindingMap: ReturnType<typeof prepareTurnExecutionModelRequest>["bindingMap"] = null
         let output: ModelStepResult
         if (recoveredCandidate !== undefined) {
           output = { text: recoveredCandidate, reasoningSummary: "", toolCalls: [], provider: "recovered", model: "recovered", finishReason: "stop", usage: null, continuation: null }
           recoveredCandidate = undefined
         } else {
           assertModelAllowance(budget.snapshot())
-          const preparedRequest = prepareTurnFinalAnswerEvidenceRequest(request, snapshot, { userId: options.identity.userId,
-            sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id })
-          request = preparedRequest.request; answerEvidenceBindingMap = preparedRequest.bindingMap
+          const preparedRequest = prepareTurnExecutionModelRequest({ options, context: requestContext, snapshot, stepId: step.id, signal,
+            continuation, freshSteering: options.identity.kind === "turn" && freshSteering, cognitiveAgendaReceipt: receipt })
+          answerEvidenceBindingMap = preparedRequest.bindingMap
           const reservation = budget.reserveModel()
-          output = await runAdmittedModelStep({ writer, stepId: step.id, taskId: options.identity.taskId, provider: request.provider, model: request.model, invoke: () => runModelStep(options.model, request, options.validateToolArguments), onStartDenied: () => reservation.settle({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }) })
-          await settleAndPersistModelUsage({ reservation, output, stepId: step.id, taskId: options.identity.taskId, writer, onUsageAccepted: () => { stepOutput = output } })
+          if (canonicalRootTurn && planSchemaRepair?.retryPending) planSchemaRepair = { ...planSchemaRepair, retryPending: false }
+          output = await runTurnExecutionModelStep({ options, writer, stepId: step.id, request: preparedRequest.request, reservation,
+            classifyRootPlanSchemaRejection: canonicalRootTurn, now: now(),
+            onUsageAccepted: accepted => { stepOutput = accepted } })
         }
         output = toolCallProjection ? { ...output, toolCalls: normalizeProjectedToolCallIds(output.toolCalls, toolCallProjection) } : output; stepOutput = output; continuation = output.continuation ?? undefined
+        if (output.planSchemaRejection === "invalid_arguments") {
+          planSchemaRepair = await schedulePlanSchemaRepair({ identity: options.identity, store: options.store, writer, step, output,
+            now: now(), alreadyUsed: !canonicalRootTurn || planSchemaRepair !== undefined && !planSchemaRepair.retryPending, onStepClosed: () => closedSteps.add(step.id) }); continue
+        }
         await publishReasoningSummary(writer, options, step, resolveTurnFinalAnswerMarkers(output.reasoningSummary, null).text, now)
         let actionableOutput = output
         let generatedDependencyWait = false
@@ -229,7 +229,6 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       stepCount: steps, toolCallCount: toolCalls, usage: budget.usage(), now, inputThroughSequence, consumedInputIds })
   }
 }
-
 function discoveryReplayOverflowStepIds(error: unknown): readonly string[] {
   if (!error || typeof error !== "object" || Array.isArray(error)) return []
   const stepIds = (error as { discoveryReplayStepIds?: unknown }).discoveryReplayStepIds

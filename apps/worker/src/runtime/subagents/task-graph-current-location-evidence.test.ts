@@ -185,6 +185,25 @@ describe("current location evidence", () => {
     }))).resolves.toEqual({ status: "unavailable" })
   })
 
+  it("skips only an interrupted Scout separately marked by terminal retirement proof", async () => {
+    const loaded = loadedGraph([
+      { key: "retired-scout", taskId: "retired-task", checkpoint: 10n, status: "interrupted" },
+      { key: "current-scout", taskId: "current-task", checkpoint: 20n, status: "completed" },
+    ])
+    const result = await resolveTaskGraphCurrentLocationEvidence(input(loaded, { retiredNodeKeys: new Set(["retired-scout"]) }))
+
+    expect(result.status).toBe("available")
+    if (result.status !== "available") return
+    expect(result.excludedHistoricalNodeKeys).toEqual(new Set())
+    expect(result.compatibleRetainedNodeKeys).toEqual(new Set())
+    expect(reproof).not.toHaveBeenCalled()
+    await expect(resolveTaskGraphCurrentLocationEvidence(input(loaded, { retiredNodeKeys: new Set(["missing-node"]) })))
+      .resolves.toEqual({ status: "unavailable" })
+    await expect(resolveTaskGraphCurrentLocationEvidence(input(loaded, {
+      retiredNodeKeys: new Set(["retired-scout"]), pendingSupersededNodeKeys: new Set(["retired-scout"]),
+    }))).resolves.toEqual({ status: "unavailable" })
+  })
+
   it.each([
     ["task role mismatch", { role: "analyst" }],
     ["task type mismatch", { taskType: "selected_job_discovery" }],

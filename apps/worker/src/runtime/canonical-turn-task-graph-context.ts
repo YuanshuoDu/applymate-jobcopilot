@@ -16,6 +16,7 @@ import { parseTaskGraphCurrentDiscoveryAttemptHealth, parseTaskGraphCurrentDisco
   type TaskGraphDiscoveryTurnEligibility } from "./subagents/task-graph-discovery-attempt-health.js"
 import { withTaskGraphRootSourceIntent } from "./subagents/task-graph-source-intent-context.js"
 import { taskGraphReviewConflictObservation } from "./context/task-graph-review-conflicts.js"
+import { replaceTaskGraphChildDeadlineObservation } from "./context/task-graph-child-deadline-observation.js"
 import { OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, type ObjectiveTailorCandidateCatalog } from "./subagents/objective-tailor-candidate.js"
 import { OBJECTIVE_TAILOR_GRAPH_MAX_NODES } from "@jobcopilot/agent-protocol"
 import { projectObjectiveTailorWaveSourceIntent, projectObjectiveTailorWaveView } from "./canonical-turn-objective-tailor-wave-view.js"
@@ -169,8 +170,11 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   const boundedIntent = wave.status === "valid" ? projectObjectiveTailorWaveSourceIntent(sourceIntent, new Set(sourceNodes.map(item => item.key))) : sourceIntent
   const content = withTaskGraphRootSourceIntent(baseContent, boundedIntent, MAX_TEXT)
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
-  return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
+  const current = retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)
+  return replaceTaskGraphChildDeadlineObservation(current, {
+    revision: Number(state.revision), nodes, packet: ownEnumerableDataValue(state, "activeChildDeadlines"),
+  })
 }
 
 /** Replaces any prior catalog observation with only a bounded public projection for the exact current graph revision. */
