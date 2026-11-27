@@ -4,7 +4,9 @@ import { SELECTED_JOB_BATCH_SLOT_IDS as PROTOCOL_SLOT_IDS } from "@jobcopilot/ag
 import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import {
   createSelectedJobBatchTemplateRegistry,
+  pairSelectedJobBatchCorrectionProposal,
   pairSelectedJobBatchPlan,
+  selectedJobBatchSlotsFromTemplates,
   SelectedJobBatchPlanError,
   SELECTED_JOB_BATCH_SLOT_IDS,
   type SelectedJobBatchSlot,
@@ -49,6 +51,16 @@ describe("selected Job batch plan", () => {
     })
     expect(Object.keys(registry.templates).join(" ")).not.toContain("job-a")
     expect(Object.keys(registry.templates).join(" ")).not.toContain("job-b")
+    expect(selectedJobBatchSlotsFromTemplates(registry.templates)).toEqual(slots)
+    expect(selectedJobBatchSlotsFromTemplates({ ...registry.templates, extra: prototypes.writer })).toBeNull()
+    expect(selectedJobBatchSlotsFromTemplates({ ...registry.templates,
+      cover_letter_reviewer_slot_2: { ...registry.templates.cover_letter_reviewer_slot_2, taskType: "writer" } })).toBeNull()
+    expect(selectedJobBatchSlotsFromTemplates({ ...registry.templates,
+      cover_letter_reviewer_slot_2: { ...registry.templates.cover_letter_reviewer_slot_2,
+        context: { selectedJobPreparation: { jobId: "job-a" } } } })).toBeNull()
+    expect(selectedJobBatchSlotsFromTemplates({ ...registry.templates,
+      cover_letter_writer_slot_1: { ...registry.templates.cover_letter_writer_slot_1,
+        allowedActions: [...registry.templates.cover_letter_writer_slot_1.allowedActions, "jobs.search"] } })).toBeNull()
   })
 
   it("pairs each dependency-free Writer with only its own Reviewer", () => {
@@ -60,6 +72,21 @@ describe("selected Job batch plan", () => {
       { slotId: "slot-2", jobId: "job-b", writerTemplateId: "cover_letter_writer_slot_2", writerNodeKey: "writer-b",
         reviewerTemplateId: "cover_letter_reviewer_slot_2", reviewerNodeKey: "reviewer-b" },
     ])
+  })
+
+  it("keeps initial admission revision-zero only and validates correction proposal shape separately", () => {
+    const correction = [
+      node("writer-a-v2", "cover_letter_writer_slot_1", ["reviewer-a"]),
+      node("reviewer-a-v2", "cover_letter_reviewer_slot_1", ["writer-a-v2"]),
+    ]
+    expect(() => pairSelectedJobBatchPlan([...twoPairPlan, ...correction], slots)).toThrowError(SelectedJobBatchPlanError)
+    expect(pairSelectedJobBatchCorrectionProposal(correction, slots)).toEqual([
+      { slotId: "slot-1", writerNodeKey: "writer-a-v2", reviewerNodeKey: "reviewer-a-v2", previousReviewerNodeKey: "reviewer-a" },
+    ])
+    expect(pairSelectedJobBatchCorrectionProposal([
+      node("writer-a-v2", "cover_letter_writer_slot_1", ["reviewer-b"]),
+      node("reviewer-a-v2", "cover_letter_reviewer_slot_1", ["writer-a-v2"]),
+    ], slots)[0]?.previousReviewerNodeKey).toBe("reviewer-b")
   })
 
   it.each([
