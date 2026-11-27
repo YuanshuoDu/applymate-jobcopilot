@@ -354,7 +354,8 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
       FROM "agent_items" AS call JOIN "agent_items" AS result ON result."taskId" = call."taskId" AND result."stepId" = call."stepId"
         AND result."turnId" = call."turnId" AND result."sessionId" = call."sessionId" AND result."type" = 'tool_result'
         AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
-      WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND call."content"->>'toolCallId' = $4`,
+      WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND call."type" = 'tool_call'
+        AND call."content"->>'toolCallId' = $4`,
     [value.sessionId, value.turnId, root.id, rootCallId])
     expect(waitRows.rows).toHaveLength(1)
     const publicRows = await db.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
