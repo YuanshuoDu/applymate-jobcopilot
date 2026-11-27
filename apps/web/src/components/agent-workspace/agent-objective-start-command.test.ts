@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { schemaVersion } from '@jobcopilot/agent-protocol'
+import { OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION } from '@jobcopilot/shared'
 import {
   AgentObjectiveStartCoordinator,
   validateObjectiveContextDraft,
@@ -506,4 +507,33 @@ describe('objective start command', () => {
     expect(calls.map(call => (call.init?.headers as Record<string, string>)['Idempotency-Key']))
       .toEqual(['accepted-1', 'accepted-2'])
   })
+  it("binds a versioned explicit country into the payload and retry identity", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input, init })
+      return jsonResponse(successBody(), 202)
+    }) as typeof fetch
+    let identity = 0
+    const coordinator = new AgentObjectiveStartCoordinator(fetcher, () => 'country-' + (++identity))
+
+    await coordinator.start('Find sponsorship-compatible roles', '', '', undefined, 'session_1', 'IE')
+    await coordinator.start('Find sponsorship-compatible roles', '', '', undefined, 'session_1', 'US')
+
+    expect(calls).toHaveLength(2)
+    expect(calls.map(call => (call.init?.headers as Record<string, string>)['Idempotency-Key']))
+      .toEqual(['country-1', 'country-2'])
+    expect(calls.map(call => JSON.parse(String(call.init?.body)).sponsorshipTargetCountry)).toEqual([
+      { schemaVersion: OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, countryCode: 'IE' },
+      { schemaVersion: OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, countryCode: 'US' },
+    ])
+  })
+
+  it("rejects unsupported country values before sending any request", async () => {
+    const fetcher = vi.fn(async () => jsonResponse(successBody(), 202)) as unknown as typeof fetch
+    const coordinator = new AgentObjectiveStartCoordinator(fetcher, () => 'country-invalid')
+    await expect(coordinator.start('Objective', '', '', undefined, 'session_1', 'XK'))
+      .rejects.toMatchObject({ status: 422, code: 'invalid_command' })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
 })

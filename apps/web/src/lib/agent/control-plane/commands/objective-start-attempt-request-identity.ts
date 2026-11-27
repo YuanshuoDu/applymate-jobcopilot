@@ -3,7 +3,7 @@ import { canonicalJson } from "@jobcopilot/shared"
 
 import type { ObjectiveStartCommand } from "./types"
 
-type AttemptIdentity = Pick<ObjectiveStartCommand, "userId" | "clientMessageId" | "sessionId" | "objective" | "content" | "verificationRequirements">
+type AttemptIdentity = Pick<ObjectiveStartCommand, "userId" | "clientMessageId" | "sessionId" | "objective" | "content" | "verificationRequirements" | "sponsorshipTargetCountry">
 
 function persistedCanonicalJson(value: unknown): string {
   const persisted = JSON.parse(JSON.stringify(value) ?? "null")
@@ -20,6 +20,7 @@ export function samePersistedJson(left: unknown, right: unknown): boolean {
 
 export function objectiveStartRequestHash(command: AttemptIdentity): string {
   const hasRequirements = Object.hasOwn(command, "verificationRequirements")
+  const hasSponsorshipTargetCountry = Object.hasOwn(command, "sponsorshipTargetCountry")
   const canonical = {
     sessionId: command.sessionId,
     objective: command.objective.trim(),
@@ -27,6 +28,7 @@ export function objectiveStartRequestHash(command: AttemptIdentity): string {
     verificationRequirements: hasRequirements
       ? { present: true, value: command.verificationRequirements ?? null }
       : { present: false },
+    ...(hasSponsorshipTargetCountry ? { sponsorshipTargetCountry: command.sponsorshipTargetCountry } : {}),
   }
   return createHash("sha256").update(persistedCanonicalJson(canonical)).digest("hex")
 }

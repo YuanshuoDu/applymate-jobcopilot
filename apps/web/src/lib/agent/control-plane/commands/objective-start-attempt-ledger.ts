@@ -1,6 +1,7 @@
 import { Prisma, type PrismaClient } from "@prisma/client"
 import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, TurnIntentSchema, validate, type InputContentPart } from "@jobcopilot/agent-protocol"
 
+import { parseObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared"
 import { objectiveStartIdempotencyConflict } from "./errors"
 import { stateWithAvailableReceiptTarget } from "./objective-start-attempt-read-model"
 import { objectiveStartRequestHash, samePersistedJson } from "./objective-start-attempt-request-identity"
@@ -106,6 +107,9 @@ async function findLegacyObjectiveStart(tx: CommandTransaction, userId: string, 
   const requirementsPresent = turnInput !== null && Object.hasOwn(turnInput, "verificationRequirements")
   const rawRequirements = turnInput?.verificationRequirements
   const requirements = rawRequirements === null ? null : parseObjectiveVerificationRequirements(rawRequirements)
+  const sponsorshipCountryPresent = turnInput !== null && Object.hasOwn(turnInput, "sponsorshipTargetCountry")
+  const sponsorshipTargetCountry = sponsorshipCountryPresent
+    ? parseObjectiveSponsorshipTargetCountry(turnInput?.sponsorshipTargetCountry) : undefined
   if (input.userId !== userId || input.session.userId !== userId || input.targetTurn.userId !== userId
     || input.sessionId !== input.targetTurn.sessionId || input.targetTurn.id !== input.targetTurnId
     || input.clientMessageId !== clientMessageId
@@ -114,7 +118,8 @@ async function findLegacyObjectiveStart(tx: CommandTransaction, userId: string, 
     || typeof objective !== "string" || !objective || objective !== objective.trim()
     || !Array.isArray(content) || !content.every((part) => validate(InputContentPartSchema, part))
     || !samePersistedJson(content, input.content)
-    || (requirementsPresent && rawRequirements !== null && requirements === null)) return { kind: "unverified" }
+    || (requirementsPresent && rawRequirements !== null && requirements === null)
+    || (sponsorshipCountryPresent && !sponsorshipTargetCountry)) return { kind: "unverified" }
 
   const event = await tx.agentEvent.findFirst({
     where: { sessionId: input.sessionId, idempotencyKey: `agent-command:${clientMessageId}` },
@@ -131,6 +136,7 @@ async function findLegacyObjectiveStart(tx: CommandTransaction, userId: string, 
     userId, clientMessageId, sessionId: input.sessionId, objective,
     content: content as InputContentPart[],
     ...(requirementsPresent ? { verificationRequirements: requirements } : {}),
+    ...(sponsorshipTargetCountry ? { sponsorshipTargetCountry } : {}),
   })
   return {
     kind: "accepted", requestHash,

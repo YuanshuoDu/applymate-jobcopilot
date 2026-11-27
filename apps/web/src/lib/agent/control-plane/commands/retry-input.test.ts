@@ -58,6 +58,35 @@ describe('persisted retry input', () => {
     })
   })
 
+  it('preserves the explicit sponsorship target country only on Objective retries', () => {
+    const sponsorshipTargetCountry = {
+      schemaVersion: 'agent-harness.v2.objective-sponsorship-target-country.v1',
+      countryCode: 'IE',
+    } as const
+    const base = {
+      goal: 'Retry sponsorship search',
+      content: [{ type: 'text', text: 'Retry sponsorship search' }],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+    }
+
+    expect(parsePersistedRetryContent('turn-country', { ...base, sponsorshipTargetCountry }))
+      .toMatchObject({ sponsorshipTargetCountry })
+    expect(parsePersistedRetryContent('turn-country-legacy', { goal: base.goal, content: base.content }))
+      .not.toHaveProperty('sponsorshipTargetCountry')
+    for (const invalid of [
+      { ...sponsorshipTargetCountry, countryCode: 'XK' },
+      { ...sponsorshipTargetCountry, schemaVersion: 'agent-harness.v2.objective-sponsorship-target-country.v2' },
+      { ...sponsorshipTargetCountry, extra: true },
+    ]) {
+      expect(() => parsePersistedRetryContent('turn-country-invalid', { ...base, sponsorshipTargetCountry: invalid })).toThrow()
+    }
+    expect(() => parsePersistedRetryContent('turn-country-wrong-intent', {
+      goal: 'Retry discovery',
+      content: [{ type: 'text', text: 'Retry discovery' }],
+      intent: { kind: 'interactive_discovery_shortlist', version: 1 },
+      sponsorshipTargetCountry,
+    })).toThrow()
+  })
   it('preserves the objective intent and valid verification requirements on retry', () => {
     const verificationRequirements = {
       schemaVersion: 'agent-harness.v2.objective-requirements.v1',

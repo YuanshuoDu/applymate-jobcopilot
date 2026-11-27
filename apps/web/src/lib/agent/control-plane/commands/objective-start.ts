@@ -1,5 +1,6 @@
 import type { PrismaClient } from "@prisma/client"
 import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, validate } from "@jobcopilot/agent-protocol"
+import { parseObjectiveSponsorshipTargetCountry, type ObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared"
 
 import { invalidCommand, isUniqueViolation, objectiveStartStateConflict, retryActiveConflict } from "./errors"
 import { lockOwnedSessionForObjectiveReplacement } from "./session-control"
@@ -93,7 +94,7 @@ async function startOnce(command: ObjectiveStartCommand, db: PrismaClient): Prom
     if (active) throw retryActiveConflict(active.id)
 
     const turn = await createRootTurn(
-      tx, command, command.content, command.objective, undefined, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, command.verificationRequirements,
+      tx, command, command.content, command.objective, undefined, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, command.verificationRequirements, undefined, command.sponsorshipTargetCountry,
     )
     const facts = await acceptInputFacts(tx, command, command.content, turn, "follow_up", "started", true)
     await recordAcceptedObjectiveStart(tx, command, requestHash, { sessionId: command.sessionId, ...facts })
@@ -129,6 +130,18 @@ export class ObjectiveStartCommandService {
         }
       }
     }
+    let sponsorshipDescriptor: PropertyDescriptor | undefined
+    try { sponsorshipDescriptor = Object.getOwnPropertyDescriptor(command, "sponsorshipTargetCountry") }
+    catch { throw invalidCommand("Objective sponsorship target country is invalid") }
+    const hasSponsorshipTargetCountry = sponsorshipDescriptor !== undefined
+    let sponsorshipTargetCountry: ObjectiveSponsorshipTargetCountry | undefined
+    if (sponsorshipDescriptor) {
+      if (!("value" in sponsorshipDescriptor) || !sponsorshipDescriptor.enumerable) {
+        throw invalidCommand("Objective sponsorship target country is invalid")
+      }
+      sponsorshipTargetCountry = parseObjectiveSponsorshipTargetCountry(sponsorshipDescriptor.value) ?? undefined
+      if (!sponsorshipTargetCountry) throw invalidCommand("Objective sponsorship target country is invalid or unsupported")
+    }
     const normalized: ObjectiveStartCommand = {
       sessionId: command.sessionId,
       userId: command.userId,
@@ -137,6 +150,7 @@ export class ObjectiveStartCommandService {
       objective: normalizeObjective(command.objective),
       content: command.content,
       ...(hasRequirements ? { verificationRequirements: requirements ?? null } : {}),
+      ...(hasSponsorshipTargetCountry ? { sponsorshipTargetCountry } : {}),
     }
     if (!hasBoundedContent(command.content)) throw invalidCommand("Objective context is invalid or exceeds the command limits")
     try {

@@ -1,5 +1,5 @@
 import type { InputContentPart, TurnIntent, TurnSource } from "@jobcopilot/agent-protocol"
-import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared"
+import { normalizeAgentLocationAllowlist, type ObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared"
 
 export const COMMAND_DISPOSITIONS = [
   "started",
@@ -167,6 +167,7 @@ export interface ObjectiveStartCommand extends CommandIdentity {
   objective: string
   content: InputContentPart[]
   verificationRequirements?: ObjectiveVerificationRequirements | null
+  sponsorshipTargetCountry?: ObjectiveSponsorshipTargetCountry
 }
 
 /** Server-owned intent metadata persisted with the root Turn input envelope. */

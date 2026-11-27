@@ -16,8 +16,12 @@ const ledgerMocks = vi.hoisted(() => {
   return {
     accepted,
     lock: vi.fn(async () => undefined),
-    hash: vi.fn((value: { sessionId: string; objective: string; content: unknown; verificationRequirements?: unknown }) =>
-      JSON.stringify([value.sessionId, value.objective.trim(), value.content, Object.hasOwn(value, "verificationRequirements") ? value.verificationRequirements : "omitted"])),
+    hash: vi.fn((value: { sessionId: string; objective: string; content: unknown; verificationRequirements?: unknown; sponsorshipTargetCountry?: unknown }) =>
+      JSON.stringify([
+        value.sessionId, value.objective.trim(), value.content,
+        Object.hasOwn(value, "verificationRequirements") ? value.verificationRequirements : "omitted",
+        ...(Object.hasOwn(value, "sponsorshipTargetCountry") ? [value.sponsorshipTargetCountry] : []),
+      ])),
     lookup: vi.fn(async (_tx: unknown, commandValue: { userId: string; clientMessageId: string; sessionId: string }, requestHash: string) => {
       const row = accepted.get(`${commandValue.userId}:${commandValue.clientMessageId}`)
       if (!row) return null
@@ -133,6 +137,11 @@ describe("ObjectiveStartCommandService validation", () => {
     await expect(service.start(command("Find Dublin roles", "automation"))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
     await expect(service.start(unsafeCommand({ ...command("Find roles"), verificationRequirements: { raw: "unknown" } })))
       .rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    await expect(service.start(unsafeCommand({ ...command("Find roles"), sponsorshipTargetCountry: {
+      schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1", countryCode: "XK",
+    } }))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    await expect(service.start(unsafeCommand({ ...command("Find roles"), sponsorshipTargetCountry: null })))
+      .rejects.toMatchObject({ code: "invalid_command", status: 422 })
     vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
     try {
       await expect(service.start(unsafeCommand({
@@ -175,8 +184,12 @@ describe("ObjectiveStartCommandService validation", () => {
       expect(Object.hasOwn(createRootTurn.mock.calls[0]?.[1] ?? {}, "verificationRequirements")).toBe(false)
 
       createRootTurn.mockClear()
-      await service.start(unsafeCommand({ ...command("Find Dublin roles"), clientMessageId: "start_valid", verificationRequirements: validRequirements }))
+      const sponsorshipTargetCountry = {
+        schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1", countryCode: "IE",
+      } as const
+      await service.start(unsafeCommand({ ...command("Find Dublin roles"), clientMessageId: "start_valid", verificationRequirements: validRequirements, sponsorshipTargetCountry }))
       expect(createRootTurn.mock.calls[0]?.[6]).toEqual(validRequirements)
+      expect(createRootTurn.mock.calls[0]?.[8]).toEqual(sponsorshipTargetCountry)
       expect(createRootTurn.mock.calls[0]?.[5]).toEqual(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
 
       createRootTurn.mockClear()
@@ -235,19 +248,26 @@ describe("ObjectiveStartCommandService validation", () => {
     }
 
     try {
+      const sponsorshipTargetCountry = {
+        schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1", countryCode: "IE",
+      } as const
       const original = await service.start(unsafeCommand({
-        ...command("Find Dublin roles"), verificationRequirements: validRequirements,
+        ...command("Find Dublin roles"), verificationRequirements: validRequirements, sponsorshipTargetCountry,
       }))
       const persistedInput = tx.agentTurn.create.mock.calls[0]?.[0]?.data.input
-      expect(persistedInput).toMatchObject({ verificationRequirements: validRequirements })
+      expect(persistedInput).toMatchObject({ verificationRequirements: validRequirements, sponsorshipTargetCountry })
       expect(persistedInput).toMatchObject({ intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT })
 
       const replay = await service.start(unsafeCommand({
-        ...command("Find Dublin roles"), verificationRequirements: validRequirements,
+        ...command("Find Dublin roles"), verificationRequirements: validRequirements, sponsorshipTargetCountry,
       }))
       expect(replay).toMatchObject({ inputId: original.inputId, turnId: original.turnId, disposition: "duplicate" })
       await expect(service.start(unsafeCommand({
-        ...command("Find Dublin roles"), verificationRequirements: replayRequirements,
+        ...command("Find Dublin roles"), verificationRequirements: replayRequirements, sponsorshipTargetCountry,
+      }))).rejects.toMatchObject({ code: "objective_start_idempotency_conflict", status: 409 })
+      await expect(service.start(unsafeCommand({
+        ...command("Find Dublin roles"), verificationRequirements: validRequirements,
+        sponsorshipTargetCountry: { ...sponsorshipTargetCountry, countryCode: "US" },
       }))).rejects.toMatchObject({ code: "objective_start_idempotency_conflict", status: 409 })
       expect(tx.agentTurn.create).toHaveBeenCalledOnce()
       expect(acceptInputFacts).toHaveBeenCalledOnce()

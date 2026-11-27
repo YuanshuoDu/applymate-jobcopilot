@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
 import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
 import {
-  resolveRootTaskObjective, resolveRootTaskVerificationRequirements, rootTaskObjectiveDigest,
+  resolveRootTaskObjective, resolveRootTaskSponsorshipTargetCountry, resolveRootTaskVerificationRequirements, rootTaskObjectiveDigest,
 } from "./root-task-objective.js"
 
 const objectiveRequirements = (minimum = 3) => ({
@@ -273,4 +273,24 @@ describe("canonical Turn verification requirements", () => {
       goal, criteria: ["Keep prose intent"], criteriaValid: true, turnGoalConflict: false,
     })
   })
+  it("resolves only the exact versioned country on the matching Objective Turn", () => {
+    const sponsorshipTargetCountry = {
+      schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1",
+      countryCode: "IE",
+    }
+    const intent = { kind: "objective_task_graph_execution", version: 1 }
+    expect(resolveRootTaskSponsorshipTargetCountry({ goal: "Find roles", intent, sponsorshipTargetCountry }))
+      .toEqual({ status: "valid", sponsorshipTargetCountry })
+    expect(resolveRootTaskSponsorshipTargetCountry({ input: { goal: "Find roles", intent, sponsorshipTargetCountry } }))
+      .toEqual({ status: "valid", sponsorshipTargetCountry })
+    expect(resolveRootTaskSponsorshipTargetCountry({ goal: "Find roles" })).toEqual({ status: "absent" })
+    for (const turnInput of [
+      { goal: "Find roles", sponsorshipTargetCountry },
+      { goal: "Find roles", intent, sponsorshipTargetCountry: { ...sponsorshipTargetCountry, countryCode: "XK" } },
+      { goal: "Find roles", intent, sponsorshipTargetCountry: { ...sponsorshipTargetCountry, extra: true } },
+      { goal: "Find roles", intent, sponsorshipTargetCountry: { ...sponsorshipTargetCountry, schemaVersion: "unknown" } },
+      { goal: "Find roles", intent, sponsorshipTargetCountry, input: { intent, sponsorshipTargetCountry: { ...sponsorshipTargetCountry, countryCode: "US" } } },
+    ]) expect(resolveRootTaskSponsorshipTargetCountry(turnInput)).toEqual({ status: "invalid" })
+  })
+
 })

@@ -13,7 +13,7 @@ import {
 const source = readFileSync(new URL('./AgentObjectiveContextForm.tsx', import.meta.url), 'utf8')
 
 const emptyState: AgentObjectiveContextFormState = {
-  objective: '', context: '', allowedLocationsDraft: '', open: false, pending: false, accepted: false, error: null,
+  objective: '', context: '', allowedLocationsDraft: '', sponsorshipTargetCountryCode: '', open: false, pending: false, accepted: false, error: null,
 }
 
 describe('AgentObjectiveContextForm', () => {
@@ -53,6 +53,7 @@ describe('AgentObjectiveContextForm', () => {
     state = objectiveContextFormReducer(state, { type: 'edit-objective', value: '  Find senior roles  ' })
     state = objectiveContextFormReducer(state, { type: 'edit-context', value: '\nReference wording stays exact.\n' })
     state = objectiveContextFormReducer(state, { type: 'edit-allowed-locations', value: 'Dublin, Ireland\nBerlin' })
+    state = objectiveContextFormReducer(state, { type: 'edit-sponsorship-country', value: 'IE' })
     expect(canSubmitObjectiveContext(state)).toBe(true)
     const pending = objectiveContextFormReducer(state, { type: 'pending' })
     expect(canSubmitObjectiveContext(pending)).toBe(false)
@@ -64,6 +65,7 @@ describe('AgentObjectiveContextForm', () => {
       objective: '  Find senior roles  ',
       context: '\nReference wording stays exact.\n',
       allowedLocationsDraft: 'Dublin, Ireland\nBerlin',
+      sponsorshipTargetCountryCode: 'IE',
       pending: false,
       error: { message: 'Session changed', conflict: true },
     })
@@ -86,6 +88,9 @@ describe('AgentObjectiveContextForm', () => {
   it('keeps the copy and interaction boundary explicit', () => {
     expect(source).toContain('The objective defines what must be complete. Background is reference material for the task.')
     expect(source).toContain('Allowed job locations (optional)')
+    expect(source).toContain('Sponsorship target country (optional)')
+    expect(source).toContain('No target country selected')
+    expect(source).toContain('ISO_3166_1_ALPHA_2_CODES.map')
     expect(source).toContain('one location per line')
     expect(source).toContain('Dublin does not match Dublin, Ireland. Aliases are not inferred.')
     expect(source).toContain('Text is sent unchanged.')
@@ -93,7 +98,7 @@ describe('AgentObjectiveContextForm', () => {
     expect(source).toContain('No existing run was changed; edit or retry explicitly.')
     expect(source).toContain('attachedFileCount > 0 || ordinaryComposerDraftPresent')
     expect(source).toContain('that content will not be sent or discarded here.')
-    expect(source.match(/coordinatorRef\.current\?\.draftEdited\(\)/g)).toHaveLength(3)
+    expect(source.match(/coordinatorRef\.current\?\.draftEdited\(\)/g)).toHaveLength(4)
     const acceptedAt = source.indexOf("dispatchAction({ type: 'accepted' })")
     const callbackAt = source.indexOf('onAccepted(result.sessionId, result.objective)')
     expect(acceptedAt).toBeGreaterThanOrEqual(0)

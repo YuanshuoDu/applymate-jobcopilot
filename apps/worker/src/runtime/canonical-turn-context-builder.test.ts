@@ -25,7 +25,7 @@ import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
-import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "./context/root-task-goal-criteria-context.js"
+import { ROOT_TASK_SPONSORSHIP_TARGET_COUNTRY_OBSERVATION_ID, ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "./context/root-task-goal-criteria-context.js"
 import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./context/task-graph-objective-progress.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
 import { mergeTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
@@ -1825,4 +1825,44 @@ describe("canonical Turn context builder", () => {
     expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
     expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
   })
+  it("projects selected country only from the current Objective Turn into planning context", async () => {
+    const goal = "Check sponsorship requirements"
+    const target = {
+      schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1",
+      countryCode: "IE",
+    }
+    const turnInput = {
+      goal, content: [{ type: "text", text: goal }],
+      intent: { kind: "objective_task_graph_execution", version: 1 },
+      sponsorshipTargetCountry: target,
+    }
+    const rootTaskObjective = { goal, successCriteria: ["Return scoped evidence"] }
+    const buildFor = async (planningEnabled: boolean, selectedJobMode: boolean) => {
+      const calls: unknown[] = []
+      const inputStore = store(calls)
+      const builder = createCanonicalTurnContextBuilder({
+        pool: { connect: async () => { throw new Error("injected readers should avoid a client") } } as unknown as Pick<pg.Pool, "connect">,
+        store: inputStore, baseBuilder: new StepContextBuilder(inputStore), scope, lease, rootTaskId: "root-a", rootAttemptCount: 1,
+        planningEnabled, selectedJobMode, turnInput, rootTaskObjective,
+        rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget,
+      })
+      return builder.build({
+        scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "country-step",
+        snapshot: { system: [], profile: [], goal: { id: "turn-goal", content: goal }, steerHistory: [], businessRefs: [], toolObservations: [] },
+      })
+    }
+    const id = `observation:${ROOT_TASK_SPONSORSHIP_TARGET_COUNTRY_OBSERVATION_ID}`
+    const planning = await buildFor(true, false)
+    expect(planning.blocks.filter(block => block.id === id)).toHaveLength(1)
+    expect(planning.blocks.find(block => block.id === id)).toMatchObject({
+      layer: "tool_observation", role: "data", trust: "external_untrusted",
+      content: {
+        status: "selected", countryCode: "IE", scope: "user_selected_sponsorship_target_only",
+        notJobLocation: true, notEvidence: true, notAuthority: true,
+      },
+    })
+    expect((await buildFor(false, false)).blocks.some(block => block.id === id)).toBe(false)
+    expect((await buildFor(true, true)).blocks.some(block => block.id === id)).toBe(false)
+  })
+
 })

@@ -53,6 +53,9 @@ export async function POST(request: NextRequest, context: RouteContext) {
       ...(Object.hasOwn(command, "verificationRequirements")
         ? { verificationRequirements: command.verificationRequirements }
         : {}),
+      ...(command.sponsorshipTargetCountry
+        ? { sponsorshipTargetCountry: command.sponsorshipTargetCountry }
+        : {}),
     })
     return respond(ok(result, 202))
   } catch (error: unknown) {

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION } from "@jobcopilot/shared"
 
 import { parseObjectiveStartBody } from "./objective-start-route-helpers"
 
@@ -86,6 +87,25 @@ describe("parseObjectiveStartBody", () => {
       })
     } finally {
       vi.unstubAllEnvs()
+    }
+  })
+
+  it("accepts only an explicit versioned ISO country selection and keeps omission absent", () => {
+    const absent = parseObjectiveStartBody(baseBody, request(), sessionId)
+    expect(Object.hasOwn(absent as object, "sponsorshipTargetCountry")).toBe(false)
+
+    const country = { schemaVersion: OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, countryCode: "IE" }
+    expect(parseObjectiveStartBody({ ...baseBody, sponsorshipTargetCountry: country }, request(), sessionId))
+      .toMatchObject({ sponsorshipTargetCountry: country })
+    for (const unsupported of [
+      { ...country, countryCode: "XK" },
+      { ...country, countryCode: "ie" },
+      { ...country, schemaVersion: "unknown" },
+      { ...country, extra: true },
+      null,
+    ]) {
+      expect(parseObjectiveStartBody({ ...baseBody, sponsorshipTargetCountry: unsupported }, request(), sessionId))
+        .toMatchObject({ status: 422 })
     }
   })
 

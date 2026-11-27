@@ -13,8 +13,8 @@ import { createPgDirectRootTaskHistoryStore } from "./context/root-task-history-
 import { selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
-  projectRootTaskGoalCriteria, rootTaskVerificationRequirementsObservation,
-  ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, type RootTaskGoalObjective,
+  projectRootTaskGoalCriteria, rootTaskVerificationRequirementsObservation, rootTaskSponsorshipTargetCountryObservation,
+  ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, ROOT_TASK_SPONSORSHIP_TARGET_COUNTRY_OBSERVATION_ID, type RootTaskGoalObjective,
 } from "./context/root-task-goal-criteria-context.js"
 import { resolveRootTaskVerificationRequirements } from "./context/root-task-objective.js"
 import { taskGraphObjectiveProgressObservation, TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./context/task-graph-objective-progress.js"
@@ -146,14 +146,18 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       const rootTaskGoalCriteria = input.planningEnabled && !input.selectedJobMode && input.rootTaskObjective
         ? projectRootTaskGoalCriteria(input.turnInput, input.rootTaskObjective) : undefined
       const objectiveRequirements = resolveRootTaskVerificationRequirements(input.turnInput)
+      const sponsorshipTargetCountry = input.planningEnabled && !input.selectedJobMode && input.rootTaskObjective
+        ? rootTaskSponsorshipTargetCountryObservation(input.turnInput) : undefined
       let verificationRequirements = input.planningEnabled || input.selectedJobMode
         ? rootTaskVerificationRequirementsObservation(input.turnInput) : undefined
       if (!input.planningEnabled && !input.selectedJobMode && objectiveRequirements.status === "invalid") {
         verificationRequirements = rootTaskVerificationRequirementsObservation(input.turnInput)
       }
       const toolObservations = snapshot.toolObservations.filter(observation => observation.id !== ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID
+        && observation.id !== ROOT_TASK_SPONSORSHIP_TARGET_COUNTRY_OBSERVATION_ID
         && observation.id !== TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID)
       if (verificationRequirements) toolObservations.push(verificationRequirements)
+      if (sponsorshipTargetCountry) toolObservations.push(sponsorshipTargetCountry)
       const objectiveProgress = taskGraphObjectiveProgressObservation({
         resolution: objectiveRequirements, observations: toolObservations,
         taskGraphRevision: snapshot.taskGraphRevision, rootTaskId: input.rootTaskId,
