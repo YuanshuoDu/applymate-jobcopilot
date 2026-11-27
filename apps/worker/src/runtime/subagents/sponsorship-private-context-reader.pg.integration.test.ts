@@ -346,8 +346,10 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
       await db.query(`UPDATE "Job" SET "description" = 'Changed source after the durable jobs.get receipt', "updatedAt" = CURRENT_TIMESTAMP
         WHERE "id" = $1 AND "userId" = $2`, [value.jobIds[0], value.userId])
       const drifted = await readPrivateSponsorshipContext(db, readerInput, restored.snapshot.toolObservations)
-      expect(drifted?.[0]?.observation).toMatchObject({ status: "unavailable", reason: "source_drift" })
-      expect(drifted?.[0]?.observation).not.toHaveProperty("sourceContext")
+      const driftedSourceMatches = drifted?.filter((entry) => entry.jobId === value.jobIds[0]) ?? []
+      expect(driftedSourceMatches).toHaveLength(1)
+      expect(driftedSourceMatches[0]?.observation).toMatchObject({ status: "unavailable", reason: "source_drift" })
+      expect(driftedSourceMatches[0]?.observation).not.toHaveProperty("sourceContext")
     }
 
     const waitRows = await db.query<{ id: string; resultItemId: string | null }>(`SELECT call."id", result."id" AS "resultItemId"
