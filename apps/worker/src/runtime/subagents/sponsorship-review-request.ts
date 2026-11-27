@@ -5,7 +5,7 @@ import { loadTaskGraphVerificationReceipts } from "./task-graph-pg-verification-
 import { lockTaskGraphScope } from "./task-graph-pg-state.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import { readSponsorshipTaskObservationsWithClient, type SponsorshipObservationTask } from "./sponsorship-observation-binder-core.js"
-import { selectedSponsorshipWaitTargets } from "./sponsorship-private-context-wait.js"
+import { readNearestRootStepBefore, selectedSponsorshipWaitTargets } from "./sponsorship-private-context-wait.js"
 import { buildSponsorshipReviewPacket } from "./sponsorship-review-packet.js"
 import { ensureNativeVerificationControl } from "./native-verification-pg-request.js"
 import type { NativeCoordinationRuntimeOptions } from "../tools/coordination-types.js"
@@ -61,6 +61,9 @@ export async function requestSponsorshipReview(pool: Pool, native: NativeCoordin
       || !Number.isSafeInteger(ordinal) || ordinal < 1 || !Number.isSafeInteger(attempt) || attempt < 1) {
       throw new Error("sponsorship_review_step_unavailable")
     }
+    const previousRootStep = await readNearestRootStepBefore(client, { userId: scope.userId, sessionId: scope.sessionId,
+      turnId: scope.turnId, rootTaskId: scope.rootTaskId, ordinal, attempt })
+    if (!previousRootStep) throw new Error("sponsorship_review_source_unavailable")
     const receipts = await loadTaskGraphVerificationReceipts(client, {
       userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
       parentTaskId: scope.rootTaskId, taskId: scope.rootTaskId, attemptCount: attempt, exclusiveBeforeOrdinal: ordinal,
@@ -68,7 +71,7 @@ export async function requestSponsorshipReview(pool: Pool, native: NativeCoordin
     const matched = await selectedSponsorshipWaitTargets(client, receipts, {
       userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
       rootAttemptCount: scope.parentAttemptCount, turnLeaseOwner: scope.turnLeaseOwner,
-      turnLeaseVersion: scope.turnLeaseVersion, attempt, previousOrdinal: ordinal - 1,
+      turnLeaseVersion: scope.turnLeaseVersion, attempt, previousOrdinal: previousRootStep.ordinal,
     }, [], { allowDurableConsumedResultWithoutProjection: true })
     if (!matched || matched.length !== 1 || matched[0]?.role !== "scout" || matched[0]?.status !== "completed") {
       throw new Error("sponsorship_review_source_unavailable")

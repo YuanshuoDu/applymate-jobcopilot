@@ -38,14 +38,17 @@ const child = { id: childId, userId, sessionId, turnId, rootTaskId, parentTaskId
   role: "scout", taskType: "job_discovery", status: "completed", attemptCount: 1,
   context: {}, result: { status: "completed", structuredResult: { candidates: [{ jobId }] } } }
 
-function runtime(options: { ordinal?: number; targetRows?: readonly unknown[]; waitRows?: readonly unknown[] } = {}) {
+function runtime(options: { ordinal?: number; attempt?: number; predecessorOrdinal?: number; predecessorAttempt?: number;
+  predecessorHasWait?: boolean; targetRows?: readonly unknown[]; waitRows?: readonly unknown[] } = {}) {
   const queries: string[] = [], values: unknown[][] = []
   const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
     queries.push(sql)
     values.push(params ?? [])
     if (sql.startsWith("BEGIN") || sql.includes("set_config") || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] }
-    if (sql.includes('SELECT step."ordinal"')) return { rows: [{ ordinal: options.ordinal ?? 2, attempt: 1, taskId: rootTaskId, status: "streaming" }] }
-    if (sql.includes('SELECT 1 FROM "agent_items"')) return { rows: [{ one: 1 }] }
+    if (sql.includes('SELECT priorStep."ordinal"')) return { rows: [{ ordinal: options.predecessorOrdinal ?? 1,
+      attempt: options.predecessorAttempt ?? options.attempt ?? 1, taskId: rootTaskId }] }
+    if (sql.includes('SELECT step."ordinal"')) return { rows: [{ ordinal: options.ordinal ?? 2, attempt: options.attempt ?? 1, taskId: rootTaskId, status: "streaming" }] }
+    if (sql.includes('SELECT 1 FROM "agent_items"')) return { rows: options.predecessorHasWait === false ? [] : [{ one: 1 }] }
     if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: options.waitRows ?? [] }
     if (sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_sessions"')) {
       const requestedIds = params?.[0] as readonly string[] | undefined
@@ -95,7 +98,7 @@ describe("private sponsorship context reader", () => {
     expect(f.client.release).toHaveBeenCalledOnce()
   })
 
-  it("fails closed if the wait is not the immediate previous step or its returned IDs differ", async () => {
+  it("fails closed if the nearest Root step is not a wait or its returned IDs differ", async () => {
     const stale = runtime()
     harness.load.mockResolvedValueOnce(receipts([{ ...waitCall, ordinal: 0 }, { ...waitResult, ordinal: 0 }]))
     expect(await readPrivateSponsorshipContext(stale.pool as never, fence)).toBeUndefined()
@@ -107,6 +110,46 @@ describe("private sponsorship context reader", () => {
       tasks: [{ taskId: child2Id, status: "completed", role: "scout", result: {}, failureReason: null }] }
     harness.load.mockResolvedValueOnce(receipts([waitCall, waitResult], wrongTargets))
     expect(await readPrivateSponsorshipContext(mismatch.pool as never, fence)).toBeUndefined()
+    expect(harness.bind).not.toHaveBeenCalled()
+  })
+
+  it("binds a wait to the nearest earlier Root step across Turn-global child ordinals", async () => {
+    const f = runtime({ ordinal: 6, predecessorOrdinal: 4 })
+    const olderWait = { ...waitCall, ordinal: 2 }
+    const olderResult = { ...waitResult, ordinal: 2 }
+    const nearestWait = { ...waitCall, ordinal: 4 }
+    const nearestResult = { ...waitResult, ordinal: 4 }
+    harness.load.mockResolvedValueOnce(receipts([olderWait, olderResult, nearestWait, nearestResult]))
+
+    const result = await readPrivateSponsorshipContext(f.pool as never, fence)
+
+    expect(result).toHaveLength(1)
+    const predecessorQuery = f.client.query.mock.calls.find(([sql]) => sql.includes('SELECT priorStep."ordinal"'))
+    expect(predecessorQuery?.[1]).toEqual([sessionId, turnId, rootTaskId, 6, userId])
+    const targetQueryIndex = f.queries.findIndex(sql => sql.includes('SELECT 1 FROM "agent_items"'))
+    expect(f.values[targetQueryIndex]).toEqual([rootTaskId, sessionId, turnId, 4, 1, userId])
+    expect(harness.bind).toHaveBeenCalledOnce()
+  })
+
+  it("does not skip a nearer non-wait Root step to reuse an older wait", async () => {
+    const f = runtime({ ordinal: 6, predecessorOrdinal: 4, predecessorHasWait: false })
+    harness.load.mockResolvedValue(receipts([{ ...waitCall, ordinal: 2 }, { ...waitResult, ordinal: 2 }]))
+
+    expect(await readPrivateSponsorshipContext(f.pool as never, fence)).toBeUndefined()
+
+    const targetQueryIndex = f.queries.findIndex(sql => sql.includes('SELECT 1 FROM "agent_items"'))
+    expect(f.values[targetQueryIndex]).toEqual([rootTaskId, sessionId, turnId, 4, 1, userId])
+    expect(harness.load).not.toHaveBeenCalled()
+    expect(harness.bind).not.toHaveBeenCalled()
+  })
+
+  it("does not skip a nearer Root step from another attempt", async () => {
+    const f = runtime({ ordinal: 6, attempt: 1, predecessorOrdinal: 4, predecessorAttempt: 2 })
+
+    expect(await readPrivateSponsorshipContext(f.pool as never, fence)).toBeUndefined()
+
+    expect(f.queries.some(sql => sql.includes('SELECT 1 FROM "agent_items"'))).toBe(false)
+    expect(harness.load).not.toHaveBeenCalled()
     expect(harness.bind).not.toHaveBeenCalled()
   })
 

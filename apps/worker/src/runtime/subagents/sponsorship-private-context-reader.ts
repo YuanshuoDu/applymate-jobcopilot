@@ -4,7 +4,7 @@ import { toSponsorshipObservationModelFrame } from "./sponsorship-observation-co
 import { readSponsorshipTaskObservationsWithClient, sponsorshipCandidateJobIds, type SponsorshipObservationTask } from "./sponsorship-observation-binder-core.js"
 import { loadTaskGraphVerificationReceipts } from "./task-graph-pg-verification-receipts.js"
 import { lockTaskGraphScope } from "./task-graph-pg-state.js"
-import { selectedSponsorshipWaitTargets } from "./sponsorship-private-context-wait.js"
+import { readNearestRootStepBefore, selectedSponsorshipWaitTargets } from "./sponsorship-private-context-wait.js"
 import { resolveRootTaskSponsorshipTargetCountry } from "../context/root-task-objective.js"
 import { readCurrentSponsorshipReviewWithClient, type SponsorshipCurrentReviewReadDiagnosticStage } from "./sponsorship-review-current-reader.js"
 
@@ -24,7 +24,7 @@ export type SponsorshipPrivateContextFence = Readonly<{
 export type PrivateSponsorshipContextEntry = Readonly<{ jobId: string; observation: SponsorshipObservationModelFrame }>
 export type SponsorshipPrivateContextReadDiagnosticStage =
   | "scope_validated" | "scope_rejected" | "connection_unavailable"
-  | "step_bound" | "step_unavailable" | "adjacent_wait_found" | "adjacent_wait_missing"
+  | "step_bound" | "step_unavailable" | "previous_root_step_missing" | "nearest_root_wait_found" | "nearest_root_wait_missing"
   | "wait_binding_started" | "wait_targets_bound" | "wait_targets_unavailable"
   | "auditor_target_bound" | "auditor_target_unavailable" | "country_bound" | "country_unavailable"
   | "review_source_readback_started" | "review_source_readback_bound" | "review_source_readback_missing"
@@ -61,7 +61,7 @@ function validFence(input: SponsorshipPrivateContextFence): boolean {
     && input.taskId === input.rootTaskId && Number.isSafeInteger(input.rootAttemptCount) && input.rootAttemptCount > 0
     && Number.isSafeInteger(input.turnLeaseVersion) && input.turnLeaseVersion > 0
 }
-/** Reads only the immediately preceding completed Root wait request, then rebinds source in this fenced transaction. */
+/** Reads only the nearest preceding same-attempt Root wait request, then rebinds source in this fenced transaction. */
 export async function readPrivateSponsorshipContext(pool: Pool, input: SponsorshipPrivateContextFence,
   waitProjections: readonly Readonly<{ id: string; content: unknown }>[] = [],
   reportStage?: (stage: SponsorshipPrivateContextReadDiagnosticStage) => void): Promise<readonly PrivateSponsorshipContextEntry[] | undefined> {
@@ -92,6 +92,9 @@ export async function readPrivateSponsorshipContext(pool: Pool, input: Sponsorsh
       await client.query("COMMIT"); transactionOpen = false; return undefined
     }
     diagnose("step_bound")
+    const previousRootStep = await readNearestRootStepBefore(client, { userId: input.userId, sessionId: input.sessionId,
+      turnId: input.turnId, rootTaskId: input.rootTaskId, ordinal, attempt })
+    if (!previousRootStep) { diagnose("previous_root_step_missing"); await client.query("COMMIT"); transactionOpen = false; return undefined }
     const targetExists = await client.query(`SELECT 1 FROM "agent_items" AS item
       JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
       JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId"
@@ -100,16 +103,16 @@ export async function readPrivateSponsorshipContext(pool: Pool, input: Sponsorsh
       WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."type" = 'tool_call'
         AND item."content"->>'toolName' IN ('agent.wait', 'wait_subagents') AND step."ordinal" = $4 AND step."attempt" = $5
         AND task."rootTaskId" = $1 AND task."parentTaskId" IS NULL AND session."userId" = $6 AND turn."userId" = $6 AND turn."rootTaskId" = $1 LIMIT 1`,
-    [input.rootTaskId, input.sessionId, input.turnId, ordinal - 1, attempt, input.userId])
-    if (targetExists.rows.length === 0) { diagnose("adjacent_wait_missing"); await client.query("COMMIT"); transactionOpen = false; return undefined }
-    diagnose("adjacent_wait_found")
+    [input.rootTaskId, input.sessionId, input.turnId, previousRootStep.ordinal, previousRootStep.attempt, input.userId])
+    if (targetExists.rows.length === 0) { diagnose("nearest_root_wait_missing"); await client.query("COMMIT"); transactionOpen = false; return undefined }
+    diagnose("nearest_root_wait_found")
     const receipts = await loadTaskGraphVerificationReceipts(client, { userId: input.userId, sessionId: input.sessionId, turnId: input.turnId,
       rootTaskId: input.rootTaskId, parentTaskId: input.rootTaskId, taskId: input.rootTaskId, attemptCount: attempt })
     diagnose("wait_binding_started")
     const matchedTargets = await selectedSponsorshipWaitTargets(client, receipts, {
       userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, rootTaskId: input.rootTaskId,
       rootAttemptCount: input.rootAttemptCount, turnLeaseOwner: input.turnLeaseOwner, turnLeaseVersion: input.turnLeaseVersion,
-      attempt, previousOrdinal: ordinal - 1,
+      attempt, previousOrdinal: previousRootStep.ordinal,
     }, waitProjections)
     if (!matchedTargets) { diagnose("wait_targets_unavailable"); await client.query("COMMIT"); transactionOpen = false; return undefined }
     diagnose("wait_targets_bound")
