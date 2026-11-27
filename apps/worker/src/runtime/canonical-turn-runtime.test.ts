@@ -83,6 +83,7 @@ import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
 import { runTurnJob } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
+import { executionOwnerFence } from "./execution-owner.js"
 import { InterruptRequestedError } from "./interrupt/registry.js"
 import { resolveProductionAgentFlags, type ProductionAgentFlags } from "./production-agent-flags.js"
 import { nativeCoordinationReceipts } from "./canonical-turn-native-graph-context.js"
@@ -3180,7 +3181,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(guard).toEqual(expect.any(Function))
     if (typeof guard !== "function") throw new Error("explicit objective terminal guard was not created")
     const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
-    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0,
+    const terminal = { owner: executionOwnerFence({ kind: "turn", taskId: "root-1", lease }), stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0,
       usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
     await expect(guard(client, terminal)).resolves.toEqual({ ok: true })
     expect(objective.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ requireTaskGraph: true, client }))
@@ -5183,7 +5184,7 @@ describe("createCanonicalTurnRuntime", () => {
     if (typeof guard !== "function") throw new Error("terminal guard was not created")
     const client = { query: vi.fn(async (sql: string) => sql.startsWith('SELECT session."id"') && sql.includes("pause_request")
       ? { rows: [{ id: "session-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }) } as never
-    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
+    const terminal = { owner: executionOwnerFence({ kind: "turn", taskId: "root-1", lease }), stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
     await expect(guard(client, terminal)).resolves.toEqual({ ok: true })
     expect(roots.checkCompletion).toHaveBeenNthCalledWith(1, expect.objectContaining({ taskGraphVerification: true }))
     expect(roots.checkCompletion).toHaveBeenNthCalledWith(2, expect.objectContaining({ taskGraphVerification: true, client }))
@@ -5210,7 +5211,7 @@ describe("createCanonicalTurnRuntime", () => {
     const guard = terminalGuards[0]
     if (typeof guard !== "function") throw new Error("selected-job terminal guard was not created")
     const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
-    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
+    const terminal = { owner: executionOwnerFence({ kind: "turn", taskId: "root-1", lease }), stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
 
     await expect(guard(client, terminal)).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
     expect(roots.checkCompletion).toHaveBeenLastCalledWith(expect.objectContaining({ taskGraphVerification: true, client }))
