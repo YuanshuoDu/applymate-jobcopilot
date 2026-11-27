@@ -1654,7 +1654,7 @@ async function createArchivedWaitChildren(rootTaskId) {
   return taskIds
 }
 async function startArchivedWaitRuntime(workerOwnerId, resume) {
-  let barrierReached = false, rounds = 0
+  let barrierReached = false, rounds = 0, archivedWaitRequestScope = null, historicalTailProjected = false
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId,
     productionFlags: { ...flags(), taskGraphPlanningEnabled: false },
@@ -1662,6 +1662,22 @@ async function startArchivedWaitRuntime(workerOwnerId, resume) {
     turnEngineStoreFactory(database, terminalGuard) {
       const base = createPgTurnEngineStore(database, terminalGuard)
       return new Proxy(base, { get(target, property, receiver) {
+        if (property === "appendEvent") return async input => {
+          const owner = record(input?.owner), scope = archivedWaitRequestScope
+          const exactHistoricalCompletion = !resume && !historicalTailProjected && scope
+            && input?.type === "model.completed" && input.correlationId === scope.stepId && input.itemId === null
+            && owner?.kind === "turn" && owner.taskId === scope.rootTaskId && owner.rootTaskId === scope.rootTaskId
+            && owner.sessionId === ids.sessionId && owner.turnId === ids.turnId && owner.userId === ids.userId
+          if (!exactHistoricalCompletion) return target.appendEvent(input)
+          const payload = record(input.payload)
+          if (!payload || JSON.stringify(Object.keys(payload).sort()) !== JSON.stringify(["model", "provider", "taskId", "toolCallCount"])
+            || payload.taskId !== scope.rootTaskId || payload.toolCallCount !== 1) {
+            throw new Error("p3_archived_wait_historical_cut_invalid")
+          }
+          const appended = await target.appendEvent({ ...input, payload: { ...payload, toolCallCount: 2 } })
+          historicalTailProjected = true
+          return appended
+        }
         if (property === "updateStep") return async input => {
           if (!resume && !barrierReached && input.owner.kind === "turn" && input.owner.turnId === ids.turnId
             && input.status === "waiting_for_tool") {
@@ -1684,13 +1700,17 @@ async function startArchivedWaitRuntime(workerOwnerId, resume) {
           if (!resume) archivedWaitProgress("model_stream_entered", rounds)
           if (!resume) {
             if (rounds !== 1) throw new Error("p3_archived_wait_unexpected_first_model_round")
-            if (!request.tools.some(tool => record(tool)?.name === "agent.wait")
-              || !request.tools.some(tool => record(tool)?.name === "agent.list")) {
+            if (!request.tools.some(tool => record(tool)?.name === "agent.wait")) {
               throw new Error("p3_archived_wait_fixture_tools_missing")
             }
             archivedWaitProgress("tools_validated", rounds)
-            const rootTaskId = record(request?.metadata)?.taskId
-            if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("p3_archived_wait_root_identity_missing")
+            const metadata = record(request?.metadata)
+            const rootTaskId = metadata?.taskId, stepId = metadata?.stepId
+            if (typeof rootTaskId !== "string" || !rootTaskId || metadata?.sessionId !== ids.sessionId
+              || metadata?.turnId !== ids.turnId || typeof stepId !== "string" || !stepId) {
+              throw new Error("p3_archived_wait_root_identity_missing")
+            }
+            archivedWaitRequestScope = { rootTaskId, stepId }
             archivedWaitProgress("root_identity_validated", rounds)
             const taskIds = await createArchivedWaitChildren(rootTaskId)
             say("P3_ARCHIVED_WAIT_TASKS_CREATED " + JSON.stringify({ rootTaskId, taskIds }))
@@ -1698,7 +1718,6 @@ async function startArchivedWaitRuntime(workerOwnerId, resume) {
             yield toolCall(archivedWaitCallId, "agent.wait", {
               idempotencyKey: `p3-process-archived-wait:${ids.turnId}`, taskIds, mode: "all", timeoutMs: 30_000,
             })
-            yield toolCall("p3-process-archived-wait-unexecuted-tail", "agent.list", { includeTerminal: true })
             yield { type: "usage", inputTokens: 23, outputTokens: 11, estimatedCostUsd: 0.004 }
             yield { type: "completed", finishReason: "tool_calls" }
             return
