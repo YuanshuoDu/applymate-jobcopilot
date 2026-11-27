@@ -22,6 +22,7 @@ import { readRootTaskHistoryChronologyWitness } from "./root-task-history-chrono
 import { updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { readRootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { readRootTaskHistoryCandidates } from "./root-task-history-source-store.js"
+import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 
 type WebPrisma = {
   $connect(): Promise<void>; $disconnect(): Promise<void>
@@ -108,6 +109,24 @@ async function createTurn(userId: string, sessionId: string, writerPool: Pick<Po
   return { userId, sessionId, turnId, rootTaskId, stepId, lease: {
     userId, sessionId, turnId, ownerId, leaseVersion: 1, leaseStartedAt: now, leaseExpiresAt: expires,
   } }
+}
+
+async function addCanonicalTaskGraph(fixture: Fixture): Promise<void> {
+  const childTaskId = `${fixture.rootTaskId}-history-source`
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+    key: "history-source", templateId: "analyst", goal: "Preserve the historical source task",
+    successCriteria: ["The historical task identity remains bound"], dependsOn: [], depth: 1, taskId: childTaskId,
+  }] })
+  await pool!.query(`INSERT INTO "sub_agent_tasks" ("id","sessionId","turnId","rootTaskId","parentTaskId","path","depth","role","taskType",
+    "status","goal","constraints","successCriteria","allowedActions","context","expectedOutputSchema","result","modelProfileSnapshot",
+    "toolPolicySnapshot","budgetSnapshot","attemptCount","maxAttempts","completedAt","updatedAt")
+    VALUES ($1,$2,$3,$4,$4,$5,1,'analyst','job_analysis','completed',$6,'[]'::jsonb,$7::jsonb,'[]'::jsonb,
+      '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+  [childTaskId, fixture.sessionId, fixture.turnId, fixture.rootTaskId, `/${fixture.rootTaskId}/history-source`,
+    "Preserve the historical source task", JSON.stringify(["The historical task identity remains bound"])])
+  await pool!.query(`INSERT INTO "agent_items" ("id","sessionId","turnId","taskId","type","status","revision","content","startedAt","completedAt","updatedAt")
+    VALUES ($1,$2,$3,$4,'task_graph','completed',1,$5::jsonb,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+  [taskGraphItemId(fixture.rootTaskId), fixture.sessionId, fixture.turnId, fixture.rootTaskId, JSON.stringify(snapshot)])
 }
 
 async function setConsent(userId: string, enabled: boolean, expectedVersion: number) {
@@ -836,6 +855,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     const userId = await createUser()
     const sourceSession = await createSession(userId), currentSession = await createSession(userId)
     const source = await createTurn(userId, sourceSession), current = await createTurn(userId, currentSession)
+    await addCanonicalTaskGraph(source)
     await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
     await setConsent(userId, true, 0)
     const prepared = await prepareCompletedStep(source)
@@ -867,6 +887,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     const userId = await createUser()
     const sourceSession = await createSession(userId), currentSession = await createSession(userId)
     const source = await createTurn(userId, sourceSession), current = await createTurn(userId, currentSession)
+    await addCanonicalTaskGraph(source)
     await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
     await setConsent(userId, true, 0)
     const prepared = await prepareCompletedStep(source)
@@ -901,6 +922,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     const userId = await createUser()
     const sourceSession = await createSession(userId), currentSession = await createSession(userId)
     const source = await createTurn(userId, sourceSession), current = await createTurn(userId, currentSession)
+    await addCanonicalTaskGraph(source)
     await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
     await setConsent(userId, true, 0)
     await appendRootTurnStarted(source)
@@ -940,6 +962,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
   it("makes a same-session failed outcome visible only after its release commits before the next Turn", async () => {
     const userId = await createUser(), sessionId = await createSession(userId)
     const source = await createTurn(userId, sessionId)
+    await addCanonicalTaskGraph(source)
     await setMatchingHistoryObjective(source)
     await setConsent(userId, true, 0)
     await appendRootTurnStarted(source)
@@ -1019,6 +1042,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     const userId = await createUser()
     const sourceSession = await createSession(userId), currentSession = await createSession(userId)
     const source = await createTurn(userId, sourceSession), current = await createTurn(userId, currentSession)
+    await addCanonicalTaskGraph(source)
     await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
     await setConsent(userId, true, 0)
     const terminalEventId = (await completeRootTurn(source)).eventId
