@@ -94,7 +94,10 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     try { runtime = await options.toolRuntimeFactory({ task: executionLease, owner, lease: executionLease }) }
     catch (error: unknown) {
       if (error instanceof TaskGraphWriterReviewFeedbackError) {
-        return { status: "failed", failureReason: error.code, retryDisposition: "terminal" }
+        const firstClaim = lease.attemptCount === 1 && lease.maxAttempts > 1 && !continuation
+        const selectedCoverLetterWriter = Boolean(selectedJob) && lease.role === "writer" && lease.taskType === "cover_letter_draft"
+        const retryDisposition = error.code === "writer_review_receipt_unavailable" && firstClaim && selectedCoverLetterWriter ? "retryable" : "terminal"
+        return { status: "failed", failureReason: error.code, retryDisposition }
       }
       throw error
     }
