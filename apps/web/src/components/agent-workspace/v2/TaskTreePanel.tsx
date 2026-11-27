@@ -1,6 +1,7 @@
 "use client"
 import React, { useEffect, useRef, useState } from "react"
 import { useI18n } from "@/lib/i18n"
+import { childWorkerFailureText } from "./child-worker-failure"
 import type { TimelineItem } from "./timeline-reducer"
 import type { TaskTreeNode } from "./types"
 export interface TaskTreePanelProps {
@@ -49,7 +50,7 @@ const INTERRUPT_COPY: Record<string, InterruptCopy> = {
 
 /** Displays the bounded Turn → Step → Tool hierarchy without executing nodes. */
 export function TaskTreePanel({ nodes, selectedId, sessionKey, showHeading = true, onSelect }: TaskTreePanelProps) {
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
   const [localSelectedId, setLocalSelectedId] = useState<string | undefined>(selectedId)
   useEffect(() => {
     setLocalSelectedId(undefined)
@@ -60,11 +61,10 @@ export function TaskTreePanel({ nodes, selectedId, sessionKey, showHeading = tru
     onSelect(node.id)
     if (node.itemId) scrollToTimelineItem(node.itemId)
   }
-
   return (
     <section aria-label={t('agent.tasks')} data-agent-task-tree="true" style={panelStyle}>
       {showHeading && <h2 style={headingStyle}>{t('agent.tasks')}</h2>}
-      <div style={{ display: "grid", gap: 4 }}>{renderNodes(nodes, 0, activeSelectedId, select, t)}</div>
+      <div style={{ display: "grid", gap: 4 }}>{renderNodes(nodes, 0, activeSelectedId, select, t, lang)}</div>
     </section>
   )
 }
@@ -194,7 +194,7 @@ export function restoreTaskInterruptFocus(trigger: HTMLElement | null, fallback:
   target?.focus()
 }
 
-function renderNodes(nodes: readonly TaskTreeNode[], depth: number, selectedId: string | undefined, onSelect: (node: TaskTreeNode) => void, t: (key: string) => string): React.ReactNode {
+function renderNodes(nodes: readonly TaskTreeNode[], depth: number, selectedId: string | undefined, onSelect: (node: TaskTreeNode) => void, t: (key: string) => string, lang: string): React.ReactNode {
   if (depth >= 5) return null
   return nodes.map(node => (
     <React.Fragment key={node.id}>
@@ -211,8 +211,8 @@ function renderNodes(nodes: readonly TaskTreeNode[], depth: number, selectedId: 
         <span style={{ color: "var(--text-muted)", fontSize: 11 }}>{statusLabel(node.status, t)}</span>
       </button>
       {node.resultAvailable && <span style={{ marginLeft: depth * 16 + 8, color: "var(--text-muted)", fontSize: 10 }}>{t('agent.toolResult')}</span>}
-      {node.detail && <span style={{ marginLeft: depth * 16 + 8, color: "var(--c-danger)", fontSize: 10, overflowWrap: "anywhere" }}>{node.detail}</span>}
-      {renderNodes(node.children ?? [], depth + 1, selectedId, onSelect, t)}
+      {(node.childFailure || node.detail) && <span style={{ marginLeft: depth * 16 + 8, color: "var(--c-danger)", fontSize: 10, overflowWrap: "anywhere" }}>{node.childFailure ? childWorkerFailureText(node.childFailure, lang) : node.detail}</span>}
+      {renderNodes(node.children ?? [], depth + 1, selectedId, onSelect, t, lang)}
     </React.Fragment>
   ))
 }

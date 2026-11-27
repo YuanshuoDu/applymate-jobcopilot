@@ -205,7 +205,7 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
         <div className="agent-chat-column" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <div className="agent-context-bar">
           <AgentCurrentObjective goal={activeTurn?.goal} />
-          <AgentSessionPauseResumeControl sessionId={selectedSessionId ?? ''} sessionStatus={controlStatus} activeTurn={activeTurn} onPause={command => sendSessionControl('pause', command)} onResume={command => sendSessionControl('resume', command)} />
+          <AgentSessionPauseResumeControl sessionId={selectedSessionId ?? ''} sessionStatus={controlStatus} activeTurn={activeTurn} pauseBlocker={timeline.pauseBlocker} onPause={command => sendSessionControl('pause', command)} onResume={command => sendSessionControl('resume', command)} />
           </div>
           <AgentTurnComposerProvider value={turnComposer}>
             <AgentUnifiedStream

@@ -6,6 +6,7 @@ import { db } from "@/lib/db"
 import { runWithTenantContext } from "@/lib/db/tenant-store"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { decoratePlanLedgerRepairTargets } from "@/lib/task-graph-repair-display"
+import { readFailedBranchReplacementDisplay, type FailedBranchReplacementDisplay } from "@/lib/task-graph-failed-branch-display"
 
 import {
   afterCursor,
@@ -198,10 +199,17 @@ async function getTaskList(request: NextRequest, context: RouteContext, userId: 
         digestCanonicalJson: (canonicalJson) => createHash("sha256").update(canonicalJson).digest("hex") }, projection,
       { displayVersion: requestedSummaryVersion ?? 1 }) : null
       const displayProjection = projection ? decoratePlanLedgerRepairTargets(projection, graph.content, graph.taskId) : null
+      let failedBranchReplacement: FailedBranchReplacementDisplay | null = null
+      if (graphLookup?.kind === "identified" && displayProjection) {
+        failedBranchReplacement = await readFailedBranchReplacementDisplay({
+          scope: { userId, sessionId: graph.sessionId, turnId: graph.turnId, rootTaskId: graph.taskId, revision: graph.revision },
+          graph: graph.content })
+      }
       const planLedger = displayProjection ? {
         identity,
         projection: displayProjection,
         ...(verificationSummary ? { verificationSummary } : {}),
+        ...(failedBranchReplacement ? { failedBranchReplacement } : {}),
       } : null
       const rootTask = scopedRows.find((row) => row.id === graph!.taskId && row.sessionId === sessionId
         && row.turnId === graph!.turnId && row.rootTaskId === graph!.taskId && row.parentTaskId === null

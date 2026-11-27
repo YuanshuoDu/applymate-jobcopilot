@@ -3,6 +3,7 @@ import { Prisma, type Job } from "@prisma/client";
 import { APPLYMATE_BACKING, loadUserAiConfig, resolveConfig } from "@/lib/model-router";
 import { db } from "@/lib/db";
 import { runAgentPipeline } from "@/lib/agent/run-service";
+import { runScheduledAuditService } from "@/lib/agent/scheduled-audit-service";
 import { isScheduledTaskGraphPostGateAction, runScheduledTaskGraphPostGateTask } from "@/lib/agent/scheduled-taskgraph-post-gate-task";
 import { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity } from "@/lib/agent/scheduled-taskgraph-run-service";
 import type { ScheduledTaskGraphAuditExecuteRpcRequest } from "@/lib/agent/scheduled-taskgraph-gate-rpc";
@@ -54,6 +55,7 @@ export async function POST(request: Request): Promise<Response> {
     body = result.request;
   }
   const auditAction = body.action === "scheduled_audit_execute" ? body : null;
+  if (auditAction && (body.prepareProof === undefined || body.gateCompletionProof === undefined)) return blocked(409, "scheduled_pipeline_audit_gate_proof_invalid");
   const { owner, attestation } = body;
   const [turn, root, session, user] = await Promise.all([
     db.agentTurn.findFirst({ where: { id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId },
@@ -226,13 +228,15 @@ export async function POST(request: Request): Promise<Response> {
     return blocked(409, "scheduled_pipeline_claim_conflict");
   }
   try {
-    const result = await runAgentPipeline({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
-      executionId: execution.id, source: "automation", aiConfig, autonomous: snapshot.autoApply,
-      ...(resumeQuestionId ? { questionId: resumeQuestionId } : {}),
-      scheduledTaskGraph: scheduledTaskGraphRunInput({ owner: executionOwner, snapshot, attestation, continuationKey: key, claimToken, ownedJobs: jobs,
-        ...(body.prepareProof !== undefined ? { prepareProof: body.prepareProof, ...(body.scheduledWaitId ? { scheduledWaitId: body.scheduledWaitId } : {}) } : {}),
-        ...(body.gateCompletionProof !== undefined ? { gateCompletionProof: body.gateCompletionProof } : {}) },
-        auditAction ? { kind: "audit", auditActor: auditAction.auditActor } : { kind: "root" }), signal: request.signal });
+    const scheduled = scheduledTaskGraphRunInput({ owner: executionOwner, snapshot, attestation, continuationKey: key, claimToken, ownedJobs: jobs,
+      ...(body.prepareProof !== undefined ? { prepareProof: body.prepareProof, ...(body.scheduledWaitId ? { scheduledWaitId: body.scheduledWaitId } : {}) } : {}),
+      ...(body.gateCompletionProof !== undefined ? { gateCompletionProof: body.gateCompletionProof } : {}) },
+      auditAction ? { kind: "audit", auditActor: auditAction.auditActor } : { kind: "root" });
+    const result = auditAction
+      ? await runScheduledAuditService({ scheduled, signal: request.signal })
+      : await runAgentPipeline({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+        executionId: execution.id, source: "automation", aiConfig, autonomous: snapshot.autoApply,
+        ...(resumeQuestionId ? { questionId: resumeQuestionId } : {}), scheduledTaskGraph: scheduled, signal: request.signal });
     if (!result) {
       const wakeWait = await loadDurableScheduledTaskGraphWait({ owner: executionOwner, key, claimToken, answeredOnly: true });
       return wakeWait ? parsed.action === "execute" ? json(202, { status: "waiting_for_user", waitId: wakeWait.waitId }) : json(202, { status: "waiting_for_user", ...wakeWait }, responseWaitId)

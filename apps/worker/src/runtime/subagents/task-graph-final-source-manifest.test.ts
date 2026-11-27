@@ -7,7 +7,8 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 
 function graph(rows: readonly GraphTaskRow[]): LoadedGraph {
-  const nodes = rows.map((task, nodeIndex) => ({ key: `private-node-${nodeIndex}`, templateId: task.taskType!, taskId: task.id }))
+  const nodes = rows.map((task, nodeIndex) => ({ key: `private-node-${nodeIndex}`,
+    templateId: task.role === "scout" && task.taskType === "job_discovery" ? "scout" : task.taskType!, taskId: task.id }))
   return { rootTaskId: "private-root-id", item: { id: taskGraphItemId("private-root-id"), revision: 7, content: {}, createdAt: new Date(0) },
     snapshot: { nodes } as unknown as TaskGraphSnapshot, state: { revision: 7 } as LoadedGraph["state"],
     tasks: new Map(rows.map(task => [task.id, task])) } as LoadedGraph
@@ -75,6 +76,33 @@ describe("TaskGraph final source manifest", () => {
       ] })
     expect(JSON.stringify(manifest)).not.toMatch(/private-old-scout|private-old-analyst|PRIVATE_TEXT|PRIVATE_ANALYST_TEXT/)
     expect(manifest?.sources.map(source => source.nodeIndex)).toEqual([1, 3])
+  })
+
+  it("emits v3 retired indices separately from historical and current sources", () => {
+    const interrupted = { ...task("private-retired-scout", "scout", "job_discovery", scoutResult), status: "interrupted" as const, attemptCount: 2 }
+    const binding = buildTaskGraphFinalSummaryBinding(graph([
+      task("private-old-scout", "scout", "scout", scoutResult), interrupted,
+      task("private-current-analyst", "analyst", "analyst", analystResult),
+    ]), new Set([0]), new Map([["private-node-1", { nodeKey: "private-node-1", taskId: "private-retired-scout", attempt: 2,
+      interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "private-retirement-event", lifecycleEventId: "private-ack-event" }]]))!
+    const manifest = buildTaskGraphFinalSourceManifest(binding, "private-final-item")
+
+    expect(manifest).toEqual({ schemaVersion: "agent-harness.v2.task-graph-sources.v3", graphRevision: 7,
+      historicalNodeIndices: [0], retiredNodeIndices: [1], sources: [
+        { sourceKey: expect.stringMatching(/^src_[A-Za-z0-9_-]{43}$/), nodeIndex: 2, role: "analyst", taskStatus: "completed", resultState: "valid", roleResultStatus: "completed" },
+      ] })
+    expect(Object.keys(manifest ?? {}).sort()).toEqual(["graphRevision", "historicalNodeIndices", "retiredNodeIndices", "schemaVersion", "sources"])
+    expect(JSON.stringify(manifest)).not.toMatch(/private-root-id|private-retired-scout|private-retirement-event|private-ack-event|PRIVATE_TEXT/)
+  })
+
+  it("rejects a retired-only binding without current business evidence", () => {
+    const interrupted = { ...task("private-retired-scout", "scout", "job_discovery", scoutResult), status: "interrupted" as const, attemptCount: 2 }
+    const binding = buildTaskGraphFinalSummaryBinding(graph([interrupted]), new Set(), new Map([[
+      "private-node-0", { nodeKey: "private-node-0", taskId: "private-retired-scout", attempt: 2,
+        interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "private-retirement-event", lifecycleEventId: "private-ack-event" },
+    ]]))!
+    expect(() => buildTaskGraphFinalSourceManifest(binding, "private-final-item"))
+      .toThrow("task_graph_final_source_retirement_without_current_source")
   })
 
   it("keeps the existing eight-member manifest bound when historical members are present", () => {

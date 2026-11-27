@@ -1,7 +1,11 @@
-import { isSelectedJobBatchTemplateId, selectedJobBatchTemplatesForSlot } from "@jobcopilot/agent-protocol"
+import { isSelectedJobBatchTemplateId, parseSelectedJobBatchGraph, selectedJobBatchTemplatesForSlot, type SelectedJobBatchSlotId } from "@jobcopilot/agent-protocol"
 import type { SelectedJobBatchCompletionWitness } from "../multi-selected-job-completion-gate.js"
-import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
-import { SELECTED_JOB_BATCH_SLOT_IDS, pairSelectedJobBatchPlan } from "./selected-job-batch-plan.js"
+import {
+  finalCorrectionReferenceFollowsPrior, projectSelectedJobBatchFinalCorrection, readSelectedJobBatchFinalCorrection, selectedJobBatchFinalBindingMatches,
+  type SelectedJobBatchFinalCorrection,
+} from "./selected-job-batch-final-correction.js"
+import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCurrentNode } from "./task-graph-command-port.js"
+import { SELECTED_JOB_BATCH_SLOT_IDS } from "./selected-job-batch-plan.js"
 import type { TaskGraphFinalSummaryBinding, TaskGraphFinalSummaryMember } from "./task-graph-final-summary-binding.js"
 import type { SubagentTaskStatus } from "./types.js"
 
@@ -20,6 +24,7 @@ export type SelectedJobBatchFinalMember = Readonly<{
 export type SelectedJobBatchFinalSlot = Readonly<{
   slotId: typeof SELECTED_JOB_BATCH_SLOT_IDS[number]; jobId: string; status: "completed" | "failed"
   writer: SelectedJobBatchFinalMember; reviewer: SelectedJobBatchFinalMember
+  priorPair?: SelectedJobBatchFinalCorrection
   artifactRef?: Readonly<{ artifactId: string; version: number; contentHash: string; sourceDigest: string }>
   reviewStatus?: "passed" | "needs_revision" | "rejected"; reviewHash?: string
 }>
@@ -32,9 +37,9 @@ export function attachSelectedJobBatchFinalOutcome(
   binding: TaskGraphFinalSummaryBinding | null | undefined,
   readyWitness: SelectedJobBatchCompletionWitness,
 ): TaskGraphFinalSummaryBinding | null {
-  if (!binding || binding.selectedJobBatchFinalOutcome !== undefined || !baseBindingIsCurrent(binding)) return null
+  if (!binding || binding.selectedJobBatchFinalOutcome !== undefined) return null
   const projection = projectReadyWitness(readyWitness)
-  return projection && projection.graphRevision === binding.graphRevision && matchesBinding(binding, projection)
+  return projection && selectedJobBatchFinalBindingMatches(binding, projection)
     ? { ...binding, selectedJobBatchFinalOutcome: projection } : null
 }
 
@@ -49,7 +54,7 @@ export function readBoundSelectedJobBatchFinalOutcome(
   binding: TaskGraphFinalSummaryBinding,
 ): SelectedJobBatchFinalOutcome | null {
   const outcome = readSelectedJobBatchFinalOutcome(binding.selectedJobBatchFinalOutcome, binding.graphRevision)
-  return outcome && matchesBinding(binding, outcome) ? outcome : null
+  return outcome && selectedJobBatchFinalBindingMatches(binding, outcome) ? outcome : null
 }
 
 export function readSelectedJobBatchFinalOutcome(value: unknown, graphRevision: number): SelectedJobBatchFinalOutcome | null {
@@ -62,14 +67,15 @@ export function readSelectedJobBatchFinalOutcome(value: unknown, graphRevision: 
     const slot = parseSlot(slots[index], index)
     if (!slot || jobs.has(slot.jobId)) return null
     jobs.add(slot.jobId)
-    for (const member of [slot.writer, slot.reviewer]) {
+    for (const member of [slot.writer, slot.reviewer, ...(slot.priorPair ? [slot.priorPair.writer, slot.priorPair.reviewer] : [])]) {
       if (tasks.has(member.taskId) || keys.has(member.nodeKey) || indices.has(member.nodeIndex)) return null
       tasks.add(member.taskId); keys.add(member.nodeKey); indices.add(member.nodeIndex)
     }
     parsed.push(slot)
   }
   const orderedIndices = [...indices].sort((left, right) => left - right)
-  if (indices.size !== slots.length * 2 || orderedIndices.some((value, index) => value !== index)) return null
+  const memberCount = parsed.reduce((count, slot) => count + (slot.priorPair ? 4 : 2), 0)
+  if (memberCount > 8 || indices.size !== memberCount || orderedIndices.some((value, index) => value !== index)) return null
   return { schemaVersion: SCHEMA, graphRevision, slots: parsed }
 }
 
@@ -86,13 +92,14 @@ export function renderSelectedJobBatchFinalOutcome(binding: TaskGraphFinalSummar
 
 function projectReadyWitness(value: unknown): SelectedJobBatchFinalOutcome | null {
   const witness = record(value), graph = witness && record(witness.graph)
-  const outcomes = witness && dense(witness.slots, 3), nodes = graph && dense(graph.nodes, 6)
+  const outcomes = witness && dense(witness.slots, 3), nodes = graph && dense(graph.nodes, 8)
   if (!witness || !exactKeys(witness, "graph,slots") || !graph || !exactKeys(graph, "nodes,revision")
     || !Number.isSafeInteger(graph.revision) || Number(graph.revision) < 1 || !outcomes || outcomes.length < 2
-    || !nodes || nodes.length !== outcomes.length * 2) return null
-  let pairs: ReturnType<typeof pairSelectedJobBatchPlan>
-  try { pairs = pairSelectedJobBatchPlan(nodes, outcomes.map(slotIdentity)) } catch { return null }
-  if (pairs.length !== outcomes.length) return null
+    || !nodes || nodes.length < outcomes.length * 2 || nodes.length > Math.min(outcomes.length * 4, 8)) return null
+  const slotIds = outcomes.map(value => record(value)?.slotId)
+  if (slotIds.some((slot, index) => slot !== SELECTED_JOB_BATCH_SLOT_IDS[index])) return null
+  const chains = parseSelectedJobBatchGraph(nodes as TaskGraphCurrentNode[], slotIds as SelectedJobBatchSlotId[])
+  if (!chains || chains.length !== outcomes.length) return null
   const byKey = new Map<string, { node: Record<string, unknown>; index: number }>()
   for (let index = 0; index < nodes.length; index++) {
     const node = record(nodes[index])
@@ -100,35 +107,47 @@ function projectReadyWitness(value: unknown): SelectedJobBatchFinalOutcome | nul
     byKey.set(node.key, { node, index })
   }
   const slots: SelectedJobBatchFinalSlot[] = []
-  for (let index = 0; index < pairs.length; index++) {
-    const pair = pairs[index]!, outcome = record(outcomes[index])
-    const writer = byKey.get(pair.writerNodeKey), reviewer = byKey.get(pair.reviewerNodeKey)
-    if (!outcome || !writer || !reviewer || outcome.slotId !== pair.slotId || outcome.jobId !== pair.jobId) return null
-    const writerMember = member(writer, pair.writerTemplateId, "writer"), reviewerMember = member(reviewer, pair.reviewerTemplateId, "reviewer")
+  for (let index = 0; index < chains.length; index++) {
+    const chain = chains[index]!, outcome = record(outcomes[index])
+    const writer = byKey.get(chain.effective.writer.key), reviewer = byKey.get(chain.effective.reviewer.key)
+    if (!outcome || !writer || !reviewer || outcome.slotId !== chain.slotId || !safeId(outcome.jobId)) return null
+    const writerMember = member(writer, chain.effective.writer.templateId, "writer"), reviewerMember = member(reviewer, chain.effective.reviewer.templateId, "reviewer")
     if (!writerMember || !reviewerMember) return null
+    const priorPair = chain.correction ? projectSelectedJobBatchFinalCorrection({
+      slotId: chain.slotId, value: outcome.priorEvidence, writer: chain.initial.writer, reviewer: chain.initial.reviewer,
+      writerIndex: byKey.get(chain.initial.writer.key)?.index ?? -1, reviewerIndex: byKey.get(chain.initial.reviewer.key)?.index ?? -1,
+    }) : undefined
+    if (chain.correction && !priorPair || !chain.correction && Object.hasOwn(outcome, "priorEvidence")) return null
     if (outcome.status === "completed") {
-      if (!exactKeys(outcome, "evidence,jobId,reviewerTaskId,slotId,status,writerTaskId")
+      const expected = chain.correction ? "evidence,jobId,priorEvidence,reviewerTaskId,slotId,status,writerTaskId" : "evidence,jobId,reviewerTaskId,slotId,status,writerTaskId"
+      if (!exactKeys(outcome, expected)
         || writerMember.status !== "completed" || reviewerMember.status !== "completed"
         || outcome.writerTaskId !== writerMember.taskId || outcome.reviewerTaskId !== reviewerMember.taskId) return null
-      const evidence = completedEvidence(outcome.evidence, reviewerMember.taskId, writer.node.resultProjection, reviewer.node.resultProjection)
+      const evidence = completedEvidence(outcome.evidence, writerMember.taskId, reviewerMember.taskId, writer.node.resultProjection, reviewer.node.resultProjection)
       if (!evidence) return null
-      slots.push({ slotId: pair.slotId, jobId: pair.jobId, status: "completed", writer: writerMember, reviewer: reviewerMember,
-        artifactRef: evidence.artifactRef, reviewStatus: evidence.reviewStatus, reviewHash: evidence.reviewHash })
+      slots.push({ slotId: chain.slotId, jobId: String(outcome.jobId), status: "completed", writer: writerMember, reviewer: reviewerMember,
+        artifactRef: evidence.artifactRef, reviewStatus: evidence.reviewStatus, reviewHash: evidence.reviewHash, ...(priorPair ? { priorPair } : {}) })
     } else if (outcome.status === "failed") {
-      if (!exactKeys(outcome, "jobId,reviewerTaskId,slotId,status,writerTaskId")
+      const expected = chain.correction ? "jobId,priorEvidence,reviewerTaskId,slotId,status,writerTaskId" : "jobId,reviewerTaskId,slotId,status,writerTaskId"
+      if (!exactKeys(outcome, expected)
         || !failedBranch(writerMember.status, reviewerMember.status)
         || outcome.writerTaskId !== writerMember.taskId || outcome.reviewerTaskId !== reviewerMember.taskId) return null
-      slots.push({ slotId: pair.slotId, jobId: pair.jobId, status: "failed", writer: writerMember, reviewer: reviewerMember })
+      slots.push({ slotId: chain.slotId, jobId: String(outcome.jobId), status: "failed", writer: writerMember, reviewer: reviewerMember,
+        ...(priorPair ? { priorPair } : {}) })
     } else return null
   }
   const projection = { schemaVersion: SCHEMA, graphRevision: Number(graph.revision), slots }
   return readSelectedJobBatchFinalOutcome(projection, projection.graphRevision)
 }
 
-function completedEvidence(value: unknown, reviewerTaskId: string, writerProjection: unknown, reviewerProjection: unknown) {
+function completedEvidence(value: unknown, writerTaskId: string, reviewerTaskId: string, writerProjection: unknown, reviewerProjection: unknown) {
   const evidence = record(value), artifactRef = evidence && readArtifactRef(evidence.artifactRef)
-  const receipt = evidence && record(evidence.reviewReceipt)
-  if (!evidence || !exactKeys(evidence, "artifactRef,reviewReceipt") || !artifactRef || !receipt
+  const version = evidence && record(evidence.artifactVersion), receipt = evidence && record(evidence.reviewReceipt)
+  if (!evidence || !exactKeys(evidence, "artifactRef,artifactVersion,reviewReceipt") || !artifactRef || !version || !receipt
+    || !exactKeys(version, "artifactId,artifactType,contentHash,previousHash,sourceDigest,taskId,version")
+    || version.artifactType !== "cover_letter" || version.taskId !== writerTaskId || version.artifactId !== artifactRef.artifactId
+    || version.version !== artifactRef.version || version.contentHash !== artifactRef.contentHash || version.sourceDigest !== artifactRef.sourceDigest
+    || version.previousHash !== null && !hash(version.previousHash)
     || !exactKeys(receipt, "artifactId,contentHash,currentSourceDigest,reviewHash,sourceDigest,status,taskId,version")
     || receipt.taskId !== reviewerTaskId || receipt.artifactId !== artifactRef.artifactId || receipt.version !== artifactRef.version
     || receipt.contentHash !== artifactRef.contentHash || receipt.sourceDigest !== artifactRef.sourceDigest
@@ -157,43 +176,29 @@ function member(value: { node: Record<string, unknown>; index: number }, templat
     taskType: role === "writer" ? "cover_letter_draft" : "cover_letter_review", role, status: node.status }
 }
 
-function matchesBinding(binding: TaskGraphFinalSummaryBinding, outcome: SelectedJobBatchFinalOutcome): boolean {
-  const members = binding.members
-  if (!baseBindingIsCurrent(binding) || binding.graphRevision !== outcome.graphRevision || !members
-    || members.length !== outcome.slots.length * 2) return false
-  const seen = new Set<number>()
-  for (const slot of outcome.slots) for (const task of [slot.writer, slot.reviewer]) {
-    const member = members[task.nodeIndex]
-    if (!member || seen.has(task.nodeIndex) || task.nodeIndex >= members.length || member.nodeIndex !== task.nodeIndex
-      || member.nodeKey !== task.nodeKey || member.templateId !== task.templateId || member.taskId !== task.taskId
-      || member.taskType !== task.taskType || member.role !== task.role || member.taskStatus !== task.status || member.kind !== "business") return false
-    seen.add(task.nodeIndex)
-  }
-  return seen.size === members.length
-}
-
-function baseBindingIsCurrent(binding: TaskGraphFinalSummaryBinding): boolean {
-  return safeNodeId(binding.rootTaskId) && safeNodeId(binding.graphItemId)
-    && Number.isSafeInteger(binding.graphRevision) && binding.graphRevision > 0
-    && binding.summary?.graphRevision === binding.graphRevision
-}
-
 function parseSlot(value: unknown, index: number): SelectedJobBatchFinalSlot | null {
   const slot = record(value), expectedSlot = SELECTED_JOB_BATCH_SLOT_IDS[index]
   const templates = selectedJobBatchTemplatesForSlot(expectedSlot)
   if (!slot || !expectedSlot || slot.slotId !== expectedSlot || !safeId(slot.jobId)
     || !templates || !exactTask(slot.writer, templates.writerTemplateId, "cover_letter_draft", "writer")
     || !exactTask(slot.reviewer, templates.reviewerTemplateId, "cover_letter_review", "reviewer")) return null
-  if (slot.status === "completed" && exactKeys(slot, "artifactRef,jobId,reviewHash,reviewStatus,reviewer,slotId,status,writer")) {
+  const priorPair = Object.hasOwn(slot, "priorPair") ? readSelectedJobBatchFinalCorrection(slot.priorPair, expectedSlot) : undefined
+  if (Object.hasOwn(slot, "priorPair") && (!priorPair || priorPair.writer.taskId === slot.writer.taskId
+    || priorPair.reviewer.taskId === slot.reviewer.taskId)) return null
+  if (slot.status === "completed" && exactKeys(slot, priorPair
+    ? "artifactRef,jobId,priorPair,reviewHash,reviewStatus,reviewer,slotId,status,writer"
+    : "artifactRef,jobId,reviewHash,reviewStatus,reviewer,slotId,status,writer")) {
     const artifactRef = readArtifactRef(slot.artifactRef)
     return artifactRef && slot.writer.status === "completed" && slot.reviewer.status === "completed"
-      && isReview(slot.reviewStatus) && hash(slot.reviewHash)
+      && isReview(slot.reviewStatus) && hash(slot.reviewHash) && (!priorPair || finalCorrectionReferenceFollowsPrior(priorPair, artifactRef))
       ? { slotId: expectedSlot, jobId: slot.jobId, status: "completed", writer: slot.writer, reviewer: slot.reviewer,
-        artifactRef, reviewStatus: slot.reviewStatus, reviewHash: slot.reviewHash } : null
+        artifactRef, reviewStatus: slot.reviewStatus, reviewHash: slot.reviewHash, ...(priorPair ? { priorPair } : {}) } : null
   }
-  return slot.status === "failed" && exactKeys(slot, "jobId,reviewer,slotId,status,writer")
+  return slot.status === "failed" && exactKeys(slot, priorPair
+    ? "jobId,priorPair,reviewer,slotId,status,writer" : "jobId,reviewer,slotId,status,writer")
     && failedBranch(slot.writer.status, slot.reviewer.status)
-    ? { slotId: expectedSlot, jobId: slot.jobId, status: "failed", writer: slot.writer, reviewer: slot.reviewer } : null
+    ? { slotId: expectedSlot, jobId: slot.jobId, status: "failed", writer: slot.writer, reviewer: slot.reviewer,
+      ...(priorPair ? { priorPair } : {}) } : null
 }
 
 function exactTask(value: unknown, templateId: string, taskType: "cover_letter_draft" | "cover_letter_review", role: "writer" | "reviewer"): value is SelectedJobBatchFinalMember {
@@ -203,14 +208,10 @@ function exactTask(value: unknown, templateId: string, taskType: "cover_letter_d
     && safeTaskId(task.taskId) && task.role === role && task.taskType === taskType && task.templateId === templateId && isStatus(task.status)
 }
 
-function slotIdentity(value: unknown): unknown {
-  const row = record(value)
-  return row ? { slotId: row.slotId, jobId: row.jobId } : value
-}
 function readArtifactRef(value: unknown) {
   const row = record(value)
-  return row && exactKeys(row, "artifactId,contentHash,sourceDigest,version") && safeId(row.artifactId)
-    && Number.isSafeInteger(row.version) && Number(row.version) > 0 && hash(row.contentHash) && hash(row.sourceDigest)
+  return row && exactKeys(row, "artifactId,contentHash,sourceDigest,version") && safeId(row.artifactId) && Number.isSafeInteger(row.version)
+    && Number(row.version) > 0 && hash(row.contentHash) && hash(row.sourceDigest)
     ? { artifactId: row.artifactId, version: Number(row.version), contentHash: row.contentHash, sourceDigest: row.sourceDigest } : null
 }
 function sameArtifact(left: NonNullable<ReturnType<typeof readArtifactRef>>, right: NonNullable<ReturnType<typeof readArtifactRef>>): boolean {

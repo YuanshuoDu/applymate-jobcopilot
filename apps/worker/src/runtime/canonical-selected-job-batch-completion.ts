@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg"
+import { parseSelectedJobBatchGraph } from "@jobcopilot/agent-protocol"
 
 import { findCurrentDraftHeadWithClient, findReviewReceiptWithClient } from "../db/agent-artifact-repo.js"
 import { readSelectedJobSourceDigestWithClient } from "./subagents/selected-job-artifact-context.js"
@@ -8,6 +9,7 @@ import {
   type SelectedJobBatchCompletionWitness,
   type SelectedJobBatchTaskContext,
 } from "./multi-selected-job-completion-gate.js"
+import type { SelectedJobBatchArtifactVersion } from "./multi-selected-job-correction-evidence.js"
 import { loadVerifiedShortlistBatchResources } from "./verified-shortlist-batch-resources.js"
 import { pairSelectedJobBatchPlan, type SelectedJobBatchPair, type SelectedJobBatchSlot } from "./subagents/selected-job-batch-plan.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
@@ -20,6 +22,7 @@ type ContextRow = Readonly<{
   taskId: string; taskSessionId: string; taskTurnId: string; taskRootTaskId: string; taskParentTaskId: string | null
   taskRole: string; context: unknown; sessionUserId: string; turnUserId: string; turnRootTaskId: string
 }>
+const SHA256 = /^sha256:[a-f0-9]{64}$/
 
 export type CanonicalSelectedJobBatchCompletionInput = Readonly<{
   client: PoolClient
@@ -52,13 +55,16 @@ export async function verifyCanonicalSelectedJobBatchCompletion(
       parentLeaseOwner: input.lease.ownerId, parentAttemptCount: root.attemptCount,
     }
     const graph = await readGraph(input.client, scope)
-    pairs = pairSelectedJobBatchPlan(graph.nodes, slots)
-    const taskContexts = await readExactTaskContexts(input.client, input.lease, input.rootTaskId, graph, pairs)
+    const chains = parseSelectedJobBatchGraph(graph.nodes, slots.map(slot => slot.slotId))
+    if (!chains) return blocked(slots)
+    pairs = pairSelectedJobBatchPlan(chains.flatMap(chain => [chain.initial.writer, chain.initial.reviewer]), slots)
+    const taskContexts = await readExactTaskContexts(input.client, input.lease, input.rootTaskId, graph, graph.nodes)
     if (!taskContexts) return blocked(pairs)
     return await verifySelectedJobBatchCompletion({
       graph, pairs, taskContexts, lease: input.lease, root,
       ...(input.acceptedWitness ? { expectedWitness: input.acceptedWitness } : {}),
       readCurrentDraftHead: scope => findCurrentDraftHeadWithClient(input.client, scope),
+      readArtifactVersion: scope => readBatchArtifactVersion(input.client, scope),
       readCurrentSourceDigest: jobId => readSelectedJobSourceDigestWithClient(input.client, input.lease.userId, jobId),
       readCurrentReviewReceipt: scope => findReviewReceiptWithClient(input.client, scope),
     })
@@ -91,16 +97,10 @@ async function lockCurrentRoot(client: PoolClient, lease: TurnLease, rootTaskId:
 }
 
 async function readExactTaskContexts(
-  client: PoolClient, lease: TurnLease, rootTaskId: string, graph: TaskGraphCurrentState, pairs: readonly SelectedJobBatchPair[],
+  client: PoolClient, lease: TurnLease, rootTaskId: string, graph: TaskGraphCurrentState, nodes: readonly TaskGraphCurrentState["nodes"][number][],
 ): Promise<readonly SelectedJobBatchTaskContext[] | null> {
-  const nodes = new Map(graph.nodes.map(node => [node.key, node]))
-  const taskIds: string[] = []
-  for (const pair of pairs) {
-    const writerId = nodes.get(pair.writerNodeKey)?.taskId, reviewerId = nodes.get(pair.reviewerNodeKey)?.taskId
-    if (!safeId(writerId) || !safeId(reviewerId)) return null
-    taskIds.push(writerId, reviewerId)
-  }
-  if (taskIds.length !== graph.nodes.length || new Set(taskIds).size !== taskIds.length) return null
+  const taskIds = nodes.map(node => node.taskId)
+  if (taskIds.length !== graph.nodes.length || taskIds.some(id => !safeId(id)) || new Set(taskIds).size !== taskIds.length) return null
   const result = await client.query<ContextRow>(`SELECT task."id" AS "taskId",
       task."sessionId" AS "taskSessionId", task."turnId" AS "taskTurnId", task."rootTaskId" AS "taskRootTaskId",
       task."parentTaskId" AS "taskParentTaskId", task."role" AS "taskRole", task."context",
@@ -128,6 +128,20 @@ async function readExactTaskContexts(
     contexts.push({ taskId, role: row.taskRole, context: row.context })
   }
   return contexts
+}
+
+async function readBatchArtifactVersion(client: PoolClient, scope: Readonly<{
+  userId: string; sessionId: string; jobId: string; artifactId: string; taskId: string; version: number
+}>): Promise<SelectedJobBatchArtifactVersion | null> {
+  const result = await client.query<SelectedJobBatchArtifactVersion>(`SELECT "artifactId", "artifactType", "taskId", "version", "contentHash", "sourceDigest", "previousHash"
+    FROM "agent_artifact_version" WHERE "userId" = $1 AND "sessionId" = $2 AND "jobId" = $3 AND "artifactId" = $4
+      AND "version" = $5 AND "artifactType" = 'cover_letter' AND "taskId" = $6
+    LIMIT 2`, [scope.userId, scope.sessionId, scope.jobId, scope.artifactId, scope.version, scope.taskId])
+  const row = result.rows[0]
+  return result.rows.length === 1 && row?.artifactId === scope.artifactId && row.artifactType === "cover_letter"
+    && row.taskId === scope.taskId && row.version === scope.version
+    && SHA256.test(row.contentHash) && SHA256.test(row.sourceDigest)
+    && (row.previousHash === null || typeof row.previousHash === "string" && SHA256.test(row.previousHash)) ? row : null
 }
 
 function blocked(value: readonly SelectedJobBatchSlot[] | readonly SelectedJobBatchPair[]): SelectedJobBatchCompletionResult {

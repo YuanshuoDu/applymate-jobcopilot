@@ -3,7 +3,9 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import { parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, canonicalTaskGraphJson,
   type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
-import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
+import * as taskGraphVerification from "./task-graph-pg-verification.js"
+import { isOrdinaryScout } from "./child-executor-admission.js"
+import { isValidScoutTaskEnvelope } from "./task-graph-pg-completed-dependency-verification.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 import type { TaskGraphFailedBranchEventIdentity, TaskGraphFailedBranchIdentity } from "./task-graph-pg-failed-branch-relation.js"
 
@@ -110,7 +112,7 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
   const outside = externalAncestors(snapshot, sourceNodes)
   if (!outside) return null
   const ids = [...new Set([derived.root, ...outside].map(node => node.taskId))].sort()
-  const taskResult = await client.query<Row>(`SELECT task."id", task."status", task."role", task."attemptCount", task."leaseOwner", task."leaseExpiresAt",
+  const taskResult = await client.query<Row>(`SELECT task."id", task."status", task."role", task."taskType", task."context", task."expectedOutputSchema", task."allowedActions", task."attemptCount", task."leaseOwner", task."leaseExpiresAt",
       task."nextAttemptAt", task."startedAt", task."completedAt", task."closedAt", task."interruptRequestedAt", task."failureReason", task."result",
       task."confidence", task."qualityGateResult", task."contextSnapshotId", task."outputArtifactIds"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
@@ -120,20 +122,38 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
     ORDER BY task."id" FOR UPDATE OF task`, [ids, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
   if (taskResult.rows.length !== ids.length) return null
   const tasks = new Map(taskResult.rows.map(row => [String(row.id), row]))
-  const failedRow = tasks.get(derived.root.taskId)
-  if (!failedRow || failedRow.status !== "failed" || failedRow.role !== "scout" || Number(failedRow.attemptCount) < 1
-    || failedRow.failureReason !== "task_graph_verification_unverified" || failedRow.leaseOwner !== null || failedRow.leaseExpiresAt !== null
-    || failedRow.nextAttemptAt !== null || failedRow.startedAt === null || failedRow.completedAt === null || failedRow.closedAt !== null
+  const failedRow = tasks.get(derived.root.taskId), failedAttempt = Number(failedRow?.attemptCount)
+  if (!failedRow || failedRow.status !== "failed" || failedRow.role !== "scout" || !Number.isSafeInteger(failedAttempt) || failedAttempt < 1
+    || (failedRow.failureReason !== "task_graph_verification_unverified" && failedRow.failureReason !== "task_graph_verification_failed")
+    || failedRow.leaseOwner !== null || failedRow.leaseExpiresAt !== null || failedRow.nextAttemptAt !== null
+    || failedRow.startedAt === null || failedRow.completedAt === null || failedRow.closedAt !== null
     || failedRow.interruptRequestedAt !== null || failedRow.result === null) return null
   const failedResult = object(failedRow.result), failedReportRaw = failedResult && object(failedResult.taskGraphVerificationReport)
   const failedReport = failedReportRaw && derived.root.verification
     ? parseTaskGraphVerificationReport(failedReportRaw, derived.root.verification.criteria.map(item => item.id)) : undefined
   if (!failedResult || Object.hasOwn(failedResult, "taskGraphRepairReceipt")
     || Object.hasOwn(failedResult, "native") || Object.hasOwn(failedResult, "nativeResult") || !failedReport
-    || failedReport.status !== "unverified" || failedReport.reasonCode !== "result_invalid" || failedReport.evidenceDigest !== null
-    || failedReport.resultDigest !== null || !taskGraphVerificationReportMatchesStatus(failedReport, "failed")) return null
+    || !taskGraphVerificationReportMatchesStatus(failedReport, "failed")) return null
+  const invalidResult = failedRow.failureReason === "task_graph_verification_unverified" && failedReport.status === "unverified"
+    && failedReport.reasonCode === "result_invalid" && failedReport.evidenceDigest === null && failedReport.resultDigest === null
+  const criterionMiss = failedRow.failureReason === "task_graph_verification_failed" && failedReport.status === "failed"
+    && failedReport.reasonCode === "criterion_not_met" && Boolean(failedReport.evidenceDigest) && Boolean(failedReport.resultDigest)
+    && failedReport.criteria.some(item => item.status === "failed") && failedReport.criteria.every(item => item.status !== "unverified")
+  if (!invalidResult && !criterionMiss) return null
+  let criterionStructuredResult: unknown
+  if (criterionMiss) {
+    const structured = object(failedResult.structuredResult), context = object(failedRow.context) ?? {}
+    const actions = Array.isArray(failedRow.allowedActions) ? failedRow.allowedActions : []
+    if (!Object.hasOwn(failedResult, "structuredResult") || structured?.role !== "scout"
+      || !Array.isArray(structured.candidates) || structured.candidates.length === 0
+      || derived.root.repairOf !== undefined || derived.root.nativeDelegation !== undefined
+      || !isValidScoutTaskEnvelope(derived.root, failedRow.taskType, failedRow.expectedOutputSchema, failedRow.allowedActions)
+      || !actions.includes("jobs.discover") || !actions.includes("tool_results.read")
+      || !isOrdinaryScout({ role: String(failedRow.role), taskType: String(failedRow.taskType), context }, "scout", undefined, context.selectedJobPreparation)) return null
+    criterionStructuredResult = failedResult.structuredResult
+  }
 
-  const expectedKeys = [taskGraphLifecycleKey(scope.rootTaskId, derived.root.key, Number(failedRow.attemptCount), "task.failed"),
+  const expectedKeys = [taskGraphLifecycleKey(scope.rootTaskId, derived.root.key, failedAttempt, "task.failed"),
     ...outside.map(node => taskGraphLifecycleKey(scope.rootTaskId, node.key, Number(tasks.get(node.taskId)?.attemptCount), "task.completed"))]
   if (expectedKeys.some(key => key.endsWith(":NaN:task.completed")) || new Set(expectedKeys).size !== expectedKeys.length) return null
   const eventResult = await client.query<Row>(`SELECT event."id", event."sessionId", event."turnId", event."itemId", event."taskId", event."sequence"::text AS "sequence",
@@ -148,12 +168,24 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
   if (eventResult.rows.length !== expectedKeys.length) return null
   const events = new Map(eventResult.rows.map(row => [String(row.idempotencyKey), row]))
   if (events.size !== expectedKeys.length) return null
-  const failureRow = events.get(expectedKeys[0]!)!, failedEvent = lifecycle(failureRow, scope, { node: derived.root, attempt: Number(failedRow.attemptCount), type: "task.failed", snapshot })
+  const failureRow = events.get(expectedKeys[0]!)!, failedEvent = lifecycle(failureRow, scope, { node: derived.root, attempt: failedAttempt, type: "task.failed", snapshot })
   if (!failedEvent || failedEvent.value.failureReason !== failedRow.failureReason) return null
   const failedSnapshot = failedEvent.graph, failedClosure = closureFor(failedSnapshot, sourceNodes), failedOutside = externalAncestors(failedSnapshot, sourceNodes)
   if (!failedClosure || !failedOutside || failedOutside.length !== outside.length
     || failedOutside.some((node, index) => node.key !== outside[index]?.key || node.taskId !== outside[index]?.taskId
       || !same(node, outside[index]))) return null
+  if (criterionMiss) {
+    const verified = await taskGraphVerification.reverifyFailedTaskGraphNodeEvidence(client, {
+      scope: { ...scope, taskId: failedClosure.root.taskId, attemptCount: failedAttempt },
+      snapshot: failedSnapshot, node: failedClosure.root, structuredResult: criterionStructuredResult,
+    })
+    if (verified.verified || verified.evaluation.status !== "failed" || verified.evaluation.reasonCode !== "criterion_not_met"
+      || verified.report.status !== "failed" || verified.report.reasonCode !== "criterion_not_met"
+      || !verified.report.criteria.some(item => item.status === "failed") || verified.report.criteria.some(item => item.status === "unverified")
+      || !verified.report.evidenceDigest || !verified.report.resultDigest || !same(verified.report, failedReportRaw)
+      || verified.structuredResult === undefined || !same(verified.structuredResult, criterionStructuredResult)
+      || verified.report.resultDigest !== taskGraphVerification.taskGraphResultDigest(verified.structuredResult)) return null
+  }
 
   const externalProofs: TaskGraphFailedBranchEvidence["verifiedExternalDependencies"][number][] = []
   for (const node of outside) {
@@ -169,10 +201,10 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
       || !sameDependencyHistory(completed.graph, failedSnapshot, node)
       || BigInt(completed.event.sequence) >= BigInt(failedEvent.event.sequence)) return null
     if (Object.hasOwn(result, "taskGraphRepairReceipt")) return null
-    externalProofs.push({ dependency: identity(node), attemptCount, resultDigest: taskGraphResultDigest(task.result),
-      reportDigest: taskGraphResultDigest(reportRaw), completedEvent: completed.event })
+    externalProofs.push({ dependency: identity(node), attemptCount, resultDigest: taskGraphVerification.taskGraphResultDigest(task.result),
+      reportDigest: taskGraphVerification.taskGraphResultDigest(reportRaw), completedEvent: completed.event })
   }
-  return { failedSource: { source: identity(derived.root), attemptCount: Number(failedRow.attemptCount),
-    resultDigest: taskGraphResultDigest(failedRow.result), reportDigest: taskGraphResultDigest(failedReportRaw), event: failedEvent.event },
+  return { failedSource: { source: identity(derived.root), attemptCount: failedAttempt,
+    resultDigest: taskGraphVerification.taskGraphResultDigest(failedRow.result), reportDigest: taskGraphVerification.taskGraphResultDigest(failedReportRaw), event: failedEvent.event },
   verifiedExternalDependencies: externalProofs.sort((left, right) => left.dependency.nodeKey.localeCompare(right.dependency.nodeKey)) }
 }

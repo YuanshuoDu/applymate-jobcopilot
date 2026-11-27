@@ -105,10 +105,48 @@ describe("agent.plan tool executor", () => {
   it("registers and admits one complete initial same-slot Writer/Reviewer pair per selected Job", async () => {
     const { tool, commandPort } = registeredSelectedBatchTool([selectedBatchReceipt, { ...selectedBatchReceipt, status: "duplicate" }])
     expect(tool.description).toContain("submit every server-listed slot's Writer and same-slot Reviewer together")
+    expect(tool.description).toContain("refresh the owner-scoped current graph and exact review evidence")
+    expect(tool.description).toContain("append at most one same-slot correction Writer directly after its original Reviewer")
+    expect(tool.description).toContain("reverify the latest artifact and review")
+    expect(tool.description).toContain("report the review as unresolved")
     await expect(tool.execute(context(), selectedBatchProposal)).resolves.toEqual(selectedBatchReceipt)
     await expect(tool.execute(context(), selectedBatchProposal)).resolves.toMatchObject({ status: "duplicate" })
     expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledTimes(2)
     expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+  })
+
+  it("admits only a balanced same-slot correction pair in later revisions", async () => {
+    const { tool, commandPort } = registeredSelectedBatchTool()
+    const correction = {
+      expectedRevision: 2,
+      nodes: [
+        { key: "writer-alpha-v2", templateId: "cover_letter_writer_slot_1", goal: "Revise its draft", successCriteria: ["Address its review"], dependsOn: ["reviewer-alpha"] },
+        { key: "reviewer-alpha-v2", templateId: "cover_letter_reviewer_slot_1", goal: "Review revised draft", successCriteria: ["Review its Writer result"], dependsOn: ["writer-alpha-v2"] },
+      ],
+    }
+    await expect(tool.execute(context(), correction)).resolves.toEqual(selectedBatchReceipt)
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledTimes(1)
+    expect(commandPort.readCurrent).not.toHaveBeenCalled()
+  })
+
+  it("preserves optional root criteria for the initial pair and rejects them on a correction append", async () => {
+    const initial = registeredSelectedBatchTool()
+    const withCriteria = { ...selectedBatchProposal, rootSuccessCriteria: ["Both reviewed materials meet the stated requirement"] }
+    await expect(initial.tool.execute(context(), withCriteria)).resolves.toEqual(selectedBatchReceipt)
+    expect(initial.commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledWith(
+      expect.objectContaining({ rootSuccessCriteria: withCriteria.rootSuccessCriteria }), expect.anything())
+
+    const later = registeredSelectedBatchTool()
+    const correction = {
+      expectedRevision: 2,
+      rootSuccessCriteria: ["Revalidate the latest review"],
+      nodes: [
+        { key: "writer-alpha-v2", templateId: "cover_letter_writer_slot_1", goal: "Revise its draft", successCriteria: ["Address its review"], dependsOn: ["reviewer-alpha"] },
+        { key: "reviewer-alpha-v2", templateId: "cover_letter_reviewer_slot_1", goal: "Review revised draft", successCriteria: ["Review its Writer result"], dependsOn: ["writer-alpha-v2"] },
+      ],
+    }
+    await expect(later.tool.execute(context(), correction)).rejects.toMatchObject({ code: "selected_job_batch_plan_invalid" })
+    expect(later.commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
   })
 
   it("rejects incomplete, cross-linked, noninitial, replacement, and repair batch plans before port access", async () => {

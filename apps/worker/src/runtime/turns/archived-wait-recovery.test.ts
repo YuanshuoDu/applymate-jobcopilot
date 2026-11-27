@@ -180,13 +180,12 @@ function turnStore(seed?: PersistedState, crashCut?: CrashCut, startStepStatus: 
   return { state, store, startedStepIds, updatedSteps, get beforeWaitClose() { return beforeWaitClose } }
 }
 
-function waitModel(requests: HarnessModelRequest[], input: unknown, appendUnexecutedTail = false): ModelAdapter {
+function waitModel(requests: HarnessModelRequest[], input: unknown): ModelAdapter {
   return {
     id: "fixture-model", profile,
     async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
       requests.push(request)
       yield { type: "tool_call_completed", callId: "wait-call-1", name: "agent.wait", arguments: input }
-      if (appendUnexecutedTail) yield { type: "tool_call_completed", callId: "tail-call-1", name: "agent.list", arguments: { includeTerminal: true } }
       yield { type: "usage", inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }
       yield { type: "completed", finishReason: "tool_calls" }
     },
@@ -269,7 +268,6 @@ function createWaitEngine(input: {
   readonly snapshot?: StepContextSnapshot
   readonly recoveredWaitControl?: RecoveredArchivedWaitControl
   readonly resume?: TurnEngineOptions["resume"]
-  readonly appendUnexecutedTail?: boolean
   readonly wait: boolean
 }): {
   readonly engine: TurnEngine
@@ -291,7 +289,7 @@ function createWaitEngine(input: {
   const requests: HarnessModelRequest[] = []
   const engine = new TurnEngine(loopOptions({
     store: persisted.store, router: runtime.router, registry: runtime.registry,
-    model: input.wait ? waitModel(requests, runtime.input, input.appendUnexecutedTail) : continuationModel(requests),
+    model: input.wait ? waitModel(requests, runtime.input) : continuationModel(requests),
     reader: reads.reader, snapshot: input.snapshot ?? snapshot(), recoveredWaitControl: input.recoveredWaitControl, resume: input.resume,
   }))
   return { engine, persisted, runtime, requests, readerCalls: reads.calls, readerAdmissions: reads.admissions, readerObservations: reads.observations }
@@ -366,12 +364,24 @@ describe("archived durable wait recovery integration", () => {
     expect(fresh.persisted.state.steps).toMatchObject([{ status: "waiting_for_tool", inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }])
   })
 
-  it("recovers a streaming archived wait from the full model batch without replaying its persisted prefix", async () => {
+  it("recovers a streaming archived wait from the historical full model batch without replaying its persisted prefix", async () => {
     const first = createWaitEngine({ controlStatus: "waiting", startStepStatus: "streaming",
-      crashCut: "before-wait-step-update", appendUnexecutedTail: true, wait: true })
+      crashCut: "before-wait-step-update", wait: true })
     await expect(first.engine.run()).resolves.toMatchObject({ status: "waiting_for_dependency", waitId, stepCount: 1, toolCallCount: 1 })
 
-    const cut = first.persisted.beforeWaitClose
+    const generatedCut = first.persisted.beforeWaitClose
+    if (!generatedCut) throw new Error("fixture_wait_cut_missing")
+    const cut = structuredClone(generatedCut)
+    const completedEventIndex = cut.events.findIndex(event => event.type === "model.completed")
+    const completedEvent = cut.events[completedEventIndex]
+    if (!completedEvent || completedEvent.payload === null || typeof completedEvent.payload !== "object" || Array.isArray(completedEvent.payload)) {
+      throw new Error("fixture_model_completion_payload_missing")
+    }
+    expect(completedEvent.payload).toMatchObject({ toolCallCount: 1 })
+    cut.events[completedEventIndex] = {
+      ...completedEvent,
+      payload: toRepositoryJson({ ...completedEvent.payload, toolCallCount: 2 }),
+    }
     expect(cut?.steps).toMatchObject([{ status: "streaming", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }])
     expect(cut?.events.filter(event => event.type.startsWith("model.")).map(event => event.type))
       .toEqual(["model.started", "model.completed", "model.usage"])

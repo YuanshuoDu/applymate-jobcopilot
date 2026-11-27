@@ -18,8 +18,14 @@ import {
 } from "./scheduled-draft-candidate.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
+import { readCurrentScheduledDraftJobMaterialDigest, readScheduledDraftJobMaterialDigests } from "./scheduled-draft-job-material.js"
 
 vi.mock("./task-graph-pg-completed-dependency-verification.js", () => ({ verifyCompletedScoutDependencies: vi.fn() }))
+vi.mock("./scheduled-draft-job-material.js", () => ({
+  readCurrentScheduledDraftJobMaterialDigest: vi.fn(async () => `sha256:${"a".repeat(64)}`),
+  readScheduledDraftJobMaterialDigests: vi.fn(async (_client: unknown, _scope: unknown, jobIds: readonly string[]) =>
+    new Map(jobIds.map(jobId => [jobId, `sha256:${"a".repeat(64)}`]))),
+}))
 vi.mock("./task-graph-pg-verification.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./task-graph-pg-verification.js")>()
   return { ...actual, verifyCompletedTaskGraphNodeEvidence: vi.fn() }
@@ -152,7 +158,9 @@ describe("verified scheduled draft candidate lane", () => {
     const value = fixture([{ key: "analyst", scoutKey: "scout", findings: [{ jobId: "db-job", score: 8 }] }])
     const selected = await selectCandidate(value)
     expect(selected?.candidate).toEqual({ jobId: "db-job", score: 8 })
-    expect(selected?.witness).toMatchObject({ graphRevision: 7, candidate: { jobId: "db-job", score: 8 }, analysts: [{ nodeKey: "analyst", taskId: "analyst-task-analyst", attemptCount: 3, scouts: [{ nodeKey: "scout", taskId: "scout-task-analyst", attemptCount: 2 }] }] })
+    expect(selected?.witness.bindingVersion).toBe(2)
+    expect(selected?.witness).toMatchObject({ graphRevision: 7,
+      candidate: { jobId: "db-job", score: 8 }, analysts: [{ nodeKey: "analyst", taskId: "analyst-task-analyst", attemptCount: 3, scouts: [{ nodeKey: "scout", taskId: "scout-task-analyst", attemptCount: 2 }] }] })
     expect(value.client.query.mock.calls[0]?.[0]).not.toContain("resultProjection")
   })
 
@@ -194,6 +202,21 @@ describe("verified scheduled draft candidate lane", () => {
     expect(["analyst-9"].includes(selected!.sourceAnalystKeys[0]!)).toBe(false)
   })
 
+  it("requires all winning Analyst receipts and current Job material to agree", async () => {
+    const value = fixture([
+      { key: "analyst-a", scoutKey: "scout-a", findings: [{ jobId: "db-job", score: 8 }] },
+      { key: "analyst-b", scoutKey: "scout-b", findings: [{ jobId: "db-job", score: 8 }] },
+    ])
+    vi.mocked(readScheduledDraftJobMaterialDigests)
+      .mockResolvedValueOnce(new Map([["db-job", `sha256:${"a".repeat(64)}`]]))
+      .mockResolvedValueOnce(new Map([["db-job", `sha256:${"b".repeat(64)}`]]))
+    await expect(selectCandidate(value, ["analyst-a", "analyst-b"])).resolves.toBeUndefined()
+
+    const stable = fixture([{ key: "analyst", scoutKey: "scout", findings: [{ jobId: "db-job", score: 8 }] }])
+    vi.mocked(readCurrentScheduledDraftJobMaterialDigest).mockResolvedValueOnce(`sha256:${"c".repeat(64)}`)
+    await expect(selectCandidate(stable)).resolves.toBeUndefined()
+  })
+
   it("fails closed when the same-graph typed Scout proof is absent", async () => {
     const value = fixture([{ key: "analyst", scoutKey: "scout", findings: [{ jobId: "db-job", score: 8 }] }])
     vi.mocked(verifyCompletedScoutDependencies).mockResolvedValueOnce(null)
@@ -231,6 +254,21 @@ describe("verified scheduled draft candidate lane", () => {
     await expect(validateScheduledDraftCandidateWitness(value.client as never, scope, snapshot, 7, "other-job", selected!.witness)).resolves.toBe(false)
     value.rows.get("analyst-task-analyst")!.attemptCount = 4
     await expect(validateScheduledDraftCandidateWitness(value.client as never, scope, snapshot, 7, "db-job", selected!.witness)).resolves.toBe(false)
+  })
+
+  it("revalidates V2 source freshness and preserves persisted V1 continuation behavior", async () => {
+    const value = fixture([{ key: "analyst", scoutKey: "scout", findings: [{ jobId: "db-job", score: 8 }] }])
+    const snapshot = addDraftPair(value), selected = await selectCandidate(value, ["analyst"], snapshot)
+    const witness = selected!.witness
+    if (witness.bindingVersion !== 2) throw new Error("expected_v2_witness")
+    vi.mocked(readCurrentScheduledDraftJobMaterialDigest).mockResolvedValueOnce(`sha256:${"b".repeat(64)}`)
+    await expect(validateScheduledDraftCandidateWitness(value.client as never, scope, snapshot, 7, "db-job", witness)).resolves.toBe(false)
+
+    const { bindingVersion: _version, jobMaterialDigest: _material, ...core } = witness
+    const legacy = { ...core, bindingVersion: "agent-harness.v2.scheduled-draft-candidate-binding.v1" } as const
+    vi.mocked(readCurrentScheduledDraftJobMaterialDigest).mockClear()
+    await expect(validateScheduledDraftCandidateWitness(value.client as never, scope, snapshot, 7, "db-job", legacy)).resolves.toBe(true)
+    expect(readCurrentScheduledDraftJobMaterialDigest).not.toHaveBeenCalled()
   })
 
   it("allows reachable Writer/Reviewer status progress at one revision and rejects regressions or graph changes", async () => {

@@ -1,6 +1,6 @@
 import { Prisma, type PrismaClient } from '@prisma/client'
-import { parseTaskGraphSnapshot, parseVerifiedShortlistSelectionBinding, sameVerifiedShortlistSelectionBinding,
-  selectedJobBatchTemplatesForSlot, SELECTED_JOB_BATCH_SLOT_IDS, type SelectedJobBatchSlotId } from '@jobcopilot/agent-protocol'
+import { parseSelectedJobBatchGraph, parseTaskGraphSnapshot, parseVerifiedShortlistSelectionBinding,
+  sameVerifiedShortlistSelectionBinding, SELECTED_JOB_BATCH_SLOT_IDS, type SelectedJobBatchSlotId } from '@jobcopilot/agent-protocol'
 
 import { taskDto, type TaskQueryRow } from '@/app/api/agent/sessions/query-dto'
 import { verifyVerifiedShortlistSelection } from '@/lib/agent/control-plane/commands/verified-shortlist-selection'
@@ -21,7 +21,8 @@ const ROLE_RESULT_SCHEMA = 'agent-harness.v2.subagent.result'
 
 type Ref = Readonly<{ artifactId: string; version: number; contentHash: string; sourceDigest: string }>; type BranchStatus = 'pending' | 'completed' | 'failed'
 type BatchTask = TaskQueryRow & Readonly<{ context: unknown }>
-type Pair = Readonly<{ slotId: SelectedJobBatchSlotId; jobId: string; company: string; role: string; writer: { key: string; taskId: string }; reviewer: { key: string; taskId: string } }>
+type PairMembers = Readonly<{ writer: { key: string; taskId: string }; reviewer: { key: string; taskId: string } }>
+type Pair = Readonly<{ slotId: SelectedJobBatchSlotId; jobId: string; company: string; role: string; initial: PairMembers; correction?: PairMembers; effective: PairMembers }>
 
 export type SelectedJobBatchWorkbenchModel = Readonly<{
   sessionId: string; turnId: string
@@ -84,7 +85,8 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
   if (!snapshot) return null
   const pairs = pairNodes(snapshot.nodes, labels)
   if (!pairs) return null
-  const taskIds = pairs.flatMap(pair => [pair.writer.taskId, pair.reviewer.taskId])
+  const taskIds = pairs.flatMap(pair => [pair.initial.writer.taskId, pair.initial.reviewer.taskId,
+    ...(pair.correction ? [pair.correction.writer.taskId, pair.correction.reviewer.taskId] : [])])
   const rows = await tx.subAgentTask.findMany({
     where: { id: { in: taskIds }, sessionId: input.sessionId, turnId: input.turnId, rootTaskId: turn.rootTaskId },
     select: { id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true, path: true,
@@ -97,7 +99,12 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
     || row.rootTaskId !== turn.rootTaskId || row.parentTaskId !== turn.rootTaskId)) return null
   const projected: SelectedJobBatchWorkbenchModel['jobs'][number][] = []
   for (const pair of pairs) {
-    const outcome = await projectPair(tx, input, pair, tasks)
+    let initial: SelectedJobBatchWorkbenchModel['jobs'][number] | null = null
+    if (pair.correction) {
+      initial = await projectPair(tx, input, pair, tasks, pair.initial, true)
+      if (!initial || initial.status !== 'completed' || initial.reviewer.reviewStatus !== 'needs_revision' || !initial.writer.artifactRef) return null
+    }
+    const outcome = await projectPair(tx, input, pair, tasks, pair.effective, false, pair.correction ? initial?.writer.artifactRef : undefined)
     if (!outcome) return null
     projected.push(outcome)
   }
@@ -107,8 +114,8 @@ async function readInTransaction(tx: Prisma.TransactionClient, input: Readonly<{
 }
 
 async function projectPair(tx: Prisma.TransactionClient, owner: { userId: string; sessionId: string; turnId: string }, pair: Pair,
-  tasks: Map<string, BatchTask>): Promise<SelectedJobBatchWorkbenchModel['jobs'][number] | null> {
-  const writer = tasks.get(pair.writer.taskId), reviewer = tasks.get(pair.reviewer.taskId)
+  tasks: Map<string, BatchTask>, members: PairMembers = pair.effective, requireCurrentSource = false, expectedPrevious?: Ref): Promise<SelectedJobBatchWorkbenchModel['jobs'][number] | null> {
+  const writer = tasks.get(members.writer.taskId), reviewer = tasks.get(members.reviewer.taskId)
   if (!writer || !reviewer || writer.role !== 'writer' || writer.taskType !== 'cover_letter_draft'
     || reviewer.role !== 'reviewer' || reviewer.taskType !== 'cover_letter_review'
     || !taskContextMatches(writer.context, pair.jobId) || !taskContextMatches(reviewer.context, pair.jobId)) return null
@@ -125,11 +132,13 @@ async function projectPair(tx: Prisma.TransactionClient, owner: { userId: string
     where: { artifactId: writerRef.artifactId, version: writerRef.version, userId: owner.userId, sessionId: owner.sessionId,
       jobId: pair.jobId, artifactType: 'cover_letter', taskId: writer.id, contentHash: writerRef.contentHash, sourceDigest: writerRef.sourceDigest },
     select: { id: true, artifactId: true, version: true, userId: true, sessionId: true, jobId: true, artifactType: true,
-      taskId: true, contentHash: true, sourceDigest: true },
+      taskId: true, contentHash: true, sourceDigest: true, previousHash: true },
   })
   if (!version || version.artifactId !== writerRef.artifactId || version.version !== writerRef.version || version.userId !== owner.userId
     || version.sessionId !== owner.sessionId || version.jobId !== pair.jobId || version.artifactType !== 'cover_letter'
-    || version.taskId !== writer.id || version.contentHash !== writerRef.contentHash || version.sourceDigest !== writerRef.sourceDigest) return null
+    || version.taskId !== writer.id || version.contentHash !== writerRef.contentHash || version.sourceDigest !== writerRef.sourceDigest
+    || expectedPrevious && (writerRef.artifactId !== expectedPrevious.artifactId || writerRef.version !== expectedPrevious.version + 1
+      || writerRef.sourceDigest !== expectedPrevious.sourceDigest || version.previousHash !== expectedPrevious.contentHash)) return null
   const review = await tx.agentArtifactReview.findFirst({
     where: { artifactVersionId: version.id, userId: owner.userId, sessionId: owner.sessionId, jobId: pair.jobId,
       taskId: reviewer.id, artifactId: writerRef.artifactId, version: writerRef.version, contentHash: writerRef.contentHash,
@@ -140,7 +149,8 @@ async function projectPair(tx: Prisma.TransactionClient, owner: { userId: string
   if (!review || review.artifactVersionId !== version.id || review.userId !== owner.userId || review.sessionId !== owner.sessionId
     || review.jobId !== pair.jobId || review.taskId !== reviewer.id || review.artifactId !== writerRef.artifactId
     || review.version !== writerRef.version || review.contentHash !== writerRef.contentHash || review.sourceDigest !== writerRef.sourceDigest
-    || review.reviewHash !== receipt.reviewHash || review.status !== receipt.reviewStatus || !isDigest(review.currentSourceDigest)) return null
+    || review.reviewHash !== receipt.reviewHash || review.status !== receipt.reviewStatus || !isDigest(review.currentSourceDigest)
+    || requireCurrentSource && review.currentSourceDigest !== writerRef.sourceDigest) return null
   return { ...base, status: 'completed', writer: { status: 'completed', artifactRef: writerRef },
     reviewer: { status: 'completed', reviewStatus: receipt.reviewStatus } }
 }
@@ -148,20 +158,12 @@ async function projectPair(tx: Prisma.TransactionClient, owner: { userId: string
 function pairNodes(nodes: NonNullable<ReturnType<typeof parseTaskGraphSnapshot>>['nodes'], labels: readonly {
   slotId: SelectedJobBatchSlotId; jobId: string; company: string; role: string
 }[]): Pair[] | null {
-  if (nodes.length !== labels.length * 2) return null
-  const pairs: Pair[] = [], used = new Set<string>()
-  for (const slot of labels) {
-    const templates = selectedJobBatchTemplatesForSlot(slot.slotId)
-    const writers = nodes.filter(node => node.templateId === templates?.writerTemplateId)
-    const reviewers = nodes.filter(node => node.templateId === templates?.reviewerTemplateId)
-    const writer = writers[0], reviewer = reviewers[0]
-    if (writers.length !== 1 || reviewers.length !== 1 || !writer || !reviewer || writer.dependsOn.length !== 0
-      || reviewer.dependsOn.length !== 1 || reviewer.dependsOn[0] !== writer.key || used.has(writer.taskId) || used.has(reviewer.taskId)) return null
-    used.add(writer.taskId); used.add(reviewer.taskId)
-    pairs.push({ ...slot, writer: { key: writer.key, taskId: writer.taskId },
-      reviewer: { key: reviewer.key, taskId: reviewer.taskId } })
-  }
-  return used.size === nodes.length ? pairs : null
+  const parsed = parseSelectedJobBatchGraph(nodes, labels.map(label => label.slotId))
+  if (!parsed || parsed.length !== labels.length) return null
+  return labels.map((label, index) => {
+    const chain = parsed[index]!
+    return { ...label, initial: chain.initial, ...(chain.correction ? { correction: chain.correction } : {}), effective: chain.effective }
+  })
 }
 
 function roleResult(value: unknown, role: 'writer'): boolean {
@@ -211,11 +213,11 @@ function sameRef(left: Ref, right: Ref): boolean {
     && left.contentHash === right.contentHash && left.sourceDigest === right.sourceDigest
 }
 
+function isDigest(value: unknown): value is string { return typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value) }
 function safeLabel(value: unknown): string {
   return typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= 160 ? value : 'Saved job'
 }
 
-function isDigest(value: unknown): value is string { return typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value) }
 function hasKeys(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)) }
 function hasRepairNode(value: unknown): boolean { const nodes = record(value)?.nodes; return Array.isArray(nodes) && nodes.some(node => Object.hasOwn(record(node) ?? {}, 'repairOf')) }
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null { const row = record(value); return row && hasKeys(row, keys) ? row : null }
