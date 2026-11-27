@@ -367,7 +367,12 @@ describe("canonical Turn context builder", () => {
       role: "instruction", trust: "system", source: "discovery_persona_context_policy" }))
     expect(context.blocks).toContainEqual(expect.objectContaining({ id: "confirmed-persona-facts", layer: "business",
       role: "data", trust: "external_untrusted", source: "confirmed_persona_facts", content: JSON.stringify(projection) }))
-    expect(context.blocks.slice(-2)).toEqual(discoveryPersonaContextBlocks(projection))
+    const policyIndex = context.blocks.findIndex(block => block.id === "discovery-persona-context-policy")
+    const goalIndex = context.blocks.findIndex(block => block.id === "base-goal")
+    const factsIndex = context.blocks.findIndex(block => block.id === "confirmed-persona-facts")
+    expect(policyIndex).toBeGreaterThanOrEqual(0)
+    expect(policyIndex).toBeLessThan(goalIndex)
+    expect(goalIndex).toBeLessThan(factsIndex)
     expect(context.canonicalJson).toContain("PRIVATE_EPHEMERAL_FACT_SENTINEL")
     expect(context.canonicalJson).not.toBe("base-context-json")
   })
