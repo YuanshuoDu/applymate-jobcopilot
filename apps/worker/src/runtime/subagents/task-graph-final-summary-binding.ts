@@ -8,6 +8,7 @@ import { normalizeResolvedRepairTaskIds } from "./task-graph-final-summary-repai
 export { readResolvedRepairTaskIds } from "./task-graph-final-summary-repair-binding.js"
 import { hasSelectedJobBatchMembers, readBoundSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 import type { SelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import { parseSponsorshipFinalAnswerBinding, sameSponsorshipFinalAnswerBinding, type SponsorshipFinalAnswerBinding } from "./sponsorship-final-answer-contract.js"
 
 export const TASK_GRAPH_FINAL_SUMMARY_BINDING: unique symbol = Symbol("task_graph_final_summary_binding")
 
@@ -42,6 +43,8 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
   members?: readonly TaskGraphFinalSummaryMember[]
   resolvedRepairTaskIds?: readonly string[]
   selectedJobBatchFinalOutcome?: SelectedJobBatchFinalOutcome
+  /** Private server-built listing assessment, re-read under the terminal fence. */
+  sponsorshipFinalAnswer?: SponsorshipFinalAnswerBinding
   summary: TaskGraphFinalSummary
 }>
 
@@ -126,6 +129,14 @@ export function buildTaskGraphFinalSummaryBinding(
     ...(resolved ? { resolvedRepairTaskIds: resolved } : {}), summary }
 }
 
+/** Attaches a private, closed current-source projection to an otherwise valid objective summary. */
+export function bindSponsorshipFinalAnswer(binding: TaskGraphFinalSummaryBinding | null | undefined,
+  value: unknown): TaskGraphFinalSummaryBinding | null {
+  const sponsorshipFinalAnswer = parseSponsorshipFinalAnswerBinding(value)
+  if (!binding || !sponsorshipFinalAnswer || binding.rootTaskId !== sponsorshipFinalAnswer.rootTaskId) return null
+  return { ...binding, sponsorshipFinalAnswer }
+}
+
 /** Compares the exact current graph revision and all deterministic reducer facts. */
 export function sameTaskGraphFinalSummaryBinding(
   left: TaskGraphFinalSummaryBinding | null | undefined,
@@ -139,6 +150,10 @@ export function sameTaskGraphFinalSummaryBinding(
     if (leftHasBatch) {
       if (!readBoundSelectedJobBatchFinalOutcome(left) || !readBoundSelectedJobBatchFinalOutcome(right)) return false
     } else if (leftBatch !== undefined || rightBatch !== undefined) return false
+    const leftSponsorship = left.sponsorshipFinalAnswer, rightSponsorship = right.sponsorshipFinalAnswer
+    if (leftSponsorship !== undefined || rightSponsorship !== undefined) {
+      if (!leftSponsorship || !rightSponsorship || !sameSponsorshipFinalAnswerBinding(leftSponsorship, rightSponsorship)) return false
+    }
     if (left.rootTaskId !== right.rootTaskId || left.graphItemId !== right.graphItemId
       || JSON.stringify(left.members) !== JSON.stringify(right.members) || left.graphRevision !== right.graphRevision
       || JSON.stringify(left.resolvedRepairTaskIds) !== JSON.stringify(right.resolvedRepairTaskIds)

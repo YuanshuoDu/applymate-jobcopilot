@@ -3,12 +3,19 @@ import { readSponsorshipTaskObservationsWithClient, type SponsorshipObservationT
 import { buildSponsorshipReviewPacket } from "./sponsorship-review-packet.js"
 import { readSponsorshipReviewObservation } from "./sponsorship-review-readback.js"
 import { nativeVerificationControlContentMatches, readNativeVerificationControlTasks } from "./native-verification-pg-request.js"
+import { digestNativeVerificationValue } from "./native-verification-contract.js"
 import { toSponsorshipObservationModelFrame, type SponsorshipObservationModelFrame } from "./sponsorship-observation-contract.js"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 
 type Row = Record<string, unknown>
 type Queryable = Pick<pg.PoolClient, "query">
-export type CurrentSponsorshipReviewEntry = Readonly<{ jobId: string; observation: SponsorshipObservationModelFrame }>
+export type CurrentSponsorshipReviewEntry = Readonly<{
+  jobId: string
+  observation: SponsorshipObservationModelFrame
+  reviewerTaskId: string
+  reviewerAttempt: number
+  reviewBindingDigest: string
+}>
 
 function row(value: unknown): Row | undefined {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return undefined } })() : value
@@ -55,5 +62,17 @@ export async function readCurrentSponsorshipReviewWithClient(client: Queryable, 
     interruptRequestedAt: reviewer.interruptRequestedAt, result: reviewer.result,
     qualityGateResult: reviewer.qualityGateResult, qualityGateResultOversize: reviewer.qualityGateResultOversize,
     control: reviewer.control, packet: reviewer.packet, source: packet })
-  return observation ? { jobId: target.jobId, observation: toSponsorshipObservationModelFrame(observation) } : undefined
+  if (!observation) return undefined
+  const modelFrame = toSponsorshipObservationModelFrame(observation)
+  const reviewBindingDigest = `sha256:${digestNativeVerificationValue({
+    owner: { userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId, rootTaskId: input.scope.rootTaskId },
+    rootAttemptCount: input.rootAttemptCount, targetCountryCode: input.targetCountryCode,
+    target, sourceBindingDigest: target.sourceBindingDigest, jobId: target.jobId,
+    reviewerTaskId: reviewer.taskId, reviewerAttempt: reviewer.attemptCount,
+    controlOperationId: reviewer.control.controlOperationId, evidencePacketDigest: reviewer.control.evidencePacketDigest,
+    reviewerResultDigest: digestNativeVerificationValue(reviewer.result), privateReportDigest: digestNativeVerificationValue(reviewer.qualityGateResult),
+    observation: modelFrame,
+  })}`
+  return { jobId: target.jobId, observation: modelFrame, reviewerTaskId: reviewer.taskId,
+    reviewerAttempt: reviewer.attemptCount, reviewBindingDigest }
 }

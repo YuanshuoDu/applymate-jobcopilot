@@ -3,6 +3,8 @@ import { readResolvedRepairTaskIds, type TaskGraphFinalSummaryBinding } from "./
 import type { TaskGraphFinalSummary, TaskGraphSummaryCount } from "./task-graph-final-summary.js"
 import { reduceTaskGraphFollowUpSuggestions, type TaskGraphFollowUpSuggestion } from "./task-graph-follow-up-suggestions.js"
 import { renderSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import { renderSponsorshipFinalAnswer } from "./sponsorship-final-answer-contract.js"
+import { sponsorshipCountryName } from "./sponsorship-review-packet.js"
 
 const MAX_RESPONSE_BYTES = 4_096
 const MAX_ARTIFACT_ROWS = TASK_GRAPH_LIMITS.maxPersistedNodes * 102
@@ -29,6 +31,9 @@ export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSumma
   const prepare = prepareRows(summary)
   const artifacts = artifactRows(summary.artifactReferences)
   const reviews = reviewRows(summary.reviewOutcomes)
+  const sponsorshipLines = binding.sponsorshipFinalAnswer === undefined ? []
+    : renderSponsorshipFinalAnswer(binding.sponsorshipFinalAnswer, sponsorshipCountryName)
+  if (sponsorshipLines === null) return `Task-reported results are unavailable. ${LIMITATION}`
   const lines = ["Task-reported results:"]
   lines.push(...renderSelectedJobBatchFinalOutcome(binding))
   lines.push(countLine("Search results", summary.counts?.discoveredJobs, discovered, ["unique job", "unique jobs"]))
@@ -36,6 +41,7 @@ export function buildGroundedTaskGraphFinalResponse(binding: TaskGraphFinalSumma
   lines.push(countLine("Preparation outcomes", summary.counts?.prepareJobs, prepare?.total ?? null, ["job outcome record", "job outcome records"]))
   lines.push(countLine("Artifact references", summary.counts?.artifactReferences, artifacts, ["artifact reference", "artifact references"]))
   lines.push(countLine("Reviewer outcomes", summary.counts?.reviewOutcomes, reviews, ["review outcome", "review outcomes"]))
+  lines.push(...sponsorshipLines)
   const prepareDetail = prepareBreakdown(summary.counts?.prepareJobs, prepare)
   if (prepareDetail) lines.push(prepareDetail)
   const reviewDetail = reviewBreakdown(summary.counts?.reviewOutcomes, summary.reviewOutcomes, reviews)

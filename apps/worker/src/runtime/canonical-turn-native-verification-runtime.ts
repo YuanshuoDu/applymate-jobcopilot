@@ -29,9 +29,10 @@ import { hasPendingSteerOrInvalidResult, hasUnresolvedPlanningSteering } from ".
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "./subagents/steering-reconciliation-contract.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
-import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { bindSponsorshipFinalAnswer, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { nativeFinalCandidateMatches, taskGraphFinalSummaryCopiesMatch, type NativeFinalCandidateTerminal } from "./finalizer.js"
-import type { AtomicTurnCompletionInput } from "./turns/turn-engine-types.js"
+import { resolveRootTaskSponsorshipTargetCountry } from "./context/root-task-objective.js"
+import { parseSponsorshipFinalAnswerBinding, SPONSORSHIP_FINAL_ANSWER_TERMINAL_GUARD, type SponsorshipFinalAnswerBinding } from "./subagents/sponsorship-final-answer-contract.js"
 
 export type NativeVerificationRuntime = Readonly<{
   port: NativeVerificationPort
@@ -83,20 +84,61 @@ export function createCanonicalTurnTerminalGuard(input: Readonly<{
   enabled: boolean
   nativeVerification: Pick<ReturnType<typeof createCanonicalNativeVerificationRuntime>, "checkTerminal">
   checkRootGraph?: (client: PoolClient, nativeVerificationPassed: boolean, admission: Parameters<TurnEngineTerminalGuard>[2]) => Promise<TurnEngineCompletionGateResult | undefined>
+  readSponsorshipFinalAnswer?: (client: PoolClient, stepId: string, graph: NonNullable<TurnEngineCompletionGateResult[typeof TASK_GRAPH_FINAL_SUMMARY_BINDING]>, targetCountryCode: string) => Promise<SponsorshipFinalAnswerBinding | undefined>
   finalizeSelectedJob?: (client: PoolClient) => Promise<TurnEngineCompletionGateResult>
 }>): TurnEngineTerminalGuard | undefined {
   if (!input.enabled) return undefined
-  return async (client, terminal: AtomicTurnCompletionInput & Readonly<{ response: string }>, admission) => {
+  const guard: TurnEngineTerminalGuard = async (client, terminal, admission) => {
+    if (!terminal.owner || terminal.owner.kind !== "turn" || terminal.owner.taskId !== terminal.owner.rootTaskId) return {
+      ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "The terminal owner fence is unavailable.",
+    }
     const native = await input.nativeVerification.checkTerminal(client, terminal)
     if (native.denial) return native.denial
-    const graph = input.checkRootGraph ? await input.checkRootGraph(client, native.nativeVerificationPassed, admission) : undefined
+    const expectedBinding = Reflect.get(terminal, TASK_GRAPH_FINAL_SUMMARY_BINDING) as { sponsorshipFinalAnswer?: unknown } | undefined
+    let country: ReturnType<typeof resolveRootTaskSponsorshipTargetCountry> = { status: "absent" }
+    const hasPersistedTurnInput = Object.hasOwn(terminal, "persistedTurnInput")
+    if (hasPersistedTurnInput) country = resolveRootTaskSponsorshipTargetCountry(terminal.persistedTurnInput)
+    else if (input.readSponsorshipFinalAnswer || expectedBinding?.sponsorshipFinalAnswer !== undefined) {
+      let persisted
+      try {
+        persisted = await client.query(`SELECT turn."input" FROM "agent_turns" AS turn
+          JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+          WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $4
+            AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6 AND turn."status" = 'in_progress' FOR SHARE OF turn`,
+        [terminal.owner.turnId, terminal.owner.sessionId, terminal.owner.userId, terminal.owner.rootTaskId, terminal.owner.ownerId, terminal.owner.leaseVersion])
+      } catch { persisted = undefined }
+      if (!persisted || persisted.rows.length !== 1) return { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "The current Turn objective could not be verified." }
+      country = resolveRootTaskSponsorshipTargetCountry(persisted.rows[0]?.input)
+    }
+    if (country.status === "invalid" || (input.readSponsorshipFinalAnswer && country.status !== "valid")) return {
+      ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "The persisted sponsorship target is invalid or no longer matches this candidate.",
+    }
+    if (country.status === "absent" && expectedBinding?.sponsorshipFinalAnswer !== undefined) return {
+      ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "The persisted sponsorship objective no longer matches the candidate answer.",
+    }
+    let graph = input.checkRootGraph ? await input.checkRootGraph(client, native.nativeVerificationPassed, admission) : undefined
     if (input.checkRootGraph && !graph) return { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph completion verification is unavailable." }
     if (graph && !graph.ok) return graph
+    if (country.status === "valid") {
+      const graphBinding = graph?.[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+      if (!input.checkRootGraph || !input.readSponsorshipFinalAnswer || !graph?.ok || !graphBinding
+        || !parseSponsorshipFinalAnswerBinding(expectedBinding?.sponsorshipFinalAnswer)) return {
+        ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "A current source-bound sponsorship result is required for this objective.",
+      }
+      let current: SponsorshipFinalAnswerBinding | undefined
+      try { current = await input.readSponsorshipFinalAnswer(client, terminal.stepId, graphBinding, country.sponsorshipTargetCountry.countryCode) }
+      catch { current = undefined }
+      const bound = bindSponsorshipFinalAnswer(graphBinding, current)
+      if (!bound) return { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "The current sponsorship evidence changed or is unavailable." }
+      graph = { ...graph, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: bound }
+    }
     if (!taskGraphFinalSummaryCopiesMatch(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING], graph?.[TASK_GRAPH_FINAL_SUMMARY_BINDING], terminal.finalContent, terminal.response, terminal.finalItemId)) return {
       ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph final summary is stale or unavailable. Re-read the current graph before completing.",
     }
     return input.finalizeSelectedJob ? input.finalizeSelectedJob(client) : { ok: true }
   }
+  Object.defineProperty(guard, SPONSORSHIP_FINAL_ANSWER_TERMINAL_GUARD, { value: true })
+  return guard
 }
 
 /** Preserves the native receipt/proof gate ahead of existing root and mode-specific gates. */
@@ -109,6 +151,7 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
   interactiveDiscovery?: () => Promise<TurnEngineCompletionGateResult>
   selectedJobMode: boolean
   selectedJobCompletion?: () => Promise<TurnEngineCompletionGateResult>
+  bindSponsorshipFinalAnswer?: (stepId: string, graph: NonNullable<TurnEngineCompletionGateResult[typeof TASK_GRAPH_FINAL_SUMMARY_BINDING]>) => Promise<SponsorshipFinalAnswerBinding | undefined>
   readTaskGraphDenialCheckpoint?: (client?: Pick<PoolClient, "query" | "release">) => Promise<TaskGraphDenialCheckpoint | null>
 }>): TurnEngineCompletionGate | undefined {
   if (!input.enabled) return undefined
@@ -120,12 +163,25 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
     if (children && !children.ok) return children
     const carryGraphSummary = (result: TurnEngineCompletionGateResult) => result.ok && children?.ok && children[TASK_GRAPH_FINAL_SUMMARY_BINDING]
       ? { ...result, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: children[TASK_GRAPH_FINAL_SUMMARY_BINDING] } : result
-    if (input.interactiveDiscovery) return carryGraphSummary(await input.interactiveDiscovery())
-    if (!input.selectedJobMode && !input.selectedJobCompletion) return children ?? { ok: true }
+    const bindSponsorship = async (result: TurnEngineCompletionGateResult): Promise<TurnEngineCompletionGateResult> => {
+      if (!input.bindSponsorshipFinalAnswer || !result.ok) return result
+      const graph = result[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+      if (!graph) return { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER,
+        feedback: "A current TaskGraph summary is required for this sponsorship-aware final answer." }
+      let sponsorship: SponsorshipFinalAnswerBinding | undefined
+      try { sponsorship = await input.bindSponsorshipFinalAnswer(stepId, graph) } catch { sponsorship = undefined }
+      const bound = bindSponsorshipFinalAnswer(graph, sponsorship)
+      return bound ? { ...result, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: bound } : {
+        ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER,
+        feedback: "A current source-bound sponsorship result is unavailable. Re-read the saved listing before completing.",
+      }
+    }
+    if (input.interactiveDiscovery) return bindSponsorship(carryGraphSummary(await input.interactiveDiscovery()))
+    if (!input.selectedJobMode && !input.selectedJobCompletion) return bindSponsorship(children ?? { ok: true })
     const selectedJob = input.selectedJobCompletion ? await input.selectedJobCompletion() : {
       ok: false, blocker: "selected_job_draft_review_required", feedback: "Selected-job completion verification is unavailable.",
     }
-    return carryGraphSummary(selectedJob.ok ? { ok: true } : selectedJob)
+    return bindSponsorship(carryGraphSummary(selectedJob.ok ? { ok: true } : selectedJob))
   }
   if (input.nativeVerification.resetSemanticProgress) gate[RESET_NATIVE_SEMANTIC_PROGRESS] = input.nativeVerification.resetSemanticProgress
   if (input.readTaskGraphDenialCheckpoint) gate[READ_TASK_GRAPH_DENIAL_CHECKPOINT] = input.readTaskGraphDenialCheckpoint

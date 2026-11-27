@@ -18,6 +18,8 @@ import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-typ
 import { loadCanonicalTurnState, type CanonicalTurnState, type CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
 import { loadSelectedJobPreparation } from "./selected-job-preparation.js"
 import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
+import { resolveRootTaskSponsorshipTargetCountry } from "./context/root-task-objective.js"
+import { readSponsorshipFinalAnswerWithClient, readSponsorshipFinalAnswerWithPool } from "./subagents/sponsorship-final-answer-reader.js"
 import { readSelectedJobSourceDigestWithClient } from "./subagents/selected-job-artifact-context.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
@@ -130,6 +132,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const { interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled, selectedJobMode, selectedJobBatch, scheduledDraftMode, selectedJobPreparation,
       turnCoordination, nativeQuestionWaitEnabled, toolCapabilities, lifecycle, toolRuntime, rootTools, root, durableWaitPort } = setup
     let { state, runtime: batchRuntime } = prepareCanonicalSelectedJobBatchRuntime({ pool, lease, root, state: setup.state, selectedJobBatch, commandPort: options.taskGraphCommandPort, rootTasks, now })
+    const sponsorshipTarget = resolveRootTaskSponsorshipTargetCountry(state.turnInput)
+    const sponsorshipFinalAnswerRequired = sponsorshipTarget.status !== "absent"
     const selectedJobRootMode = selectedJobMode || Boolean(selectedJobBatch)
     let acceptedGraphWitness: Extract<Awaited<ReturnType<typeof selectedJobArtifactCompletionGateWithWitness>>, { ok: true }>['witness'] | undefined
     const nativeVerification = createCanonicalNativeVerificationRuntime({
@@ -147,7 +151,10 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       draftHeadReader: options.selectedJobArtifactHeadReader, sourceDigestLoader: options.selectedJobSourceDigestLoader,
     }) : undefined
     const terminalGuard = createCanonicalTurnTerminalGuard({
-      enabled: selectedJobMode || objectiveTaskGraphMode || !!rootTasks.checkCompletion || taskGraphPlanningEnabled, nativeVerification,
+      enabled: selectedJobMode || objectiveTaskGraphMode || !!rootTasks.checkCompletion || taskGraphPlanningEnabled || sponsorshipFinalAnswerRequired, nativeVerification,
+      ...(sponsorshipFinalAnswerRequired ? { readSponsorshipFinalAnswer: (client: pg.PoolClient, stepId: string, graphBinding: Parameters<typeof readSponsorshipFinalAnswerWithClient>[1]["graphBinding"], targetCountryCode: string) =>
+        readSponsorshipFinalAnswerWithClient(client, { scope: turnCoordination.executionScope(stepId), rootAttemptCount: root.attemptCount,
+          targetCountryCode, graphBinding, expectedStepStatus: "completed" }) } : {}),
       checkRootGraph: rootTasks.checkCompletion || taskGraphPlanningEnabled ? async (client, nativeVerificationPassed, terminalAdmission) => batchRuntime
         ? batchRuntime.checkTerminal(client, nativeVerificationPassed)
         : rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true,
@@ -213,12 +220,16 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     let webOwnsExecution = false
     const rootCompletionGate = scheduledPipeline.attachCompletion({ gate: createCanonicalRootCompletionGate({
-      enabled: !!rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode || objectiveTaskGraphMode || taskGraphPlanningEnabled, nativeVerification,
+      enabled: !!rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode || objectiveTaskGraphMode || taskGraphPlanningEnabled || sponsorshipFinalAnswerRequired, nativeVerification,
       onCandidateStart: () => { acceptedGraphWitness = undefined; scheduledDraftRuntime?.clear(); batchRuntime?.clear() },
       checkChildren: () => batchRuntime ? batchRuntime.checkCandidate(nativeVerification.accepted()) : rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: nativeVerification.accepted(), requireTaskGraph: objectiveTaskGraphMode }),
       readTaskGraphDenialCheckpoint: taskGraphDenialCheckpointReader({ enabled: taskGraphPlanningEnabled, rootTasks, lease, rootTaskId: root.id, now }),
       interactiveDiscovery: interactiveDiscoveryMode ? () => interactiveDiscoveryCompletionGate({ pool, lease, root, load: options.interactiveDiscoveryShortlistLoader, accept: shortlist => { acceptedDiscoveryShortlist = shortlist }, markUnavailable: () => { discoveryFailureCode = "discovery_runtime_unavailable" } }) : undefined,
       selectedJobMode, selectedJobCompletion: selectedJobCompletion ?? (scheduledDraftRuntime ? () => scheduledDraftRuntime.complete() : undefined),
+      ...(sponsorshipFinalAnswerRequired ? { bindSponsorshipFinalAnswer: async (stepId, graphBinding) => sponsorshipTarget.status === "valid"
+        ? readSponsorshipFinalAnswerWithPool(pool, { scope: turnCoordination.executionScope(stepId), rootAttemptCount: root.attemptCount,
+          targetCountryCode: sponsorshipTarget.sponsorshipTargetCountry.countryCode, graphBinding, expectedStepStatus: "streaming" })
+        : undefined } : {}),
     }), owner: scheduledPipelineOwner, onWebAccepted: () => { webOwnsExecution = true },
       candidateStore: scheduledCandidateStore, rootAttemptCount: scheduledPipelineOwner?.rootAttemptCount ?? 1,
       waitPort: durableWaitPort,
@@ -237,6 +248,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ...(recoveredFinalCandidate !== undefined ? { recoveredFinalCandidate } : {}),
       ...(state.pendingToolCalls?.length ? { toolCallRecovery: classifyToolCallRecovery(state.pendingToolCalls, (name, version) => toolRuntime.registry.resolve(name, version)) } : {}),
       completionGate: rootCompletionGate,
+      sponsorshipFinalAnswerRequired,
+      ...(sponsorshipTarget.status === "valid" ? { sponsorshipTargetCountryCode: sponsorshipTarget.sponsorshipTargetCountry.countryCode } : {}),
+      ...(sponsorshipFinalAnswerRequired ? { sponsorshipRootAttemptCount: root.attemptCount } : {}),
     })
     await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     await sessionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })

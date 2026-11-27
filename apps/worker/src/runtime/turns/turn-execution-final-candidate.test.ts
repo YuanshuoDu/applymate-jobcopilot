@@ -423,6 +423,35 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(onStepClosed).toHaveBeenCalledTimes(1)
   })
 
+  it("never falls back to freeform final text when a sponsorship binding is required", async () => {
+    const append = vi.fn(async () => ({ id: "event-1" }))
+    const updateStep = vi.fn(async () => undefined)
+    const recordFinalResponse = vi.fn(async () => ({ status: "completed" as const, finalItemId: "final-1", events: [] }))
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
+    const options = { identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1",
+      sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
+      scope: { userId: "user-1" }, goal: "Find a role", store: { updateStep, recordFinalResponse },
+      completionGate: vi.fn(async () => ({ ok: true as const })), sponsorshipFinalAnswerRequired: true,
+    } as unknown as TurnExecutionOptions
+    const onStepClosed = vi.fn()
+    const outcome = await completeWithTestDefaults({ options,
+      writer: { append } as unknown as TurnExecutionEventWriter,
+      step: { id: "step-1", ordinal: 0 },
+      output: { text: "I found one role.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model",
+        finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
+      snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      signal: new AbortController().signal, now: () => new Date(), onStepClosed,
+    })
+
+    expect(outcome).toMatchObject({ kind: "replan" })
+    expect(recordFinalResponse).not.toHaveBeenCalled()
+    expect(updateStep).toHaveBeenCalledWith(expect.objectContaining({ stepId: "step-1", status: "completed" }))
+    expect(append).toHaveBeenCalledWith("final.rejected", "step-1", null, expect.objectContaining({
+      blocker: "task_graph_verification_unverified",
+    }), "final-rejected:step-1:sponsorship-binding-required")
+    expect(onStepClosed).toHaveBeenCalledOnce()
+  })
+
   it.each([
     ["a child identity", { identity: { kind: "task", taskId: "child-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", attemptCount: 1 } }],
     ["no visible evidence reader", { tools: [{ name: "agent.plan", version: "1" }] }],

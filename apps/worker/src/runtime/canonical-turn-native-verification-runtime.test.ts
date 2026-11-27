@@ -18,7 +18,8 @@ import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskGraphDenialCheckpointFromDecis
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
 import { assertSessionTerminalAdmission } from "./session-gate.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
-import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
+import { bindSponsorshipFinalAnswer, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
+import { SPONSORSHIP_FINAL_ANSWER_SCHEMA, type SponsorshipFinalAnswerBinding } from "./subagents/sponsorship-final-answer-contract.js"
 import { buildGroundedTaskGraphFinalResponse } from "./subagents/task-graph-final-response.js"
 import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
@@ -40,7 +41,7 @@ const witness: NativeVerificationRootGoalWitness = {
   criteriaDigest: "c".repeat(64), evidencePacketDigest: "d".repeat(64), reportDigest: "e".repeat(64),
 }
 const waitPort: DurableWaitPort = { wait: vi.fn(async () => { throw new Error("unexpected wait") }) }
-const terminalInput = { stepId: "step-1", finalContent: { text: candidate }, response: candidate } as unknown as Parameters<TurnEngineTerminalGuard>[1]
+const terminalInput = { owner, stepId: "step-1", finalContent: { text: candidate }, response: candidate } as unknown as Parameters<TurnEngineTerminalGuard>[1]
 
 function graphSummaryBinding(graphRevision: number, jobId: string): TaskGraphFinalSummaryBinding {
   return {
@@ -80,8 +81,12 @@ function graphFollowUpSummaryBinding(graphRevision: number): TaskGraphFinalSumma
 }
 
 type FinalSummaryTerminal = Readonly<{
+  owner: typeof owner
   stepId: string
   finalItemId: string
+  stepCount: number
+  toolCallCount: number
+  usage: { inputTokens: number; outputTokens: number; estimatedCostUsd: number }
   finalContent: { text: string; final: { schemaVersion: string; response: string; summary: string }; taskGraphSources: NonNullable<ReturnType<typeof buildTaskGraphFinalSourceManifest>> }
   response: string
   readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]: ReturnType<typeof graphSummaryBinding>
@@ -92,8 +97,16 @@ function finalSummaryTerminal(binding: ReturnType<typeof graphSummaryBinding>, r
   const finalItemId = "final-item"
   const taskGraphSources = buildTaskGraphFinalSourceManifest(binding, finalItemId)
   if (!taskGraphSources) throw new Error("Expected a public source manifest")
-  return { stepId: "step-1", finalItemId, finalContent: { text: response, final, taskGraphSources }, response: JSON.stringify(final),
+  return { owner, stepId: "step-1", finalItemId, stepCount: 1, toolCallCount: 0,
+    usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+    finalContent: { text: response, final, taskGraphSources }, response: JSON.stringify(final),
     [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
+}
+const sponsorshipTurnInput = { goal: "Find roles", intent: { kind: "objective_task_graph_execution", version: 1 },
+  sponsorshipTargetCountry: { schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1", countryCode: "IE" } }
+function sponsorshipProjection(overrides: Partial<SponsorshipFinalAnswerBinding> = {}): SponsorshipFinalAnswerBinding {
+  return { schemaVersion: SPONSORSHIP_FINAL_ANSWER_SCHEMA, rootTaskId: "root-1", rootAttemptCount: 3, candidateStepId: "step-1",
+    targetCountryCode: "IE", outcomes: [], ...overrides }
 }
 
 function coordination() {
@@ -358,6 +371,36 @@ describe("canonical native verification runtime composition", () => {
     expect(gate).toBeDefined()
     gate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
     expect(reset).toHaveBeenCalledOnce()
+  })
+
+  it("binds country-scoped completion only to a closed source-bound projection", async () => {
+    const graph = graphSummaryBinding(1, "job-1")
+    const sponsorship: SponsorshipFinalAnswerBinding = { schemaVersion: SPONSORSHIP_FINAL_ANSWER_SCHEMA,
+      rootTaskId: "root-1", rootAttemptCount: 3, candidateStepId: "step-1", targetCountryCode: "IE", outcomes: [] }
+    const bind = vi.fn(async (_stepId: string, _graph: TaskGraphFinalSummaryBinding) => sponsorship)
+    const gate = createCanonicalRootCompletionGate({ enabled: true,
+      nativeVerification: { checkCompletion: async () => null, accepted: () => false }, onCandidateStart: vi.fn(),
+      checkChildren: () => ({ ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: graph }), selectedJobMode: false,
+      bindSponsorshipFinalAnswer: bind,
+    })
+    if (!gate) throw new Error("root gate was not enabled")
+    const result = await gate({ identity: owner, scope: { userId: owner.userId }, rootTaskId: owner.rootTaskId,
+      stepId: "step-1", candidateText: candidate, signal: new AbortController().signal, now: new Date() })
+    expect(result).toMatchObject({ ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: { sponsorshipFinalAnswer: sponsorship } })
+    expect(bind).toHaveBeenCalledWith("step-1", graph)
+  })
+
+  it("denies sponsorship completion when a graph binding is missing", async () => {
+    const gate = createCanonicalRootCompletionGate({ enabled: true,
+      nativeVerification: { checkCompletion: async () => null, accepted: () => false }, onCandidateStart: vi.fn(),
+      checkChildren: () => ({ ok: true }), selectedJobMode: false,
+      bindSponsorshipFinalAnswer: vi.fn(async () => ({ schemaVersion: SPONSORSHIP_FINAL_ANSWER_SCHEMA,
+        rootTaskId: "root-1", rootAttemptCount: 3, candidateStepId: "step-1", targetCountryCode: "IE", outcomes: [] })),
+    })
+    if (!gate) throw new Error("root gate was not enabled")
+    await expect(gate({ identity: owner, scope: { userId: owner.userId }, rootTaskId: owner.rootTaskId,
+      stepId: "step-1", candidateText: candidate, signal: new AbortController().signal, now: new Date() }))
+      .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
   })
 
   it("reads a fresh owner-bound TaskGraph checkpoint without invoking native verification", async () => {
@@ -896,6 +939,37 @@ describe("canonical native verification runtime composition", () => {
     if (!matchingGuard) throw new Error("terminal guard was not enabled")
     await expect(matchingGuard(client, terminal as unknown as Parameters<TurnEngineTerminalGuard>[1])).resolves.toEqual({ ok: true })
     expect(finalizeSelectedJob).toHaveBeenCalledOnce()
+  })
+
+  it("requires a current graph and an exact sponsorship reread for country-scoped terminal completion", async () => {
+    const source = sponsorshipProjection()
+    const base = graphSummaryBinding(1, "job-1")
+    const expected = bindSponsorshipFinalAnswer(base, source)
+    if (!expected) throw new Error("Expected a bound sponsorship final answer")
+    const terminal = finalSummaryTerminal(expected, buildGroundedTaskGraphFinalResponse(expected))
+    const terminalInput = terminal as unknown as Parameters<TurnEngineTerminalGuard>[1]
+    const query = vi.fn(async () => ({ rows: [{ input: sponsorshipTurnInput }] }))
+    const client = { query } as unknown as PoolClient
+    const nativeVerification = { checkTerminal: vi.fn(async () => ({ nativeVerificationPassed: true })) }
+    const noGraph = createCanonicalTurnTerminalGuard({ enabled: true, nativeVerification })
+    if (!noGraph) throw new Error("terminal guard was not enabled")
+    await expect(noGraph(client, terminalInput)).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    const absentBindings = { ...terminalInput, persistedTurnInput: sponsorshipTurnInput }
+    await expect(noGraph(client, absentBindings)).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+
+    const readCurrent = vi.fn(async () => source)
+    const checkRootGraph = vi.fn(async () => ({ ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: base }))
+    const guard = createCanonicalTurnTerminalGuard({ enabled: true, nativeVerification, checkRootGraph,
+      readSponsorshipFinalAnswer: readCurrent })
+    if (!guard) throw new Error("terminal guard was not enabled")
+    await expect(guard(client, terminalInput)).resolves.toEqual({ ok: true })
+    expect(readCurrent).toHaveBeenCalledWith(client, "step-1", base, "IE")
+
+    const drifted = sponsorshipProjection({ rootAttemptCount: 4 })
+    const staleGuard = createCanonicalTurnTerminalGuard({ enabled: true, nativeVerification, checkRootGraph,
+      readSponsorshipFinalAnswer: vi.fn(async () => drifted) })
+    if (!staleGuard) throw new Error("terminal guard was not enabled")
+    await expect(staleGuard(client, terminalInput)).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
   })
 
   it("rejects a bound terminal whose serialized summary copies differ", async () => {
