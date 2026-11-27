@@ -50,6 +50,8 @@ export {
   sameVerifiedShortlistSelectionBinding,
 } from './verified-shortlist-selection.js'
 export type { VerifiedShortlistSelectionBinding, VerifiedShortlistSourceIdentity } from './verified-shortlist-selection.js'
+export { parseSelectedJobBatchGraph } from './selected-job-batch-graph.js'
+export type { SelectedJobBatchGraphNode, SelectedJobBatchGraphPair, SelectedJobBatchGraphSlot } from './selected-job-batch-graph.js'
 export {
   isSelectedJobBatchTemplateId,
   SELECTED_JOB_BATCH_SLOT_IDS,

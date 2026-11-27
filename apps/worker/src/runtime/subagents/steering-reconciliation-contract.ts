@@ -1,20 +1,22 @@
 import { Buffer } from "node:buffer"
-import { createHash } from "node:crypto"
 import { normalizeRootPlanCriteria } from "./root-plan-criteria.js"
+import { parseTaskGraphFailedBranchReconciliationReceipt, taskGraphFailedBranchReconciliationOperationKey,
+  TASK_GRAPH_FAILED_BRANCH_RECONCILIATION_SCHEMA_VERSION } from "@jobcopilot/agent-protocol/task-graph-failed-branch-reconciliation"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 import { parseTaskGraphSupersessionRelation, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import { parseTaskGraphBranchRepairRelation, TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, type TaskGraphBranchRepairRelation } from "./task-graph-pg-branch-repair-relation.js"
-import { parseTaskGraphFailedBranchRepairRelation, TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
-  type TaskGraphFailedBranchRepairRelation } from "./task-graph-pg-failed-branch-relation.js"
+import type { TaskGraphFailedBranchRepairRelation } from "./task-graph-pg-failed-branch-relation.js"
 import { parseTaskGraphOperationalFailedBranchRelation, TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION,
   type TaskGraphOperationalFailedBranchRelation } from "./task-graph-pg-operational-failed-branch-relation.js"
 import { parseTaskGraphBranchReplacement, type TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 import { parseTaskGraphOperationalFailureReplacement, type TaskGraphOperationalFailureReplacement } from "../planning/task-graph-operational-failure-replacement.js"
+import { taskGraphProtocolCodecs } from "./task-graph-receipt-keys.js"
+
 export const STEERING_RECONCILIATION_EVENT_TYPE = "agent.plan.reconciliation" as const
 export const STEERING_RECONCILIATION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v1" as const
 export const STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v2" as const
 export const STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v3" as const
-export const STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v4" as const
+export const STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION = TASK_GRAPH_FAILED_BRANCH_RECONCILIATION_SCHEMA_VERSION
 export const STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v5" as const
 export const STEERING_RECONCILIATION_BLOCKER = "steering_reconciliation_pending" as const
 export const STEERING_RECONCILIATION_FEEDBACK = "Accepted user steering must be reconciled against the current TaskGraph before completion. Review current input and plan, then use agent.reconcile to keep the current revision or agent.plan to revise it." as const
@@ -124,8 +126,8 @@ export function steeringReconciliationIdempotencyKey(scope: TaskGraphExecutionSc
 }
 export function steeringReconciliationDurableIdempotencyKey(scope: SteeringReconciliationDurableScope, stepId: string, callId: string): string | null {
   if (!validSteeringReconciliationDurableScope(scope, stepId) || !steeringReconciliationId(callId)) return null
-  const identity = JSON.stringify([scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, stepId, callId])
-  return `agent.plan.reconciliation:sha256:${createHash("sha256").update(identity, "utf8").digest("hex")}`
+  return taskGraphFailedBranchReconciliationOperationKey({ userId: scope.userId, sessionId: scope.sessionId,
+    turnId: scope.turnId, rootTaskId: scope.rootTaskId, stepId }, callId, taskGraphProtocolCodecs)
 }
 function validSteeringReconciliationToolCallIdentity(event: Row, item: Row, scope: SteeringReconciliationDurableScope, stepId: string,
   decision: "keep" | "revise", expectedRevision: number, replaceUnstartedNodeKey?: string, replaceBranch?: TaskGraphBranchReplacement,
@@ -194,6 +196,12 @@ export function validHistoricalFailedBranchReplacementToolCall(event: Row, item:
 export function parseSteeringReconciliationReceipt(value: unknown, expected?: SteeringReconciliationScope): SteeringReconciliationReceipt | null {
   try {
     const row = record(value)
+    if (row?.schemaVersion === STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION) {
+      if (expected && !validSteeringReconciliationScope(expected)) return null
+      const sharedExpected = expected ? { userId: expected.userId, sessionId: expected.sessionId, turnId: expected.turnId,
+        rootTaskId: expected.rootTaskId, ...(expected.stepId === undefined ? {} : { stepId: expected.stepId }) } : undefined
+      return parseTaskGraphFailedBranchReconciliationReceipt(value, taskGraphProtocolCodecs, sharedExpected) as SteeringReconciliationReceipt | null
+    }
     const baseKeys = ["schemaVersion", "sessionId", "turnId", "rootTaskId", "stepId", "decision", "observedRevision", "resultingRevision", "steerInputIds", "inputCheckpoint"]
     if (!row || !steeringReconciliationId(row.sessionId)
       || !steeringReconciliationId(row.turnId) || !steeringReconciliationId(row.rootTaskId) || !steeringReconciliationId(row.stepId)
@@ -204,8 +212,6 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
       ? parseTaskGraphSupersessionRelation(row.supersession) : null
     const branchRepair = row.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
       ? parseTaskGraphBranchRepairRelation(row.branchRepair) : null
-    const failedBranch = row.schemaVersion === STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION
-      ? parseTaskGraphFailedBranchRepairRelation(row.failedBranch) : null
     const operationalFailure = row.schemaVersion === STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION
       ? parseTaskGraphOperationalFailedBranchRelation(row.operationalFailure) : null
     if (row.schemaVersion === STEERING_RECONCILIATION_SCHEMA_VERSION) {
@@ -218,10 +224,6 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
       if (!exact(row, [...baseKeys, "branchRepair"]) || row.decision !== "revise" || !branchRepair
         || branchRepair.observedRevision !== row.observedRevision || branchRepair.resultingRevision !== row.resultingRevision
         || branchRepair.agentPlanCall.stepId !== row.stepId) return null
-    } else if (row.schemaVersion === STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION) {
-      if (!exact(row, [...baseKeys, "failedBranch"]) || row.decision !== "revise" || !failedBranch
-        || failedBranch.graphRootTaskId !== row.rootTaskId || failedBranch.observedRevision !== row.observedRevision
-        || failedBranch.resultingRevision !== row.resultingRevision || failedBranch.agentPlanCall.stepId !== row.stepId) return null
     } else if (row.schemaVersion === STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION) {
       if (!exact(row, [...baseKeys, "operationalFailure"]) || row.decision !== "revise" || !operationalFailure
         || operationalFailure.graphRootTaskId !== row.rootTaskId || operationalFailure.observedRevision !== row.observedRevision
@@ -229,7 +231,6 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
     } else return null
     const inputIds = row.steerInputIds as unknown[]
     const allowsEmptyCheckpoint = row.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION && branchRepair !== null
-      || row.schemaVersion === STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION && failedBranch !== null
       || row.schemaVersion === STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION && operationalFailure !== null
     if ((inputIds.length === 0 && !allowsEmptyCheckpoint)
       || inputIds.length > STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS || !inputIds.every(steeringReconciliationId)
@@ -240,10 +241,9 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
       || expected.stepId !== undefined && row.stepId !== expected.stepId
       || supersession && supersession.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, supersession.agentPlanCall.callId)
       || branchRepair && branchRepair.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, branchRepair.agentPlanCall.callId)
-      || failedBranch && failedBranch.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, failedBranch.agentPlanCall.callId)
       || operationalFailure && operationalFailure.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, operationalFailure.agentPlanCall.callId))) return null
     const receipt = (supersession ? { ...row, supersession } : branchRepair ? { ...row, branchRepair }
-      : failedBranch ? { ...row, failedBranch } : operationalFailure ? { ...row, operationalFailure } : row) as unknown as SteeringReconciliationReceipt
+      : operationalFailure ? { ...row, operationalFailure } : row) as unknown as SteeringReconciliationReceipt
     return Buffer.byteLength(JSON.stringify(receipt), "utf8") <= MAX_BYTES ? receipt : null
   } catch { return null }
 }

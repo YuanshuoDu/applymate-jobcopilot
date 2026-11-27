@@ -93,16 +93,66 @@ describe('cognitive agenda receipt parser', () => {
     expect(parseCognitiveAgendaReceipt(receipt(false), scope)).not.toBeNull()
   })
 
-  it('accepts v2 receipts while redacting the digest and progress payload from the view', () => {
+  it('projects validated v2 requirement statuses while redacting the digest and raw progress payload', () => {
     const source = v2Receipt()
     const view = parseCognitiveAgendaReceipt(source, scope)
 
-    expect(view).toMatchObject({ schemaVersion: 'agent-harness.cognitive-agenda-receipt.v1', goalRevision: null })
+    expect(view).toMatchObject({ schemaVersion: 'agent-harness.cognitive-agenda-view.v2', goalRevision: null })
+    expect(view?.objectiveProgress).toEqual([
+      { kind: 'candidate_count_gte', minimum: 2, status: 'reported_passed', beforeStatus: 'active' },
+      { kind: 'finding_count_gte', minimum: 3, status: 'unknown', beforeStatus: 'missing' },
+    ])
     expect(view).not.toHaveProperty('objectiveProgressSnapshot')
     expect(view).not.toHaveProperty('progressDelta')
     expect(JSON.stringify(view)).not.toContain('a'.repeat(64))
-    expect(JSON.stringify(view)).not.toContain('reported_passed')
+    expect(JSON.stringify(view)).not.toContain('candidate_minimum')
+    expect(JSON.stringify(view)).not.toContain('finding_minimum')
     expect(parseCognitiveAgendaReceipt({ ...source, goalRevision: null }, scope)).toBeNull()
+  })
+
+  it('projects canonical location progress without its requirement identity or locations', () => {
+    const source = v2Receipt()
+    const location = { id: 'location_secret', kind: 'candidate_location_in', locations: ['berlin', 'dublin'], status: 'reported_passed' }
+    const value = {
+      ...source,
+      objectiveProgressSnapshot: { ...source.objectiveProgressSnapshot, requirements: [...source.objectiveProgressSnapshot.requirements, location] },
+      progressDelta: { ...source.progressDelta, requirements: [...source.progressDelta.requirements,
+        { id: 'location_secret', kind: 'candidate_location_in', beforeStatus: 'active', afterStatus: 'reported_passed' }] },
+    }
+    const view = parseCognitiveAgendaReceipt(value, scope)
+
+    expect(view?.objectiveProgress?.at(-1)).toEqual({ kind: 'candidate_location_in', status: 'reported_passed', beforeStatus: 'active' })
+    expect(JSON.stringify(view)).not.toContain('location_secret')
+    expect(JSON.stringify(view)).not.toContain('berlin')
+    expect(JSON.stringify(view)).not.toContain('dublin')
+  })
+
+  it('rejects malformed location rows as an all-or-nothing receipt', () => {
+    const source = v2Receipt()
+    const location = { id: 'location_target', kind: 'candidate_location_in', locations: ['Berlin'], status: 'active' }
+    const value = {
+      ...source,
+      objectiveProgressSnapshot: { ...source.objectiveProgressSnapshot, requirements: [...source.objectiveProgressSnapshot.requirements, location] },
+      progressDelta: { ...source.progressDelta, requirements: [...source.progressDelta.requirements,
+        { id: 'location_target', kind: 'candidate_location_in', beforeStatus: 'unknown', afterStatus: 'active' }] },
+    }
+    expect(parseCognitiveAgendaReceipt(value, scope)).toBeNull()
+  })
+
+  it('revalidates the exact normalized progress projection during timeline hydration', () => {
+    const projected = parseCognitiveAgendaReceipt(v2Receipt(), scope)
+    if (!projected) throw new Error('fixture should produce a safe projection')
+    const roundTrip = JSON.parse(JSON.stringify(projected)) as unknown
+    expect(parseCognitiveAgendaReceipt(roundTrip, scope)).toEqual(projected)
+    expect(parseCognitiveAgendaReceipt({ ...projected, extra: 'private' }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...projected, objectiveProgress: [{ kind: 'candidate_count_gte', minimum: 2,
+      status: 'reported_passed', id: 'forged' }] }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...projected, objectiveProgress: [{ kind: 'candidate_count_gte', minimum: 2,
+      status: 'reported_passed', beforeStatus: 'reported_passed' }] }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...projected, planRevision: null, objectiveProgress: [{ kind: 'candidate_count_gte', minimum: 2,
+      status: 'reported_passed' }] }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...projected, planRevision: null, objectiveProgress: [{ kind: 'candidate_count_gte', minimum: 2,
+      status: 'unknown', beforeStatus: 'active' }] }, scope)).toBeNull()
   })
 
   it('accepts unavailable v2 progress only in the Worker canonical shapes', () => {
@@ -119,7 +169,9 @@ describe('cognitive agenda receipt parser', () => {
         requirements: [],
       },
     }
-    expect(parseCognitiveAgendaReceipt(withoutSnapshot, scope)).not.toBeNull()
+    const empty = parseCognitiveAgendaReceipt(withoutSnapshot, scope)
+    expect(empty?.schemaVersion).toBe('agent-harness.cognitive-agenda-receipt.v1')
+    expect(empty).not.toHaveProperty('objectiveProgress')
     expect(parseCognitiveAgendaReceipt({ ...withoutSnapshot, progressDelta: value.progressDelta }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({
       ...withoutSnapshot,

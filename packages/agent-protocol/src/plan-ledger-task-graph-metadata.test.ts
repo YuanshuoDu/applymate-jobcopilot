@@ -270,6 +270,50 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
     })).toBe(false)
   })
 
+  it("accepts all three typed multi-Scout selector forms and strips their private metadata", () => {
+    const analyst = {
+      ...base, key: "analyst", templateId: "analyst", dependsOn: ["scout-z", "scout-a", "scout-m"],
+      verificationDisposition: "typed",
+      verification: {
+        schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "analyst",
+        criteria: [
+          { id: "union-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-z", "scout-a"] } },
+          { id: "union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-m"], minimumPercent: 75 } },
+          { id: "each-source", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-m", "scout-z"], minimumPercent: 100 } },
+        ],
+      },
+    }
+    const projected = parsePersistedTaskGraphNode(analyst)
+    expect(projected).toEqual({
+      key: "analyst", templateId: "analyst", goal: analyst.goal, successCriteria: analyst.successCriteria,
+      dependsOn: analyst.dependsOn, depth: analyst.depth, taskId: analyst.taskId,
+    })
+    expect(JSON.stringify(projected)).not.toMatch(/verification|findings_from_scout_union|minimumPercent/)
+
+    const invalid = [
+      { ...analyst, verification: { ...analyst.verification, role: "scout" } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "duplicate", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-z", "scout-z"] } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "too-few", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-z"] } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "low", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-z", "scout-a"], minimumPercent: 0 } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "high", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-z", "scout-a"], minimumPercent: 101 } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "fraction", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-z", "scout-a"], minimumPercent: 75.5 } },
+      ] } },
+      { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "extra", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-z", "scout-a"], extra: true } },
+      ] } },
+    ]
+    for (const node of invalid) expect(parsePersistedTaskGraphNode(node)).toBeNull()
+  })
+
   it("accepts Worker repair identifier order and partial criterion sets without deciding their lineage", () => {
     const outOfOrderReport = {
       ...report, criteria: [

@@ -1,6 +1,27 @@
 import { describe, expect, it } from "vitest"
 
+import { DEPENDENCY_WAIT_BATCH_REJECTION, DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY, DEPENDENCY_WAIT_BATCH_REJECTION_MARKER } from "./dependency-wait-batch-rejection.js"
+import { classifyToolCallRecovery } from "./canonical-runtime-tool-recovery.js"
 import { restoreToolCallState } from "./persisted-tool-call-state.js"
+
+const rejectedContent = {
+  toolCallId: "call-rejected", toolName: "jobs.search", toolVersion: "1", input: { query: "Dublin" },
+  [DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY]: DEPENDENCY_WAIT_BATCH_REJECTION_MARKER,
+}
+function rejectedCall(status: "started" | "interrupted" | "completed") {
+  const content = status === "started" ? { ...rejectedContent } : status === "interrupted"
+    ? { ...rejectedContent, status, errorCode: "session_pause_requested" }
+    : { ...rejectedContent, status: "failed", errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code }
+  return { id: "rejected-call-item", stepId: "step-rejected", taskId: "root-rejected", type: "tool_call", status, revision: 1, content }
+}
+function rejectedEvents(): Array<Record<string, unknown>> {
+  return [
+    { id: "rejected-start", idempotencyKey: "rejected-start-key", type: "tool_call.started", itemId: "rejected-call-item", correlationId: "call-rejected", taskId: "root-rejected",
+      payload: null },
+    { id: "rejected-failed", idempotencyKey: "rejected-failed-key", type: "tool_call.failed", itemId: "rejected-call-item", correlationId: "call-rejected", taskId: "root-rejected",
+      payload: { toolCallId: "call-rejected", toolName: "jobs.search", status: "failed", errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code, taskId: "root-rejected" } },
+  ]
+}
 
 function legacyFailure(phase: "failed" | "cancelled" = "failed") {
   const callId = "call-legacy", taskId = "task-legacy", digest = "a".repeat(24), errorCode = phase === "failed" ? "tool_execution_failed" : "cancelled"
@@ -21,6 +42,72 @@ function legacyFailure(phase: "failed" | "cancelled" = "failed") {
 }
 
 describe("restoreToolCallState", () => {
+  it("turns an internally marked started item into a reconcile receipt before the started event exists", () => {
+    const restored = restoreToolCallState([rejectedCall("started")], [])
+    expect(restored.pending[0]?.durableResult).toEqual({
+      id: "call-rejected", toolName: "jobs.search", toolVersion: "1", status: "failed",
+      output: DEPENDENCY_WAIT_BATCH_REJECTION, errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code,
+    })
+    const classified = classifyToolCallRecovery(restored.pending, () => { throw new Error("must not replay") })
+    expect(classified[0]?.action).toBe("reconcile")
+  })
+
+  it("reconstructs the fixed output from a failed event before its result item exists", () => {
+    const restored = restoreToolCallState([rejectedCall("completed")], rejectedEvents())
+    expect(restored.pending[0]?.durableResult).toMatchObject({
+      status: "failed", output: DEPENDENCY_WAIT_BATCH_REJECTION, errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code,
+    })
+    expect(classifyToolCallRecovery(restored.pending, () => { throw new Error("must not replay") })[0]?.action).toBe("reconcile")
+  })
+
+  it("accepts recovery-written failures with no original started event", () => {
+    const events = rejectedEvents().slice(1)
+    events.push({ id: "recovered-failed", idempotencyKey: "recovered-failed-key", type: "tool_call.failed", itemId: "rejected-call-item", correlationId: "call-rejected", taskId: "root-rejected",
+      payload: { toolCallId: "call-rejected", toolName: "jobs.search", toolVersion: "1", status: "failed", errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code, taskId: "root-rejected" } })
+    const restored = restoreToolCallState([rejectedCall("completed")], events)
+    expect(restored.pending[0]?.durableResult).toMatchObject({
+      output: DEPENDENCY_WAIT_BATCH_REJECTION, errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code,
+    })
+  })
+
+  it("preserves no-dispatch recovery after the fixed pause interruption", () => {
+    const restored = restoreToolCallState([rejectedCall("interrupted")], [])
+    expect(restored.pending[0]?.durableResult).toMatchObject({
+      status: "failed", output: DEPENDENCY_WAIT_BATCH_REJECTION, errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code,
+    })
+    expect(classifyToolCallRecovery(restored.pending, () => { throw new Error("must not replay") })[0]?.action).toBe("reconcile")
+  })
+
+  it("keeps the rejection hint on a later restore with matching normal and recovery failure receipts", () => {
+    const call = rejectedCall("completed")
+    const result = { id: "rejected-result-item", stepId: "step-rejected", taskId: "root-rejected", type: "tool_result", status: "completed", revision: 1,
+      content: { toolCallId: "call-rejected", output: DEPENDENCY_WAIT_BATCH_REJECTION, errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code } }
+    const events = rejectedEvents()
+    events.push({ id: "recovered-failed", idempotencyKey: "recovered-failed-key", type: "tool_call.failed", itemId: "rejected-call-item", correlationId: "call-rejected", taskId: "root-rejected",
+      payload: { toolCallId: "call-rejected", toolName: "jobs.search", toolVersion: "1", status: "failed", errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code, taskId: "root-rejected" } })
+    const restored = restoreToolCallState([call, result], events)
+    expect(restored.pending).toEqual([])
+    expect(restored.observations[0]?.content).toMatchObject({
+      status: "failed", output: DEPENDENCY_WAIT_BATCH_REJECTION, errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code,
+    })
+  })
+
+  it("fails closed for unknown markers and marker data on a result item", () => {
+    const unknown = rejectedCall("started")
+    ;(unknown.content as Record<string, unknown>)[DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY] = "unknown-version"
+    expect(() => restoreToolCallState([unknown], [])).toThrow("tool_result_replay_uncertain")
+    const result = { type: "tool_result", content: { toolCallId: "orphan", [DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY]: DEPENDENCY_WAIT_BATCH_REJECTION_MARKER } }
+    expect(() => restoreToolCallState([result], [])).toThrow("tool_result_replay_uncertain")
+  })
+
+  it("leaves an ordinary read-only pending call on its existing replay path", () => {
+    const ordinary = { id: "ordinary-call", stepId: "step-ordinary", type: "tool_call", status: "started", revision: 0,
+      content: { toolCallId: "ordinary", toolName: "jobs.search", input: {} } }
+    const restored = restoreToolCallState([ordinary], [])
+    expect(restored.pending[0]?.durableResult).toBeUndefined()
+    expect(classifyToolCallRecovery(restored.pending, () => ({ idempotency: "read_only" }))[0]?.action).toBe("replay")
+  })
+
   it("returns an unfinished persisted call for registry-based restart recovery", () => {
     const restored = restoreToolCallState([
       { id: "call-item", stepId: "step-0", type: "tool_call", status: "started", revision: 0, content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" } } },

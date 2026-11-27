@@ -1,18 +1,20 @@
 import { Buffer } from "node:buffer"; import { createHash } from "node:crypto"; import type pg from "pg"
 import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"; import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
-import type { TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"; import type { AnalystResult } from "./role-results.js"
-import { readScheduledDraftAnalystProof } from "./scheduled-draft-candidate-analyst-proof.js"
+import { readScheduledDraftAnalystProof, type ScheduledDraftAnalystProof } from "./scheduled-draft-candidate-analyst-proof.js"
 import type { TaskGraphTaskTemplate } from "./task-graph-command-port.js"
+import { readCurrentScheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
+import { legacyWitnessMatches, makeScheduledDraftCandidateWitnessV2, parseScheduledDraftCandidateWitness,
+  type ScheduledDraftCandidate, type ScheduledDraftCandidateWitness, type ScheduledDraftCandidateWitnessV1 } from "./scheduled-draft-candidate-witness.js"
+
+export { parseScheduledDraftCandidateWitness } from "./scheduled-draft-candidate-witness.js"
+export type { ScheduledDraftCandidate, ScheduledDraftCandidateWitness } from "./scheduled-draft-candidate-witness.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
-const BINDING_VERSION = "agent-harness.v2.scheduled-draft-candidate-binding.v1" as const
 const CANONICAL_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const MAX_FINDINGS = 512
 const MAX_ANALYSTS = 8
-export type ScheduledDraftCandidate = Readonly<{ jobId: string; score: number }>
-export type ScheduledDraftCandidateWitness = Readonly<{ bindingVersion: typeof BINDING_VERSION; graphRevision: number; graphDigest: string; stableStatusDigest: string; lifecycleStatuses?: Readonly<{ writer: string; reviewer: string }>; newlyProposedNodeKeys: readonly string[]; candidate: ScheduledDraftCandidate; sourceAnalystKeys: readonly string[]; analysts: readonly Readonly<{ nodeKey: string; taskId: string; attemptCount: number; resultDigest: string; evidenceDigest: string; reportDigest: string; scouts: readonly TaskGraphVerificationDependencyBinding[] }>[] }>
 export type ScheduledDraftCandidateBinding = Readonly<{ candidate: ScheduledDraftCandidate; witness: ScheduledDraftCandidateWitness }>
 export type ScheduledDraftCandidateSelection = ScheduledDraftCandidateBinding & Readonly<{ sourceAnalystKeys: readonly string[] }>
 export type LoadedScheduledDraftCandidateBinding = Readonly<{
@@ -60,7 +62,7 @@ export async function selectVerifiedScheduledDraftCandidate(
   const expectedKeys = snapshot?.nodes.filter(node => node.templateId === "analyst" && node.verificationDisposition === "typed" && statusByKey.get(node.key) === "completed").map(node => node.key).sort(compareBytesText)
   if (!snapshot || !validRevision(graphRevision) || !validScope(scope) || !keys || !addedKeys || !stableStatusDigest
     || canonicalTaskGraphJson(keys.sort(compareBytesText)) !== canonicalTaskGraphJson(expectedKeys)) return undefined
-  const verified = [] as Array<{ result: AnalystResult; binding: ScheduledDraftCandidateWitness["analysts"][number] }>
+  const verified: ScheduledDraftAnalystProof[] = []
   for (const key of [...keys].sort(compareBytesText)) {
     const node = snapshot.nodes.find(item => item.key === key)
     const current = node && await readScheduledDraftAnalystProof(client, scope, snapshot, node)
@@ -69,11 +71,17 @@ export async function selectVerifiedScheduledDraftCandidate(
   }
   const candidate = selectTopScheduledDraftCandidate(verified.flatMap(item => item.result.findings.map(({ jobId, score }) => ({ jobId, score }))))
   if (!candidate) return undefined
-  const sourceAnalystKeys = verified.filter(item => item.result.findings.some(finding => finding.jobId === candidate.jobId && finding.score === candidate.score)).map(item => item.binding.nodeKey).sort(compareBytesText)
+  const sources = verified.filter(item => item.result.findings.some(finding => finding.jobId === candidate.jobId && finding.score === candidate.score))
+  const sourceAnalystKeys = sources.map(item => item.binding.nodeKey).sort(compareBytesText)
+  const observedDigests = sources.map(item => item.materialDigests.get(candidate.jobId))
+  if (!observedDigests.length || observedDigests.some(value => !value || value !== observedDigests[0])) return undefined
+  const currentMaterialDigest = await readCurrentScheduledDraftJobMaterialDigest(client, scope.userId, candidate.jobId)
+  if (!currentMaterialDigest || currentMaterialDigest !== observedDigests[0]) return undefined
   const lifecycle = lifecycleStatuses(snapshot, statusByKey)
   if (snapshot.nodes.some(node => isWriterNode(node) || isReviewerNode(node)) && (!lifecycle || !validStatus(lifecycle.writer) || !validStatus(lifecycle.reviewer))) return undefined
   if (verified.some(item => addedKeys.includes(item.binding.nodeKey) || item.binding.scouts.some(scout => addedKeys.includes(scout.nodeKey)))) return undefined
-  return { candidate, sourceAnalystKeys, witness: makeWitness(graphRevision, snapshot, stableStatusDigest, candidate, verified.map(item => item.binding), sourceAnalystKeys, lifecycle, addedKeys) }
+  const core = makeWitnessCore(graphRevision, snapshot, stableStatusDigest, candidate, verified.map(item => item.binding), sourceAnalystKeys, lifecycle, addedKeys)
+  return { candidate, sourceAnalystKeys, witness: makeScheduledDraftCandidateWitnessV2({ ...core, jobMaterialDigest: currentMaterialDigest }) }
 }
 
 export async function readScheduledDraftCandidateBinding(client: Queryable, scope: GraphIdentityScope): Promise<LoadedScheduledDraftCandidateBinding> {
@@ -140,7 +148,7 @@ export async function validateScheduledDraftCandidateWitness(
   if (!lifecycleStatusesValid(witness, snapshot, currentStatuses)) return false
   const currentPool = snapshot.nodes.filter(node => node.templateId === "analyst" && node.verificationDisposition === "typed" && rows.get(node.taskId)!.status === "completed").map(node => node.key).sort(compareBytesText)
   if (currentStatusDigest !== witness.stableStatusDigest || canonicalTaskGraphJson(currentPool) !== canonicalTaskGraphJson(witness.analysts.map(item => item.nodeKey))) return false
-  const keys = witness.analysts.map(item => item.nodeKey), verified = [] as Array<{ result: AnalystResult; binding: ScheduledDraftCandidateWitness["analysts"][number] }>
+  const keys = witness.analysts.map(item => item.nodeKey), verified: ScheduledDraftAnalystProof[] = []
   for (const key of keys) {
     const node = snapshot.nodes.find(item => item.key === key), current = node && await readScheduledDraftAnalystProof(client, scope, snapshot, node)
     if (!current) return false
@@ -149,50 +157,30 @@ export async function validateScheduledDraftCandidateWitness(
   const sourceKeys = verified.filter(item => item.result.findings.some(finding => finding.jobId === jobId && finding.score === witness.candidate.score))
     .map(item => item.binding.nodeKey).sort(compareBytesText)
   if (canonicalTaskGraphJson(sourceKeys) !== canonicalTaskGraphJson(witness.sourceAnalystKeys)) return false
-  const fresh = makeWitness(witness.graphRevision, snapshot, currentStatusDigest, witness.candidate, verified.map(item => item.binding), sourceKeys, witness.lifecycleStatuses, witness.newlyProposedNodeKeys)
-  if (canonicalTaskGraphJson(fresh) !== canonicalTaskGraphJson(witness)) return false
+  const core = makeWitnessCore(witness.graphRevision, snapshot, currentStatusDigest, witness.candidate, verified.map(item => item.binding), sourceKeys,
+    witness.lifecycleStatuses, witness.newlyProposedNodeKeys)
+  if (witness.bindingVersion === "agent-harness.v2.scheduled-draft-candidate-binding.v1") {
+    if (!legacyWitnessMatches(witness, core)) return false
+  } else {
+    const sourceDigests = verified.filter(item => sourceKeys.includes(item.binding.nodeKey)).map(item => item.materialDigests.get(jobId))
+    if (!sourceDigests.length || sourceDigests.some(value => value !== witness.jobMaterialDigest)) return false
+    const currentDigest = await readCurrentScheduledDraftJobMaterialDigest(client, scope.userId, jobId)
+    if (!currentDigest || currentDigest !== witness.jobMaterialDigest) return false
+    const fresh = makeScheduledDraftCandidateWitnessV2({ ...core, jobMaterialDigest: currentDigest })
+    if (canonicalTaskGraphJson(fresh) !== canonicalTaskGraphJson(witness)) return false
+  }
   const winner = selectTopScheduledDraftCandidate(verified.flatMap(item => item.result.findings.map(({ jobId, score }) => ({ jobId, score }))))
   return winner?.jobId === jobId && winner.score === witness.candidate.score
 }
 
-export function parseScheduledDraftCandidateWitness(value: unknown): ScheduledDraftCandidateWitness | undefined {
-  const row = exactRecord(value, "analysts,bindingVersion,candidate,graphDigest,graphRevision,lifecycleStatuses,newlyProposedNodeKeys,sourceAnalystKeys,stableStatusDigest")
-    ?? exactRecord(value, "analysts,bindingVersion,candidate,graphDigest,graphRevision,newlyProposedNodeKeys,sourceAnalystKeys,stableStatusDigest"), candidate = row && parseCandidate(row.candidate), proposedKeys = row?.newlyProposedNodeKeys
-  if (!row || !candidate || row.bindingVersion !== BINDING_VERSION || !validRevision(row.graphRevision) || !isDigest(row.graphDigest) || !isDigest(row.stableStatusDigest)
-    || !dense(row.analysts, MAX_ANALYSTS) || !row.analysts.length || !dense(row.sourceAnalystKeys, MAX_ANALYSTS) || !row.sourceAnalystKeys.length
-    || !dense(proposedKeys, 8) || proposedKeys.some((key, index) => !canonicalBoundId(key) || index > 0 && compareBytesText(proposedKeys[index - 1] as string, key) >= 0)) return undefined
-  const analysts = [] as ScheduledDraftCandidateWitness["analysts"][number][]
-  let previous: string | undefined
-  for (const entry of row.analysts) {
-    const item = exactRecord(entry, "attemptCount,evidenceDigest,nodeKey,reportDigest,resultDigest,scouts,taskId")
-    if (!item || !canonicalBoundId(item.nodeKey) || !canonicalBoundId(item.taskId) || !validAttempt(item.attemptCount)
-      || !isDigest(item.resultDigest) || !isDigest(item.evidenceDigest) || !isDigest(item.reportDigest)
-      || !dense(item.scouts, MAX_ANALYSTS) || !item.scouts.length || previous !== undefined && compareBytesText(previous, item.nodeKey) >= 0) return undefined
-    const scouts = item.scouts.map(parseTaskBinding)
-    if (scouts.some(binding => !binding) || !sortedUniqueBindings(scouts as TaskGraphVerificationDependencyBinding[])) return undefined
-    previous = item.nodeKey
-    analysts.push({ nodeKey: item.nodeKey, taskId: item.taskId, attemptCount: item.attemptCount, resultDigest: item.resultDigest,
-      evidenceDigest: item.evidenceDigest, reportDigest: item.reportDigest, scouts: scouts as TaskGraphVerificationDependencyBinding[] })
-  }
-  const sourceAnalystKeys = row.sourceAnalystKeys
-  if (!sourceAnalystKeys.every(canonicalBoundId) || sourceAnalystKeys.some((key, index) => index > 0 && compareBytesText(sourceAnalystKeys[index - 1] as string, key as string) >= 0)
-    || sourceAnalystKeys.some(key => !analysts.some(item => item.nodeKey === key))) return undefined
-  const lifecycle = row.lifecycleStatuses === undefined ? undefined : parseLifecycleStatuses(row.lifecycleStatuses)
-  if (row.lifecycleStatuses !== undefined && !lifecycle) return undefined
-  const newlyProposedNodeKeys = proposedKeys as string[]
-  if (analysts.some(item => newlyProposedNodeKeys.includes(item.nodeKey) || item.scouts.some(scout => newlyProposedNodeKeys.includes(scout.nodeKey)))) return undefined
-  return { bindingVersion: BINDING_VERSION, graphRevision: row.graphRevision, graphDigest: row.graphDigest, stableStatusDigest: row.stableStatusDigest, ...(lifecycle ? { lifecycleStatuses: lifecycle } : {}), newlyProposedNodeKeys, candidate, sourceAnalystKeys: sourceAnalystKeys as string[], analysts }
-}
-
-function makeWitness(graphRevision: number, snapshot: TaskGraphSnapshot, stableStatusDigest: string, candidate: ScheduledDraftCandidate, analysts: ScheduledDraftCandidateWitness["analysts"], sourceAnalystKeys: readonly string[], lifecycle?: ScheduledDraftCandidateWitness["lifecycleStatuses"], newlyProposedNodeKeys: readonly string[] = []): ScheduledDraftCandidateWitness { const added = [...newlyProposedNodeKeys].sort(compareBytesText); return { bindingVersion: BINDING_VERSION, graphRevision, graphDigest: structuralGraphDigest(snapshot, added), stableStatusDigest, ...(lifecycle ? { lifecycleStatuses: lifecycle } : {}), newlyProposedNodeKeys: added, candidate, sourceAnalystKeys: [...sourceAnalystKeys], analysts: [...analysts].sort((a, b) => compareBytesText(a.nodeKey, b.nodeKey)).map(item => ({ ...item, scouts: [...item.scouts].sort((a, b) => compareBytesText(a.nodeKey, b.nodeKey)) })) } }
-function parseCandidate(value: unknown): ScheduledDraftCandidate | undefined { const row = exactRecord(value, "jobId,score"); return row && canonicalJobId(row.jobId) && typeof row.score === "number" && Number.isFinite(row.score) && row.score >= 0 && row.score <= 10 ? { jobId: row.jobId, score: row.score } : undefined }
-function parseTaskBinding(value: unknown): TaskGraphVerificationDependencyBinding | undefined {
-  const row = exactRecord(value, "attemptCount,evidenceDigest,nodeDigest,nodeKey,reportDigest,resultDigest,taskId")
-  return row && canonicalBoundId(row.nodeKey) && canonicalBoundId(row.taskId) && validAttempt(row.attemptCount) && isDigest(row.nodeDigest) && isDigest(row.resultDigest) && isDigest(row.evidenceDigest) && isDigest(row.reportDigest)
-    ? { nodeKey: row.nodeKey, taskId: row.taskId, attemptCount: row.attemptCount, nodeDigest: row.nodeDigest, resultDigest: row.resultDigest, evidenceDigest: row.evidenceDigest, reportDigest: row.reportDigest } : undefined
-}
-function sortedUniqueBindings(values: readonly TaskGraphVerificationDependencyBinding[]): boolean {
-  return values.every((value, index) => index === 0 || compareBytesText(values[index - 1]!.nodeKey, value.nodeKey) < 0)
+function makeWitnessCore(graphRevision: number, snapshot: TaskGraphSnapshot, stableStatusDigest: string, candidate: ScheduledDraftCandidate,
+  analysts: ScheduledDraftCandidateWitness["analysts"], sourceAnalystKeys: readonly string[], lifecycle?: ScheduledDraftCandidateWitness["lifecycleStatuses"],
+  newlyProposedNodeKeys: readonly string[] = []): Omit<ScheduledDraftCandidateWitnessV1, "bindingVersion"> {
+  const added = [...newlyProposedNodeKeys].sort(compareBytesText)
+  return { graphRevision, graphDigest: structuralGraphDigest(snapshot, added), stableStatusDigest,
+    ...(lifecycle ? { lifecycleStatuses: lifecycle } : {}), newlyProposedNodeKeys: added, candidate,
+    sourceAnalystKeys: [...sourceAnalystKeys], analysts: [...analysts].sort((a, b) => compareBytesText(a.nodeKey, b.nodeKey))
+      .map(item => ({ ...item, scouts: [...item.scouts].sort((a, b) => compareBytesText(a.nodeKey, b.nodeKey)) })) }
 }
 function validAnalystKeys(values: readonly string[]): string[] | undefined {
   return Array.isArray(values) && values.length > 0 && values.length <= MAX_ANALYSTS && values.every(canonicalBoundId) && new Set(values).size === values.length ? [...values] : undefined
@@ -201,15 +189,12 @@ function validNewNodeKeys(values: readonly string[], snapshot: TaskGraphSnapshot
 function validWitnessNewKeys(witness: ScheduledDraftCandidateWitness, snapshot: TaskGraphSnapshot): boolean { const keys = validNewNodeKeys(witness.newlyProposedNodeKeys, snapshot); return Boolean(keys && canonicalTaskGraphJson(keys) === canonicalTaskGraphJson(witness.newlyProposedNodeKeys)) }
 function validScope(value: GraphIdentityScope): boolean { return [value.userId, value.sessionId, value.turnId, value.rootTaskId, value.parentTaskId].every(canonicalBoundId) && value.parentTaskId === value.rootTaskId }
 function validRevision(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 }
-function validAttempt(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 }
 function canonicalJobId(value: unknown): value is string { return typeof value === "string" && value.length <= 128 && value.trim() === value && CANONICAL_JOB_ID.test(value) }
 function canonicalBoundId(value: unknown): value is string { return canonicalJobId(value) }
-function isDigest(value: unknown): value is string { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value) }
 function digest(value: unknown): string { return createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex") }
 function structuralGraphDigest(snapshot: TaskGraphSnapshot, addedKeys: readonly string[]): string { const added = new Set(addedKeys); return digest({ ...snapshot, newlyProposedNodeKeys: addedKeys, nodes: snapshot.nodes.map(node => { if (isWriterNode(node) || isReviewerNode(node)) { const { status: _lifecycle, taskId: _mintedId, ...fields } = node as StoredTaskGraphNode & { status?: unknown }; return fields } if (added.has(node.key)) { const { taskId: _mintedId, ...fields } = node; return fields } return node }) }) }
 function statusDigest(snapshot: TaskGraphSnapshot | undefined, statuses: ReadonlyMap<string, string>, newlyProposedNodeKeys: readonly string[] = []): string | undefined { if (!snapshot || statuses.size !== snapshot.nodes.length) return undefined; const ignored = new Set(newlyProposedNodeKeys); const values = snapshot.nodes.filter(node => !isWriterNode(node) && !isReviewerNode(node) && !ignored.has(node.key)).map(node => { const status = statuses.get(node.key); return status && ["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"].includes(status) ? [node.key, status] : undefined }); return values.some(value => !value) ? undefined : digest(values) }
 function lifecycleStatuses(snapshot: TaskGraphSnapshot, statuses: ReadonlyMap<string, string>): ScheduledDraftCandidateWitness["lifecycleStatuses"] { const writer = snapshot.nodes.find(isWriterNode), reviewer = snapshot.nodes.find(isReviewerNode); return writer && reviewer ? { writer: statuses.get(writer.key) ?? "", reviewer: statuses.get(reviewer.key) ?? "" } : undefined }
-function parseLifecycleStatuses(value: unknown): ScheduledDraftCandidateWitness["lifecycleStatuses"] | undefined { const row = exactRecord(value, "reviewer,writer"); return row && validStatus(row.writer) && validStatus(row.reviewer) ? { writer: row.writer, reviewer: row.reviewer } : undefined }
 function lifecycleStatusesValid(witness: ScheduledDraftCandidateWitness, snapshot: TaskGraphSnapshot, statuses: ReadonlyMap<string, string>): boolean {
   const writer = snapshot.nodes.find(isWriterNode), reviewer = snapshot.nodes.find(isReviewerNode)
   if (!witness.lifecycleStatuses) return false

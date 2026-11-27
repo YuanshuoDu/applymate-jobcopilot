@@ -18,7 +18,7 @@ vi.mock("./task-graph-confirmed-location-completion.js", async importOriginal =>
     return Promise.resolve(locationCompletionHarness.value as Awaited<ReturnType<typeof actual.resolveTaskGraphConfirmedLocationCompletion>>)
   } }
 })
-const reconciliationHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, error: null as Error | null, calls: [] as unknown[][] }))
+const reconciliationHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, error: null as Error | null, calls: [] as unknown[][], terminalCalls: [] as unknown[][] }))
 vi.mock("../subagents/steering-reconciliation-read.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../subagents/steering-reconciliation-read.js")>()
   return { ...actual, readSteeringReconciliationState: (...args: Parameters<typeof actual.readSteeringReconciliationState>) => {
@@ -26,6 +26,11 @@ vi.mock("../subagents/steering-reconciliation-read.js", async importOriginal => 
     reconciliationHarness.calls.push(args)
     if (reconciliationHarness.error) throw reconciliationHarness.error
     return Promise.resolve(reconciliationHarness.value as Awaited<ReturnType<typeof actual.readSteeringReconciliationState>>)
+  }, readSteeringReconciliationStateForTerminal: (...args: Parameters<typeof actual.readSteeringReconciliationStateForTerminal>) => {
+    if (!reconciliationHarness.enabled) return actual.readSteeringReconciliationStateForTerminal(...args)
+    reconciliationHarness.terminalCalls.push(args)
+    if (reconciliationHarness.error) throw reconciliationHarness.error
+    return Promise.resolve(reconciliationHarness.value as Awaited<ReturnType<typeof actual.readSteeringReconciliationStateForTerminal>>)
   } }
 })
 const graphLoadHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, calls: [] as unknown[][] }))
@@ -36,6 +41,22 @@ vi.mock("../subagents/task-graph-pg-state.js", async importOriginal => {
     graphLoadHarness.calls.push(args)
     return Promise.resolve(graphLoadHarness.value as Awaited<ReturnType<typeof actual.loadTaskGraph>>)
   } }
+})
+const retirementHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown, calls: [] as unknown[][] }))
+vi.mock("./task-graph-retirement-completion.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./task-graph-retirement-completion.js")>()
+  return { ...actual, readTaskGraphRetiredScouts: (...args: Parameters<typeof actual.readTaskGraphRetiredScouts>) => {
+    if (!retirementHarness.enabled) return actual.readTaskGraphRetiredScouts(...args)
+    retirementHarness.calls.push(args)
+    return Promise.resolve(retirementHarness.value as Awaited<ReturnType<typeof actual.readTaskGraphRetiredScouts>>)
+  } }
+})
+const bindingHarness = vi.hoisted(() => ({ enabled: false, value: null as unknown }))
+vi.mock("../subagents/task-graph-final-summary-binding.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../subagents/task-graph-final-summary-binding.js")>()
+  return { ...actual, buildTaskGraphFinalSummaryBinding: (...args: Parameters<typeof actual.buildTaskGraphFinalSummaryBinding>) =>
+    bindingHarness.enabled ? bindingHarness.value as ReturnType<typeof actual.buildTaskGraphFinalSummaryBinding>
+      : actual.buildTaskGraphFinalSummaryBinding(...args) }
 })
 
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
@@ -48,9 +69,10 @@ import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK,
   type SteeringReconciliationState } from "../subagents/steering-reconciliation-contract.js"
 import { OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE } from "@jobcopilot/agent-protocol"
 import { STEERING_RECONCILIATION_EVENT_TYPE } from "../subagents/steering-reconciliation-contract.js"
+import { assertSessionTerminalAdmission } from "../session-gate.js"
 import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, SCHEDULED_POST_GATE_PLAN_REQUIRED_RECOVERY } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import { buildGroundedTaskGraphFinalResponse } from "../subagents/task-graph-final-response.js"
@@ -61,8 +83,9 @@ import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from
 import { SCHEDULED_POST_GATE_PLAN_REQUIRED_FEEDBACK } from "../subagents/scheduled-post-gate-contract.js"
 
 afterEach(() => {
-  reconciliationHarness.enabled = false; reconciliationHarness.value = null; reconciliationHarness.error = null; reconciliationHarness.calls = []
+  reconciliationHarness.enabled = false; reconciliationHarness.value = null; reconciliationHarness.error = null; reconciliationHarness.calls = []; reconciliationHarness.terminalCalls = []
   graphLoadHarness.enabled = false; graphLoadHarness.value = null; graphLoadHarness.calls = []
+  retirementHarness.enabled = false; retirementHarness.value = null; retirementHarness.calls = []; bindingHarness.enabled = false; bindingHarness.value = null
   locationReaderHarness.enabled = false; locationReaderHarness.value = null; locationReaderHarness.calls = []
   locationCompletionHarness.enabled = false; locationCompletionHarness.value = null; locationCompletionHarness.calls = []
 })
@@ -688,6 +711,30 @@ describe("TaskGraph terminal verification gate", () => {
       parentLeaseOwner: "worker-1", parentAttemptCount: 1, rootTaskId: "root-1" })
   })
 
+  it("uses the terminal-only reconciliation reader only with the same admitted transaction", async () => {
+    const state: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
+      decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null, unresolvedInputs: [] }
+    graphLoadHarness.enabled = true
+    graphLoadHarness.value = { rootTaskId: "root-1", snapshot: { nodes: [] }, item: { id: "graph-item", revision: 1, content: {}, createdAt: nowValue },
+      state: { revision: 1 }, tasks: new Map(), sourceInputCheckpointByNodeKey: new Map(), sourceInputRelationByNodeKey: new Map() }
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = state
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.startsWith('SELECT session."id"') && sql.includes("pause_request")) return { rows: [{ id: "session-1" }], rowCount: 1 }
+      const isReconciliationHint = sql.includes('event."type" = $4') && params?.[3] === STEERING_RECONCILIATION_EVENT_TYPE
+      return { rows: isReconciliationHint ? [{ id: "receipt-hint" }] : [], rowCount: isReconciliationHint ? 1 : 0 }
+    }) } as never
+    const admission = await assertSessionTerminalAdmission(client, { sessionId: "session-1", userId: "user-1", turnId: "turn-1",
+      rootTaskId: "root-1", source: "user", executionMode: "canonical_task_graph" })
+
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1", false, false, admission)).resolves.toMatchObject({ ok: true })
+    expect(reconciliationHarness.terminalCalls).toHaveLength(1)
+    expect(reconciliationHarness.terminalCalls[0]?.[0]).toBe(client)
+    expect(reconciliationHarness.terminalCalls[0]?.[1]).toMatchObject({ rootTaskId: "root-1", turnLeaseOwner: "worker-1", parentAttemptCount: 1 })
+    expect(reconciliationHarness.terminalCalls[0]?.[2]).toBe(admission)
+    expect(reconciliationHarness.calls).toHaveLength(0)
+  })
+
   it("routes the typed location event through the exact reconciled cutoff and persisted Turn input", async () => {
     const state: SteeringReconciliationState = { originalInputId: null, currentRevision: 1, decisionStepId: null,
       decisionStepOrdinal: null, decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null,
@@ -765,6 +812,45 @@ describe("TaskGraph terminal verification gate", () => {
       feedback: expect.stringContaining("issue=result_applicability") })
     if (decision.ok) return
     expect(decision.feedback.length).toBeLessThanOrEqual(512)
+  })
+
+  it("fails closed if a proven retirement cannot be bound into the final summary", async () => {
+    const retired = node("old-scout", "old-task")
+    const current = node("new-scout", "new-task")
+    const loaded = { rootTaskId: "root-1", discoveryTurnEligibility: "ordinary", snapshot: { nodes: [retired, current] },
+      item: { id: taskGraphItemId("root-1"), revision: 1, content: {}, createdAt: nowValue }, state: { revision: 1 },
+      tasks: new Map([
+        [retired.taskId, { id: retired.taskId, role: "scout", taskType: "job_discovery", status: "interrupted", failureReason: "worker interrupted", attemptCount: 2, result: null }],
+        [current.taskId, { id: current.taskId, role: "scout", taskType: "job_discovery", status: "completed", failureReason: null, attemptCount: 1, result: storedResult("passed") }],
+      ]), sourceInputCheckpointByNodeKey: new Map([[retired.key, { inputThroughSequence: 9n }], [current.key, { inputThroughSequence: 10n }]]) }
+    reconciliationHarness.enabled = true
+    reconciliationHarness.value = { originalInputId: null, currentRevision: 1, decisionStepId: null, decisionStepOrdinal: null,
+      decisionStepAttempt: null, decisionInputThroughSequence: null, agendaPlanRevision: null, unresolvedInputs: [],
+      latestUserRevision: { resultingRevision: 1, stepId: "revise-step", inputThroughSequence: 10n } }
+    graphLoadHarness.enabled = true
+    graphLoadHarness.value = loaded
+    retirementHarness.enabled = true
+    retirementHarness.value = new Map([[retired.key, { nodeKey: retired.key, taskId: retired.taskId, attempt: 2,
+      interruptRequestedAt: "2026-09-24T12:00:00.000Z", receiptEventId: "retirement-event", lifecycleEventId: "interrupt-event" }]])
+    bindingHarness.enabled = true
+    bindingHarness.value = null
+    const client = { query: vi.fn(async (sql: string) => {
+      const hinted = sql.includes("to_jsonb(turn)->>'source' = 'user'")
+      return { rows: hinted ? [{ id: "reconciliation-hint" }] : [], rowCount: hinted ? 1 : 0 }
+    }) } as never
+
+    const denied = await checkTaskGraphTerminalVerification(client, graphLease, "root-1")
+    expect(reconciliationHarness.calls).toHaveLength(1)
+    expect(retirementHarness.calls).toHaveLength(1)
+    expect(denied).toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER,
+      feedback: expect.stringContaining("issue=result_applicability") })
+
+    loaded.snapshot = { nodes: [current] }
+    loaded.tasks = new Map([[current.taskId, { id: current.taskId, role: "scout", taskType: "job_discovery",
+      status: "completed", failureReason: null, attemptCount: 1, result: storedResult("passed") }]])
+    loaded.sourceInputCheckpointByNodeKey = new Map([[current.key, { inputThroughSequence: 10n }]])
+    retirementHarness.value = new Map()
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1")).resolves.toEqual({ ok: true })
   })
 
   it("fails closed when hinted reconciliation history is corrupt", async () => {

@@ -9,6 +9,7 @@ import { steeringReconciliationId, steeringReconciliationRevision, steeringRecon
 import { lockTaskGraphScope } from "./task-graph-pg-state.js"
 import { taskGraphItemId } from "./task-graph-snapshot.js"
 import { readSteeringReconciliationHistory } from "./steering-reconciliation-history.js"
+import { sessionTerminalAdmissionKindFor, type SessionTerminalAdmission } from "../session-gate.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -176,9 +177,10 @@ async function readAgenda(client: Client, scope: SteeringReconciliationScope, st
   return agenda.planRevision
 }
 
-export async function readSteeringReconciliationState(client: Client, scope: SteeringReconciliationScope): Promise<SteeringReconciliationState> {
+async function readSteeringReconciliationStateInternal(client: Client, scope: SteeringReconciliationScope, admission?: SessionTerminalAdmission): Promise<SteeringReconciliationState> {
   if (!validSteeringReconciliationScope(scope)) throw new Error("steering_reconciliation_scope_invalid")
-  await lockTaskGraphScope(client, scope, true)
+  const admissionKind = admission ? sessionTerminalAdmissionKindFor(admission, client, scope) : null
+  await lockTaskGraphScope(client, scope, admissionKind !== "derived_fill")
   const rootId = await readOriginalInputId(client, scope, scope.rootInputId)
   const candidates = readInputCandidates(client, scope, rootId)
   const graph = await client.query<Row>(`SELECT item."revision" FROM "agent_items" AS item WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4 AND item."type" = 'task_graph'`,
@@ -231,7 +233,8 @@ export async function readSteeringReconciliationState(client: Client, scope: Ste
     ...(previousCheckpoint !== null ? { lastReconciledInputThroughSequence: previousCheckpoint } : {}),
     unresolvedInputs: current.map(({ id, acceptedSequence, status, consumedByStepId, consumingOrdinal }) => ({ id, acceptedSequence, status, consumedByStepId, consumingOrdinal })) }
 }
-
+export const readSteeringReconciliationState = (client: Client, scope: SteeringReconciliationScope) => readSteeringReconciliationStateInternal(client, scope)
+export const readSteeringReconciliationStateForTerminal = (client: Client, scope: SteeringReconciliationScope, admission: SessionTerminalAdmission) => readSteeringReconciliationStateInternal(client, scope, admission)
 async function readCurrentDecisionStep(client: Client, scope: SteeringReconciliationScope): Promise<Step> {
   const result = await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds"
     FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 FOR UPDATE`,

@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto"
+import { isDeepStrictEqual } from "node:util"
 import { TurnEngineError, toRepositoryJson, type ToolCallRecovery, type TurnEngineToolResult } from "./turn-engine-types.js"
 import { executionId, type ExecutionItemHandle, type TurnExecutionOptions } from "./turn-execution-types.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { readTrustedNativeQuestionAttestation } from "./native-question-attestation.js"
+import { DEPENDENCY_WAIT_BATCH_REJECTION, DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY, DEPENDENCY_WAIT_BATCH_REJECTION_MARKER } from "./dependency-wait-batch-rejection.js"
 
 function itemId(options: TurnExecutionOptions, prefix: string): string {
   const scoped = executionId(options.identity, prefix)
@@ -33,15 +35,27 @@ export async function persistRecoveredToolCall(
     }
     persistedResult = { ...result, output: nativeQuestionAttestation ? { question: "[REDACTED]", choices: [] } : null }
   }
+  const identity = options.identity
+  const rejectedBatchResult = {
+    id: recovery.call.id, toolName: recovery.call.name, toolVersion: recovery.toolVersion,
+    status: "failed", errorCode: DEPENDENCY_WAIT_BATCH_REJECTION.code, output: DEPENDENCY_WAIT_BATCH_REJECTION,
+  }
+  const retainsDependencyWaitBatchMarker = identity.kind === "turn" && identity.taskId === identity.rootTaskId
+    && recovery.durableResult !== undefined && isDeepStrictEqual(recovery.durableResult, rejectedBatchResult)
+    && isDeepStrictEqual(result, rejectedBatchResult)
   const callItem: ExecutionItemHandle = { id: recovery.callItem.id, type: "tool_call", phase: null, revision: recovery.callItem.revision }
-  const callContent = {
+  const callEventContent = {
     toolCallId: recovery.call.id, toolName: recovery.call.name, toolVersion: recovery.toolVersion,
     status: persistedResult.status, errorCode: persistedResult.errorCode, input: toRepositoryJson(recovery.call.arguments),
   }
-  const callEventContent = nativeQuestion
+  const callContent = {
+    ...callEventContent,
+    ...(retainsDependencyWaitBatchMarker ? { [DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY]: DEPENDENCY_WAIT_BATCH_REJECTION_MARKER } : {}),
+  }
+  const projectedCallEventContent = nativeQuestion
     ? { toolCallId: recovery.call.id, toolName: recovery.call.name, toolVersion: recovery.toolVersion, status: persistedResult.status, errorCode: persistedResult.errorCode }
-    : callContent
-  await writer.completeItem(callItem, callContent, now(), `tool-call-recovered:${recovery.call.id}`, callEventContent)
+    : callEventContent
+  await writer.completeItem(callItem, callContent, now(), `tool-call-recovered:${recovery.call.id}`, projectedCallEventContent)
   await writer.append(persistedResult.status === "completed" ? "tool_call.completed" : "tool_call.failed", recovery.call.id, callItem.id, {
     toolCallId: recovery.call.id, toolName: recovery.call.name, toolVersion: persistedResult.toolVersion, status: persistedResult.status,
     errorCode: persistedResult.errorCode, taskId: options.identity.taskId,
