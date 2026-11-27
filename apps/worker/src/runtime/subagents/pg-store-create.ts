@@ -4,7 +4,9 @@ import { isTerminalSubagentStatus, SubagentLimitError, type SubagentPolicy, type
 import { actionList, asObject, INSERT_TASK, json, rowToTask, SELECT_TASK, type Queryable } from "./pg-store-persistence.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
-import type { SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
+import { STEERING_RECONCILIATION_BLOCKER, type SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
+import { readSteeringReconciliationStateForTerminal } from "./steering-reconciliation-read.js"
+import type { SessionTerminalAdmission } from "../session-gate.js"
 import { filterNestedScoutProtectedActions, hasNestedScoutPrivateContext, hasNestedScoutProtectedActions,
   isNestedScoutCreationAuthorityValid, type NestedScoutCreationAuthority } from "./nested-scout-creation-authority.js"
 import { admitOwnedObjectiveTaskGraphChild } from "./objective-task-graph-child-authority.js"
@@ -40,11 +42,21 @@ export async function lockSubagentTurnForWork(client: Queryable, input: { sessio
   await assertSessionWorkAdmission(client, input)
 }
 
-export async function assertPlanningRootHasNoUnresolvedSteering(client: Queryable, allowedActions: unknown, scope: SteeringReconciliationScope): Promise<void> {
+function planningRootHasPlan(allowedActions: unknown): boolean {
   let actions = allowedActions
   if (typeof actions === "string") { try { actions = JSON.parse(actions) as unknown } catch { throw new Error("steering_reconciliation_root_policy_invalid") } }
   if (!Array.isArray(actions) || actions.some(action => typeof action !== "string")) throw new Error("steering_reconciliation_root_policy_invalid")
-  if (actions.includes("agent.plan")) await assertNoUnresolvedSteering(client, scope)
+  return actions.includes("agent.plan")
+}
+
+export async function assertPlanningRootHasNoUnresolvedSteering(client: Queryable, allowedActions: unknown, scope: SteeringReconciliationScope): Promise<void> {
+  if (planningRootHasPlan(allowedActions)) await assertNoUnresolvedSteering(client, scope)
+}
+
+export async function assertTerminalPlanningRootHasNoUnresolvedSteering(client: Queryable, allowedActions: unknown, scope: SteeringReconciliationScope, admission: SessionTerminalAdmission): Promise<void> {
+  if (!planningRootHasPlan(allowedActions)) return
+  const state = await readSteeringReconciliationStateForTerminal(client, scope, admission)
+  if (state.unresolvedInputs.length) throw new Error(STEERING_RECONCILIATION_BLOCKER)
 }
 
 export async function createSubagentTask(
