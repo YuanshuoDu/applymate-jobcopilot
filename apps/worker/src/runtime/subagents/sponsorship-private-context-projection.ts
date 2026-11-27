@@ -11,8 +11,15 @@ export function hasSponsorshipWaitHint(snapshot: StepContextSnapshot): boolean {
     const output = content?.output && typeof content.output === "object" && !Array.isArray(content.output)
       ? content.output as Record<string, unknown> : undefined
     const waitTasks = Array.isArray(output?.tasks) ? output.tasks : []
-    const hasCompletedAuditor = waitTasks.some(value => value && typeof value === "object" && !Array.isArray(value)
-      && (value as Record<string, unknown>).role === "auditor" && (value as Record<string, unknown>).status === "completed")
+    const matchedTaskIds = new Set(Array.isArray(output?.matchedTaskIds)
+      ? output.matchedTaskIds.filter((taskId): taskId is string => typeof taskId === "string") : [])
+    const hasCompletedRole = (role: "auditor" | "scout", matchedOnly = false) => waitTasks.some(value => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false
+      const task = value as Record<string, unknown>
+      return task.role === role && task.status === "completed"
+        && (!matchedOnly || typeof task.taskId === "string" && matchedTaskIds.has(task.taskId))
+    })
+    const hasCompletedAuditor = hasCompletedRole("auditor")
     if (observationId.startsWith("wait-result:")) {
       const waitId = observationId.slice("wait-result:".length)
       // A durable consumed projection has no sponsorship sidecar. Its exact
@@ -20,7 +27,7 @@ export function hasSponsorshipWaitHint(snapshot: StepContextSnapshot): boolean {
       return !!waitId && content?.toolCallId === `wait:${waitId}` && content.toolName === "agent.wait"
         && content.status === "completed" && content.errorCode === null && output?.waitId === waitId
         && output.status === "ready" && Array.isArray(output.targetTaskIds) && Array.isArray(output.matchedTaskIds)
-        && Array.isArray(output.tasks) && (hasCompletedAuditor || waitTasks.some(value => {
+        && Array.isArray(output.tasks) && (hasCompletedRole("auditor", true) || hasCompletedRole("scout", true) || waitTasks.some(value => {
           if (!value || typeof value !== "object" || Array.isArray(value)) return false
           const result = (value as Record<string, unknown>).result
           return !!result && typeof result === "object" && !Array.isArray(result)
