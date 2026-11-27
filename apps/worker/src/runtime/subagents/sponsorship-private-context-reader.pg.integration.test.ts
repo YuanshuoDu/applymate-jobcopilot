@@ -328,7 +328,8 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
       const receipt = await invokeTool({ identity, store: engine, router: runtime.router, actorRole: "subagent", capabilities: [], stepId: step.id,
         call: { id: `p3-sponsorship-private-jobs-get-${value.suffix}-${index}`, name: "jobs.get", arguments: { jobId: value.jobIds[index] } } }) as { job?: { id?: string; description?: string | null } | null }
       expect(receipt.job?.id).toBe(value.jobIds[index])
-      expect(receipt.job?.description).toContain(SOURCE_CANARY)
+      const expectedDescriptionMarker = mode === "any" && index === 0 ? "PRIVATE-SPONSORSHIP-REVIEW-CANARY" : SOURCE_CANARY
+      expect(receipt.job?.description?.includes(expectedDescriptionMarker)).toBe(true)
       await engine.updateStep({ owner: identity, stepId: step.id, status: "completed", finishReason: "stop", errorCode: null,
         inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: new Date() })
     }
