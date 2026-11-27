@@ -4,7 +4,7 @@ import { parseDurableDiscoveryReference } from "./child-durable-discovery.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
 import type { TaskGraphReplayReceipt } from "./task-graph-pg-event-validation.js"
 
-export type TaskGraphVerificationScope = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; taskId: string; attemptCount: number }>
+export type TaskGraphVerificationScope = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; taskId: string; attemptCount: number; exclusiveBeforeOrdinal?: number }>
 type Row = Record<string, unknown>
 const EVIDENCE_TOOLS = new Set(["jobs.search", "jobs.get", "jobs.discover", "tool_results.read", "persona.retrieve", "resume.get_base"])
 const MAX_TOTAL_BYTES = 2 * 1024 * 1024
@@ -14,6 +14,10 @@ const TOOL_RESULT_REF = /^tool-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab
 const SHA256 = /^[0-9a-f]{64}$/
 
 export function validateTaskGraphVerificationItems(values: readonly unknown[], scope: TaskGraphVerificationScope): Row[] {
+  if (scope.exclusiveBeforeOrdinal !== undefined
+    && (!Number.isSafeInteger(scope.exclusiveBeforeOrdinal) || scope.exclusiveBeforeOrdinal < 0)) {
+    throw new Error("task_graph_verification_ordinal_scope_invalid")
+  }
   const parsed = values.map(record)
   if (parsed.some(item => !item)) throw new Error("task_graph_verification_item_invalid")
   const items = parsed as Row[], calls = new Map<string, Row>(), results = new Map<string, Row>(), ids = new Set<string>()
@@ -21,6 +25,7 @@ export function validateTaskGraphVerificationItems(values: readonly unknown[], s
     if (!text(item.id) || ids.has(item.id) || item.sessionId !== scope.sessionId || item.turnId !== scope.turnId || item.taskId !== scope.taskId
       || item.rootTaskId !== scope.rootTaskId || item.turnRootTaskId !== scope.rootTaskId || item.joinedStepId !== item.stepId || !text(item.stepId)
       || Number(item.attempt) !== scope.attemptCount || !Number.isSafeInteger(Number(item.ordinal)) || Number(item.ordinal) < 0
+      || scope.exclusiveBeforeOrdinal !== undefined && Number(item.ordinal) >= scope.exclusiveBeforeOrdinal
       || !Number.isSafeInteger(Number(item.revision)) || Number(item.revision) < 0 || item.status !== "completed"
       || !["queued", "streaming", "completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(String(item.stepStatus))) throw new Error("task_graph_verification_item_invalid")
     ids.add(item.id)

@@ -52,4 +52,41 @@ describe("loadTaskGraphVerificationReceipts", () => {
     expect(fake.query.mock.calls[0]?.[1]).toEqual([rootScope.taskId, rootScope.sessionId, rootScope.turnId,
       rootScope.rootTaskId, rootScope.parentTaskId, rootScope.userId, rootScope.attemptCount])
   })
+
+  it("loads only completed history before the current ordinal while a current tool call is started", async () => {
+    const rootScope: TaskGraphVerificationScope = { ...scope, taskId: "root-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      exclusiveBeforeOrdinal: 1 }
+    const history = rows.map(row => ({ ...row, taskId: rootScope.taskId, rootTaskId: rootScope.rootTaskId,
+      turnRootTaskId: rootScope.rootTaskId, ordinal: 0 }))
+    const currentStarted = { ...history[0]!, id: "current-review-call", stepId: "current-step", joinedStepId: "current-step",
+      ordinal: 1, stepStatus: "streaming", status: "started", content: { toolCallId: "current-review", toolName: "agent.review_sponsorship",
+        toolVersion: "1", input: { jobId: "job-1" } } }
+    const later = [
+      { ...history[0]!, id: "later-call", stepId: "later-step", joinedStepId: "later-step", ordinal: 2,
+        content: { ...callContent, toolCallId: "later-call-id" } },
+      { ...history[1]!, id: "later-result", stepId: "later-step", joinedStepId: "later-step", ordinal: 2,
+        content: { toolCallId: "later-call-id", output: { jobs: [{ id: "job-2", source: "greenhouse" }] }, errorCode: null } },
+    ]
+    const candidates = [...history.map(row => ({ ...row, taskId: rootScope.taskId, rootTaskId: rootScope.rootTaskId,
+      turnRootTaskId: rootScope.rootTaskId })), currentStarted, ...later]
+    const rootEvents = events.map(event => ({ ...event, taskId: rootScope.taskId,
+      payload: { ...event.payload, taskId: rootScope.taskId } }))
+    const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      if (sql.includes('SELECT item."id"')) {
+        const bounded = sql.includes('AND step."ordinal" < $8')
+          ? candidates.filter(row => Number(row.ordinal) < Number(values?.[7]))
+          : candidates
+        return { rows: bounded, rowCount: bounded.length }
+      }
+      if (sql.includes('SELECT event."id"')) return { rows: rootEvents, rowCount: rootEvents.length }
+      throw new Error("unexpected_verification_receipt_query")
+    })
+    const receipt = await loadTaskGraphVerificationReceipts({ query } as unknown as Pick<pg.PoolClient, "query">, rootScope)
+
+    expect(receipt.items).toHaveLength(2)
+    expect(receipt.items.every(item => item.ordinal === 0)).toBe(true)
+    expect(query.mock.calls[0]?.[0]).toContain('AND step."ordinal" < $8')
+    expect(query.mock.calls[0]?.[1]).toEqual([rootScope.taskId, rootScope.sessionId, rootScope.turnId,
+      rootScope.rootTaskId, rootScope.parentTaskId, rootScope.userId, rootScope.attemptCount, 1])
+  })
 })
