@@ -15,6 +15,19 @@ const options = {
 }
 
 describe("coordination tool definitions", () => {
+  it("registers the one-Job sponsorship review only when a server-owned Root requester is configured", () => {
+    expect(createCoordinationTools(options).some(definition => definition.name === "agent.review_sponsorship")).toBe(false)
+    const definitions = createCoordinationTools({ ...options, sponsorshipReviewRequester: async () => ({ taskId: "reviewer-task", status: "queued" }) })
+    const registry = new ToolRegistry(definitions)
+    const review = definitions.find(definition => definition.name === "agent.review_sponsorship")
+    expect(review).toMatchObject({ risk: "internal_write", domain: "coordination", idempotency: "idempotent",
+      requiredCapabilities: ["canManageChildren"] })
+    expect(registry.validateArguments("agent.review_sponsorship", { jobId: "job-1" })).toBe(true)
+    expect(registry.validateArguments("agent.review_sponsorship", { jobId: "job-1", targetCountryCode: "IE" })).not.toBe(true)
+    expect(review?.description).toContain("no-tool review")
+    expect(review?.description).toContain("do not assert employer policy")
+  })
+
   it("exposes canonical coordination names with shared metadata and manager fencing", () => {
     const definitions = createCoordinationTools(options)
     expect(definitions.map(definition => definition.name)).toEqual([

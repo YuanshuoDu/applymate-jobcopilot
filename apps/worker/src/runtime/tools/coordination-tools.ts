@@ -7,6 +7,7 @@ import {
   executeFollowup,
   executeInterruptSubagent,
   executeListSubagents,
+  executeReviewSponsorship,
   executeSendMessage,
   executeSpawn,
   executeWaitSubagents,
@@ -80,6 +81,8 @@ export const WaitSubagentsInputSchema = Type.Object({
   timeoutMs: Type.Integer({ minimum: 1, maximum: 30_000 }),
 }, { additionalProperties: false })
 export type WaitSubagentsInput = Static<typeof WaitSubagentsInputSchema>
+const ReviewSponsorshipInputSchema = Type.Object({ jobId: IdSchema }, { additionalProperties: false })
+export type SponsorshipReviewInput = Static<typeof ReviewSponsorshipInputSchema>
 
 export const InterruptSubagentInputSchema = Type.Object({
   taskId: IdSchema,
@@ -166,7 +169,7 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
   const interruptExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeInterruptSubagent(context, input as InterruptSubagentInput, options)
   const listExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeListSubagents(context, input as ListSubagentsInput, options)
   const closeExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeCloseSubagent(context, input as CloseSubagentInput, options)
-  return [
+  const tools: RuntimeToolDefinition[] = [
     {
       ...metadata("spawn_subagent", `Create one permission-scoped child task and durably enqueue it.${NATIVE_CAPACITY_GUIDANCE}`, "internal_write", "requires_key"),
       inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
@@ -229,4 +232,11 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
       execute: closeExecutor,
     },
   ]
+  if (options.sponsorshipReviewRequester) tools.push({
+    ...metadata("agent.review_sponsorship", "Start one independent no-tool review of a completed Scout Job listing against the user's explicit Objective country. The private result is available after agent.wait. Report only what the saved listing states at review time; do not assert employer policy or guarantees.", "internal_write", "idempotent"),
+    inputSchema: ReviewSponsorshipInputSchema,
+    outputSchema: Type.Object({ taskId: IdSchema, status: StatusSchema }, { additionalProperties: false }),
+    execute: (context, input) => executeReviewSponsorship(context, input as SponsorshipReviewInput, options),
+  })
+  return tools
 }

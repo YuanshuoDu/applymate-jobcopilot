@@ -67,6 +67,15 @@ async function build(builder: ReturnType<typeof createCanonicalTurnContextBuilde
     snapshot: suppliedSnapshot ?? snapshot(withHint), now, lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now } })
 }
 
+function consumedAsyncWaitProjection(role: "scout" | "auditor" = "scout") {
+  const waitId = "wait-12345678-1234-4234-9234-123456789012"
+  const taskId = "subagent-12345678-1234-4234-9234-123456789012"
+  return { id: `wait-result:${waitId}`, content: { toolCallId: `wait:${waitId}`, toolName: "agent.wait",
+    input: { taskIds: [taskId], mode: "all" }, status: "completed", errorCode: null,
+    output: { waitId, status: "ready", targetTaskIds: [taskId], matchedTaskIds: [taskId], tasks: [{ taskId,
+      status: "completed", role, result: { sourceMaterial: "must not become the source context" }, failureReason: null }] } } }
+}
+
 describe("canonical Root private sponsorship context", () => {
   beforeEach(() => { vi.clearAllMocks(); reader.read.mockResolvedValue([privateEntry]) })
 
@@ -119,12 +128,7 @@ describe("canonical Root private sponsorship context", () => {
 
   it("discovers a consumed async wait projection without any sponsorship sidecar", async () => {
     const { builder } = fixture()
-    const waitId = "wait-12345678-1234-4234-9234-123456789012"
-    const projection = { id: `wait-result:${waitId}`, content: { toolCallId: `wait:${waitId}`, toolName: "agent.wait",
-      input: { taskIds: ["subagent-12345678-1234-4234-9234-123456789012"], mode: "all" }, status: "completed", errorCode: null,
-      output: { waitId, status: "ready", targetTaskIds: ["subagent-12345678-1234-4234-9234-123456789012"],
-        matchedTaskIds: ["subagent-12345678-1234-4234-9234-123456789012"], tasks: [{ taskId: "subagent-12345678-1234-4234-9234-123456789012",
-          status: "completed", role: "scout", result: { sourceMaterial: "must not become the source context" }, failureReason: null }] } } }
+    const projection = consumedAsyncWaitProjection()
     const asyncSnapshot = { ...snapshot(false), toolObservations: [projection] }
     const context = await build(builder, false, asyncSnapshot)
     expect(reader.read).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ stepId: "step-current" }), [projection])
@@ -132,6 +136,26 @@ describe("canonical Root private sponsorship context", () => {
     const publicProjection = JSON.stringify(context.blocks.find(block => block.id === `observation:${projection.id}`)?.content)
     expect(publicProjection).not.toContain(excerpt)
     expect(JSON.stringify(context.blocks.find(block => block.id === "sponsorship-private-source-0")?.content)).not.toContain("must not become the source context")
+  })
+
+  it("also discovers a completed Auditor in a consumed wait without a sponsorship sidecar", async () => {
+    const { builder } = fixture(true)
+    const projection = consumedAsyncWaitProjection("auditor")
+    const context = await build(builder, false, { ...snapshot(false), toolObservations: [projection] })
+
+    expect(reader.read).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ stepId: "step-current" }), [projection])
+    expect(context.blocks.some(block => block.id === "sponsorship-private-source-0")).toBe(true)
+    expect(JSON.stringify(context.blocks.find(block => block.id === `observation:${projection.id}`)?.content)).not.toContain(excerpt)
+  })
+
+  it("does not use an async wait hint whose projected tool call is bound to another wait", async () => {
+    const { builder } = fixture()
+    const projection = consumedAsyncWaitProjection()
+    const mismatchedProjection = { ...projection, content: { ...projection.content, toolCallId: "wait:another-id" } }
+    const context = await build(builder, false, { ...snapshot(false), toolObservations: [mismatchedProjection] })
+
+    expect(reader.read).not.toHaveBeenCalled()
+    expect(context.blocks.some(block => block.id.startsWith("sponsorship-private-source-"))).toBe(false)
   })
 
   it("keeps ordinary Root execution usable if optional source enrichment throws or has no current wait hint", async () => {

@@ -49,7 +49,7 @@ type RoleToolMetadata = Pick<RuntimeToolDefinition, "name" | "version" | "risk" 
 const READ_DOMAINS: readonly PolicyDomain[] = ["jobs", "persona", "resume", "application", "coordination", "unknown"]
 const COORDINATION_TOOL_NAMES: ReadonlySet<string> = new Set([
   "spawn_subagent", "agent.spawn", "agent.followup",
-  "send_message", "agent.send", "wait_subagents", "agent.wait",
+  "send_message", "agent.send", "wait_subagents", "agent.wait", "agent.review_sponsorship",
   "scout.delegate", "scout.results",
   "list_subagents", "agent.list", "interrupt_subagent", "agent.interrupt",
   "close_subagent", "agent.close",

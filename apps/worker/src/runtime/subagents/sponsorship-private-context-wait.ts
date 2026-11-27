@@ -14,6 +14,29 @@ type Projection = Readonly<{ id: string; content: unknown }>
 type SelectedWait = Readonly<{ id: string; toolName: "agent.wait" | "wait_subagents"; stepId: string
   input: Row; output: Row }>
 
+/** Finds the nearest earlier Root-owned step despite Turn-global child-step ordinals. */
+export async function readNearestRootStepBefore(client: Queryable, input: Readonly<{
+  userId: string; sessionId: string; turnId: string; rootTaskId: string; ordinal: number; attempt: number
+}>): Promise<Readonly<{ ordinal: number; attempt: number }> | undefined> {
+  if (!text(input.userId) || !text(input.sessionId) || !text(input.turnId) || !text(input.rootTaskId)
+    || !Number.isSafeInteger(input.ordinal) || input.ordinal < 1 || !Number.isSafeInteger(input.attempt) || input.attempt < 1) return undefined
+  const result = await client.query(`SELECT priorStep."ordinal", priorStep."attempt", priorStep."taskId"
+    FROM "agent_steps" AS priorStep
+    JOIN "sub_agent_tasks" AS root ON root."id" = priorStep."taskId" AND root."sessionId" = priorStep."sessionId" AND root."turnId" = priorStep."turnId"
+    JOIN "agent_sessions" AS session ON session."id" = priorStep."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = priorStep."turnId" AND turn."sessionId" = priorStep."sessionId"
+    WHERE priorStep."sessionId" = $1 AND priorStep."turnId" = $2 AND priorStep."taskId" = $3 AND priorStep."ordinal" < $4
+      AND root."id" = $3 AND root."rootTaskId" = $3 AND root."parentTaskId" IS NULL
+      AND session."userId" = $5 AND turn."userId" = $5 AND turn."rootTaskId" = $3
+    ORDER BY priorStep."ordinal" DESC LIMIT 1`,
+  [input.sessionId, input.turnId, input.rootTaskId, input.ordinal, input.userId])
+  if (result.rows.length !== 1) return undefined
+  const predecessor = object(result.rows[0]), ordinal = Number(predecessor?.ordinal), attempt = Number(predecessor?.attempt)
+  if (predecessor?.taskId !== input.rootTaskId || !Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal >= input.ordinal
+    || !Number.isSafeInteger(attempt) || attempt !== input.attempt) return undefined
+  return { ordinal, attempt }
+}
+
 const WAIT_TOOLS = new Set(["agent.wait", "wait_subagents"])
 const TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
@@ -192,13 +215,14 @@ async function consumedReadyTargets(client: Queryable, scope: Scope, wait: Selec
   const matchedAreTerminal = matched.every(id => TERMINAL.has(String(taskById.get(id)?.status ?? "")))
   if (taskById.size !== targets.length || !matchedAreTerminal || wait.input.mode === "all" && !sameIds(matched, targets)) return undefined
   const selected = matched.map(id => ({ taskId: id, status: String(taskById.get(id)!.status), role: String(taskById.get(id)!.role) }))
-  if (!projectionMatches(projections, String(saved.waitId), String(saved.mode), targets, matched, [...taskById.values()])) return undefined
+  if (projections.length > 0 && !projectionMatches(projections, String(saved.waitId), String(saved.mode), targets, matched, [...taskById.values()])) return undefined
   return selected
 }
 
 /** Resolves only an exact inline ready receipt or its matching consumed Root wait projection. */
 export async function selectedSponsorshipWaitTargets(
   client: Queryable, receipts: TaskGraphVerificationReceipts, scope: Scope, projections: readonly Projection[] = [],
+  options: Readonly<{ allowDurableConsumedResultWithoutProjection?: boolean }> = {},
 ): Promise<readonly WaitTarget[] | undefined> {
   const wait = selectedWait(receipts, scope.previousOrdinal)
   if (!wait || Number(wait.input.timeoutMs) < 1 || Number(wait.input.timeoutMs) > 30_000) return undefined
@@ -207,6 +231,9 @@ export async function selectedSponsorshipWaitTargets(
   if (!call || call.taskId !== scope.rootTaskId || Number(call.attempt) !== scope.attempt
     || !text(call.stepId) || call.stepId !== wait.stepId) return undefined
   if (wait.output.status === "ready") return readyInlineTargets(wait)
-  if (wait.output.status === "waiting") return consumedReadyTargets(client, scope, wait, projections)
+  if (wait.output.status === "waiting") {
+    if (!projections.length && options.allowDurableConsumedResultWithoutProjection !== true) return undefined
+    return consumedReadyTargets(client, scope, wait, projections)
+  }
   return undefined
 }

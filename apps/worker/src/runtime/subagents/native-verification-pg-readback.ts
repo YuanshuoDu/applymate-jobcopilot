@@ -91,9 +91,13 @@ export async function readNativeVerificationControlProofs(
 }
 
 function historyTargets(proofs: readonly NativeVerificationControlProof[]) {
-  return proofs.map(proof => ({ controlTaskId: proof.task.taskId, targetKind: proof.task.control.target.kind,
-    ...(proof.task.control.target.kind === "root_goal" ? { candidateDigest: proof.task.control.target.candidateDigest,
-      childBindingSetDigest: proof.task.control.target.childBindingSetDigest } : {}) }))
+  return proofs.flatMap(proof => {
+    const target = proof.task.control.target
+    if (target.kind === "sponsorship_source") return []
+    return [{ controlTaskId: proof.task.taskId, targetKind: target.kind,
+      ...(target.kind === "root_goal" ? { candidateDigest: target.candidateDigest,
+        childBindingSetDigest: target.childBindingSetDigest } : {}) }]
+  })
 }
 
 function currentGraphReady(graph: LoadedGraph, state: NativeVerificationOwnedState): boolean {
@@ -122,7 +126,7 @@ async function currentNativeChildrenMatch(client: Queryable, graph: LoadedGraph,
 }
 
 export function nativeVerificationHistory(proofs: readonly NativeVerificationControlProof[]): readonly NativeVerificationHistoryEntry[] {
-  return proofs.map(proof => {
+  return proofs.filter(proof => proof.task.control.target.kind !== "sponsorship_source").map(proof => {
     const target = proof.task.control.target
     const criterionSummary = JSON.stringify({
       failureReason: proof.task.failureReason === null ? null : safeFailure(proof.task.failureReason),
@@ -223,11 +227,7 @@ export const readNativeVerificationTerminalProofWithClient: NativeVerificationTe
     || proof.task.control.target.kind !== "root_goal"
     || proof.task.control.target.childBindingSetDigest !== childBindingSetDigest
     || proof.task.control.target.candidateDigest !== candidateDigest) return false
-  const rootHistory = nativeVerificationRootPacketHistory(history, proofs.map(item => ({
-    controlTaskId: item.task.taskId, targetKind: item.task.control.target.kind,
-    ...(item.task.control.target.kind === "root_goal" ? { candidateDigest: item.task.control.target.candidateDigest,
-      childBindingSetDigest: item.task.control.target.childBindingSetDigest } : {}),
-  })), candidateDigest, childBindingSetDigest)
+  const rootHistory = nativeVerificationRootPacketHistory(history, historyTargets(proofs), candidateDigest, childBindingSetDigest)
   const baseContent = buildNativeRootPacketContent({ state, candidateText, childBindingSetDigest, history: rootHistory })
   const content = baseContent && await appendNativeUserSelfAttestations(client, scope, baseContent,
     stepId === undefined ? { kind: "exact" } : { kind: "exact", stepId })

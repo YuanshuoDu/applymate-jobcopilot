@@ -32,6 +32,7 @@ import type {
   SpawnSubagentInput,
   WaitSubagentsInput,
 } from "./coordination-tools.js"
+import type { SponsorshipReviewInput } from "./coordination-tools.js"
 import type { TaskGraphReadScope } from "../subagents/task-graph-command-port.js"
 
 async function assertPostGateChildCreationAllowed(context: ToolExecutionContext, options: CoordinationExecutorOptions): Promise<void> {
@@ -209,6 +210,18 @@ export async function executeWaitSubagents(context: ToolExecutionContext, input:
   })
   const aggregate = buildScoutAnalystAggregate(hydratedTargets)
   return { waitId: result.waitId, status: result.status, taskIds: targets.map(task => task.id), deadlineAt: result.deadlineAt, matchedTaskIds: [...result.matchedTaskIds], tasks, ...(aggregate ? { aggregate } : {}) }
+}
+
+export async function executeReviewSponsorship(context: ToolExecutionContext, input: SponsorshipReviewInput, options: CoordinationExecutorOptions) {
+  if (context.actorRole !== "orchestrator" || !context.taskId || context.taskId !== context.rootTaskId
+    || !options.nativeCoordination?.enabled || !options.sponsorshipReviewRequester) {
+    throw new CoordinationError("coordination_sponsorship_review_unavailable", "A Root-only sponsorship review is unavailable in this execution mode")
+  }
+  try { return await options.sponsorshipReviewRequester(context, input.jobId) }
+  catch (error: unknown) {
+    const code = error instanceof Error && /^sponsorship_review_[a-z_]+$/.test(error.message) ? error.message : "sponsorship_review_unavailable"
+    throw new CoordinationError(`coordination_${code}`, "The saved Job sponsorship review could not be started")
+  }
 }
 
 export async function executeListSubagents(context: ToolExecutionContext, input: ListSubagentsInput, options: CoordinationExecutorOptions) {

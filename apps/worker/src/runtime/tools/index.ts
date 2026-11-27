@@ -22,6 +22,7 @@ import type { RootTaskVerificationRequirementsResolution } from "../context/root
 import { createAskUserTool } from "./ask-user.js"
 import { createJobsDiscoverTool, type JobDiscoverToolOptions } from "./job-discover-tool.js"
 import { createScheduledApplicationPrepareTool, type ScheduledApplicationPrepareDependencies } from "./scheduled-application-prepare.js"
+import { requestSponsorshipReview } from "../subagents/sponsorship-review-request.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -55,6 +56,7 @@ export type WorkerCoordinationOptions = {
   readonly nativeCoordination?: NativeCoordinationRuntimeOptions
   readonly verificationRequirements?: RootTaskVerificationRequirementsResolution
   readonly askUserEnabled?: boolean
+  readonly sponsorshipReviewEnabled?: boolean
 }
 
 export type WorkerGmailOptions = GmailToolOptions
@@ -88,6 +90,12 @@ export function createWorkerToolRuntime(
       nativeCoordination: coordination.nativeCoordination,
       verificationRequirements: coordination.verificationRequirements,
       sponsorshipObservationReader: task => readSponsorshipWaitObservations(pool, task),
+      ...(coordination.sponsorshipReviewEnabled ? {
+        sponsorshipReviewRequester: (context, jobId) => {
+          if (!coordination.nativeCoordination) throw new Error("sponsorship_review_unavailable")
+          return requestSponsorshipReview(pool, coordination.nativeCoordination, context, jobId)
+        },
+      } : {}),
     }
     definitions.push(...createCoordinationTools(options))
     if (coordination.askUserEnabled) definitions.push(createAskUserTool() as RuntimeToolDefinition)

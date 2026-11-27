@@ -129,6 +129,8 @@ describe("parent finish with descendants", () => {
 
     const updateIndex = db.calls.findIndex(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))
     expect(updateIndex).toBeGreaterThan(-1)
+    expect(db.calls[updateIndex]?.[0]).not.toContain('"qualityGateResult"')
+    expect(db.calls[updateIndex]?.[1]).toHaveLength(10)
     expect(mocks.interruptMatchingInSession).toHaveBeenCalledWith(db.client, {
       sessionId: "session-1", rootTaskId: "root-1", targetPath: "/root-1/parent-1",
     }, "user-1", now)
@@ -142,5 +144,50 @@ describe("parent finish with descendants", () => {
 
     expect(mocks.hasActiveSubagentDescendants).not.toHaveBeenCalled()
     expect(mocks.interruptMatchingInSession).not.toHaveBeenCalled()
+  })
+
+  it("redacts a malformed sponsorship marker without touching the private proof column", async () => {
+    const canary = "PRIVATE-SPONSORSHIP-CITATION-CANARY"
+    const task = { ...liveTask, role: "auditor", taskType: "native_verification",
+      expectedOutputSchema: { schemaVersion: "agent-harness.v2.native-verifier-control.v1", target: { kind: "sponsorship_source" } },
+      context: {}, qualityGateResult: null }
+    const db = fakePool([task])
+
+    await expect(finishSubagentTask(db.pool, input({ result: { status: "completed", stepCount: 1, toolCallCount: 0,
+      nativeVerificationReport: { citation: canary } } }))).resolves.toBe("failed")
+
+    const update = db.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))
+    expect(update?.[0]).not.toContain('"qualityGateResult"')
+    expect(JSON.parse(String(update?.[1]?.[3]))).toEqual({ status: "failed", stepCount: 1, toolCallCount: 0 })
+    expect(JSON.stringify(update?.[1]?.[3])).not.toContain(canary)
+    expect(update?.[1]).toHaveLength(10)
+    expect(JSON.stringify(db.calls.filter(([sql]) => sql.includes("agent_events") || sql.includes("agent_outbox")))).not.toContain(canary)
+  })
+
+  it("uses the private proof column only for an exact sponsorship control bound to this task", async () => {
+    const digest = "a".repeat(64)
+    const control = {
+      schemaVersion: "agent-harness.v2.native-verifier-control.v1",
+      controlOperationId: "native-verification-operation-1",
+      controlTaskId: liveTask.id,
+      owner: { userId: liveTask.userId, sessionId: liveTask.sessionId, turnId: liveTask.turnId,
+        rootTaskId: liveTask.rootTaskId, parentTaskId: liveTask.parentTaskId },
+      target: { kind: "sponsorship_source", jobId: "job-1", scoutTaskId: "scout-1", scoutAttempt: 1,
+        scoutResultDigest: `sha256:${digest}`, sourceReceiptDigest: `sha256:${digest}`, materialDigest: `sha256:${digest}`,
+        roleDigest: `sha256:${digest}`, targetCountryCode: "IE", rootAttemptCount: 1, sourceBindingDigest: `sha256:${digest}` },
+      goalDigest: digest, criteriaDigest: digest, evidencePacketDigest: digest,
+    }
+    const task = { ...liveTask, role: "auditor", taskType: "native_verification", expectedOutputSchema: control, context: {} }
+    const db = fakePool([task])
+
+    await expect(finishSubagentTask(db.pool, input({ result: { status: "completed", stepCount: 1, toolCallCount: 0,
+      nativeVerificationReport: { privateText: "PRIVATE-SPONSORSHIP-REPORT-CANARY" } } }))).resolves.toBe("failed")
+
+    const update = db.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))
+    expect(update?.[0]).toContain('"qualityGateResult" = $11::jsonb')
+    expect(update?.[1]).toHaveLength(11)
+    expect(update?.[1]?.[10]).toBe("null")
+    expect(JSON.parse(String(update?.[1]?.[3]))).toEqual({ status: "failed", stepCount: 1, toolCallCount: 0 })
+    expect(JSON.stringify(update?.[1])).not.toContain("PRIVATE-SPONSORSHIP-REPORT-CANARY")
   })
 })

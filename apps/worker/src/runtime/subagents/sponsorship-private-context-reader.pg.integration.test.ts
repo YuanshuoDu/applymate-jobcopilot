@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 import { Pool } from "pg"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION } from "@jobcopilot/shared"
+import type { HarnessModelRequest, ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-model"
 
 import { loadCanonicalTurnState } from "../canonical-turn-state.js"
 import { executionOwnerFence, type ExecutionOwnerFence } from "../execution-owner.js"
@@ -17,8 +20,10 @@ import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { readPrivateSponsorshipContext } from "./sponsorship-private-context-reader.js"
-import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
+import { readPrivateSponsorshipContext, type SponsorshipPrivateContextReadDiagnosticStage } from "./sponsorship-private-context-reader.js"
+import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "./native-verification-contract.js"
+import { parseNativeVerificationPacket } from "./native-verification-packet.js"
+import { defaultSubagentPolicy, type PgSubagentPool, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import type { TurnEngineToolExecutor } from "../turns/turn-engine-tool-executor.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -95,6 +100,8 @@ function makePolicy(): PolicyEngine {
       outcome: "allow", reasonCode: "fixture_read_allowed", reason: "Allow the fixture owner-scoped read" },
     { id: "private-sponsorship-root-wait", roles: ["orchestrator"], tools: ["agent.wait"], risks: ["internal_write"], domains: ["coordination"],
       requiredCapabilities: ["canManageChildren"], outcome: "allow", reasonCode: "fixture_wait_allowed", reason: "Allow the fixture durable wait" },
+    { id: "private-sponsorship-root-review", roles: ["orchestrator"], tools: ["agent.review_sponsorship"], risks: ["internal_write"], domains: ["coordination"],
+      requiredCapabilities: ["canManageChildren"], outcome: "allow", reasonCode: "fixture_review_allowed", reason: "Allow the fixture source-bound review request" },
   ] } })
 }
 
@@ -150,10 +157,11 @@ async function invokeTool(input: {
   actorRole: "orchestrator" | "subagent"
   capabilities: readonly string[]
   stepId: string
+  ordinal?: number
   call: { id: string; name: string; arguments: unknown }
 }): Promise<unknown> {
   const options = toolOptions(input)
-  const step = { id: input.stepId, ordinal: 0 }
+  const step = { id: input.stepId, ordinal: input.ordinal ?? 0 }
   const result = await executeToolWithItems(options, new TurnExecutionEventWriter(options), step,
     { id: input.call.id, name: input.call.name, arguments: input.call.arguments }, () => new Date())
   if (result.status !== "completed") throw new Error(`Fixture ${input.call.name} failed with ${result.errorCode ?? "no error code"}`)
@@ -181,6 +189,66 @@ async function finishScout(input: {
   if (finished !== "completed") throw new Error(`Fixture Scout ${input.candidateIndex + 1} did not finish`)
 }
 
+async function executeSponsorshipAuditor(pool: Pool, input: Readonly<{ taskId: string; sessionId: string; rootTaskId: string }>): Promise<{
+  outcome: { status: string }; requests: HarnessModelRequest[]
+}> {
+  const [{ createProductionChildExecutor }, { runSubagentQueueJob }] = await Promise.all([
+    import("./production-child-runtime.js"), import("../../queue/subagent-pause-dispatch.js"),
+  ])
+  const requests: HarnessModelRequest[] = []
+  const profile: ModelCapabilityProfile = {
+    provider: "fixture", model: "sponsorship-review-deterministic", nativeTools: true, structuredOutput: true, streaming: true,
+    continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false,
+    supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false,
+    maxContextTokens: null, maxOutputTokens: 128, costClass: "low",
+  }
+  const executor = createProductionChildExecutor({
+    pool,
+    authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+      settle: async () => undefined, settleUnknown: async () => undefined }),
+    modelRuntimeFactory: ({ task }) => {
+      const control = parseNativeVerificationControl(task.expectedOutputSchema)
+      const packet = control ? parseNativeVerificationPacket(task.context, control) : null
+      if (!control || !packet || task.id !== input.taskId || packet.target.kind !== "sponsorship_source") {
+        throw new Error("fixture_sponsorship_packet_unavailable")
+      }
+      const sourceEvidence = packet.evidence.find(item => {
+        if (item.kind !== "saved_job_listing_description_segment") return false
+        try {
+          const summary = JSON.parse(item.summary) as { quote?: unknown }
+          return typeof summary.quote === "string" && summary.quote.includes("Backend Engineer")
+            && summary.quote.includes("Ireland") && summary.quote.includes("sponsorship is available")
+        } catch { return false }
+      })
+      if (!sourceEvidence || packet.criteria.length !== 2) throw new Error("fixture_sponsorship_source_segment_unavailable")
+      return {
+        id: "sponsorship-review-deterministic", profile,
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          const report = { schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
+            criteria: [
+              { criterionId: packet.criteria[0]!.criterionId, disposition: "passed", reasonCode: "meets_criterion",
+                evidenceReferenceIds: [sourceEvidence.referenceId] },
+              { criterionId: packet.criteria[1]!.criterionId, disposition: "failed", reasonCode: "does_not_meet_criterion",
+                evidenceReferenceIds: [] },
+            ] }
+          yield { type: "text_delta", text: JSON.stringify(report) }
+          yield { type: "usage", inputTokens: 173, outputTokens: 41, estimatedCostUsd: 0.013 }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      } satisfies ModelAdapter
+    },
+  })
+  const manager = new AgentTreeManager(new PgSubagentTaskStore(pool))
+  try {
+    const outcome = await runSubagentQueueJob(pool as unknown as PgSubagentPool, manager, executor, {
+      taskId: input.taskId, sessionId: input.sessionId, rootTaskId: input.rootTaskId,
+      ownerId: `p3-sponsorship-auditor-${randomUUID()}`,
+    })
+    return { outcome, requests }
+  } finally { await manager.shutdown() }
+}
+
 describeWithDisposablePostgres("private sponsorship context reader with disposable PostgreSQL", () => {
   let pool: Pool | undefined
 
@@ -205,11 +273,21 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     if (!db) throw new Error("Disposable PostgreSQL fixture was not initialized")
     const value = fixture()
     await seed(db, value)
+    if (mode === "any") {
+      await db.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
+        goal: "Check saved job sponsorship evidence", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+        sponsorshipTargetCountry: { schemaVersion: OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, countryCode: "IE" },
+      })])
+      await db.query(`UPDATE "Job" SET "description" = $3, "url" = $4, "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = $1 AND "userId" = $2`, [value.jobIds[0], value.userId,
+        "For this Backend Engineer role in Ireland, work visa sponsorship is available. PRIVATE-SPONSORSHIP-REVIEW-CANARY.",
+        "https://jobs.example.test/role-1"])
+    }
 
     const turnLease = await claimTurnLease(db, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId }, new Date(), 300_000)
     const rootStore = createPgRootTaskStore(db)
     const root = await rootStore.ensure({ lease: turnLease, goal: "Check saved job sponsorship evidence",
-      allowedActions: ["agent.wait", "jobs.get"], modelProfileSnapshot: MODEL,
+      allowedActions: ["agent.wait", "jobs.get", "agent.review_sponsorship"], modelProfileSnapshot: MODEL,
       toolPolicySnapshot: { version: "policy.v1", rules: [] }, budgetSnapshot: { limits: { maxSteps: 12, maxToolCalls: 24 } } })
     const tasks = new PgSubagentTaskStore(db, 300_000)
     const policy = defaultSubagentPolicy()
@@ -250,7 +328,8 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
       const receipt = await invokeTool({ identity, store: engine, router: runtime.router, actorRole: "subagent", capabilities: [], stepId: step.id,
         call: { id: `p3-sponsorship-private-jobs-get-${value.suffix}-${index}`, name: "jobs.get", arguments: { jobId: value.jobIds[index] } } }) as { job?: { id?: string; description?: string | null } | null }
       expect(receipt.job?.id).toBe(value.jobIds[index])
-      expect(receipt.job?.description).toContain(SOURCE_CANARY)
+      const expectedDescriptionMarker = mode === "any" && index === 0 ? "PRIVATE-SPONSORSHIP-REVIEW-CANARY" : SOURCE_CANARY
+      expect(receipt.job?.description?.includes(expectedDescriptionMarker)).toBe(true)
       await engine.updateStep({ owner: identity, stepId: step.id, status: "completed", finishReason: "stop", errorCode: null,
         inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: new Date() })
     }
@@ -312,7 +391,7 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     currentRootLease = await claimTurnLease(db, { turnId: value.turnId, sessionId: value.sessionId,
       ownerId: `p3-sponsorship-private-resume-${value.suffix}` }, new Date(), 300_000)
     const resumedRoot = await rootStore.ensure({ lease: currentRootLease, goal: "Check saved job sponsorship evidence",
-      allowedActions: ["agent.wait", "jobs.get"], modelProfileSnapshot: MODEL,
+      allowedActions: ["agent.wait", "jobs.get", "agent.review_sponsorship"], modelProfileSnapshot: MODEL,
       toolPolicySnapshot: { version: "policy.v1", rules: [] }, budgetSnapshot: { limits: { maxSteps: 12, maxToolCalls: 24 } } })
     expect(resumedRoot.id).toBe(root.id)
     const restored = await loadCanonicalTurnState(db, currentRootLease, new Date(), { consumeWaitOutcomes: true })
@@ -321,7 +400,7 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
 
     const resumedIdentity = executionOwnerFence({ kind: "turn", taskId: root.id, lease: currentRootLease })
     const currentStep = await engine.startStep({ owner: resumedIdentity, stepId: `p3-sponsorship-private-root-resume-${value.suffix}`,
-      ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+      ordinal: 1, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
     const currentRoot = await pool!.query<{ parentTaskId: string | null; attemptCount: number }>(
       `SELECT "parentTaskId", "attemptCount" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
       [root.id, value.sessionId, value.turnId])
@@ -334,13 +413,151 @@ describeWithDisposablePostgres("private sponsorship context reader with disposab
     const expectedCount = mode === "all" ? 2 : 1
     expect(context).toHaveLength(expectedCount)
     expect(context?.map(entry => entry.jobId).sort()).toEqual(mode === "all" ? [...value.jobIds].sort() : [value.jobIds[0]])
+    const expectedSourceCanary = mode === "any" ? "PRIVATE-SPONSORSHIP-REVIEW-CANARY" : SOURCE_CANARY
     for (const entry of context ?? []) {
       expect(entry.observation).toMatchObject({ status: "inconclusive", reason: "interpretation_unverified",
-        sourceContext: { trustBoundary: "untrusted_saved_job_listing", descriptionExcerpt: expect.stringContaining(SOURCE_CANARY) } })
+        sourceContext: { trustBoundary: "untrusted_saved_job_listing", descriptionExcerpt: expect.stringContaining(expectedSourceCanary) } })
     }
 
     const wrongOwner = await readPrivateSponsorshipContext(db, { ...readerInput, turnLeaseOwner: "foreign-private-reader-owner" }, restored.snapshot.toolObservations)
     expect(wrongOwner).toBeUndefined()
+
+    if (mode === "any") {
+      const currentRootAttempt = Number(currentRoot.rows[0]?.attemptCount)
+      const reviewManager = new AgentTreeManager(tasks)
+      const reviewRuntime = createWorkerToolRuntime(db, {
+        sink: lifecycleSink,
+        resolveOwner: context => {
+          if (context.taskId === root.id) return { kind: "turn", taskId: root.id, lease: currentRootLease }
+          const lease = context.taskId ? childLeaseById.get(context.taskId) : undefined
+          if (lease) return { kind: "task", lease }
+          throw new Error("Fixture lifecycle owner was not found")
+        },
+      }, makePolicy(), { manager: reviewManager, wait: durable, sponsorshipReviewEnabled: true,
+        nativeCoordination: { enabled: true, turnLeaseOwner: currentRootLease.ownerId,
+          turnLeaseVersion: currentRootLease.leaseVersion, parentLeaseOwner: currentRootLease.ownerId,
+          parentAttemptCount: () => currentRootAttempt } })
+      try {
+        const reviewCallId = `p3-sponsorship-review-request-${value.suffix}`
+        const review = await invokeTool({ identity: resumedIdentity, store: engine, router: reviewRuntime.router,
+          actorRole: "orchestrator", capabilities: ["canManageChildren"], stepId: currentStep.id, ordinal: 1,
+          call: { id: reviewCallId, name: "agent.review_sponsorship", arguments: { jobId: value.jobIds[0] } } }) as { taskId: string; status: string }
+        expect(review.status).toBe("queued")
+        await engine.updateStep({ owner: resumedIdentity, stepId: currentStep.id, status: "completed", finishReason: "tool_calls", errorCode: null,
+          inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0, now: new Date() })
+
+        const auditorWaitStep = await engine.startStep({ owner: resumedIdentity, stepId: `p3-sponsorship-review-wait-${value.suffix}`,
+          ordinal: 2, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+        const auditorWaitCallId = `p3-sponsorship-review-wait-call-${value.suffix}`
+        const auditorWait = await invokeTool({ identity: resumedIdentity, store: engine, router: reviewRuntime.router,
+          actorRole: "orchestrator", capabilities: ["canManageChildren"], stepId: auditorWaitStep.id, ordinal: 2,
+          call: { id: auditorWaitCallId, name: "agent.wait", arguments: { idempotencyKey: `p3-sponsorship-review-wait-key-${value.suffix}`,
+            taskIds: [review.taskId], mode: "any", timeoutMs: 30_000 } } }) as { waitId: string; status: string }
+        expect(auditorWait.status).toBe("waiting")
+        await engine.updateStep({ owner: resumedIdentity, stepId: auditorWaitStep.id, status: "waiting_for_tool", finishReason: "tool_calls", errorCode: null,
+          inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0, now: new Date() })
+        const auditorHandoff = await durable.suspendAndRelease({ lease: currentRootLease, waitId: auditorWait.waitId, now: new Date() })
+        expect(auditorHandoff).toMatchObject({ handoff: "suspended", waitStatus: "waiting" })
+
+        const executed = await executeSponsorshipAuditor(db, { taskId: review.taskId, sessionId: value.sessionId, rootTaskId: root.id })
+        expect(executed.outcome.status).toBe("completed")
+        expect(executed.requests).toHaveLength(1)
+        expect(executed.requests[0]?.tools).toEqual([])
+        expect(JSON.stringify(executed.requests[0]?.messages)).toContain("PRIVATE-SPONSORSHIP-REVIEW-CANARY")
+        const auditorStepRows = await db.query<{ ordinal: number; attempt: number }>(`SELECT "ordinal", "attempt" FROM "agent_steps"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`, [value.sessionId, value.turnId, review.taskId])
+        expect(auditorStepRows.rows).toHaveLength(1)
+        const auditorStepOrdinal = Number(auditorStepRows.rows[0]?.ordinal)
+        expect(Number(auditorStepRows.rows[0]?.attempt)).toBe(1)
+        expect(auditorStepOrdinal).toBeGreaterThan(auditorWaitStep.ordinal)
+
+        const reviewerRows = await db.query<{ status: string; failureReason: string | null; result: unknown; qualityGateResult: unknown;
+          context: unknown; expectedOutputSchema: unknown }>(
+          `SELECT "status", "failureReason", "result", "qualityGateResult", "context", "expectedOutputSchema" FROM "sub_agent_tasks"
+           WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
+             AND "role" = 'auditor' AND "taskType" = 'native_verification'`, [review.taskId, value.sessionId, value.turnId, root.id])
+        expect(reviewerRows.rows).toHaveLength(1)
+        const reviewerRow = reviewerRows.rows[0]!
+        expect(reviewerRow).toMatchObject({ status: "completed", failureReason: null,
+          result: { status: "completed", toolCallCount: 0 } })
+        const reviewerControl = parseNativeVerificationControl(reviewerRow.expectedOutputSchema)
+        const reviewerPacket = reviewerControl ? parseNativeVerificationPacket(reviewerRow.context, reviewerControl) : null
+        const citedSource = reviewerPacket?.evidence.find(item => {
+          if (item.kind !== "saved_job_listing_description_segment") return false
+          try {
+            const summary = JSON.parse(item.summary) as { quote?: unknown }
+            return typeof summary.quote === "string" && summary.quote.includes("Backend Engineer")
+              && summary.quote.includes("Ireland") && summary.quote.includes("sponsorship is available")
+          } catch { return false }
+        })
+        expect(citedSource?.referenceId).toMatch(/^sponsorship-citation:[a-f0-9]{32}$/)
+        const qualityGate = reviewerRow.qualityGateResult as { disposition?: unknown; criteria?: unknown }
+        expect(qualityGate.disposition).toBe("failed")
+        expect(qualityGate.criteria).toEqual([
+          { criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion",
+            evidenceReferenceIds: [citedSource!.referenceId] },
+          { criterionId: "criterion-2", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: [] },
+        ])
+        const reviewPublicRows = await db.query<{ type: string; payload: unknown }>(`SELECT "type", "payload" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" IN ($3, $4)`
+        , [value.sessionId, value.turnId, root.id, review.taskId])
+        const reviewPublicOutbox = await db.query<{ payload: unknown }>(`SELECT outbox."payload" FROM "agent_outbox" AS outbox
+          JOIN "agent_events" AS event ON event."id" = outbox."payload"->>'eventId'
+          WHERE outbox."aggregateId" = $1 AND event."turnId" = $2 AND event."taskId" IN ($3, $4)`
+        , [value.sessionId, value.turnId, root.id, review.taskId])
+        expect(JSON.stringify({ events: reviewPublicRows.rows, outbox: reviewPublicOutbox.rows, result: reviewerRow.result }))
+          .not.toContain("PRIVATE-SPONSORSHIP-REVIEW-CANARY")
+
+        const auditorResolver = await reconcileDurableWaits(db, { ownerId: `p3-sponsorship-review-resolver-${value.suffix}`, now: new Date() })
+        expect(auditorResolver.resolved).toBe(1)
+        expect(auditorResolver.woken).toBe(1)
+        currentRootLease = await claimTurnLease(db, { turnId: value.turnId, sessionId: value.sessionId,
+          ownerId: `p3-sponsorship-review-resume-${value.suffix}` }, new Date(), 300_000)
+        const reviewerResumedRoot = await rootStore.ensure({ lease: currentRootLease, goal: "Check saved job sponsorship evidence",
+          allowedActions: ["agent.wait", "jobs.get", "agent.review_sponsorship"], modelProfileSnapshot: MODEL,
+          toolPolicySnapshot: { version: "policy.v1", rules: [] }, budgetSnapshot: { limits: { maxSteps: 12, maxToolCalls: 24 } } })
+        expect(reviewerResumedRoot.id).toBe(root.id)
+        const reviewerRestored = await loadCanonicalTurnState(db, currentRootLease, new Date(), { consumeWaitOutcomes: true })
+        const privateReviewStep = await engine.startStep({ owner: executionOwnerFence({ kind: "turn", taskId: root.id, lease: currentRootLease }),
+          stepId: `p3-sponsorship-review-private-context-${value.suffix}`, ordinal: 3, attempt: 1,
+          inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: MODEL, now: new Date() })
+        expect(auditorStepOrdinal).toBeLessThan(privateReviewStep.ordinal)
+        const priorRootStepRows = await db.query<{ ordinal: number; attempt: number }>(`SELECT "ordinal", "attempt" FROM "agent_steps"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "ordinal" < $4
+          ORDER BY "ordinal" DESC LIMIT 1`, [value.sessionId, value.turnId, root.id, privateReviewStep.ordinal])
+        expect(priorRootStepRows.rows).toHaveLength(1)
+        expect(Number(priorRootStepRows.rows[0]?.ordinal)).toBe(auditorWaitStep.ordinal)
+        expect(Number(priorRootStepRows.rows[0]?.attempt)).toBe(1)
+        const reviewReadStages: SponsorshipPrivateContextReadDiagnosticStage[] = []
+        const reviewContext = await readPrivateSponsorshipContext(db, { userId: value.userId, sessionId: value.sessionId,
+          turnId: value.turnId, taskId: root.id, rootTaskId: root.id, rootAttemptCount: currentRootAttempt,
+          turnLeaseOwner: currentRootLease.ownerId, turnLeaseVersion: currentRootLease.leaseVersion, stepId: privateReviewStep.id },
+        reviewerRestored.snapshot.toolObservations, stage => reviewReadStages.push(stage))
+        if (!reviewContext || reviewContext.length !== 1) {
+          console.error(`sponsorship-private-context-reader diagnostic stages: ${reviewReadStages.slice(0, 16).join(",")}`)
+        }
+        expect(reviewContext).toHaveLength(1)
+        expect(reviewContext?.[0]).toMatchObject({ jobId: value.jobIds[0], observation: {
+          status: "explicit", claim: { kind: "work_visa_sponsorship", polarity: "available", countryCode: "IE" },
+          citation: { sourceRef: "saved_job_listing.description", quote: expect.stringContaining("Backend Engineer") },
+          sourceContext: { sourceUrl: "https://jobs.example.test/role-1", trustBoundary: "untrusted_saved_job_listing",
+            descriptionExcerpt: expect.stringContaining("PRIVATE-SPONSORSHIP-REVIEW-CANARY") },
+        } })
+        const oldCitation = reviewContext?.[0]?.observation.status === "explicit" ? reviewContext[0].observation.citation.quote : ""
+        expect(oldCitation).toContain("PRIVATE-SPONSORSHIP-REVIEW-CANARY")
+        await db.query(`UPDATE "Job" SET "description" = 'Listing changed after the sponsorship review completed.', "updatedAt" = CURRENT_TIMESTAMP
+          WHERE "id" = $1 AND "userId" = $2`, [value.jobIds[0], value.userId])
+        const afterReviewDrift = await readPrivateSponsorshipContext(db, { userId: value.userId, sessionId: value.sessionId,
+          turnId: value.turnId, taskId: root.id, rootTaskId: root.id, rootAttemptCount: currentRootAttempt,
+          turnLeaseOwner: currentRootLease.ownerId, turnLeaseVersion: currentRootLease.leaseVersion, stepId: privateReviewStep.id },
+        reviewerRestored.snapshot.toolObservations)
+        expect(afterReviewDrift).toBeUndefined()
+        const postDriftCitations = (afterReviewDrift ?? []).flatMap(entry => entry.observation.status === "explicit"
+          ? [entry.observation.citation.quote] : [])
+        expect(postDriftCitations).toEqual([])
+        expect(JSON.stringify(afterReviewDrift ?? [])).not.toContain(oldCitation)
+      } finally { await reviewManager.shutdown() }
+    }
 
     if (mode === "all") {
       await db.query(`UPDATE "Job" SET "description" = 'Changed source after the durable jobs.get receipt', "updatedAt" = CURRENT_TIMESTAMP

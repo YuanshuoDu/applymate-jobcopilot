@@ -101,6 +101,18 @@ describe("coordination executor support", () => {
     expect(JSON.stringify({ objectResult, serializedResult })).not.toContain("sponsorshipObservations")
   })
 
+  it("never projects the private sponsorship review proof or citation through a generic wait task", () => {
+    const citation = "PRIVATE-SPONSORSHIP-REVIEW-CITATION-CANARY"
+    const reviewed = { ...task, role: "auditor", taskType: "native_verification", status: "completed" as const,
+      result: { status: "completed", stepCount: 1, toolCallCount: 0 },
+      qualityGateResult: { privateCitation: citation, reviewerResultDigest: "private-digest" } }
+    const projected = waitTaskOutput(reviewed as unknown as CoordinationTaskView)
+    expect(projected.result).toEqual({ status: "completed", stepCount: 1, toolCallCount: 0 })
+    expect(JSON.stringify(projected)).not.toContain(citation)
+    expect(JSON.stringify(projected)).not.toContain("qualityGateResult")
+    expect(JSON.stringify(projected)).not.toContain("reviewerResultDigest")
+  })
+
   it("projects native proof receipts to bounded feedback before exposing task results", () => {
     const nativeVerificationReport = {
       schemaVersion: NATIVE_VERIFICATION_REPORT_SCHEMA, controlOperationId: "verify-op", controlTaskId: "verify-task", controlAttempt: 1,

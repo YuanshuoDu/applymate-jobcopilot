@@ -201,9 +201,13 @@ function rootWitness(proof: NativeVerificationControlProof): NativeVerificationR
 }
 
 function historyTargets(proofs: readonly NativeVerificationControlProof[]) {
-  return proofs.map(proof => ({ controlTaskId: proof.task.taskId, targetKind: proof.task.control.target.kind,
-    ...(proof.task.control.target.kind === "root_goal" ? { candidateDigest: proof.task.control.target.candidateDigest,
-      childBindingSetDigest: proof.task.control.target.childBindingSetDigest } : {}) }))
+  return proofs.flatMap(proof => {
+    const target = proof.task.control.target
+    if (target.kind === "sponsorship_source") return []
+    return [{ controlTaskId: proof.task.taskId, targetKind: target.kind,
+      ...(target.kind === "root_goal" ? { candidateDigest: target.candidateDigest,
+        childBindingSetDigest: target.childBindingSetDigest } : {}) }]
+  })
 }
 
 function nativeVerificationControlPacketMatches(task: NativeVerificationControlTask, content: NonNullable<ReturnType<typeof buildNativeRootPacketContent>>): boolean {

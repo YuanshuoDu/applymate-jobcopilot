@@ -6,7 +6,7 @@ import {
 
 import type { ExecutionOwner } from "../execution-owner.js"
 import { MAX_TOOL_RESULT_BYTES, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
-import { prepareLifecycleValue, prepareSafeValue, prepareScheduledPrepareLifecycleOutput, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeLifecyclePreview, type PreparedLifecycleValue, type ToolResultReferenceStore } from "./redaction.js"
+import { prepareLifecycleValue, prepareSafeValue, prepareScheduledPrepareLifecycleOutput, prepareSponsorshipReviewReceipt, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeLifecyclePreview, type PreparedLifecycleValue, type ToolResultReferenceStore } from "./redaction.js"
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { hasNativeCoordinationEnvelope, prepareResolvedOwnerWaitLifecycleOutput, prepareVerifiedToolResultChunk } from "./lifecycle-receipt-output.js"
@@ -172,6 +172,9 @@ export class ToolLifecycle {
     } else if (call.toolName === "agent.wait" || call.toolName === "wait_subagents") {
       prepared = prepareResolvedOwnerWaitLifecycleOutput(output, call.toolName,
         () => this.options.resolveOwner?.({ ...call, toolCallId: call.id }))
+    } else if (call.toolName === "agent.review_sponsorship") {
+      try { prepared = prepareSponsorshipReviewReceipt(output, call) }
+      catch { throw new ToolExecutionError("sponsorship_review_receipt_invalid", "Sponsorship review receipt is invalid") }
     } else if (call.toolName === "scheduled.application.prepare") {
       try {
         if (!call.taskId) throw new Error("scheduled_prepare_task_id_missing")

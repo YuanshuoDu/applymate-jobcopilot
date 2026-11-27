@@ -179,7 +179,11 @@ describe("sponsorship observation contract", () => {
     const wrongRole = { ...sourceContext, role: "Different role" }
     expect(parseSponsorshipObservation(inconclusive({ sourceContext: wrongRole }),
       expectation({ sourceContext: wrongRole }))).toBeNull()
-    expect(parseSponsorshipObservation(inconclusive({ sourceContext: { ...sourceContext, sourceUrl: "https://jobs.example/listing?id=private" } }), expectation())).toBeNull()
+    const safePath = { ...sourceContext, sourceUrl: "https://jobs.example/listing" }
+    const sanitizedUrl = parseSponsorshipObservation(inconclusive({ sourceContext: {
+      ...sourceContext, sourceUrl: "https://user:secret@jobs.example/listing?token=private#fragment",
+    } }), expectation({ sourceContext: safePath }))
+    expect(sanitizedUrl).toMatchObject({ status: "inconclusive", sourceContext: { sourceUrl: "https://jobs.example/listing" } })
   })
 
   it("rejects open schemas and accessor-backed input without invoking the accessor", () => {

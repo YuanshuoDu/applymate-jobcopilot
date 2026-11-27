@@ -10,7 +10,7 @@ const shortlist = { schemaVersion: 1 as const, status: "completed" as const, ite
 
 describe("interactive discovery runtime", () => {
   it("uses a closed Root objective surface and rejects hidden calls before dispatch", async () => {
-    const visible = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile", "agent.retire_superseded_scout"]
+    const visible = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile", "agent.retire_superseded_scout", "agent.review_sponsorship"]
       .map(name => ({ name, risk: "internal_write" }))
     for (const name of visible.map(tool => tool.name)) expect(objectiveTaskGraphRootToolAllowed({ name, risk: "read" })).toBe(true)
     for (const name of ["jobs.search", "persona.retrieve", "resume.get_base", "application.get", "agent.spawn", "spawn_subagent", "agent.followup", "scheduled.application.prepare", "tool_results.read"]) {
