@@ -14,10 +14,10 @@ export function objectiveTailorWaveOutcomeGuidance(
   const pending = observation.slots.some(slot => slot.status === "pending")
   const hasTailor = visibleWaveTailor(tools)
   const actions = [
-    pending ? "Pending slots are still in progress; wait for the current graph and do not claim an outcome." : "",
+    pending ? "Pending slots remain unresolved. Do not claim the wave is settled or finish this Turn while any slot remains pending; continue waiting or refresh verified progress as needed." : "",
     observation.slots.some(slot => slot.status === "ready") ? "Preserve every ready slot; do not revise it." : "",
     initialNeedsRevision.length && hasTailor
-      ? `For an initial pair marked needs_revision, the bounded outcome frame may justify proposing at most one correction for that same slot with the current expectedRevision and existing agent.tailor v2 correction form. The command must independently revalidate the current slot and Reviewer receipt; do not claim correction success until its canonical tool result confirms acceptance. Slots: ${initialNeedsRevision.map(slot => slot.slotId).join(", ")}.`
+      ? `For an initial pair marked needs_revision, the bounded outcome frame may justify proposing at most one correction for that same slot with the current expectedRevision and existing agent.tailor v2 correction form. A different pending slot does not block this independently eligible correction. The command must independently revalidate the current slot and Reviewer receipt; do not claim correction success until its canonical tool result confirms acceptance. Slots: ${initialNeedsRevision.map(slot => slot.slotId).join(", ")}.`
       : initialNeedsRevision.length ? "An initial pair needs revision, but no unambiguous request-visible agent.tailor v2 tool is available; report the blocker without claiming a correction." : "",
     correctionNeedsRevision.length ? `A correction pair still marked needs_revision is unresolved; do not request a second correction. Slots: ${correctionNeedsRevision.map(slot => slot.slotId).join(", ")}.` : "",
     observation.slots.some(slot => ["rejected", "stale", "failed"].includes(slot.status))

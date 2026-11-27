@@ -29,7 +29,7 @@ function guidanceText(rows: readonly Readonly<{ slotId: string; effectivePair: "
 }
 
 describe("Objective Tailor wave outcome guidance", () => {
-  it("routes only initial needs_revision through one evidence-backed same-slot correction and preserves ready or pending", () => {
+  it("keeps pending slots unresolved while allowing an independent settled needs_revision correction", () => {
     const text = guidanceText([
       { slotId: "tailor-1", effectivePair: "initial", status: "needs_revision" },
       { slotId: "tailor-2", effectivePair: "initial", status: "ready" },
@@ -37,11 +37,13 @@ describe("Objective Tailor wave outcome guidance", () => {
     ])
     if (!text) throw new Error("expected Root guidance")
     expect(text).toContain("at most one correction for that same slot")
+    expect(text).toContain("Do not claim the wave is settled or finish this Turn while any slot remains pending")
+    expect(text).toContain("A different pending slot does not block this independently eligible correction")
     expect(text).toContain("command must independently revalidate the current slot and Reviewer receipt")
     expect(text).toContain("do not assume concurrent acceptance")
     expect(text).toContain("tailor-1")
     expect(text).toContain("Preserve every ready slot")
-    expect(text).toContain("wait for the current graph")
+    expect(text).toContain("continue waiting or refresh verified progress as needed")
     expect(text).toContain("grants no permission, approval, completion, or submission authority")
     for (const privateValue of ["PRIVATE_SOURCE", "PRIVATE_INITIAL", "PRIVATE_CORRECTION", "PRIVATE_TASK"]) expect(text).not.toContain(privateValue)
   })
