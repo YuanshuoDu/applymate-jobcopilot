@@ -4,6 +4,7 @@ import { Prisma, type Job } from '@prisma/client'
 import { db } from '@/lib/db'
 import { configureTenantTransaction } from '@/lib/db/tenant-store'
 import { DiscoveryToolError } from './discovery-tool-support'
+import { acquireSourceMaterialFence } from './source-material-fence'
 import type { DiscoveredJob } from './discover'
 
 export type DiscoveryJobMaterializerFence = Readonly<{ userId: string; sessionId: string; turnId: string; stepId: string; taskId: string; rootTaskId: string; leaseOwner: string; attemptCount: number }>
@@ -127,11 +128,10 @@ function assertFence(userId: string, fence: DiscoveryJobMaterializerFence | unde
   }
 }
 
-type MaterializerFenceTransaction = MaterializerTransaction
 type ActiveTaskRow = { id: string; sessionId: string; turnId: string | null; rootTaskId: string | null; parentTaskId: string | null; role: string; taskType: string; status: string; interruptRequestedAt: Date | string | null; closedAt: Date | string | null; leaseOwner: string | null; attemptCount: number; allowedActions: unknown }
-
-async function lockAndValidateAttempt(tx: MaterializerFenceTransaction, fence: DiscoveryJobMaterializerFence): Promise<void> {
+async function lockAndValidateAttempt(tx: MaterializerTransaction, fence: DiscoveryJobMaterializerFence): Promise<void> {
   await configureTenantTransaction(tx as never, fence.userId)
+  await acquireSourceMaterialFence(tx as never, [fence.userId])
   const session = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
     SELECT "id", "status" FROM "agent_sessions"
     WHERE "id" = ${fence.sessionId} AND "userId" = ${fence.userId}
@@ -186,7 +186,7 @@ async function lockAndValidateAttempt(tx: MaterializerFenceTransaction, fence: D
   await assertLiveAttempt(tx, fence)
 }
 
-async function assertLiveAttempt(tx: MaterializerFenceTransaction, fence: DiscoveryJobMaterializerFence): Promise<void> {
+async function assertLiveAttempt(tx: MaterializerTransaction, fence: DiscoveryJobMaterializerFence): Promise<void> {
   const rows = await tx.$queryRaw<Array<{ status: string; interruptRequestedAt: Date | string | null; closedAt: Date | string | null; leaseOwner: string | null; attemptCount: number; live: boolean }>>(Prisma.sql`
     SELECT task."status", task."interruptRequestedAt", task."closedAt", task."leaseOwner", task."attemptCount",
       task."leaseExpiresAt" > clock_timestamp() AS "live"

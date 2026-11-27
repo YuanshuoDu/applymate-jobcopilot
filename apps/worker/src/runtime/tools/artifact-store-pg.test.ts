@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import type { Pool } from "pg"
+import { vi } from "vitest"
 import type { AgentArtifactSourceDigestReader } from "../../db/agent-artifact-repo.js"
 import { hashArtifactContent } from "../subagents/artifact-adapters.js"
 import { PgArtifactToolStore } from "./artifact-store-pg.js"
@@ -23,6 +24,34 @@ function executionContext(taskId = "task-a", toolCallId = "call-a", leaseOwner =
 }
 
 describe("PgArtifactToolStore immutable persistence", () => {
+  it("preserves stale_hash mapping for duplicate source-base IDs with matching or changed content", async () => {
+    const duplicate = Object.assign(new Error("duplicate key violates unique constraint"), { code: "23505" })
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        calls.push({ sql, values })
+        if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return { rows: [{ transaction_id: "42" }], rowCount: 1 }
+        if (sql.startsWith('INSERT INTO "agent_artifact"')) throw duplicate
+        return { rows: [], rowCount: 0 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn(async () => client) } as unknown as Pool
+    const store = new PgArtifactToolStore(pool)
+    const existingBase = { id: "resume-base-a", type: "resume" as const, userId: "user-a", jobId: "job-a", content: { summary: "same" } }
+
+    await expect(store.registerBase(existingBase)).rejects.toMatchObject({ code: "stale_hash" })
+    await expect(store.registerBase({ ...existingBase, content: { summary: "changed" } })).rejects.toMatchObject({ code: "stale_hash" })
+
+    const inserts = calls.filter(call => call.sql.startsWith('INSERT INTO "agent_artifact"'))
+    expect(inserts).toHaveLength(2)
+    expect(inserts.map(call => call.values?.[0])).toEqual(["resume-base-a", "resume-base-a"])
+    expect(inserts.map(call => call.values?.[5])).toEqual(['{"summary":"same"}', '{"summary":"changed"}'])
+    expect(inserts.every(call => !call.sql.includes("ON CONFLICT"))).toBe(true)
+    expect(calls.filter(call => call.sql === "ROLLBACK")).toHaveLength(2)
+    expect(client.release).toHaveBeenCalledTimes(2)
+  })
+
   it("persists, reads exact versions and reviews across store instances", async () => {
     const pool = new FakeArtifactPool() as unknown as Pool
     const writer = new PgArtifactToolStore(pool)
@@ -61,17 +90,39 @@ describe("PgArtifactToolStore immutable persistence", () => {
     })
 
     const statements = pool.transactions.at(-1)!
+    const sourceLock = statements.findIndex(sql => sql.includes("hashtextextended($1::text, 0)"))
+    const sourceVerify = statements.findIndex((sql, index) => index > sourceLock && sql === "SELECT pg_current_xact_id()::text AS transaction_id")
+    const artifactLock = statements.findIndex(sql => sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))"))
     const staged = statements.findIndex(sql => sql.startsWith('INSERT INTO "agent_artifact_version"'))
     const jobLock = statements.findIndex(sql => sql.includes('FROM "Job"') && sql.endsWith("FOR SHARE"))
     const guarded = statements.indexOf("SELECT fake material guard")
     const leaseChecks = statements.flatMap((sql, index) => sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()') ? [index] : [])
     expect(version.version).toBe(1)
     expect(guardClient).toBe(pool.lastConnectedClient)
-    expect(staged).toBeGreaterThanOrEqual(0)
+    expect(sourceLock).toBeGreaterThanOrEqual(0)
+    expect(pool.sourceLockKeys.at(-1)).toEqual(["applymate:gate-source-fence:v1:user-a"])
+    expect(sourceVerify).toBeGreaterThan(sourceLock)
+    expect(artifactLock).toBeGreaterThan(sourceVerify)
+    expect(staged).toBeGreaterThan(artifactLock)
     expect(jobLock).toBeGreaterThan(staged)
     expect(guarded).toBeGreaterThan(jobLock)
     expect(leaseChecks.at(-1)).toBeGreaterThan(guarded)
     expect(statements.at(-1)).toBe("COMMIT")
+  })
+
+  it("rolls back a scheduled draft before writing when the source fence fails", async () => {
+    const pool = new FakeArtifactPool()
+    const guard = vi.fn(async () => true)
+    const store = new PgArtifactToolStore(pool as unknown as Pool, undefined, guard)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    pool.failSourceFence = true
+
+    await expect(store.writeDraft(scope, {
+      baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("request"),
+    })).rejects.toThrow("source material fence transaction verification failed")
+    expect(guard).not.toHaveBeenCalled()
+    expect(pool.transactions.at(-1)?.at(-1)).toBe("ROLLBACK")
+    expect(pool.transactions.at(-1)?.some(sql => sql.startsWith('INSERT INTO "agent_artifact_version"'))).toBe(false)
   })
 
   it("rolls back a staged scheduled draft when current material is unavailable or stale", async () => {
@@ -348,6 +399,8 @@ class FakeArtifactPool {
   conflictWinnerReads = 0
   private resolvingVersionConflict = false
   private advisoryLockTail: Promise<void> = Promise.resolve()
+  readonly sourceLockKeys: unknown[][] = []
+  failSourceFence = false
   readonly transactions: string[][] = []
   lastConnectedClient: object | undefined
   readonly fence = {
@@ -358,14 +411,23 @@ class FakeArtifactPool {
   }
   async connect() {
     let releaseLock: (() => void) | undefined
+    let jobLockHeld = false
     let transactionStatements: string[] = []
     let transactionSnapshot: ReturnType<FakeArtifactPool["snapshot"]> | undefined
     const client = {
       query: async (sql: string, values?: unknown[]) => {
-        if (sql.includes("pg_advisory_xact_lock")) {
+        if (sql.includes("hashtextextended($1::text, 0)")) {
+          transactionStatements.push(sql)
+          this.sourceLockKeys.push(values ?? [])
+          if (this.failSourceFence) throw new Error("fence failure")
+          return this.query(sql, values)
+        }
+        if (sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))")) {
+          if (jobLockHeld) return this.empty()
           const predecessor = this.advisoryLockTail
           this.advisoryLockTail = new Promise<void>(resolve => { releaseLock = resolve })
           await predecessor
+          jobLockHeld = true
           transactionSnapshot = this.snapshot()
         }
         if (sql === "BEGIN") transactionSnapshot = this.snapshot()
@@ -376,16 +438,17 @@ class FakeArtifactPool {
           this.transactions.push(transactionStatements)
           transactionStatements = []
           transactionSnapshot = undefined
-          releaseLock?.(); releaseLock = undefined
+          releaseLock?.(); releaseLock = undefined; jobLockHeld = false
         }
         return result
       },
-      release: () => { releaseLock?.(); releaseLock = undefined },
+      release: () => { releaseLock?.(); releaseLock = undefined; jobLockHeld = false },
     }
     this.lastConnectedClient = client
     return client
   }
   async query(sql: string, values: unknown[] = []): Promise<Result> {
+    if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return this.one({ transaction_id: "42" })
     if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 0 }
     if (sql.includes('FROM "Job"') && sql.endsWith("FOR SHARE")) return this.one(values?.[0] === "job-a" && values?.[1] === "user-a" ? { id: "job-a" } : undefined)
     if (sql === "SELECT fake material guard") return this.one({ current: values?.[0] === "user-a" && values?.[1] === "job-a" })

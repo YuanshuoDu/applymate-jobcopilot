@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { materializeDiscoveredJobs, type DiscoveryJobMaterializerDatabase } from './discovery-job-materializer'
-import { executeDiscover, type DiscoveryToolDependencies } from './discovery-tool-executors'
+import { executeDiscover, executeScore, type DiscoveryToolDependencies } from './discovery-tool-executors'
 import type { DiscoveredJob, DiscoverParams } from './discover'
 import type { DiscoveryToolContext, ToolUsageState } from './discovery-tool-support'
-import type { JobsSearchInput } from './discovery-tool-types'
+import type { JobsScoreInput, JobsSearchInput } from './discovery-tool-types'
+import type { Job } from '@prisma/client'
+import type { PipelineCtx } from './types'
+import { AnalyzeSourceChangedError } from './stages/analyze-model-input'
 
 const mocks = vi.hoisted(() => ({ findMany: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: { job: { findMany: mocks.findMany } } }))
@@ -16,7 +19,7 @@ type FixtureJobDelegate = {
 }
 type FixtureTransaction = {
   job: FixtureJobDelegate
-  $queryRaw<T>(query: { sql: string }): Promise<T>
+  $queryRaw<T>(query: TemplateStringsArray | { sql: string }): Promise<T>
   $executeRaw: (...args: unknown[]) => Promise<number>
   $executeRawUnsafe: (query: string) => Promise<number>
 }
@@ -78,8 +81,9 @@ function materializerFixture() {
       },
         $executeRaw: async () => 1,
         $executeRawUnsafe: async () => 1,
-        $queryRaw: async <T>(query: { sql: string }): Promise<T> => {
-          const sql = query.sql
+        $queryRaw: async <T>(query: TemplateStringsArray | { sql: string }): Promise<T> => {
+          const sql = 'sql' in query ? query.sql : query.join('?')
+          if (sql.includes('pg_current_xact_id()::text AS transaction_id')) return [{ transaction_id: '17' }] as T
           if (sql.includes('FROM "agent_sessions"')) return [{ id: executionFence.sessionId, status: 'running' }] as T
           if (sql.includes('FROM "agent_turns"')) return [{ id: executionFence.turnId, rootTaskId: executionFence.rootTaskId, status: 'in_progress' }] as T
           if (sql.includes('FROM "agent_steps"')) return [{ id: executionFence.stepId }] as T
@@ -309,5 +313,26 @@ describe('executeDiscover', () => {
       .rejects.toMatchObject({ code: 'cancelled' })
     expect(materialize).not.toHaveBeenCalled()
     expect(cancelledUsage.jobsFailed).toBe(0)
+  })
+})
+
+describe('executeScore', () => {
+  it('preserves source drift as an explicit failed-job code', async () => {
+    const row = { id: 'job_1', userId: 'user-1', company: 'Acme', role: 'Engineer', url: 'https://example.com/job' } as Job
+    const input: JobsScoreInput = { jobIds: [row.id] }
+    const pipelineContext = { userId: 'user-1', aiConfig: { provider: 'minimax', model: 'MiniMax-M3' } } as PipelineCtx
+    const scoreContext = { ...context, pipelineContext } as DiscoveryToolContext
+    const db = { job: { findMany: vi.fn(async () => [row]) } }
+    const sourceChanged = new AnalyzeSourceChangedError()
+    const usageState = usage()
+
+    const result = await executeScore(input, scoreContext, {
+      db, analyze: async () => { throw sourceChanged },
+    }, usageState)
+
+    expect(result.results).toEqual([expect.objectContaining({
+      jobId: row.id, status: 'failed', code: 'analyze_source_changed', message: sourceChanged.message,
+    })])
+    expect(usageState).toMatchObject({ jobsProcessed: 1, jobsSucceeded: 0, jobsFailed: 1 })
   })
 })

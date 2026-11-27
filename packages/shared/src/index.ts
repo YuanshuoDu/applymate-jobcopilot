@@ -35,6 +35,11 @@ export { credentialContext, decryptSecret, encryptSecret, isEncryptedSecret, mas
 export { pinnedFetch, validatePinnedUrl, type PinnedFetchOptions } from "./pinned-outbound.js";
 export { redactAgentEvent, redactSensitiveText, redactSensitiveValue } from "./agent-redaction.js";
 export { hashAgentReceiptValue } from "./agent-receipt.js";
+export {
+  buildAgentSourceMaterialFenceKey,
+  normalizeAgentSourceMaterialFenceError,
+  sortUniqueAgentSourceMaterialFenceUserIds,
+} from "./agent-source-material-fence.js";
 export { normalizeAgentLocation, normalizeAgentLocationAllowlist } from "./agent-location-normalization.js";
 export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type ExternalApiErrorCode, type SharedExternalApiUsage, recordSharedExternalApiUsage } from "./external-api-usage.js";
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";

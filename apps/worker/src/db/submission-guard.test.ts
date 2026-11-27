@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const withExactAttemptFence = vi.hoisted(() => vi.fn());
 const appendFencedSubmitAudit = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const acquireSourceMaterialFence = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 vi.mock("../queue/application-submit-fence.js", () => ({
   withExactAttemptFence,
   appendFencedSubmitAudit,
 }));
+vi.mock("./source-material-fence.js", () => ({ acquireSourceMaterialFence }));
 
 import {
   claimUnattendedSubmission,
@@ -35,12 +37,14 @@ function poolWith(...responses: Array<{ rowCount?: number | null; rows?: unknown
     return responses.shift() ?? { rowCount: 0, rows: [] };
   });
   const release = vi.fn();
-  const connect = vi.fn().mockResolvedValue({ query, release });
-  return { pool: { connect } as unknown as Pool, query, release };
+  const client = { query, release };
+  const connect = vi.fn().mockResolvedValue(client);
+  return { pool: { connect } as unknown as Pool, client, query, release };
 }
 
 beforeEach(() => {
   withExactAttemptFence.mockClear();
+  acquireSourceMaterialFence.mockReset().mockResolvedValue(undefined);
   withExactAttemptFence.mockImplementation(async (
     _client: unknown,
     _identity: ApplicationSubmitIdentity,
@@ -50,6 +54,59 @@ beforeEach(() => {
 });
 
 describe("submission guard", () => {
+  it("acquires the exact user source fence before the attempt fence and Job update", async () => {
+    const order: string[] = [];
+    const { pool, client, query } = poolWith({ rowCount: 1, rows: [] });
+    query.mockImplementation(async (sql: string) => {
+      if (sql === "BEGIN") order.push("begin");
+      if (sql.includes("set_config")) order.push("tenant-context");
+      if (sql.includes('UPDATE "Job" SET status')) order.push("job-write");
+      if (sql === "COMMIT") order.push("commit");
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) {
+        return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 1 };
+    });
+    acquireSourceMaterialFence.mockImplementationOnce(async (fencedClient: unknown, userIds: readonly string[]) => {
+      expect(fencedClient).toBe(client);
+      expect(userIds).toEqual([identity.userId]);
+      order.push("source-fence");
+    });
+    withExactAttemptFence.mockImplementationOnce(async (
+      _client: unknown,
+      _identity: ApplicationSubmitIdentity,
+      write: () => Promise<unknown>,
+    ) => {
+      order.push("attempt-fence");
+      return { kind: "current", value: await write() };
+    });
+
+    await expect(updateJobForSubmission(
+      pool, identity, { status: "applied", workflowState: "submitted", applied: true }, "finish_apply_job_state",
+    )).resolves.toEqual({ kind: "current", value: true });
+
+    expect(order).toEqual(["begin", "tenant-context", "source-fence", "attempt-fence", "job-write", "commit"]);
+    expect(acquireSourceMaterialFence).toHaveBeenCalledOnce();
+  });
+
+  it("rolls back before attempt locks or Job writes when the source fence fails", async () => {
+    const fenceError = new Error("source material fence failed");
+    const { pool, query } = poolWith();
+    acquireSourceMaterialFence.mockRejectedValueOnce(fenceError);
+
+    await expect(updateJobForSubmission(
+      pool, identity, { status: "applied", workflowState: "submitted", applied: true }, "finish_apply_job_state",
+    )).rejects.toBe(fenceError);
+
+    expect(acquireSourceMaterialFence).toHaveBeenCalledOnce();
+    expect(acquireSourceMaterialFence).toHaveBeenCalledWith(expect.anything(), [identity.userId]);
+    expect(withExactAttemptFence).not.toHaveBeenCalled();
+    expect(query.mock.calls.map(([sql]) => sql)).toEqual([
+      "BEGIN", "SELECT set_config($1, $2, true)", "ROLLBACK",
+    ]);
+    expect(query).not.toHaveBeenCalledWith(expect.stringContaining('UPDATE "Job"'), expect.anything());
+  });
+
   it("claims a queued job exactly once before opening a browser", async () => {
     const { pool, query, release } = poolWith(
       { rowCount: 1, rows: [{ id: "approval-1" }] },
@@ -177,6 +234,7 @@ describe("submission guard", () => {
 
     expect(withExactAttemptFence).toHaveBeenCalledOnce();
     expect(currentDelivery).toHaveBeenCalledOnce();
+    expect(acquireSourceMaterialFence).not.toHaveBeenCalled();
     expect(query.mock.calls.some(([sql]) => String(sql).includes("UPDATE application_tasks"))).toBe(false);
     expect(query.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO application_task_events"))).toBe(false);
     expect(query).toHaveBeenCalledWith("COMMIT");

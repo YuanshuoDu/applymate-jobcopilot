@@ -120,7 +120,26 @@ function persist(pool: pg.Pool, binding: ScheduledPrepareArtifactWriteBinding) {
 }
 
 function artifactPool(): pg.Pool {
-  const client = { query: vi.fn(async () => ({ rows: [] })), release: vi.fn() }
+  let nextTransactionId = 0
+  let activeTransactionId: string | null = null
+  const client = {
+    query: vi.fn(async (sql: string) => {
+      if (sql === "BEGIN") {
+        activeTransactionId = String(++nextTransactionId)
+        return { rows: [] }
+      }
+      if (sql.includes("pg_current_xact_id()::text AS transaction_id")) {
+        return { rows: activeTransactionId ? [{ transaction_id: activeTransactionId }] : [] }
+      }
+      if (sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))")) {
+        if (activeTransactionId === null) throw new Error("artifact job lock expected an open transaction")
+        return { rows: [{ pg_advisory_xact_lock: null }] }
+      }
+      if (sql === "COMMIT" || sql === "ROLLBACK") activeTransactionId = null
+      return { rows: [] }
+    }),
+    release: vi.fn(),
+  }
   return { connect: vi.fn(async () => client) } as unknown as pg.Pool
 }
 

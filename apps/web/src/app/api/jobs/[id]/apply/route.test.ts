@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest } from 'next/server'
 
 const mocks = vi.hoisted(() => ({
-  requireAuth: vi.fn(), findFirst: vi.fn(), count: vi.fn(), update: vi.fn(), transaction: vi.fn(),
+  requireAuth: vi.fn(), findFirst: vi.fn(), count: vi.fn(), update: vi.fn(), transaction: vi.fn(), fenceQuery: vi.fn(),
   activityCreate: vi.fn(), checkEntitlementLimit: vi.fn(), purge: vi.fn(),
 }))
 vi.mock('@/lib/api-helpers', () => ({
@@ -34,7 +34,12 @@ describe('POST manual application record', () => {
     mocks.checkEntitlementLimit.mockResolvedValue({ allowed: true, reason: 'available' })
     mocks.update.mockResolvedValue({ count: 1 })
     mocks.activityCreate.mockResolvedValue({})
-    mocks.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => fn({ job: { updateMany: mocks.update }, activity: { create: mocks.activityCreate } }))
+    mocks.fenceQuery.mockResolvedValue([{ transaction_id: '100' }])
+    mocks.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => fn({
+      $queryRaw: mocks.fenceQuery,
+      job: { updateMany: mocks.update },
+      activity: { create: mocks.activityCreate },
+    }))
     mocks.purge.mockResolvedValue(undefined)
   })
 
@@ -86,6 +91,29 @@ describe('POST manual application record', () => {
     expect(mocks.update).toHaveBeenCalledWith({ where: { id: 'job-1', userId: 'user-1', status: { in: ['saved', 'applied'] }, workflowState: { in: ['draft', 'ready_to_apply'] }, appliedAt: null }, data: { status: 'applied', workflowState: 'submitted', appliedAt: expect.any(Date) } })
     expect(mocks.activityCreate).toHaveBeenCalledWith({ data: { userId: 'user-1', jobId: 'job-1', type: 'applied', text: 'You applied manually Example · Engineer', color: '#059669' } })
     expect(mocks.purge).toHaveBeenCalledWith('user-1', 'job-1')
+  })
+
+  it('acquires the authenticated user fence before the conditional write in the caller transaction', async () => {
+    const response = await POST(request(), context)
+
+    expect(response.status).toBe(200)
+    expect(mocks.fenceQuery).toHaveBeenCalledTimes(2)
+    expect(mocks.fenceQuery.mock.calls[0]?.[1]).toBe('applymate:gate-source-fence:v1:user-1')
+    expect(mocks.fenceQuery.mock.invocationCallOrder[0]).toBeLessThan(mocks.update.mock.invocationCallOrder[0]!)
+    expect(mocks.fenceQuery.mock.invocationCallOrder[1]).toBeLessThan(mocks.update.mock.invocationCallOrder[0]!)
+    expect(mocks.update.mock.invocationCallOrder[0]).toBeLessThan(mocks.activityCreate.mock.invocationCallOrder[0]!)
+    expect(mocks.transaction.mock.invocationCallOrder[0]).toBeLessThan(mocks.fenceQuery.mock.invocationCallOrder[0]!)
+    expect(mocks.transaction.mock.invocationCallOrder[0]).toBeLessThan(mocks.purge.mock.invocationCallOrder[0]!)
+  })
+
+  it('fails closed before the Job write when the transaction fence cannot be acquired', async () => {
+    mocks.fenceQuery.mockRejectedValue(new Error('private database detail for user-1'))
+
+    await expect(POST(request(), context)).rejects.toThrow('source material fence transaction verification failed')
+
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(mocks.purge).not.toHaveBeenCalled()
   })
 
   it('returns the original authentication failure without querying or writing', async () => {

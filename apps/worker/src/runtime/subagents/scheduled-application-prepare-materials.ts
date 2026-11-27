@@ -1,8 +1,6 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
 import type { HarnessModelRequest, ModelAdapter, ModelResponse } from "@jobcopilot/agent-model"
-import { createAgentArtifactRepository, type AgentArtifactBaseInsert, type AgentArtifactDraftWrite, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
-import { withArtifactTransaction } from "../../db/agent-artifact-repo-helpers.js"
 import { createUsageAwareModelAdapter, type UsageAwareModelOptions } from "../turns/usage-aware-model.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { toRepositoryJson } from "../turns/turn-engine-types.js"
@@ -11,13 +9,16 @@ import type { TurnExecutionOwnerFence, ExecutionOwnerFence } from "../execution-
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
+import { persistScheduledPrepareMaterial, scheduledPrepareProvenanceRefs } from "./scheduled-application-prepare-persistence.js"
+import type { ScheduledPrepareMaterialSources } from "./scheduled-application-prepare-persistence.js"
+export { persistScheduledPrepareMaterial, scheduledPrepareArtifactIdentity, scheduledPrepareContainsRefs } from "./scheduled-application-prepare-persistence.js"
+export type { ScheduledPrepareMaterialSources } from "./scheduled-application-prepare-persistence.js"
 import type { ScheduledPrepareJobInput, ScheduledPrepareOwner, ScheduledPrepareTailoringChoice,
-  ScheduledPrepareArtifactWriteBinding, VerifiedScheduledPrepareInvocation, ScheduledPrepareChoiceResolution } from "../tools/scheduled-application-prepare.js"
+  VerifiedScheduledPrepareInvocation, ScheduledPrepareChoiceResolution } from "../tools/scheduled-application-prepare.js"
 import { SCHEDULED_PREPARE_CHOICE_SCHEMA } from "../tools/scheduled-application-prepare.js"
 import type { AnalystResult } from "./role-results.js"
 
 type Row = Record<string, unknown>
-export type ScheduledPrepareMaterialSources = Awaited<ReturnType<typeof loadSelectedJobArtifactContext>>
 export type ScheduledPrepareMaterialDetail = Readonly<{ sources: ScheduledPrepareMaterialSources; matched: readonly string[]; missing: readonly string[] }>
 export type ScheduledPrepareMaterialOptions = Readonly<{
   pool: pg.Pool; owner: ExecutionOwnerFence; resolveModel(): Promise<ModelAdapter>; authorize: UsageAwareModelOptions["authorize"]
@@ -68,10 +69,6 @@ export function scheduledPrepareCitedRefs(result: AnalystResult, jobId: string, 
   if (refs.length !== ids.length || new Set(refs).size !== refs.length || !refs.includes(jobRef)
     || !validId(baseResumeId) || refs.some(ref => ref !== jobRef && ref !== resumeRef && !ref.startsWith("persona:"))) return null
   return [jobRef, resumeRef, ...refs.filter(ref => ref.startsWith("persona:"))].sort()
-}
-export function scheduledPrepareContainsRefs(sources: ScheduledPrepareMaterialSources, refs: readonly string[]): boolean {
-  const approved = new Set(sources.preparation.evidenceRefs), available = new Set(sources.transientSources.map(source => source.sourceRef))
-  return refs.length > 0 && new Set(refs).size === refs.length && refs.every(ref => approved.has(ref) && available.has(ref))
 }
 export async function prepareScheduledJobMaterials(options: ScheduledPrepareMaterialOptions, input: ScheduledPrepareJobInput,
   detail: ScheduledPrepareMaterialDetail | undefined, signal: AbortSignal): Promise<{ status: "prepared"; materials: Array<{ kind: "resume" | "cover_letter"; artifactRef: unknown }> }> {
@@ -220,60 +217,6 @@ async function complete(adapter: ModelAdapter, request: HarnessModelRequest,
   return value
 }
 
-export async function persistScheduledPrepareMaterial(pool: pg.Pool, input: ScheduledPrepareJobInput, kind: "resume" | "cover_letter",
-  content: unknown, sources: ScheduledPrepareMaterialSources, usedRefs?: readonly string[]) {
-  const binding: ScheduledPrepareArtifactWriteBinding = input.artifactBinding(kind)
-  const provenanceRefs = usedRefs ?? binding.evidenceRefs
-  const current = await loadSelectedJobArtifactContext(pool, binding.userId, binding.jobId)
-  if (sources.preparation.sourceDigest !== binding.sourceDigest || current.preparation.sourceDigest !== binding.sourceDigest
-    || !scheduledPrepareProvenanceRefs(sources, binding.jobId, provenanceRefs) || !scheduledPrepareProvenanceRefs(current, binding.jobId, provenanceRefs)) {
-    throw new Error("scheduled_prepare_source_changed")
-  }
-  const baseContent = kind === "resume" ? sourceContent(sources, "resume:" + sources.baseResumeId)
-    : { kind: "scheduled_cover_letter_base", jobId: binding.jobId, sourceResumeId: sources.baseResumeId, sourceDigest: binding.sourceDigest }
-  if (baseContent === undefined) throw new Error("scheduled_prepare_base_missing")
-  const identity = scheduledPrepareArtifactIdentity(binding, input.invocation.owner.rootAttemptCount, provenanceRefs)
-  const hash = hashArtifactContent(baseContent)
-  const base: AgentArtifactBaseInsert = { id: identity.baseId, userId: binding.userId, jobId: binding.jobId, artifactType: kind, content: baseContent,
-    hash, constraintHash: identity.baseConstraintHash, provenanceRefs: [...provenanceRefs], evidenceRefs: [...provenanceRefs] }
-  const taskFence: AgentArtifactTaskFence = { ...binding.taskFence, taskFenceMode: "scheduled_prepare",
-    turnLeaseOwnerId: input.invocation.owner.turnLeaseOwnerId, turnLeaseVersion: input.invocation.owner.turnLeaseVersion }
-  const repository = createAgentArtifactRepository(pool)
-  const prior = await repository.find(binding.userId, identity.draftId)
-  const write: AgentArtifactDraftWrite = { id: identity.draftId, userId: binding.userId, sessionId: binding.sessionId, jobId: binding.jobId,
-    artifactType: kind, content, hash: hashArtifactContent(content), constraintHash: identity.constraintHash, provenanceRefs: [...provenanceRefs],
-    evidenceRefs: [...provenanceRefs], baseId: identity.baseId, baseHash: hash, previousHash: prior?.hash ?? null, sourceDigest: binding.sourceDigest,
-    taskId: binding.taskFence.taskId, toolCallId: identity.toolCallId, requestHash: binding.requestHash, taskFence }
-  const row = await withArtifactTransaction(pool, binding.userId, async client => {
-    await repository.insertBaseWithClient(client, base, taskFence)
-    return repository.saveDraft(write, client)
-  })
-  return { artifactId: row.artifactId, version: row.version, contentHash: row.contentHash, sourceDigest: row.sourceDigest }
-}
-
-export function scheduledPrepareArtifactIdentity(binding: ScheduledPrepareArtifactWriteBinding, rootAttemptCount: number,
-  usedRefs: readonly string[] = binding.evidenceRefs) {
-  const sourceIdentity = { schemaVersion: "agent-harness.v2.scheduled-prepare-source-artifact.v1", kind: binding.kind,
-    userId: binding.userId, jobId: binding.jobId, sourceDigest: binding.sourceDigest, evidenceRefs: usedRefs }
-  const baseDigest = hashArtifactContent(sourceIdentity)
-  const executionDigest = hashArtifactContent({ schemaVersion: "agent-harness.v2.scheduled-prepare-material.v1",
-    userId: binding.userId, sessionId: binding.sessionId, turnId: binding.turnId, rootTaskId: binding.rootTaskId, rootAttemptCount,
-    taskId: binding.taskId, executionId: binding.executionId, executionAttemptCount: binding.executionAttemptCount,
-    sourceDigest: binding.sourceDigest, jobId: binding.jobId, kind: binding.kind, toolCallId: binding.toolCallId })
-  return {
-    baseId: "scheduled-base:" + baseDigest.slice(7), baseConstraintHash: baseDigest,
-    draftId: "scheduled-draft:" + executionDigest.slice(7), toolCallId: "scheduled-prepare:" + executionDigest.slice(7),
-    constraintHash: hashArtifactContent({ kind: binding.kind, score: binding.score, checkpointDigest: binding.checkpointDigest,
-      choiceDigest: binding.resumeTailoringChoiceDigest, evidenceRefs: usedRefs }),
-  }
-}
-
-function scheduledPrepareProvenanceRefs(sources: ScheduledPrepareMaterialSources, jobId: string, refs: readonly string[]): boolean {
-  const required = ["job:" + jobId, "resume:" + sources.baseResumeId], persona = refs.filter(ref => ref.startsWith("persona:"))
-  const expected = [...required, ...persona].sort()
-  return refs.length === expected.length && refs.every((ref, index) => ref === expected[index]) && scheduledPrepareContainsRefs(sources, refs)
-}
-
 function referencedPersonaSources(sources: ScheduledPrepareMaterialSources, refs: readonly string[]) {
   const selected = new Set(refs.filter(ref => ref.startsWith("persona:")))
   return sources.transientSources.filter(source => selected.has(source.sourceRef))
@@ -283,6 +226,7 @@ function sourceContent(sources: ScheduledPrepareMaterialSources, ref: string): u
   const matches = sources.transientSources.filter(source => source.sourceRef === ref)
   return matches.length === 1 ? matches[0]!.content : undefined
 }
+
 function record(value: unknown): Row | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Row : null }
 function validId(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) }
 function stringArray(value: unknown): value is string[] { return Array.isArray(value) && value.length <= 200 && value.every(item => typeof item === "string" && item.length <= 256) }

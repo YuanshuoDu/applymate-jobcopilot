@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   turn: vi.fn(), root: vi.fn(), session: vi.fn(), user: vi.fn(), execution: vi.fn(), claim: vi.fn(), jobs: vi.fn(),
   question: vi.fn(), runPipeline: vi.fn(), nativeAudit: vi.fn(), postGateTask: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
   auditCurrent: vi.fn(), auditClaim: vi.fn(), auditRace: vi.fn(), validateAuditPrepare: vi.fn(),
+  sourceTerminal: vi.fn(), sourceUntrusted: vi.fn(), sourceAnalyzeResponse: vi.fn(), sourceAnalyzeError: vi.fn(), renew: vi.fn(), snapshotDigest: vi.fn(),
 }));
 vi.mock("@/lib/db", () => ({ db: {
   agentTurn: { findFirst: mocks.turn }, subAgentTask: { findFirst: mocks.root },
@@ -19,6 +20,11 @@ vi.mock("@/lib/agent/scheduled-taskgraph-post-gate-task", () => ({
   runScheduledTaskGraphPostGateTask: mocks.postGateTask,
 }));
 vi.mock("@/lib/agent/scheduled-taskgraph-gate-runtime-rpc", () => ({ runScheduledTaskGraphActionRpc: mocks.gateAction }));
+vi.mock("@/lib/agent/scheduled-taskgraph-source-change-terminal", () => ({
+  isAnalyzeSourceChangedError: mocks.sourceAnalyzeError,
+  isScheduledTaskGraphSourceChangeTerminal: mocks.sourceTerminal, isScheduledTaskGraphAnalyzeProofUntrusted: mocks.sourceUntrusted,
+  renewExpiredScheduledAnalyzeClaim: mocks.renew, respondToScheduledTaskGraphAnalyzeSourceChange: mocks.sourceAnalyzeResponse,
+}));
 vi.mock("@/lib/agent/scheduled-taskgraph-audit-action", () => ({
   claimScheduledAuditExecution: mocks.auditClaim, scheduledAuditChildIsCurrent: mocks.auditCurrent,
   scheduledAuditClaimRaceResponse: mocks.auditRace,
@@ -44,7 +50,7 @@ vi.mock("@/lib/model-router", () => ({
 }));
 vi.mock("@/lib/agent/scheduled-automation-snapshot", () => ({ parseScheduledAutomationSnapshot: mocks.snapshot }));
 vi.mock("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint", () => ({
-  scheduledAutomationSnapshotDigest: () => "sha256:" + "a".repeat(64),
+  scheduledAutomationSnapshotDigest: mocks.snapshotDigest,
   scheduledTaskGraphContinuationKey: () => "continuation-4",
   buildScheduledTaskGraphPrepareCheckpoint: (input: { owner: Record<string, unknown>; attestation: Record<string, unknown>; ownedJobs: Array<{ id: string }>;
     existingCheckpoint: Record<string, unknown> }) => {
@@ -162,6 +168,17 @@ describe("scheduled pipeline continuation route", () => {
     Object.values(mocks).forEach(mock => mock.mockReset());
     process.env.AGENT_WORKER_SECRET = "worker-secret";
     mocks.snapshot.mockReturnValue(scheduledSnapshot);
+    mocks.snapshotDigest.mockReturnValue(attestation.snapshotDigest);
+    mocks.sourceTerminal.mockReturnValue(false);
+    mocks.sourceUntrusted.mockReturnValue(false);
+    mocks.sourceAnalyzeError.mockReturnValue(false);
+    mocks.sourceAnalyzeResponse.mockResolvedValue(Response.json({ status: "blocked", errorCode: "scheduled_pipeline_claim_conflict" }, { status: 409 }));
+    mocks.renew.mockImplementation((input: { state: Record<string, unknown>; claimToken: string }) => {
+      const oldClaim = input.state.scheduledTaskGraphClaim as Record<string, unknown>;
+      const now = new Date();
+      return { ...input.state, scheduledTaskGraphClaim: { ...oldClaim, claimToken: input.claimToken,
+        claimedAt: now.toISOString(), leaseExpiresAt: new Date(now.getTime() + 600_000).toISOString() } };
+    });
     mocks.turn.mockResolvedValue({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
       status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
       input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: owner.rootTaskId,
@@ -194,6 +211,168 @@ describe("scheduled pipeline continuation route", () => {
     mocks.validateAuditPrepare.mockResolvedValue(true);
   });
 
+  it("preserves the snapshot-mismatch response without terminalizing source state", async () => {
+    const state = waitingState();
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state });
+    mocks.snapshotDigest.mockReturnValueOnce("sha256:" + "f".repeat(64));
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_snapshot_mismatch" });
+    expect(mocks.sourceAnalyzeResponse).not.toHaveBeenCalled();
+    expect(mocks.jobs).not.toHaveBeenCalled();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("keeps a snapshot mismatch nonterminal under the ownerless waiting Turn lease", async () => {
+    const state = waitingState();
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+      status: "waiting_for_user", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: owner.rootTaskId,
+      leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null });
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, status: "waiting_for_user", state });
+    mocks.snapshotDigest.mockReturnValueOnce("sha256:" + "f".repeat(64));
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_snapshot_mismatch" });
+    expect(mocks.sourceAnalyzeResponse).not.toHaveBeenCalled();
+    expect(mocks.jobs).not.toHaveBeenCalled();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+  it.each(["foreign root", "stale root"])("does not terminalize snapshot drift for a %s", async kind => {
+    mocks.root.mockResolvedValueOnce(kind === "foreign root"
+      ? { id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: "foreign-root",
+        parentTaskId: null, status: "running", attemptCount: owner.rootAttemptCount, interruptRequestedAt: null, closedAt: null }
+      : { id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        parentTaskId: null, status: "completed", attemptCount: owner.rootAttemptCount, interruptRequestedAt: null, closedAt: null });
+    mocks.snapshotDigest.mockReturnValueOnce("sha256:" + "f".repeat(64));
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "blocked", errorCode:
+      kind === "foreign root" ? "scheduled_pipeline_owner_mismatch" : "scheduled_pipeline_turn_stale" });
+    expect(mocks.sourceAnalyzeResponse).not.toHaveBeenCalled();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+  it("routes Analyze source-change errors through terminalization and exposes only the typed 409", async () => {
+    const sourceError = Object.assign(new Error("source changed"), { code: "scheduled_pipeline_source_changed" });
+    mocks.runPipeline.mockRejectedValueOnce(sourceError);
+    mocks.sourceAnalyzeError.mockReturnValueOnce(true);
+    mocks.sourceAnalyzeResponse.mockResolvedValueOnce(Response.json(
+      { status: "blocked", errorCode: "scheduled_pipeline_source_changed" }, { status: 409 }));
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+    const runInput = mocks.runPipeline.mock.calls[0]?.[0] as { scheduledTaskGraph: { claimToken: string } };
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_source_changed" });
+    expect(mocks.sourceAnalyzeResponse).toHaveBeenCalledWith({
+      owner: fullOwner, key, claimToken: runInput.scheduledTaskGraph.claimToken,
+      sourceChangeError: sourceError, attestationSnapshotDigest: attestation.snapshotDigest,
+    });
+    expect(mocks.claim).toHaveBeenCalledTimes(1);
+  });
+
+  it("terminalizes an unproven legacy checkpoint before lease rebind using the live Turn owner", async () => {
+    const oldOwner = { ...fullOwner, turnLeaseOwnerId: "worker-old", turnLeaseVersion: owner.turnLeaseVersion - 1 }
+    const state = { nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: owner.userId }],
+      scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 82, analysisFenceAt }],
+      scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key,
+        claimToken: "claim-old", owner: oldOwner, claimedAt: "2026-11-01T12:00:00.000Z", leaseExpiresAt: "2026-11-01T12:10:00.000Z" },
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key,
+        owner: oldOwner, snapshotDigest: attestation.snapshotDigest, graphRevision: 9, evidenceDigest: attestation.evidenceDigest },
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v1", key,
+        owner: oldOwner, attemptsByJob: { "job-1": 1 }, failedJobIds: [] } }
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state })
+    mocks.sourceUntrusted.mockReturnValueOnce(true)
+    mocks.sourceAnalyzeResponse.mockResolvedValueOnce(Response.json(
+      { status: "blocked", errorCode: "scheduled_pipeline_source_changed" }, { status: 409 }))
+    const { POST } = await import("./route")
+
+    const response = await POST(request())
+
+    expect(response.status).toBe(409)
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_source_changed" })
+    expect(mocks.sourceAnalyzeResponse).toHaveBeenCalledWith({ owner: fullOwner, attestationSnapshotDigest: attestation.snapshotDigest,
+      allowPriorLease: true, currentTurn: { leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion } })
+    expect(mocks.jobs).not.toHaveBeenCalled()
+    expect(mocks.claim).not.toHaveBeenCalled()
+    expect(mocks.runPipeline).not.toHaveBeenCalled()
+  });
+  it("keeps a prior-lease legacy checkpoint untouched when its attestation mismatches the live snapshot", async () => {
+    const oldOwner = { ...fullOwner, turnLeaseOwnerId: "worker-old", turnLeaseVersion: owner.turnLeaseVersion - 1 }
+    const state = { nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: owner.userId }],
+      scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 82, analysisFenceAt }],
+      scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key,
+        claimToken: "claim-old", owner: oldOwner, claimedAt: "2026-11-01T12:00:00.000Z", leaseExpiresAt: "2026-11-01T12:10:00.000Z" },
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key,
+        owner: oldOwner, snapshotDigest: attestation.snapshotDigest, graphRevision: 9, evidenceDigest: attestation.evidenceDigest },
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v1", key,
+        owner: oldOwner, attemptsByJob: { "job-1": 1 }, failedJobIds: [] } }
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state })
+    mocks.sourceUntrusted.mockReturnValueOnce(true)
+    mocks.snapshotDigest.mockReturnValueOnce(`sha256:${"f".repeat(64)}`)
+    const { POST } = await import("./route")
+
+    const response = await POST(request())
+
+    expect(response.status).toBe(409)
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_snapshot_mismatch" })
+    expect(mocks.sourceUntrusted).not.toHaveBeenCalled()
+    expect(mocks.sourceAnalyzeResponse).not.toHaveBeenCalled()
+    expect(mocks.jobs).not.toHaveBeenCalled()
+    expect(mocks.claim).not.toHaveBeenCalled()
+    expect(mocks.runPipeline).not.toHaveBeenCalled()
+  });
+  it("returns the typed source-change result for a later read of the same failed owner and attempt", async () => {
+    const terminalState = { scheduledTaskGraphSourceChangeTerminal: {
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-source-change-terminal.v1",
+      owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        rootAttemptCount: owner.rootAttemptCount, executionId: "execution-1", executionAttemptCount: 0 },
+    } };
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "failed", attemptCount: 0, state: terminalState,
+      error: "scheduled_pipeline_source_changed" });
+    mocks.sourceTerminal.mockReturnValueOnce(true);
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_source_changed" });
+    expect(mocks.snapshotDigest).not.toHaveBeenCalled();
+    expect(mocks.jobs).not.toHaveBeenCalled();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("does not call another owner's terminal tombstone a source-change result", async () => {
+    const foreignTerminalState = { scheduledTaskGraphSourceChangeTerminal: {
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-source-change-terminal.v1",
+      owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: "other-root",
+        rootAttemptCount: owner.rootAttemptCount, executionId: "execution-1", executionAttemptCount: 0 },
+    } };
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "failed", attemptCount: 0,
+      state: foreignTerminalState, error: "scheduled_pipeline_source_changed" });
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_execution_mismatch" });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
   it("authenticates the Worker before reading owner state", async () => {
     const { POST } = await import("./route");
     const response = await POST(new Request("https://local.test", { method: "POST", body: "{}" }));
@@ -576,7 +755,59 @@ describe("scheduled pipeline continuation route", () => {
     }));
   });
 
+  it("upgrades an expired same-owner scoreless v1 journal in the exact claim CAS", async () => {
+    const { scheduledAnalyzeSourceProofIsUntrusted, renewExpiredScheduledAnalyzeClaim } = await import("@/lib/agent/scheduled-taskgraph-source-change-task-cleanup");
+    mocks.sourceUntrusted.mockImplementation(scheduledAnalyzeSourceProofIsUntrusted);
+    mocks.renew.mockImplementation(renewExpiredScheduledAnalyzeClaim);
+    const expiredAt = new Date(Date.now() - 60_000).toISOString();
+    const priorState = { nextStage: "scout", scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphClaim: { ...ownerClaim(expiredAt), claimedAt: new Date(Date.now() - 120_000).toISOString() },
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v1", key, owner: fullOwner,
+        attemptsByJob: { "job-1": 1 }, failedJobIds: [] } };
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: priorState });
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(200);
+    const update = mocks.claim.mock.calls[0]?.[0];
+    const nextState = update?.data?.state as Record<string, unknown>;
+    expect(update?.where.state.equals).toBe(priorState);
+    expect(nextState.scheduledTaskGraphClaim).toMatchObject({ key, owner: fullOwner, claimToken: expect.any(String) });
+    expect((nextState.scheduledTaskGraphClaim as Record<string, unknown>).claimToken).not.toBe(claimToken);
+    expect(nextState.scheduledTaskGraphAnalyzeJournal).toMatchObject({
+      schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v2", key, owner: fullOwner,
+      attemptsByJob: { "job-1": 1 }, failedJobIds: [], sourceFingerprintsByJob: {},
+    });
+    expect(mocks.sourceAnalyzeResponse).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      scheduledTaskGraph: expect.objectContaining({ owner: fullOwner, continuationKey: key,
+        claimToken: (nextState.scheduledTaskGraphClaim as Record<string, unknown>).claimToken }),
+    }));
+  });
+
+  it("rejects a malformed same-owner scoreless v1 journal without rewriting execution state", async () => {
+    const { scheduledAnalyzeSourceProofIsUntrusted } = await import("@/lib/agent/scheduled-taskgraph-source-change-task-cleanup");
+    mocks.sourceUntrusted.mockImplementation(scheduledAnalyzeSourceProofIsUntrusted);
+    const expiredAt = new Date(Date.now() - 60_000).toISOString();
+    const priorState = { nextStage: "scout", scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphClaim: { ...ownerClaim(expiredAt), claimedAt: new Date(Date.now() - 120_000).toISOString() },
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v1", key, owner: fullOwner,
+        attemptsByJob: { "job-1": 3 }, failedJobIds: [] } };
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: priorState });
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_claim_conflict" });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
   it("atomically rebinds a partial Analyze journal with the claim when the Turn lease rolls over", async () => {
+    const { scheduledAnalyzeSourceProofIsUntrusted } = await import("@/lib/agent/scheduled-taskgraph-source-change-task-cleanup");
+    mocks.sourceUntrusted.mockImplementation(scheduledAnalyzeSourceProofIsUntrusted);
     const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
     const nextFullOwner = { ...nextOwner, executionId: fullOwner.executionId, executionAttemptCount: fullOwner.executionAttemptCount };
     const priorState = { nextStage: "scout", scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs: [], analysisFailed: 0,
@@ -604,11 +835,109 @@ describe("scheduled pipeline continuation route", () => {
     const journal = nextState.scheduledTaskGraphAnalyzeJournal as Record<string, unknown>;
     expect(update?.where.state.equals).toBe(priorState);
     expect(nextClaim).toMatchObject({ key, owner: nextFullOwner });
-    expect(journal).toMatchObject({ key, owner: nextFullOwner, attemptsByJob: { "job-1": 1 } });
+    expect(journal).toMatchObject({ schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v2",
+      key, owner: nextFullOwner, attemptsByJob: { "job-1": 1 }, failedJobIds: [], sourceFingerprintsByJob: {} });
+    expect(mocks.sourceAnalyzeResponse).not.toHaveBeenCalled();
     expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
       scheduledTaskGraph: expect.objectContaining({ owner: nextFullOwner, continuationKey: key, claimToken: nextClaim.claimToken }),
     }));
   });
+
+  it("resumes a reader-valid v2 scoreless partial with an exact failed ledger after lease rollover", async () => {
+    const { scheduledAnalyzeSourceProofIsUntrusted } = await import("@/lib/agent/scheduled-taskgraph-source-change-task-cleanup");
+    mocks.sourceUntrusted.mockImplementation(scheduledAnalyzeSourceProofIsUntrusted);
+    const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
+    const nextFullOwner = { ...nextOwner, executionId: fullOwner.executionId, executionAttemptCount: fullOwner.executionAttemptCount };
+    const priorState = { nextStage: "scout", scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs: [], analysisFailed: 1,
+      scheduledTaskGraphClaim: ownerClaim(),
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v2", key,
+        owner: fullOwner, attemptsByJob: { "job-1": 1 }, failedJobIds: ["job-1"], sourceFingerprintsByJob: {} } };
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+      status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: owner.rootTaskId,
+      leaseOwnerId: nextOwner.turnLeaseOwnerId, leaseVersion: nextOwner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: priorState });
+    const { POST } = await import("./route");
+
+    const response = await POST(request({ owner: nextOwner, attestation: { ...attestation, owner: nextOwner } }));
+
+    expect(response.status).toBe(200);
+    const update = mocks.claim.mock.calls[0]?.[0];
+    const nextState = update?.data?.state as Record<string, unknown>;
+    expect(update?.where.state.equals).toBe(priorState);
+    expect(nextState.scheduledTaskGraphClaim).toMatchObject({ key, owner: nextFullOwner });
+    expect(nextState.scheduledTaskGraphAnalyzeJournal).toMatchObject({
+      schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v2", key, owner: nextFullOwner,
+      attemptsByJob: { "job-1": 1 }, failedJobIds: ["job-1"], sourceFingerprintsByJob: {},
+    });
+    expect(mocks.sourceAnalyzeResponse).not.toHaveBeenCalled();
+  });
+
+  it("rejects a v2 scoreless partial with an inconsistent failure ledger before claim or run", async () => {
+    const { scheduledAnalyzeSourceProofIsUntrusted } = await import("@/lib/agent/scheduled-taskgraph-source-change-task-cleanup");
+    mocks.sourceUntrusted.mockImplementation(scheduledAnalyzeSourceProofIsUntrusted);
+    const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
+    const priorState = { nextStage: "scout", scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphClaim: ownerClaim(),
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v2", key, owner: fullOwner,
+        attemptsByJob: { "job-1": 1 }, failedJobIds: ["job-1"], sourceFingerprintsByJob: {} } };
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+      status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: owner.rootTaskId,
+      leaseOwnerId: nextOwner.turnLeaseOwnerId, leaseVersion: nextOwner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: priorState });
+    const { POST } = await import("./route");
+
+    const response = await POST(request({ owner: nextOwner, attestation: { ...attestation, owner: nextOwner } }));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_claim_conflict" });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it.each(["foreign owner", "candidate mismatch", "invalid attempts", "nonempty scores", "failure count mismatch", "missing attempts"])(
+    "refuses scoreless v1 journal lease upgrade with %s",
+    async defect => {
+      const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
+      const journalOwner = { ...fullOwner };
+      const priorState: Record<string, unknown> = { nextStage: "scout", scoutedJobs: [{ id: "job-1", userId: owner.userId }],
+        scoredJobs: [], analysisFailed: 0,
+        scheduledTaskGraphClaim: { ...ownerClaim(), owner: journalOwner },
+        scheduledTaskGraphAnalyzeJournal: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v1", key,
+          owner: journalOwner, attemptsByJob: { "job-1": 1 }, failedJobIds: [] } };
+      const journal = priorState.scheduledTaskGraphAnalyzeJournal as Record<string, unknown>;
+      if (defect === "foreign owner") {
+        const foreign = { ...journalOwner, rootTaskId: "other-root" };
+        (priorState.scheduledTaskGraphClaim as Record<string, unknown>).owner = foreign;
+        journal.owner = foreign;
+      }
+      if (defect === "candidate mismatch") {
+        priorState.scoutedJobs = [{ id: "other-job", userId: owner.userId }];
+        journal.attemptsByJob = { "other-job": 1 };
+      }
+      if (defect === "invalid attempts") journal.attemptsByJob = { "job-1": 99 };
+      if (defect === "nonempty scores") priorState.scoredJobs = [scoredJobRow()];
+      if (defect === "failure count mismatch") priorState.analysisFailed = 1;
+      if (defect === "missing attempts") Reflect.deleteProperty(journal, "attemptsByJob");
+      mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+        status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
+        input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: owner.rootTaskId,
+        leaseOwnerId: nextOwner.turnLeaseOwnerId, leaseVersion: nextOwner.turnLeaseVersion,
+        leaseExpiresAt: new Date(Date.now() + 60_000) });
+      mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: priorState });
+      const { POST } = await import("./route");
+
+      const response = await POST(request({ owner: nextOwner, attestation: { ...attestation, owner: nextOwner } }));
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_claim_conflict" });
+      expect(mocks.claim).not.toHaveBeenCalled();
+      expect(mocks.runPipeline).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(["missing expiry", "malformed expiry", "malformed claimedAt", "invalid token", "unexpected field"])(
     "rejects markerless recovery with a %s persisted claim",

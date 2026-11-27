@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { discoverJobs, type DiscoveredJob } from './discover'
 import { enrichJob } from './enrich'
 import { runAnalyze } from './stages/analyze'
+import { isAnalyzeSourceChangedError } from './stages/analyze-model-input'
 import type { AnalyzeOutput, PipelineCtx, StageResult } from './types'
 import { materializeDiscoveredJobs, normalizeDiscoveryJobUrl, type DiscoveryJobMaterializerFence } from './discovery-job-materializer'
 import { DiscoveryToolError, decodeProviderDiscoveryCursor, decodeSearchCursor, encodeProviderDiscoveryCursor, encodeSearchCursor, providerDiscoveryOutput, queryFingerprint, selectProviderDiscoveryPage, stableJobId, type DiscoveryToolContext, type ScorePipelineContext, type ToolUsageState } from './discovery-tool-support'
@@ -192,7 +193,7 @@ export async function executeScore(input: JobsScoreInput, context: DiscoveryTool
   const rows = await loadJobs(input.jobIds, context, deps)
   const evidence: JobEvidence[] = []
   const settled = await Promise.allSettled(input.jobIds.map(jobId => scoreOne(jobId, rows.get(jobId), context, deps, usage, evidence)))
-  const results = settled.map((result, index) => result.status === 'fulfilled' ? result.value : failed(input.jobIds[index]!, 'score_failed', safeMessage(result.reason)))
+  const results = settled.map((result, index) => result.status === 'fulfilled' ? result.value : failed(input.jobIds[index]!, isAnalyzeSourceChangedError(result.reason) ? 'analyze_source_changed' : 'score_failed', safeMessage(result.reason)))
   usage.jobsProcessed = input.jobIds.length
   usage.jobsSucceeded = results.filter(result => result.status === 'scored').length
   usage.jobsFailed = input.jobIds.length - usage.jobsSucceeded

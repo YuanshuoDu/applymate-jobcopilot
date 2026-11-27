@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from "pg"
 import { randomUUID } from "node:crypto"
+import { withFencedArtifactWriteTransaction } from "./agent-artifact-write-transaction.js"
 import { hasExactCorrectionDraftResumeReceiptWithClient } from "./agent-artifact-revision-resume.js"
 import {
   AgentArtifactRepositoryError, artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive, findCurrentDraftHeadWithClient, findReviewReceiptWithClient,
@@ -41,6 +42,11 @@ const columns = `"id", "userId", "jobId", "artifactType", "lifecycle", "baseId",
 const versionColumns = `"id", "artifactId", "version", "userId", "sessionId", "jobId", "artifactType", "content", "contentHash", "sourceDigest", "constraintHash", "provenanceRefs", "evidenceRefs", "baseId", "baseHash", "previousHash", "taskId", "toolCallId", "requestHash", "createdAt"`
 const reviewColumns = `"id", "artifactVersionId", "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "findings", "evidenceRefs", "taskId", "toolCallId", "requestHash", "reviewHash", "createdAt"`
 const reviewReceiptColumns = `"userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "taskId", "toolCallId", "reviewHash"`
+
+function isSourceArtifactType(artifactType: string): boolean {
+  return artifactType === "resume" || artifactType === "cover_letter"
+}
+
 async function selectOne(client: Pick<Pool, "query">, userId: string, artifactId: string, lock = false): Promise<AgentArtifactRow | null> {
   const result = await client.query<Record<string, unknown>>(`SELECT ${columns} FROM "agent_artifact" WHERE "id" = $1 AND "userId" = $2${lock ? " FOR UPDATE" : ""}`, [artifactId, userId])
   return result.rows[0] ? toAgentArtifactRow(result.rows[0]) : null
@@ -99,6 +105,15 @@ export function createAgentArtifactRepository(pool: Pool) {
     },
 
     async insertBase(input: AgentArtifactBaseInsert): Promise<AgentArtifactRow> {
+      if (isSourceArtifactType(input.artifactType)) {
+        return withFencedArtifactWriteTransaction(pool, input.userId, input.jobId, async client => {
+          const result = await client.query<Record<string, unknown>>(
+            `INSERT INTO "agent_artifact" (${columns}) VALUES ($1, $2, $3, $4, 'base', $1, $5, $6::jsonb, $7, $8, $9, $10, NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ${columns}`,
+            [input.id, input.userId, input.jobId, input.artifactType, input.hash, JSON.stringify(input.content), input.hash, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs]],
+          )
+          return toAgentArtifactRow(result.rows[0] ?? {})
+        })
+      }
       const result = await pool.query<Record<string, unknown>>(
         `INSERT INTO "agent_artifact" (${columns}) VALUES ($1, $2, $3, $4, 'base', $1, $5, $6::jsonb, $7, $8, $9, $10, NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ${columns}`,
         [input.id, input.userId, input.jobId, input.artifactType, input.hash, JSON.stringify(input.content), input.hash, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs]],
@@ -110,9 +125,11 @@ export function createAgentArtifactRepository(pool: Pool) {
 
     /** A supplied client must already be in a transaction scoped to input.userId. */
     async saveDraft(input: AgentArtifactDraftWrite, client?: Pick<PoolClient, "query">): Promise<AgentArtifactVersionRow> {
-      return client
-        ? saveAgentArtifactDraftWithClient(client, input)
-        : withArtifactTransaction(pool, input.userId, transaction => saveAgentArtifactDraftWithClient(transaction, input))
+      if (client) return saveAgentArtifactDraftWithClient(client, input)
+      if (isSourceArtifactType(input.artifactType)) {
+        return withFencedArtifactWriteTransaction(pool, input.userId, input.jobId, transaction => saveAgentArtifactDraftWithClient(transaction, input))
+      }
+      return withArtifactTransaction(pool, input.userId, transaction => saveAgentArtifactDraftWithClient(transaction, input))
     },
 
     async findVersion(scope: { userId: string; sessionId: string; jobId: string; artifactId: string; version: number }): Promise<AgentArtifactVersionRow | null> {

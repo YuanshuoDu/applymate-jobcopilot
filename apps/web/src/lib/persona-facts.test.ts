@@ -2,12 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   findMany: vi.fn(), findFirst: vi.fn(), txFindMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn(), upsert: vi.fn(),
-  transaction: vi.fn(), lock: vi.fn(),
+  transaction: vi.fn(), lock: vi.fn(), sourceFence: vi.fn(),
 }))
 vi.mock('@/lib/db', () => ({ db: {
   personaFact: { findMany: mocks.findMany, findFirst: mocks.findFirst, findUnique: mocks.findUnique, update: mocks.update, updateMany: mocks.updateMany, upsert: mocks.upsert },
   $transaction: mocks.transaction,
 } }))
+vi.mock('@/lib/agent/source-material-fence', () => ({ acquireSourceMaterialFence: mocks.sourceFence }))
 
 import { confirmPersonaFacts, listConfirmedPersonaFacts, listDiscoveryPersonaFacts, revokePersonaFact, setDiscoveryPersonaFactConsent } from './persona-facts'
 
@@ -27,6 +28,7 @@ describe('persona facts', () => {
     mocks.findMany.mockReset().mockResolvedValue([]); mocks.findFirst.mockReset(); mocks.txFindMany.mockReset().mockResolvedValue([]); mocks.findUnique.mockReset()
     mocks.update.mockReset().mockResolvedValue({}); mocks.updateMany.mockReset().mockResolvedValue({ count: 1 })
     mocks.upsert.mockReset().mockResolvedValue({}); mocks.lock.mockReset().mockResolvedValue([])
+    mocks.sourceFence.mockReset().mockResolvedValue(undefined)
     mocks.transaction.mockReset().mockImplementation(async (callback: (tx: never) => unknown) => callback({
       $queryRaw: mocks.lock,
       personaFact: { findMany: mocks.txFindMany, findFirst: mocks.findFirst, findUnique: mocks.findUnique, update: mocks.update, updateMany: mocks.updateMany, upsert: mocks.upsert },
@@ -60,6 +62,50 @@ describe('persona facts', () => {
     expect(query.join('?')).toContain("pg_advisory_xact_lock(hashtextextended('applymate:persona-facts:' || ?::text, 0))::text AS lock_acquired")
     expect(userId).toBe('user_1')
     expect(mocks.upsert.mock.calls[0]?.[0].update.allowedUses).toEqual(['form_fill', 'discovery'])
+  })
+
+  it('takes the shared source fence before the persona lock in every writer transaction', async () => {
+    mocks.findUnique.mockResolvedValue(null)
+    mocks.findFirst.mockResolvedValue(row({ allowedUses: ['form_fill'] }))
+    mocks.txFindMany.mockResolvedValue([row()])
+
+    await confirmPersonaFacts('user_1', [{ key: 'notice_period', label: 'Notice period', value: 'One month', category: 'work', confidence: 1, source: 'manual', updatedAt: '' }])
+    await setDiscoveryPersonaFactConsent('user_1', {
+      factId: 'fact-1', key: 'notice_period', expectedValue: 'One month', expectedNormalizedValue: 'one month',
+      expectedUpdatedAt: version.toISOString(), enabled: true,
+    })
+    await revokePersonaFact('user_1', 'notice_period')
+
+    expect(mocks.sourceFence).toHaveBeenCalledTimes(3)
+    expect(mocks.sourceFence.mock.calls.map((call) => call[1])).toEqual([['user_1'], ['user_1'], ['user_1']])
+    expect(mocks.lock).toHaveBeenCalledTimes(3)
+    for (let index = 0; index < 3; index += 1) {
+      expect(mocks.sourceFence.mock.invocationCallOrder[index]!).toBeLessThan(mocks.lock.mock.invocationCallOrder[index]!)
+    }
+    expect(mocks.upsert).toHaveBeenCalledTimes(1)
+    expect(mocks.updateMany).toHaveBeenCalledTimes(2)
+  })
+
+  it('propagates a source-fence failure before persona locks or fact writes', async () => {
+    const operations = [
+      () => confirmPersonaFacts('user_1', [{ key: 'notice_period', label: 'Notice period', value: 'One month', category: 'work', confidence: 1, source: 'manual', updatedAt: '' }]),
+      () => setDiscoveryPersonaFactConsent('user_1', {
+        factId: 'fact-1', key: 'notice_period', expectedValue: 'One month', expectedNormalizedValue: 'one month',
+        expectedUpdatedAt: version.toISOString(), enabled: true,
+      }),
+      () => revokePersonaFact('user_1', 'notice_period'),
+    ]
+
+    for (const operation of operations) {
+      const fenceError = new Error('fence unavailable')
+      mocks.sourceFence.mockRejectedValueOnce(fenceError)
+      await expect(operation()).rejects.toBe(fenceError)
+    }
+
+    expect(mocks.lock).not.toHaveBeenCalled()
+    expect(mocks.upsert).not.toHaveBeenCalled()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.updateMany).not.toHaveBeenCalled()
   })
 
   it('does not resurrect revoked discovery on a same-millisecond generic save and advances the version', async () => {

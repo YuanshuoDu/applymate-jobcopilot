@@ -8,6 +8,7 @@ import { db }                                    from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { purgeTemporaryGeneratedCoverLetters } from '@/lib/cover-letter-retention'
 import { checkEntitlementLimit } from '@/lib/entitlements'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
 
 export async function POST(
   req: NextRequest,
@@ -38,6 +39,7 @@ export async function POST(
   }
 
   const recorded = await db.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [auth.userId])
     // This conditional write is the decision point for competing manual records.
     const result = await tx.job.updateMany({
       where: { id, userId: auth.userId, status: { in: ['saved', 'applied'] }, workflowState: { in: ['draft', 'ready_to_apply'] }, appliedAt: null },
