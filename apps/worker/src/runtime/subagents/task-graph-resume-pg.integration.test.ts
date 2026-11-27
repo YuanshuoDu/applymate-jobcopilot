@@ -6680,6 +6680,11 @@ type AnalystWaitDiagWaitRow = {
 type ScopedPersistedTaskWaitRow = AnalystWaitDiagWaitRow & { idempotencyKey: string }
 type PersistedTaskWaitScope = Readonly<{ userId: string; sessionId: string; parentTaskId: string }>
 type PersistedTaskWaitScopeSource = PersistedTaskWaitScope | (() => PersistedTaskWaitScope | undefined)
+type PersistedTaskWaitProjection = Readonly<{
+  idempotencyKey: string
+  targetTaskIds?: readonly string[]
+  mode?: "all" | "any"
+}>
 
 function analystWaitDiagIncrement(value: number): number { return Math.min(99, value + 1) }
 
@@ -6904,6 +6909,7 @@ async function waitForPersistedTaskWait(
   diagnosticFixtureCounters?: LeaseRecoveryFixtureDiagnostics,
   analystWaitDiag?: AnalystWaitDiagContext,
   exactWaitScope?: PersistedTaskWaitScopeSource,
+  expectedWaitProjections?: () => readonly PersistedTaskWaitProjection[],
 ): Promise<{ id: string; parentTaskId?: string }> {
   const deadline = Date.now() + timeoutMs
   let lastWaitRow: AnalystWaitDiagWaitRow | undefined
@@ -6913,17 +6919,72 @@ async function waitForPersistedTaskWait(
     let row: { id: string; status: string; suspendedAt: Date | null } | AnalystWaitDiagWaitRow | ScopedPersistedTaskWaitRow | undefined
     if (exactWaitScope && expectedScope) {
       lastExpectedScope = expectedScope
-      const result = await pool.query<ScopedPersistedTaskWaitRow>(
-        `SELECT "id", "status", "suspendedAt", "userId", "sessionId", "turnId", "parentTaskId", "idempotencyKey"
-         FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
-           AND "parentTaskId" = $4 AND "idempotencyKey" = $5 LIMIT 1`,
-        [expectedScope.userId, expectedScope.sessionId, turnId, expectedScope.parentTaskId, idempotencyKey],
+      const suppliedProjections = expectedWaitProjections?.()
+      if (expectedWaitProjections && !suppliedProjections?.length) {
+        await new Promise(resolve => setTimeout(resolve, 20))
+        continue
+      }
+      const projections: readonly PersistedTaskWaitProjection[] = expectedWaitProjections
+        ? suppliedProjections ?? []
+        : [{ idempotencyKey }]
+      if (projections.length > VERIFICATION_REPAIR_MAX_WAIT_POLLS) throw new Error("Task wait fixture exceeded its bounded accepted poll count")
+      const allowedProjections = projections.filter(projection => {
+        const key = projection.idempotencyKey
+        if (key === idempotencyKey) return true
+        const prefix = `${idempotencyKey}:poll:`
+        if (!key.startsWith(prefix)) return false
+        const ordinalText = key.slice(prefix.length)
+        if (!/^[1-9]\d*$/.test(ordinalText)) return false
+        const ordinal = Number(ordinalText)
+        return Number.isSafeInteger(ordinal) && ordinal >= 2 && ordinal <= VERIFICATION_REPAIR_MAX_WAIT_POLLS
+      })
+      if (allowedProjections.length !== projections.length || allowedProjections.length === 0
+        || new Set(allowedProjections.map(projection => projection.idempotencyKey)).size !== allowedProjections.length) {
+        throw new Error("Task wait fixture lost its exact accepted wait projection")
+      }
+      if (allowedProjections.some(projection => projection.targetTaskIds && (
+        projection.targetTaskIds.length === 0 || projection.targetTaskIds.some(taskId => !taskId)
+          || new Set(projection.targetTaskIds).size !== projection.targetTaskIds.length
+      ))) throw new Error("Task wait fixture lost its exact target task identities")
+      const projectionByKey = new Map(allowedProjections.map(projection => [projection.idempotencyKey, projection]))
+      const result = await pool.query<ScopedPersistedTaskWaitRow & {
+        targetTaskIds: unknown; mode: string; stepId: string; stepStatus: string; stepAttempt: number;
+      }>(
+        `SELECT wait."id", wait."status", wait."suspendedAt", wait."userId", wait."sessionId", wait."turnId",
+           wait."parentTaskId", wait."idempotencyKey", wait."targetTaskIds", wait."mode", wait."stepId",
+           step."status" AS "stepStatus", step."attempt" AS "stepAttempt"
+         FROM "agent_wait_conditions" AS wait
+         JOIN "agent_turns" AS turn ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId"
+           AND turn."userId" = wait."userId" AND turn."rootTaskId" = wait."parentTaskId"
+           AND turn."status" = 'waiting_for_dependency' AND turn."leaseOwnerId" IS NULL
+         JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."turnId" = wait."turnId"
+           AND step."sessionId" = wait."sessionId" AND (step."taskId" = wait."parentTaskId" OR step."taskId" IS NULL)
+           AND step."status" = 'waiting_for_tool' AND step."attempt" = 1
+         JOIN "agent_sessions" AS session ON session."id" = wait."sessionId" AND session."userId" = wait."userId"
+           AND session."status" NOT IN ('aborted', 'archived')
+         WHERE wait."userId" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3
+           AND wait."parentTaskId" = $4 AND wait."idempotencyKey" = ANY($5::text[])
+           AND wait."status" = 'waiting' AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NULL
+         ORDER BY wait."createdAt" DESC, wait."id" DESC LIMIT $6`,
+        [expectedScope.userId, expectedScope.sessionId, turnId, expectedScope.parentTaskId,
+          [...projectionByKey.keys()], VERIFICATION_REPAIR_MAX_WAIT_POLLS],
       )
-      const candidate = result.rows[0]
-      lastWaitRow = candidate
-      row = candidate && candidate.userId === expectedScope.userId && candidate.sessionId === expectedScope.sessionId
-        && candidate.turnId === turnId && candidate.parentTaskId === expectedScope.parentTaskId
-        && candidate.idempotencyKey === idempotencyKey ? candidate : undefined
+      const matchesProjection = (candidate: typeof result.rows[number]) => {
+        const projection = projectionByKey.get(candidate.idempotencyKey)
+        const targetTaskIds = Array.isArray(candidate.targetTaskIds) ? candidate.targetTaskIds
+          : typeof candidate.targetTaskIds === "string" ? (() => { try { return JSON.parse(candidate.targetTaskIds) as unknown } catch { return null } })() : null
+        return !!projection && candidate.userId === expectedScope.userId && candidate.sessionId === expectedScope.sessionId
+          && candidate.turnId === turnId && candidate.parentTaskId === expectedScope.parentTaskId
+          && candidate.status === "waiting" && candidate.suspendedAt instanceof Date
+          && candidate.stepStatus === "waiting_for_tool" && Number(candidate.stepAttempt) === 1
+          && (projection.mode === undefined || candidate.mode === projection.mode)
+          && (projection.targetTaskIds === undefined || Array.isArray(targetTaskIds)
+            && targetTaskIds.length === projection.targetTaskIds.length
+            && targetTaskIds.every((taskId, index) => taskId === projection.targetTaskIds?.[index]))
+      }
+      const candidate = result.rows.find(matchesProjection)
+      lastWaitRow = candidate ?? result.rows[0]
+      row = candidate
     } else if (!exactWaitScope && analystWaitDiag) {
       const result = await pool.query<AnalystWaitDiagWaitRow>(
         `SELECT "id", "status", "suspendedAt", "userId", "sessionId", "turnId", "parentTaskId"
@@ -7110,16 +7171,53 @@ describe("persisted TaskGraph wait scope", () => {
       userId: expectedScope.userId, sessionId: expectedScope.sessionId, turnId: "turn-1", parentTaskId: "foreign-parent",
     }
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
-      expect(sql).toContain('AND "parentTaskId" = $4 AND "idempotencyKey" = $5 LIMIT 1')
-      expect(values).toEqual([expectedScope.userId, expectedScope.sessionId, "turn-1", expectedScope.parentTaskId, "same-key"])
-      const matched = values?.[3] === foreignWait.parentTaskId
-      return { rows: matched ? [foreignWait] : [], rowCount: matched ? 1 : 0 } as QueryResult<ScopedPersistedTaskWaitRow>
+      expect(sql).toContain('AND wait."parentTaskId" = $4 AND wait."idempotencyKey" = ANY($5::text[])')
+      expect(sql).toContain('AND step."status" = \'waiting_for_tool\' AND step."attempt" = 1')
+      expect(values).toEqual([
+        expectedScope.userId, expectedScope.sessionId, "turn-1", expectedScope.parentTaskId,
+        ["same-key"], VERIFICATION_REPAIR_MAX_WAIT_POLLS,
+      ])
+      const foreignRow = {
+        ...foreignWait, targetTaskIds: [], mode: "all", stepId: "step-1",
+        stepStatus: "waiting_for_tool", stepAttempt: 1,
+      }
+      return { rows: [foreignRow], rowCount: 1 } as unknown as QueryResult<ScopedPersistedTaskWaitRow>
     })
     const pool = { query } as unknown as Pool
 
     await expect(waitForPersistedTaskWait(pool, "turn-1", "same-key", 1, undefined, undefined, undefined, expectedScope))
       .rejects.toThrow("Follow-up parent wait was not durably suspended")
     expect(query).toHaveBeenCalledTimes(1)
+  })
+
+  it("accepts only canonical bounded decimal poll suffixes", async () => {
+    const expectedScope: PersistedTaskWaitScope = {
+      userId: "user-1", sessionId: "session-1", parentTaskId: "root-1",
+    }
+    const waitRow = {
+      id: "wait-1", status: "waiting", suspendedAt: new Date(), idempotencyKey: "repair:poll:2",
+      userId: expectedScope.userId, sessionId: expectedScope.sessionId, turnId: "turn-1",
+      parentTaskId: expectedScope.parentTaskId, targetTaskIds: [], mode: "all", stepId: "step-1",
+      stepStatus: "waiting_for_tool", stepAttempt: 1,
+    }
+    const query = vi.fn(async () => ({ rows: [waitRow], rowCount: 1 }) as unknown as QueryResult<ScopedPersistedTaskWaitRow>)
+    const pool = { query } as unknown as Pool
+
+    await expect(waitForPersistedTaskWait(pool, "turn-1", "repair", 50, undefined, undefined, undefined,
+      expectedScope, () => [{ idempotencyKey: "repair:poll:2" }]))
+      .resolves.toEqual({ id: "wait-1", parentTaskId: "root-1" })
+    expect(query).toHaveBeenCalledTimes(1)
+
+    for (const idempotencyKey of [
+      "repair:poll:02", "repair:poll:2e0", `repair:poll:${VERIFICATION_REPAIR_MAX_WAIT_POLLS + 1}`,
+    ]) {
+      const invalidQuery = vi.fn()
+      const invalidPool = { query: invalidQuery } as unknown as Pool
+      await expect(waitForPersistedTaskWait(invalidPool, "turn-1", "repair", 50, undefined, undefined, undefined,
+        expectedScope, () => [{ idempotencyKey }]))
+        .rejects.toThrow("Task wait fixture lost its exact accepted wait projection")
+      expect(invalidQuery).not.toHaveBeenCalled()
+    }
   })
 })
 
@@ -16874,6 +16972,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let repairPlanSent = false
     let repairWaitSent = false
     const repairWaitCallIds: string[] = []
+    let repairWaitTargetTaskIds: string[] = []
     const repairWaitStatuses: string[] = []
     const repairWaitReadCallIds: string[] = []
     const repairWaitReadCallIdsByWaitCall = new Map<string, string[]>()
@@ -17038,6 +17137,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const pollSuffix = pollIndex === 0 ? "" : `:poll:${pollIndex + 1}`
               const callId = `${repairWaitCallId}${pollSuffix}`
               repairWaitCallIds.push(callId)
+              repairWaitTargetTaskIds = taskIds
               privateWaitDiagnostics.setLatestInvocation(callId, execution)
               yield { type: "tool_call_completed", callId, name: "agent.wait", arguments: {
                 idempotencyKey: `${repairWaitCallId}${pollSuffix}`, taskIds, mode: "all", timeoutMs: 30_000,
@@ -17340,7 +17440,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 analystWaitDiagObserveLease(task, value), analystWaitDiagState.expectedRootTaskId,
               ),
             } : undefined
-            await waitForPersistedTaskWait(pool!, value.turnId, waitKey, undefined, undefined, undefined, analystWaitDiag)
+            if (analystWaitDiag && !analystWaitDiagState.expectedRootTaskId) {
+              throw new Error("Repair wait fixture lost the current Root identity before Analyst continuation")
+            }
+            const exactRepairWaitScope = analystWaitDiag ? {
+              userId: value.userId, sessionId: value.sessionId, parentTaskId: analystWaitDiagState.expectedRootTaskId!,
+            } : undefined
+            const expectedRepairWaitProjections = analystWaitDiag ? () => repairWaitCallIds.map(idempotencyKey => ({
+              idempotencyKey, targetTaskIds: [...repairWaitTargetTaskIds].sort(), mode: "all" as const,
+            })) : undefined
+            await waitForPersistedTaskWait(pool!, value.turnId, waitKey, undefined, undefined, undefined, analystWaitDiag,
+              exactRepairWaitScope, expectedRepairWaitProjections)
             setExecutionStage("wait_persisted")
             setExecutionStage("tool_result_inspection")
             const inspections = jobIds.map(expectedJobId =>
