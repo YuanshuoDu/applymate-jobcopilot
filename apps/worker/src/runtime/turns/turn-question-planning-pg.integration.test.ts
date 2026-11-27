@@ -728,18 +728,18 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       await beforeLock.client.query("COMMIT")
       releasedBefore = true
       await Promise.all([acceptBefore, waitAfterAccept])
-      const refreshed = await admin!.query<{ turnStatus: string; stepStatus: string; stepErrorCode: string; inputTokens: number; outputTokens: number; estimatedCostUsd: string;
+      const refreshed = await admin!.query<{ turnStatus: string; stepStatus: string; stepErrorCode: string; inputTokens: number; outputTokens: number; estimatedCostMatches: boolean;
         questionCount: number; planningCount: number; refreshEvents: number }>(`SELECT turn."status" AS "turnStatus", step."status" AS "stepStatus", step."errorCode" AS "stepErrorCode",
-        step."inputTokens", step."outputTokens", step."estimatedCostUsd",
+        step."inputTokens", step."outputTokens", step."estimatedCostUsd" = $5::numeric AS "estimatedCostMatches",
         (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = turn."sessionId" AND "turnId" = turn."id" AND "type" = 'question') AS "questionCount",
         (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = turn."sessionId" AND "turnId" = turn."id" AND "type" = $2) AS "planningCount",
         (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = turn."sessionId" AND "turnId" = turn."id"
           AND "idempotencyKey" LIKE $3) AS "refreshEvents"
         FROM "agent_turns" AS turn JOIN "agent_steps" AS step ON step."sessionId" = turn."sessionId" AND step."turnId" = turn."id"
         WHERE turn."id" = $1 AND step."id" = $4`, [beforeFixture.turnId, PRIVATE_EVENT,
-        `turn:${beforeFixture.turnId}:event:question-steering-refresh:%`, beforeFixture.stepId])
+        `turn:${beforeFixture.turnId}:event:question-steering-refresh:%`, beforeFixture.stepId, "0.004"])
       expect(refreshed.rows).toEqual([{ turnStatus: "in_progress", stepStatus: "failed", stepErrorCode: "steering_changed_before_question_wait",
-        inputTokens: 31, outputTokens: 9, estimatedCostUsd: "0.004", questionCount: 0, planningCount: 0, refreshEvents: 4 }])
+        inputTokens: 31, outputTokens: 9, estimatedCostMatches: true, questionCount: 0, planningCount: 0, refreshEvents: 4 }])
       const invalidated = await admin!.query<{ type: string; status: string | null; errorCode: string | null; output: unknown }>(`SELECT item."type",
         item."content"->>'status' AS "status", item."content"->>'errorCode' AS "errorCode", item."content"->'output' AS "output"
         FROM "agent_items" AS item WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."stepId" = $3
