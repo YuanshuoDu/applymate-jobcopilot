@@ -9,6 +9,7 @@ import { buildTaskGraphRecoveryInstruction } from "./task-graph-recovery-guidanc
 import { buildTaskGraphExecutionFailureInstruction } from "./task-graph-execution-failure-guidance.js"
 import { buildTaskGraphObjectiveProgressInstruction } from "./task-graph-objective-progress-guidance.js"
 import { buildTurnEngineSteeringGuidance } from "./turn-engine-steering-guidance.js"
+import { objectiveTailorWaveOutcomeGuidance } from "./objective-tailor-wave-outcome-guidance.js"
 
 const SAFE_TOOL_NAME = /^[a-z][a-z0-9_.-]{0,63}$/i
 
@@ -158,6 +159,7 @@ function messagesForRequest(context: StepContext, tools: readonly unknown[], fre
     agenda ? cognitiveAgendaInstruction() : null,
     taskGraphReviewConflictInstruction(context, tools, isCurrentRootStep),
     discoveryQueryFootprintInstruction(context, isCurrentRootStep),
+    objectiveTailorWaveOutcomeGuidance(context, tools, isCurrentRootStep),
     buildTaskGraphObjectiveProgressInstruction(context, tools, isCurrentRootStep),
     buildTaskGraphRecoveryInstruction(context, tools, rootTaskId),
     buildTaskGraphExecutionFailureInstruction(context, tools),

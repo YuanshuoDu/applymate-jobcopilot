@@ -8,6 +8,7 @@ import type { SelectedJobArtifactCompletionGateWithWitnessResult } from "./selec
 import type { SelectedJobArtifactFinalizationGuardInput } from "./selected-job-finalization-guard.js"
 import type { TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
 import type { ObjectiveTailorWaveCompletionWitness, ObjectiveTailorWaveCompletionResult } from "./canonical-objective-tailor-wave-completion.js"
+import type { ObjectiveTailorWaveOutcomeObservation } from "./objective-tailor-wave-outcome-projection.js"
 
 const deps = vi.hoisted(() => ({
   lock: vi.fn(async (..._args: unknown[]) => ({})),
@@ -15,6 +16,7 @@ const deps = vi.hoisted(() => ({
   graph: vi.fn((): TaskGraphCurrentState => ({ revision: 1, nodes: [] })),
   binding: vi.fn(async (..._args: unknown[]): Promise<ObjectiveTailorCurrentBinding> => ({ status: "absent" })),
   wave: vi.fn(async (..._args: unknown[]): Promise<ObjectiveTailorWaveCompletionResult> => ({ status: "blocked", outcomes: [] })),
+  project: vi.fn((..._args: unknown[]): ObjectiveTailorWaveOutcomeObservation | undefined => undefined),
   candidateGate: vi.fn(async (..._args: unknown[]): Promise<SelectedJobArtifactCompletionGateWithWitnessResult> => ({
     ok: true, witness: { revision: 1, nodes: [] },
   })),
@@ -27,6 +29,7 @@ vi.mock("./subagents/task-graph-pg-state.js", () => ({
 }))
 vi.mock("./subagents/objective-tailor-current-binding.js", () => ({ readCurrentObjectiveTailorBinding: deps.binding }))
 vi.mock("./canonical-objective-tailor-wave-completion.js", () => ({ verifyCanonicalObjectiveTailorWaveCompletion: deps.wave }))
+vi.mock("./objective-tailor-wave-outcome-projection.js", () => ({ projectObjectiveTailorWaveOutcomeObservation: deps.project }))
 vi.mock("./selected-job-completion-gate.js", () => ({ selectedJobArtifactCompletionGateWithWitness: deps.candidateGate }))
 vi.mock("./selected-job-finalization-guard.js", () => ({ selectedJobArtifactFinalizationGuard: deps.finalize }))
 vi.mock("../db/agent-artifact-repo.js", () => ({
@@ -52,7 +55,8 @@ const waveWitness = { graphRevision: 3, graphDigest: "a".repeat(64), marker: { s
   sourceNodeCount: 2, slots: [] }, sourceGraphRevision: 1, sourceGraphDigest: "b".repeat(64), sourceStatusDigest: "c".repeat(64),
   outcomes: [] } as unknown as ObjectiveTailorWaveCompletionWitness
 const graph: TaskGraphCurrentState = { revision: 2, nodes: [] }
-const waveLoaded = { snapshot: { objectiveTailor: waveWitness.marker }, state: { objectiveTailor: waveWitness.marker } } as unknown as LoadedGraph
+const waveLoaded = { rootTaskId: "root-1", item: { id: "item-1", revision: 3 }, snapshot: { objectiveTailor: waveWitness.marker, nodes: [] },
+  state: { objectiveTailor: waveWitness.marker }, discoveryTurnEligibility: "ordinary" } as unknown as LoadedGraph
 const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })), release: vi.fn() } as never as PoolClient
 const commandPort = { appendAndSchedule: vi.fn(), readCurrent: vi.fn(), readCurrentWithClient: vi.fn() } as never
 const pool = { connect: vi.fn(async () => client) } as never
@@ -64,6 +68,7 @@ beforeEach(() => {
   deps.graph.mockReturnValue(graph)
   deps.binding.mockResolvedValue({ status: "absent" })
   deps.wave.mockResolvedValue({ status: "blocked", outcomes: [] })
+  deps.project.mockReturnValue(undefined)
   deps.candidateGate.mockResolvedValue({ ok: true, witness: graph })
   deps.finalize.mockResolvedValue({ ok: true })
 })
@@ -147,6 +152,50 @@ describe("createCanonicalObjectiveTailorRuntime", () => {
     expect(deps.wave).toHaveBeenNthCalledWith(1, expect.objectContaining({ client, loaded: waveLoaded, allowAbsent: false }))
     expect(deps.wave).toHaveBeenNthCalledWith(2, expect.objectContaining({ client, loaded: waveLoaded,
       allowAbsent: false, acceptedWitness: waveWitness }))
+  })
+
+  it("reads model-visible progress from the same locked scope and revision transaction", async () => {
+    const observation = { schemaVersion: "agent-harness.v2.objective-tailor-wave-outcomes.v1", graphRevision: 3,
+      slots: [{ slotId: "tailor-1", effectivePair: "initial", status: "pending" }] } as const
+    const verified: ObjectiveTailorWaveCompletionResult = { status: "pending", outcomes: [] }
+    deps.load.mockResolvedValue(waveLoaded)
+    deps.wave.mockResolvedValue(verified)
+    deps.project.mockReturnValue(observation)
+    const runtime = createCanonicalObjectiveTailorRuntime({ pool, lease, root, commandPort })
+
+    await expect(runtime.readProgress()).resolves.toEqual(observation)
+    expect(deps.lock).toHaveBeenCalledWith(client, readScope, true)
+    expect(deps.load).toHaveBeenCalledWith(client, expect.objectContaining({ rootTaskId: "root-1" }), true)
+    expect(deps.wave).toHaveBeenCalledWith({ client, lease, root, loaded: waveLoaded, allowAbsent: false })
+    expect(deps.project).toHaveBeenCalledWith({ graphRevision: 3, marker: waveWitness.marker, nodes: [], result: verified })
+    expect(client.query).toHaveBeenCalledWith("COMMIT")
+    expect(deps.binding).not.toHaveBeenCalled()
+  })
+
+  it("does not project blocked proof or read progress without the V2 command path", async () => {
+    deps.load.mockResolvedValue(waveLoaded)
+    deps.wave.mockResolvedValue({ status: "blocked", outcomes: [] })
+    const blocked = createCanonicalObjectiveTailorRuntime({ pool, lease, root, commandPort })
+    await expect(blocked.readProgress()).resolves.toBeUndefined()
+    expect(deps.project).toHaveBeenCalledOnce()
+    expect(deps.project).toHaveBeenCalledWith(expect.objectContaining({ result: { status: "blocked", outcomes: [] } }))
+    expect(deps.project.mock.results[0]?.value).toBeUndefined()
+    expect(client.query).toHaveBeenCalledWith("ROLLBACK")
+
+    const noCommandPort = createCanonicalObjectiveTailorRuntime({ pool, lease, root, commandPort: undefined })
+    await expect(noCommandPort.readProgress()).resolves.toBeUndefined()
+  })
+
+  it("does not read progress when the owner or lease scope cannot be locked", async () => {
+    deps.lock.mockRejectedValueOnce(new Error("task_graph_turn_fenced"))
+    const runtime = createCanonicalObjectiveTailorRuntime({ pool, lease, root, commandPort })
+
+    await expect(runtime.readProgress()).resolves.toBeUndefined()
+    expect(deps.load).not.toHaveBeenCalled()
+    expect(deps.wave).not.toHaveBeenCalled()
+    expect(deps.project).not.toHaveBeenCalled()
+    expect(client.query).toHaveBeenCalledWith("ROLLBACK")
+    expect(client.release).toHaveBeenCalledOnce()
   })
 
   it("blocks pending or changed marked evidence without falling back to the V1 binding", async () => {

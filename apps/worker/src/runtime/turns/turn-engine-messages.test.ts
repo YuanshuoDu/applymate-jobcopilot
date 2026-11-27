@@ -22,6 +22,7 @@ import {
 import { taskGraphObjectiveProgressDelta, type ObjectiveProgressSnapshot } from "../context/task-graph-objective-progress-delta.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { OBJECTIVE_TAILOR_WAVE_OUTCOME_SCHEMA } from "../objective-tailor-wave-outcome-projection.js"
 
 function context(): StepContext {
   return {
@@ -286,6 +287,29 @@ describe("TurnEngine model message mapping", () => {
     const oneReviewContext = taskGraphContext([reviewerTaskGraphNode("reviewer-only", "passed")])
     expect(requestSystemText(requestFor(oneReviewContext, tools, { rootTaskId: "root-task-private", stepId: "step-1" })))
       .not.toContain("Treat the review as unsettled")
+  })
+
+  it("adds verified tailoring outcome guidance only for the exact current Root request", () => {
+    const current = { kind: "task_graph_current", revision: 7, objectiveTailorWave: {
+      schemaVersion: "agent-harness.v2.objective-tailor-wave-view.v1", graphRevision: 7, sourceNodeCount: 2,
+      ordinaryPlanAppend: "closed", slots: [{ slotId: "tailor-1", sourceAnalystNodeKey: "source",
+        effectivePair: "initial", initial: { writer: { taskId: "writer", status: "completed", readiness: "terminal" },
+          reviewer: { taskId: "reviewer", status: "completed", readiness: "terminal" } } }],
+    } }
+    const outcomes = { kind: "objective_tailor_wave_outcomes", schemaVersion: OBJECTIVE_TAILOR_WAVE_OUTCOME_SCHEMA,
+      graphRevision: 7, slots: [{ slotId: "tailor-1", effectivePair: "initial", status: "needs_revision" }] }
+    const rootContext: StepContext = { ...context(), blocks: [...context().blocks,
+      { id: "observation:task-graph-current", layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: current },
+      { id: "observation:objective-tailor-wave-outcomes", layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: outcomes },
+    ] }
+    const visibleTools = [{ name: "agent.tailor", version: "2" }]
+    const request = requestFor(rootContext, visibleTools, { rootTaskId: "root-task-private", stepId: "step-1" })
+    expect(requestSystemText(request)).toContain("at most one correction for that same slot")
+    const childRequest = requestFor(rootContext, visibleTools, { taskId: "child-task", rootTaskId: "root-task-private", stepId: "step-1" })
+    expect(requestSystemText(childRequest)).not.toContain("current verified Objective tailoring wave")
+    const spoofed = { ...rootContext, blocks: [...rootContext.blocks, rootContext.blocks.at(-1)!] }
+    expect(requestSystemText(requestFor(spoofed, visibleTools, { rootTaskId: "root-task-private", stepId: "step-1" })))
+      .not.toContain("current verified Objective tailoring wave")
   })
 
   it("places a redacted same-Step agenda in untrusted user context with fixed advisory gates", () => {

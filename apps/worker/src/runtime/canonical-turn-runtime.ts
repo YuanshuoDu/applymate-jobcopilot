@@ -206,7 +206,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       turnInput: state.turnInput, rootTaskObjective: { goal: root.goal, successCriteria: root.successCriteria },
       taskGraphTemplateRoles: setup.taskGraphTemplateRoles,
       planningEnabled: taskGraphPlanningEnabled, selectedJobMode: selectedJobRootMode, objectiveTaskGraphMode, discoveryPersonaMemoryEnabled, objectiveTailorToolVersion,
-      readObjectiveTailorCatalog: options.taskGraphCommandPort?.readObjectiveTailorCatalog?.bind(options.taskGraphCommandPort), readObjectiveTailorWaveCatalog: options.taskGraphCommandPort?.readObjectiveTailorWaveCatalog?.bind(options.taskGraphCommandPort),
+      readObjectiveTailorCatalog: options.taskGraphCommandPort?.readObjectiveTailorCatalog?.bind(options.taskGraphCommandPort), readObjectiveTailorWaveCatalog: options.taskGraphCommandPort?.readObjectiveTailorWaveCatalog?.bind(options.taskGraphCommandPort), readObjectiveTailorWaveProgress: objectiveTailorToolVersion === "2" ? objectiveTailorRuntime?.readProgress : undefined,
       crossSessionRootTaskHistoryEnabled: productionFlags?.crossSessionRootTaskHistoryEnabled === true && taskGraphPlanningEnabled && !selectedJobRootMode,
       objectiveHistoryIndexEnabled: productionFlags?.objectiveHistoryIndexEnabled === true && taskGraphPlanningEnabled && !selectedJobRootMode,
       selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,

@@ -13,8 +13,10 @@ import { createPgDirectRootTaskHistoryStore } from "./context/root-task-history-
 import { appendObjectiveTailorCandidateCatalog, selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
 import type { ObjectiveTailorCandidateCatalog } from "./subagents/objective-tailor-candidate.js"
 import type { ObjectiveTailorToolVersion } from "./canonical-turn-objective-tailor-mode.js"
-import { appendObjectiveTailorWaveCandidateCatalog } from "./canonical-turn-objective-tailor-wave-context.js"
+import { appendObjectiveTailorWaveCandidateCatalog, appendObjectiveTailorWaveOutcomeObservation,
+  appendObjectiveTailorWaveContextFromReaders } from "./canonical-turn-objective-tailor-wave-context.js"
 import type { ObjectiveTailorWaveCandidateCatalog } from "./subagents/objective-tailor-candidate-v2.js"
+import type { ObjectiveTailorWaveOutcomeObservation } from "./objective-tailor-wave-outcome-projection.js"
 import type { TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
@@ -60,6 +62,7 @@ type Input = Readonly<{
   objectiveTailorToolVersion?: ObjectiveTailorToolVersion
   readObjectiveTailorCatalog?: (scope: TaskGraphReadScope) => Promise<ObjectiveTailorCandidateCatalog | undefined>
   readObjectiveTailorWaveCatalog?: (scope: TaskGraphReadScope) => Promise<ObjectiveTailorWaveCandidateCatalog | undefined>
+  readObjectiveTailorWaveProgress?: () => Promise<ObjectiveTailorWaveOutcomeObservation | undefined>
   discoveryPersonaMemoryEnabled?: boolean
   selectedJobMemories?: readonly SelectedJobMemoryRecord[]
   selectedJobId?: string
@@ -95,6 +98,8 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
     && hasObjectiveTaskGraphIntent(input.turnInput) ? input.readObjectiveTailorCatalog : undefined
   const objectiveTailorWaveCatalogReader = input.objectiveTailorToolVersion === "2" && input.objectiveTaskGraphMode === true && input.planningEnabled && !input.selectedJobMode
     && hasObjectiveTaskGraphIntent(input.turnInput) ? input.readObjectiveTailorWaveCatalog : undefined
+  const objectiveTailorWaveProgressReader = input.objectiveTailorToolVersion === "2" && input.objectiveTaskGraphMode === true && input.planningEnabled && !input.selectedJobMode
+    && hasObjectiveTaskGraphIntent(input.turnInput) ? input.readObjectiveTailorWaveProgress : undefined
   const reconciliationScope = canonicalSteeringHydrationScope(input)
   const discoveryMemoryEnabled = input.discoveryPersonaMemoryEnabled === true && input.planningEnabled && !input.selectedJobMode
   const loadDiscoveryPersonaMemory = async (stepId: string) => {
@@ -126,8 +131,9 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
     objectiveProgressGoalRevision: () => input.rootTaskObjective
       ? rootTaskHistoryObjectiveDigest(input.turnInput, { goal: input.rootTaskObjective.goal, successCriteria: input.rootTaskObjective.successCriteria }) : undefined,
     build: async request => {
-      let snapshot: StepContextSnapshot = appendObjectiveTailorWaveCandidateCatalog(
-        appendObjectiveTailorCandidateCatalog(withoutCallerSearchFootprints(request.snapshot), undefined, undefined), undefined, undefined)
+      let snapshot: StepContextSnapshot = appendObjectiveTailorWaveOutcomeObservation(
+        appendObjectiveTailorWaveCandidateCatalog(
+          appendObjectiveTailorCandidateCatalog(withoutCallerSearchFootprints(request.snapshot), undefined, undefined), undefined, undefined), undefined, undefined)
       if (input.selectedJobMode) {
         snapshot = injectSelectedJobMemory({ snapshot: selectedJobSnapshot(snapshot), records: input.selectedJobMemories ?? [], jobId: input.selectedJobId, turnId: input.lease.turnId, rootTaskId: input.rootTaskId })
         if (directHistoryReader) snapshot = await appendCanonicalSelectedJobHistoryOutcomes({
@@ -180,21 +186,11 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       })
       if (objectiveProgress) toolObservations.push(objectiveProgress)
       snapshot = { ...snapshot, rootTaskGoalCriteria, toolObservations }
-      if ((objectiveTailorCatalogReader || objectiveTailorWaveCatalogReader) && snapshot.taskGraphRevision !== undefined) {
-        const readScope: TaskGraphReadScope = { userId: input.scope.userId, sessionId: input.lease.sessionId, turnId: input.lease.turnId,
-          rootTaskId: input.rootTaskId, parentTaskId: input.rootTaskId, turnLeaseOwner: input.lease.ownerId,
-          turnLeaseVersion: input.lease.leaseVersion, parentLeaseOwner: input.lease.ownerId, parentAttemptCount: input.rootAttemptCount }
-        try {
-          if (objectiveTailorCatalogReader) {
-            const catalog = await objectiveTailorCatalogReader(readScope)
-            snapshot = appendObjectiveTailorCandidateCatalog(snapshot, catalog, snapshot.taskGraphRevision)
-          } else if (objectiveTailorWaveCatalogReader) {
-            const catalog = await objectiveTailorWaveCatalogReader(readScope)
-            snapshot = appendObjectiveTailorWaveCandidateCatalog(snapshot, catalog, snapshot.taskGraphRevision)
-          }
-        } catch (error: unknown) {
-          if (error instanceof TurnLeaseError || error instanceof TurnEngineError) throw error
-        }
+      if ((objectiveTailorCatalogReader || objectiveTailorWaveCatalogReader || objectiveTailorWaveProgressReader) && snapshot.taskGraphRevision !== undefined) {
+        snapshot = await appendObjectiveTailorWaveContextFromReaders({ snapshot, expectedRevision: snapshot.taskGraphRevision,
+          readers: { catalog: objectiveTailorCatalogReader, waveCatalog: objectiveTailorWaveCatalogReader,
+            progress: objectiveTailorWaveProgressReader }, userId: input.scope.userId, lease: input.lease,
+          rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount })
       }
       let built: import("./context/step-context-builder.js").StepContext
       if (rootTaskHistoryReader && base.buildInTransaction && rootTaskHistoryReader.loadWithClient) {

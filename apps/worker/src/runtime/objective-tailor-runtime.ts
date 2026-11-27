@@ -14,6 +14,7 @@ import { selectedJobArtifactCompletionGateWithWitness, type SelectedJobCompletio
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
 import { verifyCanonicalObjectiveTailorWaveCompletion, type ObjectiveTailorWaveCompletionWitness } from "./canonical-objective-tailor-wave-completion.js"
 import type { LoadedGraph } from "./subagents/task-graph-pg-state.js"
+import { projectObjectiveTailorWaveOutcomeObservation, type ObjectiveTailorWaveOutcomeObservation } from "./objective-tailor-wave-outcome-projection.js"
 
 type Accepted = Readonly<{ status: "absent" }> | Readonly<{
   status: "bound"
@@ -38,6 +39,7 @@ const BLOCKED: Extract<TurnEngineCompletionGateResult, { ok: false }> = Object.f
 export function createCanonicalObjectiveTailorRuntime(input: Input): Readonly<{
   complete(): Promise<TurnEngineCompletionGateResult>
   finalize(client: PoolClient): Promise<TurnEngineCompletionGateResult>
+  readProgress(): Promise<ObjectiveTailorWaveOutcomeObservation | undefined>
   clear(): void
 }> {
   let accepted: Accepted | undefined
@@ -108,8 +110,41 @@ export function createCanonicalObjectiveTailorRuntime(input: Input): Readonly<{
     }
   }
 
+  async function readProgress(): Promise<ObjectiveTailorWaveOutcomeObservation | undefined> {
+    if (!input.commandPort) return undefined
+    let client: PoolClient | undefined
+    let committed = false
+    try {
+      const txClient = await input.pool.connect()
+      client = txClient
+      await txClient.query("BEGIN")
+      await txClient.query("SELECT set_config($1, $2, true)", ["app.user_id", input.lease.userId])
+      const readScope = scope()
+      await lockTaskGraphScope(txClient, readScope, true)
+      const loaded = await loadTaskGraph(txClient, identity(readScope), true)
+      if (!hasWaveMarker(loaded) || !loaded.item || !loaded.snapshot || !loaded.state
+        || loaded.rootTaskId !== input.root.id || loaded.discoveryTurnEligibility !== "ordinary") return undefined
+      const verified = await verifyCanonicalObjectiveTailorWaveCompletion({ client: txClient, lease: input.lease,
+        root: input.root, loaded, allowAbsent: false })
+      const observation = projectObjectiveTailorWaveOutcomeObservation({ graphRevision: loaded.item.revision,
+        marker: loaded.snapshot.objectiveTailor, nodes: loaded.snapshot.nodes, result: verified })
+      if (!observation) return undefined
+      await txClient.query("COMMIT")
+      committed = true
+      return observation
+    } catch {
+      return undefined
+    } finally {
+      if (client) {
+        if (!committed) await client.query("ROLLBACK").catch(() => undefined)
+        client.release()
+      }
+    }
+  }
+
   return {
     clear() { accepted = undefined },
+    readProgress,
     async complete() {
       accepted = undefined
       const next = await withCandidateTransaction()
