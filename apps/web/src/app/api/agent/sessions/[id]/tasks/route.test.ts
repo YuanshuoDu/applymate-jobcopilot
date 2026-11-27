@@ -1,4 +1,13 @@
+import { Buffer } from "node:buffer"
+import { createHash } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  TASK_GRAPH_FAILED_BRANCH_RECONCILIATION_SCHEMA_VERSION,
+  TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+  taskGraphFailedBranchReconciliationOperationKey,
+  taskGraphLifecycleKey,
+  taskGraphProposalKey,
+} from "@jobcopilot/agent-protocol/task-graph-failed-branch-reconciliation"
 
 const mocks = vi.hoisted(() => {
   const tenantContext = { userId: null as string | null }
@@ -9,6 +18,7 @@ const mocks = vi.hoisted(() => {
       try { return await callback() } finally { tenantContext.userId = null }
     }),
     requireAuth: vi.fn(), sessionFindFirst: vi.fn(), taskFindMany: vi.fn(), graphFindFirst: vi.fn(), graphFindMany: vi.fn(),
+    agentEventFindMany: vi.fn(),
   }
 })
 
@@ -20,6 +30,7 @@ vi.mock("@/lib/api-helpers", () => ({
 
 vi.mock("@/lib/db", () => ({ db: {
   agentSession: { findFirst: mocks.sessionFindFirst }, subAgentTask: { findMany: mocks.taskFindMany }, agentItem: { findFirst: mocks.graphFindFirst, findMany: mocks.graphFindMany },
+  agentEvent: { findMany: mocks.agentEventFindMany },
 } }))
 
 vi.mock("@/lib/db/tenant-store", () => ({ runWithTenantContext: mocks.runWithTenantContext }))
@@ -30,15 +41,22 @@ function request(path = "") {
   return new Request(`http://localhost/api/agent/sessions/session_1/tasks${path}`)
 }
 
+const receiptCodecs = {
+  sha256: (value: string) => createHash("sha256").update(value, "utf8").digest("hex"),
+  utf8ByteLength: (value: string) => Buffer.byteLength(value, "utf8"),
+}
+
 describe("agent task query API", () => {
   beforeEach(() => {
     vi.resetModules()
     mocks.requireAuth.mockReset(); mocks.sessionFindFirst.mockReset(); mocks.taskFindMany.mockReset(); mocks.graphFindFirst.mockReset(); mocks.graphFindMany.mockReset()
+    mocks.agentEventFindMany.mockReset()
     mocks.runWithTenantContext.mockClear(); mocks.tenantContext.userId = null
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
     mocks.graphFindFirst.mockResolvedValue(null)
     mocks.graphFindMany.mockResolvedValue([])
+    mocks.agentEventFindMany.mockResolvedValue([])
     mocks.taskFindMany.mockResolvedValue([{
       id: "task_1", sessionId: "session_1", role: "scout", taskType: "job_search", status: "passed", goal: "Find EU roles",
       confidence: 0.95, failureReason: null, result: { jobs: [{ id: "job_1" }], resumeText: "private" },
@@ -161,6 +179,89 @@ describe("agent task query API", () => {
     for (const secret of ["child_1", "private-job", "private-evidence", "private-final", "private.example", "PRIVATE_MODEL_TEXT"]) {
       expect(serialized).not.toContain(secret)
     }
+  })
+
+  it("adds only the current identified failed-branch display projection", async () => {
+    const graph = { schemaVersion: "agent-harness.v2.task-graph", nodes: [
+      { key: "fresh-scout", templateId: "scout", goal: "Find roles", successCriteria: ["Find evidence"], dependsOn: [], depth: 1, taskId: "fresh_scout_task" },
+      { key: "fresh-analyst", templateId: "analyst", goal: "Review roles", successCriteria: ["Review evidence"], dependsOn: ["fresh-scout"], depth: 2, taskId: "fresh_analyst_task" },
+    ] }
+    const identity = { sessionId: "session_1", graphItemId: "graph_replacement", turnId: "turn_replacement", rootTaskId: "root_replacement", revision: 5 }
+    mocks.graphFindFirst.mockResolvedValueOnce({ id: identity.graphItemId, sessionId: identity.sessionId, turnId: identity.turnId,
+      taskId: identity.rootTaskId, revision: identity.revision, content: graph })
+    mocks.taskFindMany.mockResolvedValueOnce([
+      { id: identity.rootTaskId, sessionId: identity.sessionId, turnId: identity.turnId, rootTaskId: identity.rootTaskId,
+        parentTaskId: null, path: "root", role: "orchestrator", taskType: "root", status: "running", goal: "Plan", confidence: null,
+        failureReason: null, result: null, attemptCount: 1, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: "fresh_scout_task", sessionId: identity.sessionId, turnId: identity.turnId, rootTaskId: identity.rootTaskId,
+        parentTaskId: identity.rootTaskId, path: "0", role: "scout", taskType: "job_discovery", status: "queued", goal: "Find roles",
+        confidence: null, failureReason: null, result: null, attemptCount: 0, createdAt: new Date(0), updatedAt: new Date(0) },
+      { id: "fresh_analyst_task", sessionId: identity.sessionId, turnId: identity.turnId, rootTaskId: identity.rootTaskId,
+        parentTaskId: identity.rootTaskId, path: "1", role: "analyst", taskType: "analysis", status: "waiting", goal: "Review roles",
+        confidence: null, failureReason: null, result: null, attemptCount: 0, createdAt: new Date(0), updatedAt: new Date(0) },
+    ])
+    const stepId = "reconciliation_step"
+    const callId = "reconciliation_call"
+    const branchRoot = { nodeKey: "old-scout", taskId: "old_scout_task" }
+    const replaceBranch = { root: branchRoot, sources: [
+      { ...branchRoot, replacementKey: "fresh-scout" },
+      { nodeKey: "old-analyst", taskId: "old_analyst_task", replacementKey: "fresh-analyst" },
+    ] }
+    const operationKey = taskGraphFailedBranchReconciliationOperationKey({
+      userId: "user_1", sessionId: identity.sessionId, turnId: identity.turnId, rootTaskId: identity.rootTaskId, stepId,
+    }, callId, receiptCodecs)
+    if (!operationKey) throw new Error("route test failed to create the canonical receipt key")
+    const payload = {
+      schemaVersion: TASK_GRAPH_FAILED_BRANCH_RECONCILIATION_SCHEMA_VERSION,
+      sessionId: identity.sessionId, turnId: identity.turnId, rootTaskId: identity.rootTaskId, stepId,
+      decision: "revise", observedRevision: 3, resultingRevision: identity.revision,
+      steerInputIds: [], inputCheckpoint: { throughSequence: "47" },
+      failedBranch: {
+        schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+        operationKey, graphRootTaskId: identity.rootTaskId, observedRevision: 3, resultingRevision: identity.revision, branchRoot,
+        sources: replaceBranch.sources.map(({ nodeKey, taskId, replacementKey }) => ({ source: { nodeKey, taskId }, replacementKey })),
+        failedSource: { source: branchRoot, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64), event: {
+          id: "private_failed_event_id", sequence: "30",
+          idempotencyKey: taskGraphLifecycleKey(identity.rootTaskId, branchRoot.nodeKey, 1, "task.failed", receiptCodecs),
+        } },
+        cancellations: [{ source: { nodeKey: "old-analyst", taskId: "old_analyst_task" }, event: {
+          id: "private_cancelled_event_id", sequence: "31",
+          idempotencyKey: taskGraphLifecycleKey(identity.rootTaskId, "old-analyst", 0, "task.cancelled", receiptCodecs),
+        } }],
+        verifiedExternalDependencies: [],
+        planEvent: { id: "private_plan_event_id", sequence: "32", idempotencyKey: taskGraphProposalKey(identity.rootTaskId, 4, receiptCodecs) },
+        requestFingerprint: "c".repeat(64),
+        agentPlanCall: { callId, stepId, expectedRevision: 3, replaceBranch },
+      },
+    }
+    const privateDigest = "c".repeat(64)
+    const event = {
+      id: "private_reconciliation_event_id", sessionId: identity.sessionId, turnId: identity.turnId, itemId: null,
+      taskId: identity.rootTaskId, sequence: BigInt(33), type: "agent.plan.reconciliation", actor: "orchestrator",
+      correlationId: identity.turnId, causationId: stepId, idempotencyKey: operationKey, payload,
+    }
+    mocks.agentEventFindMany.mockResolvedValueOnce([event])
+
+    const { GET } = await import("./route")
+    const response = await GET(request(`?taskId=${identity.rootTaskId}&taskId=fresh_scout_task&taskId=fresh_analyst_task&graphItemId=${identity.graphItemId}&graphTurnId=${identity.turnId}&rootTaskId=${identity.rootTaskId}&graphRevision=${identity.revision}`) as never, params)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(mocks.agentEventFindMany).toHaveBeenCalledWith({
+      where: { sessionId: identity.sessionId, turnId: identity.turnId, itemId: null, taskId: identity.rootTaskId,
+        type: "agent.plan.reconciliation", actor: "orchestrator", correlationId: identity.turnId,
+        AND: [
+          { payload: { path: ["schemaVersion"], equals: TASK_GRAPH_FAILED_BRANCH_RECONCILIATION_SCHEMA_VERSION } },
+          { payload: { path: ["resultingRevision"], equals: identity.revision } },
+        ] },
+      select: { id: true, sessionId: true, turnId: true, itemId: true, taskId: true, sequence: true,
+        type: true, actor: true, correlationId: true, causationId: true, idempotencyKey: true, payload: true },
+      take: 2,
+    })
+    expect(body.planLedger.failedBranchReplacement).toEqual({ reason: "previous_branch_unverified", successorNodeIndexes: [0, 1] })
+    const ledger = JSON.stringify(body.planLedger)
+    for (const privateValue of [event.id, "private_failed_event_id", "private_cancelled_event_id", "private_plan_event_id",
+      "old_scout_task", "old_analyst_task", operationKey, privateDigest]) expect(ledger).not.toContain(privateValue)
   })
 
   it("adds only the sanitized recorded verification sidecar from the same scoped result read", async () => {
@@ -460,6 +561,7 @@ describe("agent task query API", () => {
       take: 2,
     })
     expect(mocks.graphFindFirst).not.toHaveBeenCalled()
+    expect(mocks.agentEventFindMany).not.toHaveBeenCalled()
     expect(mocks.taskFindMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { sessionId: "session_1", turnId: "turn_old", rootTaskId: "root_old", id: { in: ["root_old", "child_old"] } },
     }))

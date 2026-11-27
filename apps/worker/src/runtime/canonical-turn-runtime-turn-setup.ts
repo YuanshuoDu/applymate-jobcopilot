@@ -23,6 +23,7 @@ import { createPgDurableWaitPort } from "./subagents/durable-wait-store.js"
 import type { RootTaskStore } from "./subagents/root-task-store.js"
 import { createWorkerToolRuntime } from "./tools/index.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
+import { registerTaskGraphSupersededScoutRetirementTool } from "./tools/task-graph-retire-superseded-scout.js"
 import { assertCanonicalCoordinationSurface, assertCanonicalQuestionSurface, isNativeQuestionWaitEnabled } from "./turns/canonical-runtime-tool-recovery.js"
 import { failInteractiveDiscoveryUnavailable, failObjectiveTaskGraphUnavailable, objectiveTaskGraphRootToolAllowed } from "./interactive-discovery-runtime.js"
 import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurface } from "./interactive-discovery-contract.js"
@@ -157,7 +158,10 @@ export async function prepareCanonicalTurnSetup(input: {
     coordination: input.coordinationEnabled, nativeRoot: turnCoordination.nativeOptions.enabled,
     requested: options.nativeQuestionWaitEnabled, customAdapters: !!options.turnEngineStoreFactory || !!options.toolRuntimeFactory,
   })
-  const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, input.coordinationEnabled, graph.enabled)
+  const scoutRetirementPolicyEnabled = objectiveTaskGraphMode && graph.enabled && input.coordinationEnabled
+    && input.childExecutionEnabled && input.consumeWaitOutcomes
+    && typeof options.taskGraphCommandPort?.requestSupersededScoutRetirement === "function"
+  const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, input.coordinationEnabled, graph.enabled, scoutRetirementPolicyEnabled)
   const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
   const toolCapabilities = [...new Set([...configuredCapabilities, ...(input.coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
   const lifecycle = { sink: null as ToolLifecycleSink | null, owner: null as ExecutionOwner | null, taskGraphParentAttemptCount: null as number | null, policyDecisionRecorder: null as ((decision: RuntimePolicyDecision) => Promise<void>) | null }
@@ -186,6 +190,10 @@ export async function prepareCanonicalTurnSetup(input: {
     turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId,
     parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null,
     ...(selectedJobBatch ? { selectedJobBatchSlots: selectedJobBatch.slots } : {}),
+  })
+  registerTaskGraphSupersededScoutRetirementTool(toolRuntime.registry, objectiveTaskGraphMode, {
+    commandPort: options.taskGraphCommandPort, manager, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+    parentLeaseOwner: lease.ownerId, parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount,
   })
   if (input.coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
   if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { formatObjectiveLocationSteerMessage, OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE, OBJECTIVE_LOCATION_STEER_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
-import { readTaskGraphConfirmedLocationSteer } from "./task-graph-confirmed-location-steer.js"
+import { readTaskGraphConfirmedLocationSteer, readTaskGraphConfirmedLocationSteerAtSequence } from "./task-graph-confirmed-location-steer.js"
 
 const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" } as const
 const inputContent = [{ type: "text", text: formatObjectiveLocationSteerMessage(["berlin", "dublin"]) }]
@@ -44,12 +44,24 @@ describe("task graph confirmed location steer", () => {
   it("confirms a canonical receipt bound to one owned consumed steer and root Step", async () => {
     const f = fixture()
     await expect(readTaskGraphConfirmedLocationSteer(f.client, scope, 10n)).resolves.toEqual({
-      kind: "confirmed", locations: ["berlin", "dublin"], acceptedInputSequence: 10n,
+      kind: "confirmed", locations: ["berlin", "dublin"], acceptedInputSequence: 10n, acceptedInputId: "input-1",
     })
     expect(f.calls[0]?.sql).toContain('turn."rootTaskId" AS "turnRootTaskId"')
     expect(f.calls[0]?.sql).toContain('turn."userId" = $4 AND session."userId" = $4')
     expect(f.calls[0]?.sql).toContain('ORDER BY event."sequence" DESC LIMIT 1')
     expect(f.calls.at(-1)?.sql).toContain('step."id" = $1')
+  })
+
+  it("revalidates one exact historical input sequence without falling back to newer receipts", async () => {
+    const exact = fixture()
+    await expect(readTaskGraphConfirmedLocationSteerAtSequence(exact.client, scope, 10n, 10n)).resolves.toEqual({
+      kind: "confirmed", locations: ["berlin", "dublin"], acceptedInputSequence: 10n, acceptedInputId: "input-1",
+    })
+    expect(exact.calls[0]?.sql).toContain(`event."payload"->>'acceptedInputSequence' = $5`)
+    const mismatch = fixture({ latest: [event({ ...receipt, acceptedInputSequence: 11 })] })
+    await expect(readTaskGraphConfirmedLocationSteerAtSequence(mismatch.client, scope, 11n, 10n)).resolves.toEqual({ kind: "unavailable" })
+    const duplicate = fixture({ latest: [event(), event()] })
+    await expect(readTaskGraphConfirmedLocationSteerAtSequence(duplicate.client, scope, 10n, 10n)).resolves.toEqual({ kind: "unavailable" })
   })
 
   it("returns pending for a valid newer unconsumed steer without claiming it as confirmed", async () => {

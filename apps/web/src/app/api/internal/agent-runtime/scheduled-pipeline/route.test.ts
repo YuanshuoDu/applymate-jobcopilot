@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   turn: vi.fn(), root: vi.fn(), session: vi.fn(), user: vi.fn(), execution: vi.fn(), claim: vi.fn(), jobs: vi.fn(),
-  question: vi.fn(), runPipeline: vi.fn(), postGateTask: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
+  question: vi.fn(), runPipeline: vi.fn(), nativeAudit: vi.fn(), postGateTask: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
   auditCurrent: vi.fn(), auditClaim: vi.fn(), auditRace: vi.fn(), validateAuditPrepare: vi.fn(),
   sourceTerminal: vi.fn(), sourceUntrusted: vi.fn(), sourceAnalyzeResponse: vi.fn(), sourceAnalyzeError: vi.fn(), renew: vi.fn(), snapshotDigest: vi.fn(),
 }));
@@ -13,6 +13,7 @@ vi.mock("@/lib/db", () => ({ db: {
   agentItem: { findFirst: mocks.question },
 } }));
 vi.mock("@/lib/agent/run-service", () => ({ runAgentPipeline: mocks.runPipeline }));
+vi.mock("@/lib/agent/scheduled-audit-service", () => ({ runScheduledAuditService: mocks.nativeAudit }));
 vi.mock("@/lib/agent/scheduled-taskgraph-post-gate-task", () => ({
   isScheduledTaskGraphPostGateAction: (value: unknown) => Boolean(value && typeof value === "object"
     && ["scheduled_post_gate_execute", "scheduled_post_gate_audit"].includes(String((value as { action?: unknown }).action))),
@@ -193,6 +194,7 @@ describe("scheduled pipeline continuation route", () => {
     mocks.jobs.mockResolvedValue([{ id: "job-1", userId: owner.userId }]);
     mocks.question.mockResolvedValue(null);
     mocks.runPipeline.mockResolvedValue(report);
+    mocks.nativeAudit.mockResolvedValue(report);
     mocks.postGateTask.mockResolvedValue(Response.json({ status: "completed", structuredResult: { queued: [], failed: [] } }));
     mocks.validatePrepareWait.mockResolvedValue(true);
     mocks.loadAi.mockResolvedValue({ resolvedKey: "api-key", provider: "openai", model: "test-model" });
@@ -541,9 +543,43 @@ describe("scheduled pipeline continuation route", () => {
       proof: prepareProof, scheduledWaitId });
     expect(mocks.validatePrepareWait).not.toHaveBeenCalled();
     expect(mocks.claim).not.toHaveBeenCalled();
-    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({ scheduledTaskGraph: expect.objectContaining({
+    expect(mocks.nativeAudit).toHaveBeenCalledWith(expect.objectContaining({ scheduled: expect.objectContaining({
       action: "scheduled_audit_execute", auditActor, owner: fullOwner,
     }) }));
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a scheduled Audit envelope missing its Gate proof", async () => {
+    const auditRequest = { action: "scheduled_audit_execute", owner, attestation, prepareProof: {},
+      auditActor: { taskId: "audit-1", attemptCount: 2, leaseOwner: "audit-worker-2" } };
+    const { POST } = await import("./route");
+
+    const response = await POST(request(auditRequest));
+
+    expect(response.status).toBe(400);
+    expect(mocks.nativeAudit).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("replays a committed scheduled Audit without claiming or entering either runner", async () => {
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"d".repeat(64)}`;
+    const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+    const auditActor = { taskId: "audit-1", attemptCount: 2, leaseOwner: "audit-worker-2" };
+    const auditRequest = { action: "scheduled_audit_execute", owner, attestation, prepareProof, scheduledWaitId,
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
+        prepareProof, gate: { taskId: "gate-1", attemptCount: 1, resultDigest: `sha256:${"b".repeat(64)}`, completedEventRevision: 1 } }, auditActor };
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "completed", attemptCount: 0,
+      state: { ...completedState(), scheduledTaskGraphScheduledWaitId: scheduledWaitId } });
+    const replay = Response.json({ status: "completed", report });
+    mocks.gateAction.mockResolvedValueOnce({ kind: "scheduled_audit_execute", request: auditRequest }).mockResolvedValueOnce(replay);
+    const { POST } = await import("./route");
+
+    const response = await POST(request(auditRequest));
+
+    expect(response).toBe(replay);
+    expect(mocks.auditClaim).not.toHaveBeenCalled();
+    expect(mocks.nativeAudit).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
 
   it("reports a fenced Audit actor without starting the root pipeline", async () => {

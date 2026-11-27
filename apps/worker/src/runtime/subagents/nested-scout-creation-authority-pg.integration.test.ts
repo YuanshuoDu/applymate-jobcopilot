@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool } from "pg"
+import { executionOwnerFence, type ExecutionOwnerFence } from "../execution-owner.js"
+import { claimTurnLease } from "../turns/lease.js"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { executionId, executionKey } from "../turns/turn-execution-types.js"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { createSubagentTask } from "./pg-store-create.js"
@@ -27,6 +31,91 @@ const url = disposableUrl(), describePg = url ? describe : describe.skip
 const ROOT_ACTIONS = ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read", "wait_subagents", "scout.delegate", "scout.results"]
 const PROFILE_ACTIONS = [...ROOT_ACTIONS]
 const POLICY = normalizeSubagentPolicy({ maxConcurrency: 2, maxDepth: 2, maxFanOut: 2, maxAttempts: 2 })
+
+type BudgetRootFixture = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; owner: ExecutionOwnerFence }>
+
+async function createBudgetRootFixture(pool: Pool, userId: string, suffix: string, policy = POLICY): Promise<BudgetRootFixture> {
+  const sessionId = `nested-budget-session-${suffix}`, turnId = `nested-budget-turn-${suffix}`
+  await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+    VALUES ($1, $2, 'nested Scout shared tool budget', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
+  await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input",
+    "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+    VALUES ($1, $2, $3, 'queued', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+  [turnId, sessionId, userId])
+  const turnLease = await claimTurnLease(pool, { turnId, sessionId, ownerId: `nested-budget-root-owner-${suffix}` })
+  const root = await transaction(pool, async client => {
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId])
+    return createSubagentTask(client, { userId, sessionId, turnId, role: "orchestrator", taskType: "root",
+      goal: "Bound nested Scout tool calls", constraints: [], successCriteria: [], allowedActions: ROOT_ACTIONS,
+      context: {}, expectedOutputSchema: {}, policy }, false)
+  })
+  await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2 WHERE "id" = $1 AND "sessionId" = $3`,
+    [turnId, root.id, sessionId])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'running', "attemptCount" = 1, "leaseOwner" = $2,
+    "leaseExpiresAt" = $3, "budgetSnapshot" = $4::jsonb WHERE "id" = $1 AND "sessionId" = $5`, [
+    root.id, turnLease.ownerId, turnLease.leaseExpiresAt,
+    JSON.stringify({ limits: { maxSteps: 16, maxToolCalls: 2 }, subagentPolicy: policy }), sessionId,
+  ])
+  return { userId, sessionId, turnId, rootTaskId: root.id, owner: executionOwnerFence({ kind: "turn", taskId: root.id, lease: turnLease }) }
+}
+
+async function createBudgetScoutChildren(pool: Pool, fixture: BudgetRootFixture, manager: AgentTreeManager, suffix: string, policy = POLICY) {
+  const parentSpec = { userId: fixture.userId,
+    sessionId: fixture.sessionId, turnId: fixture.turnId, parentTaskId: fixture.rootTaskId, role: "scout", taskType: "job_discovery",
+    goal: "Bounded Scout parent", constraints: [], successCriteria: ["Return typed results"], allowedActions: PROFILE_ACTIONS,
+    context: { nestedScoutProfile: NESTED_SCOUT_PROFILE_MARKER }, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, policy }
+  const parent = await transaction(pool, async client => {
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [parentSpec.userId])
+    return createSubagentTask(client, parentSpec, false, { nestedScoutAuthority: "parent_template", taskGraphChildDeadline: true })
+  })
+  const childScope = { nestedScoutSourceSlice: ["greenhouse"], nestedScoutQueryScope: [
+    { source: "greenhouse", targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], maxPageSize: 20 },
+  ] }
+  const childSpec = { ...parentSpec, parentTaskId: parent.id, goal: "Read-only scoped child",
+    allowedActions: ["jobs.discover", "tool_results.read"], context: childScope }
+  const children = await Promise.all([0, 1].map(index => transaction(pool, async client => {
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [parentSpec.userId])
+    return createSubagentTask(client, childSpec, false, { nestedScoutAuthority: "child_execution", taskGraphChildDeadline: true })
+  })))
+  await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'waiting' WHERE "id" = $1 AND "sessionId" = $2`,
+    [parent.id, fixture.sessionId])
+  const leases = await Promise.all(children.map(async (child, index) => {
+    const ownerId = `nested-budget-child-owner-${suffix}-${index}`
+    const lease = await manager.claim({ taskId: child.id, sessionId: fixture.sessionId, rootTaskId: fixture.rootTaskId, ownerId })
+    if (!lease) throw Error("Nested Scout budget child could not be claimed")
+    return lease
+  }))
+  return leases
+}
+
+async function startBudgetStep(pool: Pool, owner: ExecutionOwnerFence, stepId: string, attempt: number): Promise<void> {
+  await createPgTurnEngineStore(pool).startStep({ owner, stepId, ordinal: 0, attempt, inputThroughSequence: 0n,
+    consumedInputIds: [], modelProfileSnapshot: {}, now: new Date() })
+}
+
+async function admitBudgetToolCall(pool: Pool, owner: ExecutionOwnerFence, stepId: string, callId: string): Promise<string> {
+  const store = createPgTurnEngineStore(pool), itemId = executionId(owner, `item:tool-call:${callId}`)
+  const now = new Date()
+  await store.createItem({ owner, itemId, stepId, type: "tool_call", status: "started", phase: null,
+    content: { toolCallId: callId, toolName: "jobs.discover", toolVersion: "1", input: {} }, now })
+  const itemStartedId = executionId(owner, `event:item-started:${itemId}`), key = executionKey(owner)
+  await store.appendEvent({ owner, id: itemStartedId, type: "item.started", itemId, correlationId: stepId, causationId: null,
+    idempotencyKey: `${key}:event:item-started:${itemId}`, payload: { itemId, type: "tool_call", phase: null } })
+  await store.appendEvent({ owner, id: executionId(owner, `event:tool-started:${callId}`), type: "tool_call.started", itemId,
+    correlationId: callId, causationId: itemStartedId, idempotencyKey: `${key}:event:tool-started:${callId}`,
+    payload: { toolCallId: callId, toolName: "jobs.discover", taskId: owner.taskId } })
+  return itemId
+}
+
+async function countBudgetEvidence(pool: Pool, fixture: BudgetRootFixture, callId: string) {
+  const result = await pool.query<{ items: number; startedEvents: number }>(`SELECT
+      (SELECT count(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_call'
+        AND "content"->>'toolCallId' = $3) AS "items",
+      (SELECT count(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+        AND "type" = 'tool_call.started' AND "payload"->>'toolCallId' = $3) AS "startedEvents"`,
+    [fixture.sessionId, fixture.turnId, callId])
+  return result.rows[0]
+}
 
 describePg("nested Scout creation authority: disposable PostgreSQL", () => {
   let pool: Pool
@@ -204,6 +293,81 @@ describePg("nested Scout creation authority: disposable PostgreSQL", () => {
       await manager?.shutdown()
       await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [ids.session])
       await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.user])
+    }
+  })
+
+  it("enforces the shared Root maxToolCalls cap across competing nested Scout child leases", async () => {
+    const suffix = randomUUID(), userId = `nested-budget-user-${suffix}`, sessions: string[] = []
+    let manager: AgentTreeManager | undefined
+    try {
+      await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+        [userId, `${userId}@example.invalid`])
+      const rootSuffix = `${suffix}-capped`, controlSuffix = `${suffix}-control`
+      // maxConcurrency counts the running Root task too, so three slots are needed for Root plus both child leases.
+      // The shared tool-call cap under test remains exactly two.
+      const rootPolicy = normalizeSubagentPolicy({ ...POLICY, maxConcurrency: 3 })
+      sessions.push(`nested-budget-session-${rootSuffix}`, `nested-budget-session-${controlSuffix}`)
+      const root = await createBudgetRootFixture(pool, userId, rootSuffix, rootPolicy)
+      const controlRoot = await createBudgetRootFixture(pool, userId, controlSuffix)
+      manager = new AgentTreeManager(new PgSubagentTaskStore(pool), { heartbeatMs: 300_000 })
+      const childLeases = await createBudgetScoutChildren(pool, root, manager, suffix, rootPolicy)
+      expect(childLeases).toHaveLength(2)
+      expect(manager.activeCount(root.sessionId)).toBe(2)
+      expect(new Set(childLeases.map(lease => lease.ownerId)).size).toBe(2)
+      expect(childLeases.every(lease => lease.rootTaskId === root.rootTaskId
+        && lease.sessionId === root.sessionId && lease.turnId === root.turnId
+        && lease.leaseExpiresAt.getTime() > Date.now())).toBe(true)
+      const childLeaseRows = await pool.query<{ id: string; status: string; leaseOwner: string | null; attemptCount: number; rootTaskId: string | null; leaseExpiresAt: Date | null }>(
+        `SELECT "id", "status", "leaseOwner", "attemptCount", "rootTaskId", "leaseExpiresAt"
+          FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "id" = ANY($2::text[]) ORDER BY "id"`,
+        [root.sessionId, childLeases.map(lease => lease.id)])
+      expect(childLeaseRows.rows).toHaveLength(2)
+      expect(childLeaseRows.rows.map(row => ({ id: row.id, status: row.status, leaseOwner: row.leaseOwner,
+        attemptCount: row.attemptCount, rootTaskId: row.rootTaskId, live: !!row.leaseExpiresAt && row.leaseExpiresAt.getTime() > Date.now() }))
+        .sort((left, right) => left.id.localeCompare(right.id))).toEqual(childLeases.map(lease => ({ id: lease.id,
+          status: "running", leaseOwner: lease.ownerId, attemptCount: lease.attemptCount, rootTaskId: root.rootTaskId, live: true }))
+          .sort((left, right) => left.id.localeCompare(right.id)))
+
+      const rootStepId = `nested-budget-root-step-${suffix}`
+      await startBudgetStep(pool, root.owner, rootStepId, 1)
+      await admitBudgetToolCall(pool, root.owner, rootStepId, `nested-budget-root-call-${suffix}`)
+
+      const contenders = await Promise.all(childLeases.map(async (lease, index) => {
+        const owner = executionOwnerFence({ kind: "task", lease })
+        const stepId = `nested-budget-child-step-${suffix}-${index}`
+        const callId = `nested-budget-child-call-${suffix}-${index}`
+        await startBudgetStep(pool, owner, stepId, lease.attemptCount)
+        return { owner, stepId, callId }
+      }))
+      const attempts = await Promise.allSettled(contenders.map(contender =>
+        admitBudgetToolCall(pool, contender.owner, contender.stepId, contender.callId)))
+      const accepted = attempts.flatMap((attempt, index) => attempt.status === "fulfilled" ? [contenders[index]!] : [])
+      const denied = attempts.flatMap((attempt, index) => attempt.status === "rejected" ? [{ contender: contenders[index]!, error: attempt.reason }] : [])
+      expect(accepted).toHaveLength(1)
+      expect(denied).toHaveLength(1)
+      expect(denied[0]!.error).toMatchObject({ code: "budget_exhausted", metric: "tool_calls", limit: 2, used: 2, attempted: 3 })
+
+      const durableCalls = await pool.query<{ taskId: string; callId: string }>(`SELECT "taskId", "content"->>'toolCallId' AS "callId"
+        FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_call' ORDER BY "id"`,
+      [root.sessionId, root.turnId])
+      expect(durableCalls.rows).toHaveLength(2)
+      expect(durableCalls.rows.map(row => row.callId).sort()).toEqual([
+        `nested-budget-root-call-${suffix}`, accepted[0]!.callId,
+      ].sort())
+      expect(durableCalls.rows.filter(row => row.taskId === accepted[0]!.owner.taskId)).toHaveLength(1)
+      expect(await countBudgetEvidence(pool, root, denied[0]!.contender.callId)).toEqual({ items: 0, startedEvents: 0 })
+      expect(await countBudgetEvidence(pool, root, accepted[0]!.callId)).toEqual({ items: 1, startedEvents: 1 })
+
+      const controlStepId = `nested-budget-control-step-${suffix}`
+      await startBudgetStep(pool, controlRoot.owner, controlStepId, 1)
+      await expect(admitBudgetToolCall(pool, controlRoot.owner, controlStepId, `nested-budget-control-call-${suffix}`))
+        .resolves.toBe(executionId(controlRoot.owner, `item:tool-call:nested-budget-control-call-${suffix}`))
+      expect(await countBudgetEvidence(pool, controlRoot, `nested-budget-control-call-${suffix}`))
+        .toEqual({ items: 1, startedEvents: 1 })
+    } finally {
+      await manager?.shutdown()
+      for (const sessionId of sessions) await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [sessionId])
+      await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
     }
   })
 })

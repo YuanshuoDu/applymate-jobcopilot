@@ -13,13 +13,16 @@ import type { ChildToolRuntime } from "./child-executor.js"
 import type { ChildAttemptResume } from "./child-resume.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import { createJobDiscoveryClient, type JobDiscoveryRequest } from "../tools/job-discovery-client.js"
-import { InMemoryArtifactToolStore } from "../tools/artifact-tools.js"
+import { InMemoryArtifactToolStore, type ArtifactToolDraftInput } from "../tools/artifact-tools.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient } from "./selected-job-artifact-context.js"
+import { makeScheduledDraftCandidateWitnessV2 } from "./scheduled-draft-candidate-witness.js"
+import { scheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
 import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { buildInteractiveDiscoveryShortlist, requireCurrentOwnerJobs } from "../interactive-discovery-persistence.js"
 import { restoreToolCallState } from "../turns/persisted-tool-call-state.js"
+import { buildChildResumeObservations } from "./child-resume-observations.js"
 import type { ChildMailboxReader } from "./child-context.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
@@ -29,7 +32,7 @@ import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE
   SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
 import { NESTED_SCOUT_PROFILE_MARKER } from "./nested-scout-profile.js"
 
-const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown }))
+const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown, draftMaterialAssertion: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
   execute: vi.fn(async (_input: { pool: unknown; lease: unknown }) => ({
     status: "completed" as const, result: { status: "filled_for_user_review" },
@@ -39,6 +42,7 @@ const scheduledGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const scheduledAuditRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const scheduledPostGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const selectedJobSourceCanary = "APPLYMATE_TRANSIENT_SELECTED_JOB_CANARY"
+const scheduledWriterJobId = "c123456789012345678901234"
 vi.mock("./application-fill-for-review.js", () => ({ executeApplicationFillForReview: applicationFillExecutorMock.execute }))
 vi.mock("./scheduled-gate-child-runtime.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-gate-child-runtime.js")>(),
@@ -61,6 +65,14 @@ vi.mock("../tools/artifact-tools.js", async importOriginal => {
       return artifactStoreMock.current as import("../tools/artifact-tools.js").ArtifactToolStore
     },
   }
+})
+vi.mock("../tools/artifact-store-pg.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../tools/artifact-store-pg.js")>()
+  function fixtureStore(...args: unknown[]) {
+    artifactStoreMock.draftMaterialAssertion = args[2]
+    return artifactStoreMock.current
+  }
+  return { ...actual, PgArtifactToolStore: fixtureStore as unknown as typeof actual.PgArtifactToolStore }
 })
 
 afterEach(() => {
@@ -171,6 +183,8 @@ type PersistedWriterReviewGraphFixture = Readonly<{
   readonly reviewerResult: unknown
   readonly writerTemplateId?: string
   readonly writerExpectedOutputSchema?: unknown
+  readonly writerAttemptCount?: number
+  readonly writerLeaseOwner?: string
 }>
 
 function persistedWriterReviewGraph(fixture: PersistedWriterReviewGraphFixture) {
@@ -213,7 +227,8 @@ function persistedWriterReviewGraph(fixture: PersistedWriterReviewGraphFixture) 
     ],
     writerLease: {
       id: fixture.writerTaskId, sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
-      userId: "user-1", status: "running", role: "writer", leaseOwner: "worker-1", attemptCount: 1,
+      userId: "user-1", status: "running", role: "writer", leaseOwner: fixture.writerLeaseOwner ?? "worker-1",
+      attemptCount: fixture.writerAttemptCount ?? 1,
       interruptRequestedAt: null,
     },
   }
@@ -263,7 +278,7 @@ function selectedJobPool(persistedWriterReview?: PersistedWriterReviewGraphFixtu
     release: vi.fn(),
   } : undefined
   return {
-    query, graphQueries, transactionQueries, tenantScopeUserIds,
+    job, query, graphQueries, transactionQueries, tenantScopeUserIds,
     ...(client ? { connect: async () => client } : {}),
   }
 }
@@ -289,6 +304,12 @@ function legacyInitialWriterPool() {
   return { ...base, connect: async () => client, graphQueries, transactionQueries, tenantScopeUserIds }
 }
 
+function scheduledInitialWriterPool(writerTaskId: string) {
+  const pool = initialWriterPool(writerTaskId)
+  pool.job.id = scheduledWriterJobId
+  return pool
+}
+
 const emptyMailboxReader: ChildMailboxReader = { listPendingMessages: async () => [] }
 
 function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPreparation: { jobId: "job-1" } }): SubagentLease {
@@ -301,6 +322,18 @@ function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPr
     context, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role },
     toolPolicySnapshot: {},
   }
+}
+
+function scheduledDraftCandidateWitness(jobMaterialDigest: string, jobId = "job-1") {
+  const digest = "a".repeat(64)
+  return makeScheduledDraftCandidateWitnessV2({
+    graphRevision: 3, graphDigest: digest, stableStatusDigest: digest, newlyProposedNodeKeys: [],
+    candidate: { jobId, score: 8 }, sourceAnalystKeys: ["analyst-1"],
+    analysts: [{ nodeKey: "analyst-1", taskId: "analyst-task", attemptCount: 1, resultDigest: digest,
+      evidenceDigest: digest, reportDigest: digest, scouts: [{ nodeKey: "scout-1", taskId: "scout-task", attemptCount: 1,
+        nodeDigest: digest, resultDigest: digest, evidenceDigest: digest, reportDigest: digest }] }],
+    jobMaterialDigest,
+  })
 }
 
 function privateDraftPolicySnapshot(outcome: "deny" | "require_approval" | "require_user_input") {
@@ -348,13 +381,15 @@ function selectedJobExecutor(input: {
   readonly model: ModelAdapter
   readonly pool?: ReturnType<typeof selectedJobPool>
   readonly mailboxReader?: ChildMailboxReader
+  readonly resumeLoader?: (lease: SubagentLease) => Promise<ChildAttemptResume | undefined>
 }) {
   artifactStoreMock.current = input.artifactStore
+  artifactStoreMock.draftMaterialAssertion = null
   const pool = input.pool ?? selectedJobPool()
   const executor = createOptionalProductionChildExecutor({
     enabled: true, pool: pool as never, turnStore: input.persistence.engineStore, treeBudget: budget(),
     authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }), modelRuntimeFactory: () => input.model,
-    resumeLoader: async () => undefined,
+    resumeLoader: input.resumeLoader ?? (async () => undefined),
     ...(input.mailboxReader ? { mailboxReader: input.mailboxReader } : {}),
   })
   if (!executor) throw new Error("production selected-job child executor was not created")
@@ -1486,6 +1521,83 @@ describe("production child runtime", () => {
     assertNoExternalTools(requests[0]!)
   })
 
+  it("admits a scheduled V2 Writer when its loaded Job matches the persisted material witness", async () => {
+    const body = "A scheduled cover-letter draft from the witnessed current Job source."
+    const pool = scheduledInitialWriterPool("scheduled-v2-writer")
+    const selected = await loadSelectedJobArtifactContext(pool as never, "user-1", scheduledWriterJobId)
+    const jobSource = selected.transientSources.find(source => source.sourceRef === `job:${scheduledWriterJobId}`)
+    const materialDigest = scheduledDraftJobMaterialDigest(jobSource?.content)
+    if (!materialDigest) throw new Error("fixture selected Job material was not digestible")
+    const preparation = selected.preparation
+    const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: scheduledWriterJobId }).slice(7)}`
+    const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: scheduledWriterJobId })
+    const artifactRef = {
+      artifactId: `cover-letter:${hashArtifactContent({ userId: "user-1", jobId: scheduledWriterJobId }).slice(7)}`,
+      version: 1, contentHash: hashArtifactContent(body), sourceDigest: preparation.sourceDigest,
+    }
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "scheduled-draft", name: "cover_letter.draft", arguments: {
+            baseArtifactId, baseHash, content: body, constraints: { maxWords: 160 },
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const artifacts = new InMemoryArtifactToolStore(), draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence: recordingStore(), model, pool, mailboxReader: emptyMailboxReader })
+    const context = {
+      selectedJobPreparation: { jobId: scheduledWriterJobId }, scheduledDraftCandidateMode: true,
+      scheduledDraftCandidateWitness: scheduledDraftCandidateWitness(materialDigest, scheduledWriterJobId),
+      taskGraphDependencyResults: { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [] },
+    }
+
+    await expect(executor({ lease: { ...jobTask("writer", context), id: "scheduled-v2-writer" } })).resolves.toMatchObject({ status: "completed" })
+    expect(requests).toHaveLength(2)
+    expect(draftSpy).toHaveBeenCalledOnce()
+    expect(artifactStoreMock.draftMaterialAssertion).toBeTypeOf("function")
+  })
+
+  it("denies scheduled V2 material drift before resolving a base, writing a draft, or invoking the model", async () => {
+    const pool = scheduledInitialWriterPool("scheduled-v2-drifted-writer")
+    const selected = await loadSelectedJobArtifactContext(pool as never, "user-1", scheduledWriterJobId)
+    const jobSource = selected.transientSources.find(source => source.sourceRef === `job:${scheduledWriterJobId}`)
+    const materialDigest = scheduledDraftJobMaterialDigest(jobSource?.content)
+    if (!materialDigest) throw new Error("fixture selected Job material was not digestible")
+    pool.job.description = "The current Job changed after candidate admission."
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        yield { type: "text_delta", text: "unexpected Writer invocation" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const artifacts = new InMemoryArtifactToolStore()
+    const baseSpy = vi.spyOn(artifacts, "registerBase"), draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence: recordingStore(), model, pool, mailboxReader: emptyMailboxReader })
+    const context = {
+      selectedJobPreparation: { jobId: scheduledWriterJobId }, scheduledDraftCandidateMode: true,
+      scheduledDraftCandidateWitness: scheduledDraftCandidateWitness(materialDigest, scheduledWriterJobId),
+      taskGraphDependencyResults: { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [] },
+    }
+
+    await expect(executor({ lease: { ...jobTask("writer", context), id: "scheduled-v2-drifted-writer" } })).resolves.toMatchObject({
+      status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal",
+    })
+    expect(requests).toHaveLength(0)
+    expect(baseSpy).not.toHaveBeenCalled()
+    expect(draftSpy).not.toHaveBeenCalled()
+  })
+
   it("does not treat graph-derived non-Reviewer context as legacy when the graph item is absent", async () => {
     const requests: HarnessModelRequest[] = []
     const model: ModelAdapter = {
@@ -2016,6 +2128,138 @@ describe("production child runtime", () => {
     expect(forgedRequests).toHaveLength(0)
     expect(revisionReviewReadSpy).not.toHaveBeenCalled()
     expect(draftSpy).not.toHaveBeenCalled()
+  })
+
+  it("resumes a correction Writer from its exact earlier draft receipt and immediate artifact successor", async () => {
+    const selected = await selectedJobSourceDigest()
+    const preparation = selected.preparation
+    const artifacts = new InMemoryArtifactToolStore()
+    const base = artifacts.registerBase({
+      id: `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`,
+      type: "cover_letter", jobId: "job-1", userId: "user-1", content: { text: "Base cover-letter material" },
+    })
+    const initialFence = {
+      taskId: "writer-initial", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      parentTaskId: "root-1", leaseOwner: "worker-1", attemptCount: 1,
+    }
+    const initialScope = { ...preparation, userId: "user-1", sessionId: "session-1", taskId: initialFence.taskId,
+      toolCallId: "initial-draft-call", taskFence: initialFence }
+    const initialInput: ArtifactToolDraftInput = { baseArtifactId: base.id, baseHash: base.hash,
+      content: "Initial draft with an unclear opening.", constraints: { maxWords: 160 } }
+    const initialVersion = await artifacts.writeDraft(initialScope, { ...initialInput,
+      requestHash: hashArtifactContent({ callId: initialScope.toolCallId, input: initialInput }) })
+    const predecessorRef = { artifactId: initialVersion.artifactId, version: initialVersion.version,
+      contentHash: initialVersion.contentHash, sourceDigest: initialVersion.sourceDigest }
+    const finding = {
+      id: "opening_clarity", code: "content_clarity", severity: "warning" as const,
+      message: "Clarify the opening without adding unsupported claims.", artifactHash: predecessorRef.contentHash,
+      evidence: [{ artifactHash: predecessorRef.contentHash, path: "$.text", summary: "The opening does not identify the strongest experience." }],
+    }
+    const reviewHash = hashArtifactContent({ artifactRef: predecessorRef, currentSourceDigest: preparation.sourceDigest,
+      status: "needs_revision", findings: [finding], evidenceRefs: preparation.evidenceRefs })
+    const reviewerFence = { ...initialFence, taskId: "reviewer-task" }
+    const storedReview = await artifacts.saveReview({
+      userId: "user-1", sessionId: "session-1", jobId: "job-1", artifactId: predecessorRef.artifactId,
+      version: predecessorRef.version, contentHash: predecessorRef.contentHash, sourceDigest: preparation.sourceDigest,
+      currentSourceDigest: preparation.sourceDigest, status: "needs_revision", findings: [finding], evidenceRefs: [...preparation.evidenceRefs],
+      taskId: reviewerFence.taskId, toolCallId: "review-call", requestHash: hashArtifactContent({ predecessorRef, finding }), reviewHash,
+      taskFence: reviewerFence,
+    })
+    const reviewerStructuredResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed",
+      artifactRef: predecessorRef, reviewStatus: "needs_revision", reviewHash }
+    const reviewerResult = { status: "completed", stepCount: 3, toolCallCount: 2, finalItemId: null,
+      finalText: JSON.stringify(reviewerStructuredResult), structuredResult: reviewerStructuredResult }
+    const scope = taskScope()
+    const revisionContext = materializeTaskGraphDependencyContext({ selectedJobPreparation: { jobId: "job-1" } }, scope, ["reviewer"], [{
+      ...scope, key: "reviewer", taskId: reviewerFence.taskId, status: "completed", role: "reviewer",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" }, result: reviewerResult,
+    }])
+    const correctionWriterId = "writer-correction"
+    const correctionLease = {
+      ...jobTask("writer", revisionContext), id: correctionWriterId, ownerId: "worker-2", leaseOwner: "worker-2", attemptCount: 2,
+      leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
+    }
+    const correctionCallId = "correction-draft-call"
+    const correctionInput: ArtifactToolDraftInput = {
+      baseArtifactId: base.id, baseHash: base.hash, content: "Corrected opening with the strongest relevant experience.",
+      constraints: { maxWords: 160 }, expectedPreviousVersion: predecessorRef.version, expectedPreviousHash: predecessorRef.contentHash,
+    }
+    const correctionScope = { ...preparation, userId: "user-1", sessionId: "session-1", taskId: correctionWriterId,
+      toolCallId: correctionCallId, taskFence: { ...initialFence, taskId: correctionWriterId } }
+    const successor = await artifacts.writeDraft(correctionScope, { ...correctionInput,
+      requestHash: hashArtifactContent({ callId: correctionCallId, input: correctionInput }) })
+    const successorRef = { artifactId: successor.artifactId, version: successor.version,
+      contentHash: successor.contentHash, sourceDigest: successor.sourceDigest }
+    const persistedInput = {
+      baseArtifactId: correctionInput.baseArtifactId, baseHash: correctionInput.baseHash,
+    }
+    const stepId = `task:${correctionWriterId}:step:0:attempt:1`
+    const resumeRows = [
+      { id: "correction-call-item", revision: 1, stepId, attempt: 1, ordinal: 0, sessionId: "session-1", turnId: "turn-1",
+        rootTaskId: "root-1", taskId: correctionWriterId, type: "tool_call", status: "completed",
+        content: { toolCallId: correctionCallId, toolName: "cover_letter.draft", input: persistedInput } },
+      { id: "correction-result-item", revision: 1, stepId, attempt: 1, ordinal: 0, sessionId: "session-1", turnId: "turn-1",
+        rootTaskId: "root-1", taskId: correctionWriterId, type: "tool_result", status: "completed",
+        content: { toolCallId: correctionCallId, output: { artifactRef: successorRef }, errorCode: null } },
+    ]
+    const restored = buildChildResumeObservations(resumeRows, correctionLease)
+    const ordinaryReviewRead = artifacts.readRevisionReview.bind(artifacts)
+    const reviewRead = vi.spyOn(artifacts, "readRevisionReview").mockImplementation(async (readScope, revision) => {
+      const prior = await ordinaryReviewRead(readScope, revision)
+      if (prior) return prior
+      const currentHead = await artifacts.read(readScope.userId, predecessorRef.artifactId)
+      const persistedSuccessor = await artifacts.readVersion(readScope, successorRef)
+      const receipt = restored.childToolReplayReceipts.find(candidate => candidate.toolCallId === correctionCallId)
+      const boundReceipt = receipt?.userId === correctionLease.userId && receipt.sessionId === correctionLease.sessionId
+        && receipt.turnId === correctionLease.turnId && receipt.rootTaskId === correctionLease.rootTaskId
+        && receipt.taskId === correctionWriterId && receipt.attempt === 1 && receipt.toolName === "cover_letter.draft"
+        && receipt.result.status === "completed" && receipt.result.errorCode === null
+        && JSON.stringify(receipt.input) === JSON.stringify(persistedInput)
+        && JSON.stringify(receipt.result.output) === JSON.stringify({ artifactRef: successorRef })
+      if (!boundReceipt || !persistedSuccessor || !currentHead || revision.dependencyTaskId !== reviewerFence.taskId
+        || revision.reviewHash !== reviewHash || revision.currentSourceDigest !== preparation.sourceDigest
+        || persistedSuccessor.version !== predecessorRef.version + 1 || persistedSuccessor.previousHash !== predecessorRef.contentHash
+        || persistedSuccessor.taskId !== correctionWriterId || persistedSuccessor.toolCallId !== correctionCallId
+        || persistedSuccessor.sourceDigest !== preparation.sourceDigest || currentHead.version !== successorRef.version
+        || currentHead.hash !== successorRef.contentHash) return null
+      return artifacts.findReview(readScope, revision.artifactRef)
+    })
+    const draftWrite = vi.spyOn(artifacts, "writeDraft")
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: successorRef }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const pool = selectedJobPool({ writerTaskId: correctionWriterId, reviewerTaskId: reviewerFence.taskId,
+      writerDependsOnReviewer: true, reviewerResult, writerAttemptCount: 2, writerLeaseOwner: "worker-2" })
+    const persistence = recordingStore()
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence, model, pool, mailboxReader: emptyMailboxReader,
+      resumeLoader: async lease => lease.attemptCount === 2 ? {
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 2n, consumedInputIds: [],
+          usage: { inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0 } },
+        observations: restored.observations, childToolReplayReceipts: restored.childToolReplayReceipts,
+      } : undefined })
+
+    const result = await executor({ lease: correctionLease })
+
+    expect(reviewRead).toHaveBeenCalledOnce()
+    await expect(reviewRead.mock.results[0]?.value).resolves.toMatchObject({ id: storedReview.id, status: "needs_revision" })
+    expect(result).toMatchObject({ status: "completed", result: { structuredResult: { artifactRef: successorRef } } })
+    expect(requests).toHaveLength(1)
+    const restoredContext = stringsDeep(requests[0]!).join("\n")
+    expect(restoredContext).toContain(successorRef.artifactId)
+    expect(restoredContext).toContain(successorRef.contentHash)
+    expect(restoredContext).toContain('"version":2')
+    expect(restoredContext).not.toContain(correctionInput.content)
+    expect(restoredContext).toContain(finding.message)
+    expect(JSON.stringify(persistence.writes)).not.toContain(finding.message)
+    expect(draftWrite).not.toHaveBeenCalled()
+    expect(await artifacts.readVersion(correctionScope, successorRef)).toMatchObject({ id: successor.id, version: 2,
+      previousHash: predecessorRef.contentHash, taskId: correctionWriterId, toolCallId: correctionCallId })
   })
 
   it("fails closed when an omitted dependency hides a persisted direct Reviewer edge", async () => {

@@ -26,23 +26,37 @@ const references: Readonly<Record<string, TestReference>> = {
   "job-a": { artifactId: "draft-a", version: 3, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` },
   "job-b": { artifactId: "draft-b", version: 2, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}` },
 }
+const correctionReferences: Readonly<Record<string, TestReference>> = {
+  "job-a": { artifactId: "draft-a", version: 4, contentHash: `sha256:${"9".repeat(64)}`, sourceDigest: references["job-a"].sourceDigest },
+  "job-b": { artifactId: "draft-b", version: 3, contentHash: `sha256:${"8".repeat(64)}`, sourceDigest: references["job-b"].sourceDigest },
+}
 
 function graph(options: Readonly<{
   statuses?: Readonly<Record<string, TaskGraphCurrentNode["status"]>>
   writerRefs?: Readonly<Record<string, TestReference>>
   reviewStatuses?: Readonly<Record<string, "passed" | "needs_revision" | "rejected">>
   dependencies?: Readonly<Record<string, readonly string[]>>
+  corrections?: readonly string[]
 }> = {}): TaskGraphCurrentState {
   const nodes = pairs.flatMap(pair => {
     const writerStatus = options.statuses?.[pair.writerNodeKey] ?? "completed"
     const reviewerStatus = options.statuses?.[pair.reviewerNodeKey] ?? "completed"
     const writerRef = options.writerRefs?.[pair.jobId] ?? references[pair.jobId]
-    const reviewRef = references[pair.jobId]
-    return [
-      node(pair.writerNodeKey, pair.writerTemplateId, writerStatus, [], writerRef, "writer"),
-      node(pair.reviewerNodeKey, pair.reviewerTemplateId, reviewerStatus,
-        options.dependencies?.[pair.reviewerNodeKey] ?? [pair.writerNodeKey], reviewRef, "reviewer", options.reviewStatuses?.[pair.jobId] ?? "passed"),
-    ]
+    const reviewRef = writerRef
+    const correction = options.corrections?.includes(pair.jobId) ?? false
+    const initialReview = node(pair.reviewerNodeKey, pair.reviewerTemplateId, reviewerStatus,
+      options.dependencies?.[pair.reviewerNodeKey] ?? [pair.writerNodeKey], reviewRef, "reviewer",
+      options.reviewStatuses?.[pair.jobId] ?? (correction ? "needs_revision" : "passed"))
+    const result = [node(pair.writerNodeKey, pair.writerTemplateId, writerStatus, [], writerRef, "writer"), initialReview]
+    if (correction) {
+      const correctionWriterKey = `${pair.writerNodeKey}-correction`, correctionReviewerKey = `${pair.reviewerNodeKey}-correction`
+      const correctionRef = correctionReferences[pair.jobId]
+      result.push(node(correctionWriterKey, pair.writerTemplateId, options.statuses?.[correctionWriterKey] ?? "completed",
+        [pair.reviewerNodeKey], correctionRef, "writer"))
+      result.push(node(correctionReviewerKey, pair.reviewerTemplateId, options.statuses?.[correctionReviewerKey] ?? "completed",
+        [correctionWriterKey], correctionRef, "reviewer", options.reviewStatuses?.[`${pair.jobId}-correction`] ?? "passed"))
+    }
+    return result
   })
   return { revision: 7, nodes }
 }
@@ -61,19 +75,44 @@ function node(
   }
 }
 
-function contexts(): SelectedJobBatchTaskContext[] {
-  return pairs.flatMap(pair => [
-    { taskId: `${pair.writerNodeKey}-task`, role: "writer", context: { selectedJobPreparation: { jobId: pair.jobId } } },
-    { taskId: `${pair.reviewerNodeKey}-task`, role: "reviewer", context: { selectedJobPreparation: { jobId: pair.jobId } } },
-  ])
+function contexts(state = graph(), options: { crossedJob?: boolean; wrongCorrectionReview?: boolean } = {}): SelectedJobBatchTaskContext[] {
+  return state.nodes.map(current => {
+    const pair = pairs.find(value => current.templateId.includes(value.slotId.replace("-", "_")))!
+    const dependency = current.dependsOn[0] ? state.nodes.find(value => value.key === current.dependsOn[0]) : undefined
+    const selectedJobId = options.crossedJob && current.key === "reviewer-b" ? "job-a" : pair.jobId
+    let context: Record<string, unknown> = { selectedJobPreparation: { jobId: selectedJobId } }
+    if (current.templateId.includes("writer") && current.key.endsWith("-correction") && dependency?.resultProjection) {
+      const result = options.wrongCorrectionReview ? { ...dependency.resultProjection, reviewHash: `sha256:${"e".repeat(64)}` } : dependency.resultProjection
+      context = { ...context, taskGraphDependencyResults: dependencyEvidence(dependency, result) }
+    } else if (current.templateId.includes("reviewer") && dependency?.resultProjection) {
+      context = { ...context, taskGraphDependencyResults: dependencyEvidence(dependency, dependency.resultProjection) }
+    }
+    return { taskId: current.taskId!, role: current.templateId.includes("writer") ? "writer" : "reviewer", context }
+  })
+}
+
+function dependencyEvidence(node: TaskGraphCurrentNode, result: unknown) {
+  return { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{ dependencyKey: node.key,
+    ...(node.templateId.includes("reviewer") ? { dependencyTaskId: node.taskId } : {}),
+    role: node.templateId.includes("writer") ? "writer" : "reviewer", taskStatus: "completed", result }] }
 }
 
 function input(overrides: Partial<VerifySelectedJobBatchCompletionInput> = {}): VerifySelectedJobBatchCompletionInput {
+  const currentGraph = overrides.graph ?? graph()
   return {
-    graph: graph(), pairs, taskContexts: contexts(), lease, root,
+    graph: currentGraph, pairs, taskContexts: overrides.taskContexts ?? contexts(currentGraph), lease, root,
     readCurrentDraftHead: vi.fn(async scope => {
-      const reference = references[scope.jobId]
+      const pair = pairs.find(value => value.jobId === scope.jobId)
+      const correctionKey = pair && `${pair.writerNodeKey}-correction`
+      const reference = correctionKey && currentGraph.nodes.some(node => node.key === correctionKey)
+        ? correctionReferences[scope.jobId] : references[scope.jobId]
       return reference ? { ...reference, artifactId: scope.artifactId } : null
+    }),
+    readArtifactVersion: vi.fn(async scope => {
+      const correction = scope.taskId.includes("correction")
+      const reference = correction ? correctionReferences[scope.jobId] : references[scope.jobId]
+      return reference ? { ...reference, artifactType: "cover_letter" as const, taskId: scope.taskId,
+        previousHash: correction ? references[scope.jobId]?.contentHash ?? null : null } : null
     }),
     readCurrentSourceDigest: vi.fn(async jobId => references[jobId]?.sourceDigest ?? null),
     readCurrentReviewReceipt: vi.fn(async scope => ({ ...scope, toolCallId: `review-${scope.jobId}` })),
@@ -96,7 +135,7 @@ describe("multi-selected-job completion evidence gate", () => {
       evidence: { artifactRef: references["job-a"], reviewReceipt: { taskId: "reviewer-a-task", status: "passed" } },
     })
     expect(result.witness.graph.nodes.map(value => value.templateId)).toEqual(pairs.flatMap(pair => [pair.writerTemplateId, pair.reviewerTemplateId]))
-    expect(args.readCurrentSourceDigest).toHaveBeenCalledTimes(4)
+    expect(args.readCurrentSourceDigest).toHaveBeenCalledTimes(6)
     expect(args.readCurrentReviewReceipt).toHaveBeenCalledTimes(2)
   })
 
@@ -109,12 +148,12 @@ describe("multi-selected-job completion evidence gate", () => {
 
   it("keeps ordinary mixed progress pending and reports a settled branch failure separately", async () => {
     const inProgress = graph({ statuses: { "writer-a": "failed", "reviewer-a": "queued" } })
-    const pending = await verifySelectedJobBatchCompletion(input({ graph: inProgress }))
+    const pending = await verifySelectedJobBatchCompletion(input({ graph: inProgress, taskContexts: contexts(inProgress) }))
     expect(pending.status).toBe("pending")
     expect(pending.outcomes.map(value => [value.jobId, value.status])).toEqual([["job-a", "pending"], ["job-b", "completed"]])
 
     const settled = graph({ statuses: { "writer-a": "failed", "reviewer-a": "cancelled" } })
-    const partial = await verifySelectedJobBatchCompletion(input({ graph: settled }))
+    const partial = await verifySelectedJobBatchCompletion(input({ graph: settled, taskContexts: contexts(settled) }))
     expect(partial.status).toBe("ready")
     expect(partial.outcomes.map(value => [value.jobId, value.status])).toEqual([["job-a", "failed"], ["job-b", "completed"]])
   })
@@ -141,6 +180,55 @@ describe("multi-selected-job completion evidence gate", () => {
     const recheck = await verifySelectedJobBatchCompletion(input({ graph: changedGraph, expectedWitness: first.witness }))
     expect(recheck.status).toBe("blocked")
     expect(recheck.outcomes.every(value => value.status === "completed")).toBe(true)
+  })
+
+  it("uses the latest correction pair while retaining the exact initial Reviewer evidence", async () => {
+    const corrected = graph({ corrections: ["job-a"] })
+    const args = input({ graph: corrected, taskContexts: contexts(corrected) })
+    const result = await verifySelectedJobBatchCompletion(args)
+
+    expect(result.status).toBe("ready")
+    if (result.status !== "ready") return
+    expect(result.outcomes[0]).toMatchObject({ status: "completed", writerTaskId: "writer-a-correction-task",
+      reviewerTaskId: "reviewer-a-correction-task", evidence: { artifactRef: correctionReferences["job-a"] },
+      priorEvidence: { writerTaskId: "writer-a-task", reviewerTaskId: "reviewer-a-task", artifactRef: references["job-a"],
+        reviewStatus: "needs_revision", reviewReceipt: { status: "needs_revision", taskId: "reviewer-a-task" } } })
+    expect(result.witness.graph.nodes).toHaveLength(6)
+    expect(args.readArtifactVersion).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, jobId: "job-a",
+      artifactId: references["job-a"].artifactId, taskId: "writer-a-task", version: references["job-a"].version })
+    expect(args.readArtifactVersion).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, jobId: "job-a",
+      artifactId: correctionReferences["job-a"].artifactId, taskId: "writer-a-correction-task", version: correctionReferences["job-a"].version })
+  })
+
+  it.each([
+    ["prior review passed", graph({ corrections: ["job-a"], reviewStatuses: { "job-a": "passed" } }), false],
+    ["feedback hash changed", graph({ corrections: ["job-a"] }), true],
+    ["new version skipped", graph({ corrections: ["job-a"] }), false],
+  ])("blocks a correction with %s", async (_label, value, wrongFeedback) => {
+    const taskContexts = contexts(value, { wrongCorrectionReview: wrongFeedback })
+    const readArtifactVersion = vi.fn(async scope => {
+      const row = scope.taskId.includes("correction") ? { ...correctionReferences[scope.jobId], artifactType: "cover_letter" as const,
+        taskId: scope.taskId, previousHash: references[scope.jobId]?.contentHash ?? null } : {
+        ...references[scope.jobId], artifactType: "cover_letter" as const, taskId: scope.taskId, previousHash: null,
+      }
+      return _label === "new version skipped" && scope.taskId.includes("correction") ? { ...row, version: row.version + 1 } : row
+    })
+    const result = await verifySelectedJobBatchCompletion(input({ graph: value, taskContexts, readArtifactVersion }))
+    expect(result.status).toBe("blocked")
+    expect(result.outcomes[0]?.status).toBe("invalid")
+  })
+
+  it("keeps a failed or pending correction explicit instead of falling back to the initial pair", async () => {
+    const pendingGraph = graph({ corrections: ["job-a"], statuses: { "reviewer-a-correction": "queued" } })
+    const pending = await verifySelectedJobBatchCompletion(input({ graph: pendingGraph, taskContexts: contexts(pendingGraph) }))
+    expect(pending.status).toBe("pending")
+    expect(pending.outcomes[0]).toMatchObject({ status: "pending", writerTaskId: "writer-a-correction-task", reviewerTaskId: "reviewer-a-correction-task" })
+
+    const failedGraph = graph({ corrections: ["job-a"], statuses: { "reviewer-a-correction": "failed" } })
+    const failed = await verifySelectedJobBatchCompletion(input({ graph: failedGraph, taskContexts: contexts(failedGraph) }))
+    expect(failed.status).toBe("ready")
+    expect(failed.outcomes[0]).toMatchObject({ status: "failed", writerTaskId: "writer-a-correction-task", reviewerTaskId: "reviewer-a-correction-task",
+      priorEvidence: { reviewerTaskId: "reviewer-a-task" } })
   })
 
   it("keeps a successful sibling visible when a transaction-bound evidence read is lost", async () => {

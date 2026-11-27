@@ -10,6 +10,7 @@ import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-rep
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { projectWaitCallCompletionPayload } from "./turn-execution-wait-event-projection.js"
+import { DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY, DEPENDENCY_WAIT_BATCH_REJECTION_MARKER } from "./dependency-wait-batch-rejection.js"
 
 type BatchAppendEntryBase = { correlationId: string; itemId: string | null; payload: unknown; key: string }
 export type BatchAppendEntry =
@@ -116,9 +117,12 @@ export async function executeToolWithItems(
   onResultItemPersisted?: (receipt: PersistedToolExecutionReceipt) => void,
 ): Promise<TurnEngineToolResult> {
   const input = toRepositoryJson(call.arguments)
+  const rejectionMarker = options.dependencyWaitBatchRejected === true
+    ? { [DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY]: DEPENDENCY_WAIT_BATCH_REJECTION_MARKER }
+    : {}
   const callItem = await writer.startItem({
     id: itemId(options, `item:tool-call:${call.id}`), stepId: step.id, type: "tool_call", phase: null,
-    content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input }, now: now(),
+    content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input, ...rejectionMarker }, now: now(),
   })
   onCallItemPersisted?.()
   const startKey = options.childWaitCallStartKey?.(step.id, call) ?? `tool-started:${call.id}`
@@ -126,7 +130,11 @@ export async function executeToolWithItems(
   try { startedEventId = await writer.append("tool_call.started", call.id, callItem.id, { toolCallId: call.id, toolName: call.name, taskId: options.identity.taskId }, startKey) }
   catch (error: unknown) {
     if (!isSessionPauseRequestedError(error)) throw error
-    await writer.updateItem(callItem, "interrupted", { toolCallId: call.id, toolName: call.name, status: "interrupted", errorCode: "session_pause_requested" }, now(), "tool-start-denied")
+    const interruptedCall = { toolCallId: call.id, toolName: call.name, status: "interrupted", errorCode: "session_pause_requested" }
+    const interruptedPrivateCall = options.dependencyWaitBatchRejected === true
+      ? { ...interruptedCall, toolVersion: "1", input, ...rejectionMarker }
+      : interruptedCall
+    await writer.updateItem(callItem, "interrupted", interruptedPrivateCall, now(), "tool-start-denied", interruptedCall)
     throw error
   }
   if (startKey !== `tool-started:${call.id}`) options.childWaitCallStarted?.(step.id, call, startedEventId)
@@ -146,10 +154,11 @@ export async function executeToolWithItems(
       result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "session_pause_requested" }
     } else result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "tool_execution_failed" }
   }
-  await writer.completeItem(callItem, {
+  const completedCall = {
     toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion,
     status: result.status, errorCode: result.errorCode, input,
-  }, now(), `tool-call-completed:${call.id}`)
+  }
+  await writer.completeItem(callItem, { ...completedCall, ...rejectionMarker }, now(), `tool-call-completed:${call.id}`, completedCall)
   await writer.append(
     result.status === "completed" ? "tool_call.completed" : "tool_call.failed", call.id, callItem.id,
     { toolCallId: call.id, toolName: call.name, status: result.status, errorCode: result.errorCode, taskId: options.identity.taskId },
