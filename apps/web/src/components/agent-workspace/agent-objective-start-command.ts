@@ -1,5 +1,6 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared/agent-location-normalization"
+import { OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION, parseObjectiveSponsorshipTargetCountry, type ObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared"
 import type { ObjectiveVerificationRequirements } from "@/lib/agent/control-plane/commands/types"
 
 export interface ObjectiveContextDraft {
@@ -18,6 +19,7 @@ export interface ObjectiveStartResult {
 
 interface ObjectiveStartAttempt extends ObjectiveContextDraft {
   readonly verificationRequirements?: ObjectiveVerificationRequirements
+  readonly sponsorshipTargetCountry?: ObjectiveSponsorshipTargetCountry
   readonly clientMessageId: string
 }
 
@@ -86,6 +88,7 @@ export class AgentObjectiveStartCoordinator {
     allowedLocationsDraft = "",
     existingRequirements?: ObjectiveVerificationRequirements,
     selectedSessionId?: string,
+    sponsorshipTargetCountryCode?: string,
   ): Promise<ObjectiveStartResult> {
     if (selectedSessionId !== undefined && !isIdentifier(selectedSessionId)) {
       return Promise.reject(invalidInput("Selected Session ID is invalid"))
@@ -119,9 +122,18 @@ export class AgentObjectiveStartCoordinator {
       return Promise.reject(error)
     }
 
+    let sponsorshipTargetCountry: ObjectiveSponsorshipTargetCountry | undefined
+    if (sponsorshipTargetCountryCode !== undefined) {
+      sponsorshipTargetCountry = parseObjectiveSponsorshipTargetCountry({
+        schemaVersion: OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION,
+        countryCode: sponsorshipTargetCountryCode,
+      }) ?? undefined
+      if (!sponsorshipTargetCountry) return Promise.reject(invalidInput("Choose a supported ISO 3166-1 alpha-2 country"))
+    }
+
     const targetKey = selectedSessionId === undefined || (this.targetKey === "new-session" && selectedSessionId === this.sessionId)
       ? "new-session" : `session:${selectedSessionId}`
-    const identityKey = objectiveStartIdentity(targetKey, draft, verificationRequirements)
+    const identityKey = objectiveStartIdentity(targetKey, draft, verificationRequirements, sponsorshipTargetCountry)
     if (this.inFlight) {
       if (this.inFlightIdentityKey === identityKey) return this.inFlight
       return Promise.reject(new ObjectiveStartCommandError(
@@ -139,7 +151,7 @@ export class AgentObjectiveStartCoordinator {
     this.accepted = null
 
     if (!this.attempt || this.attemptIdentityKey !== identityKey) {
-      this.attempt = { ...draft, ...(verificationRequirements ? { verificationRequirements } : {}), clientMessageId: this.makeClientMessageId() }
+      this.attempt = { ...draft, ...(verificationRequirements ? { verificationRequirements } : {}), ...(sponsorshipTargetCountry ? { sponsorshipTargetCountry } : {}), clientMessageId: this.makeClientMessageId() }
       this.attemptIdentityKey = identityKey
     }
     const attempt = this.attempt
@@ -181,8 +193,11 @@ export class AgentObjectiveStartCoordinator {
   }
 }
 
-function objectiveStartIdentity(targetKey: string, draft: ObjectiveContextDraft, requirements?: ObjectiveVerificationRequirements): string {
-  return JSON.stringify([targetKey, draft.objective, draft.context, requirements ?? null])
+function objectiveStartIdentity(targetKey: string, draft: ObjectiveContextDraft, requirements?: ObjectiveVerificationRequirements,
+  sponsorshipTargetCountry?: ObjectiveSponsorshipTargetCountry): string {
+  const identity: unknown[] = [targetKey, draft.objective, draft.context, requirements ?? null]
+  if (sponsorshipTargetCountry) identity.push(sponsorshipTargetCountry)
+  return JSON.stringify(identity)
 }
 async function createObjectiveSession(attempt: ObjectiveStartAttempt, fetcher: typeof fetch): Promise<string> {
   const response = await fetcher("/api/agent/sessions", {
@@ -214,6 +229,7 @@ async function startAgentObjective(sessionId: string, attempt: ObjectiveStartAtt
       objective: attempt.objective,
       content: [{ type: "text", text: contentText }],
       ...(attempt.verificationRequirements ? { verificationRequirements: attempt.verificationRequirements } : {}),
+      ...(attempt.sponsorshipTargetCountry ? { sponsorshipTargetCountry: attempt.sponsorshipTargetCountry } : {}),
     }),
   })
   const body: unknown = await response.json().catch(() => null)

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
-  projectRootTaskGoalCriteria, rootTaskGoalCriteriaBlocks, rootTaskVerificationRequirementsObservation,
+  projectRootTaskGoalCriteria, rootTaskGoalCriteriaBlocks, rootTaskSponsorshipTargetCountryObservation, rootTaskVerificationRequirementsObservation,
 } from "./root-task-goal-criteria-context.js"
 
 const goal = "Find EU software roles"
@@ -103,4 +103,38 @@ describe("canonical Root goal-criteria context", () => {
     })
     expect(JSON.stringify(observation)).not.toContain("minimum")
   })
+  it("projects an explicit country only as untrusted user-selected scope, never as job evidence or authority", () => {
+    const target = {
+      schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1",
+      countryCode: "IE",
+    }
+    const observation = rootTaskSponsorshipTargetCountryObservation({
+      goal: "Find roles",
+      intent: { kind: "objective_task_graph_execution", version: 1 },
+      sponsorshipTargetCountry: target,
+      privateTurnId: "PRIVATE_TURN_ID",
+    })
+    expect(observation).toMatchObject({
+      id: "root-task-sponsorship-target-country",
+      content: {
+        kind: "canonical_objective_sponsorship_target_country",
+        schemaVersion: target.schemaVersion,
+        trust: "external_untrusted",
+        source: "canonical_turn_objective",
+        status: "selected",
+        countryCode: "IE",
+        scope: "user_selected_sponsorship_target_only",
+        notJobLocation: true,
+        notEvidence: true,
+        notAuthority: true,
+      },
+    })
+    expect(JSON.stringify(observation)).not.toContain("PRIVATE_TURN_ID")
+    expect(rootTaskSponsorshipTargetCountryObservation({ goal: "Find roles" })).toBeUndefined()
+    expect(rootTaskSponsorshipTargetCountryObservation({
+      intent: { kind: "objective_task_graph_execution", version: 1 },
+      sponsorshipTargetCountry: { ...target, countryCode: "XK" },
+    })?.content).toMatchObject({ status: "invalid" })
+  })
+
 })

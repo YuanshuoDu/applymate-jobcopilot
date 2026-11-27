@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useEffect, useReducer, useRef, type FormEvent, type MutableRefObject } from 'react'
+import { ISO_3166_1_ALPHA_2_CODES } from '@jobcopilot/shared'
 import {
   AgentObjectiveStartCoordinator,
   ObjectiveStartCommandError,
@@ -9,6 +10,7 @@ import {
 
 export interface AgentObjectiveContextFormState extends ObjectiveContextDraft {
   allowedLocationsDraft?: string
+  sponsorshipTargetCountryCode: string
   open: boolean
   pending: boolean
   accepted: boolean
@@ -20,6 +22,7 @@ type FormAction =
   | { type: 'edit-objective'; value: string }
   | { type: 'edit-context'; value: string }
   | { type: 'edit-allowed-locations'; value: string }
+  | { type: 'edit-sponsorship-country'; value: string }
   | { type: 'pending' }
   | { type: 'failed'; error: { message: string; conflict: boolean } }
   | { type: 'accepted' }
@@ -27,7 +30,7 @@ type FormAction =
   | { type: 'discard' }
 
 const initialFormState: AgentObjectiveContextFormState = {
-  objective: '', context: '', allowedLocationsDraft: '', open: false, pending: false, accepted: false, error: null,
+  objective: '', context: '', allowedLocationsDraft: '', sponsorshipTargetCountryCode: '', open: false, pending: false, accepted: false, error: null,
 }
 
 export function objectiveContextFormReducer(
@@ -38,6 +41,7 @@ export function objectiveContextFormReducer(
   if (action.type === 'edit-objective') return { ...state, objective: action.value, error: null }
   if (action.type === 'edit-context') return { ...state, context: action.value, error: null }
   if (action.type === 'edit-allowed-locations') return { ...state, allowedLocationsDraft: action.value, error: null }
+  if (action.type === 'edit-sponsorship-country') return { ...state, sponsorshipTargetCountryCode: action.value, error: null }
   if (action.type === 'pending') return { ...state, pending: true, error: null }
   if (action.type === 'failed') return { ...state, pending: false, error: action.error }
   if (action.type === 'accepted') return { ...initialFormState, accepted: true }
@@ -66,6 +70,9 @@ export function shouldReleaseInputAfterSessionSelection(
 ): boolean {
   return wasEntryAvailable && !entryAvailable && sessionSwitchPending
 }
+
+const countryNames = new Intl.DisplayNames(['en'], { type: 'region' })
+function countryDisplayName(code: string): string { return countryNames.of(code) ?? code }
 
 export function canSubmitObjectiveContext(state: AgentObjectiveContextFormState): boolean {
   return state.open && !state.pending && !state.accepted && Boolean(state.objective.trim())
@@ -110,7 +117,8 @@ export function AgentObjectiveContextForm({ startLockRef, attachedFileCount = 0,
     startLockRef.current = true
     onBusyChange?.(true)
     dispatchAction({ type: 'pending' })
-    void coordinatorRef.current!.start(state.objective, state.context, state.allowedLocationsDraft).then(result => {
+    void coordinatorRef.current!.start(state.objective, state.context, state.allowedLocationsDraft, undefined, undefined,
+      state.sponsorshipTargetCountryCode || undefined).then(result => {
       dispatchAction({ type: 'accepted' })
       try {
         onAccepted(result.sessionId, result.objective)
@@ -184,6 +192,25 @@ export function AgentObjectiveContextForm({ startLockRef, attachedFileCount = 0,
             }}
             style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical', border: '1px solid var(--border)', borderRadius: 7, padding: 8, color: 'var(--text)', background: 'var(--bg)', font: 'inherit' }}
           />
+          <label htmlFor="agent-task-sponsorship-country">Sponsorship target country (optional)</label>
+          <p style={{ margin: 0 }}>This records the country you selected for sponsorship review. It is not evidence that a role is located there or offers sponsorship.</p>
+          <select
+            id="agent-task-sponsorship-country"
+            data-testid="objective-context-sponsorship-country"
+            aria-label="Sponsorship target country (optional)"
+            value={state.sponsorshipTargetCountryCode}
+            disabled={state.pending || disabled}
+            onChange={event => {
+              coordinatorRef.current?.draftEdited()
+              dispatchAction({ type: 'edit-sponsorship-country', value: event.target.value })
+            }}
+            style={{ width: '100%', boxSizing: 'border-box', border: '1px solid var(--border)', borderRadius: 7, padding: 8, color: 'var(--text)', background: 'var(--bg)', font: 'inherit' }}
+          >
+            <option value="">No target country selected</option>
+            {ISO_3166_1_ALPHA_2_CODES.map(code => (
+              <option key={code} value={code}>{countryDisplayName(code)} ({code})</option>
+            ))}
+          </select>
           <label htmlFor="agent-task-background">Background and reference</label>
           <p style={{ margin: 0 }}>Optional, up to 20,000 characters. Text is sent unchanged.</p>
           <textarea

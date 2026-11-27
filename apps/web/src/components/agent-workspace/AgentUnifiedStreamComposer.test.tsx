@@ -29,7 +29,7 @@ const formSource = readFileSync(new URL('./AgentObjectiveContextForm.tsx', impor
 const taskModeSource = readFileSync(new URL('./agent-composer-task-mode.ts', import.meta.url), 'utf8')
 
 const emptyFormState: AgentObjectiveContextFormState = {
-  objective: '', context: '', open: false, pending: false, accepted: false, error: null,
+  objective: '', context: '', sponsorshipTargetCountryCode: '', open: false, pending: false, accepted: false, error: null,
 }
 
 describe('Agent unified stream composer', () => {

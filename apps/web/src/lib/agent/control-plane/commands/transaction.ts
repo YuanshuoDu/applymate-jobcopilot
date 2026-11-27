@@ -5,6 +5,7 @@ import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_I
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { activeTurnChanged, sessionNotFound } from "./errors"
+import type { ObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared"
 import type { CommandDisposition, CommandIdentity, InterruptDisposition, ObjectiveVerificationRequirements, SelectedJobPreparationScope, ServerAgentTurnIntent } from "./types"
 
 export { fallbackDisposition, findExistingCommand } from "./existing-command"
@@ -91,10 +92,12 @@ export async function createRootTurn(
   selectedJobPreparation?: SelectedJobPreparationScope,
   intent?: ServerAgentTurnIntent,
   verificationRequirements?: ObjectiveVerificationRequirements | null, verifiedShortlistSelection?: VerifiedShortlistSelectionBinding,
+  sponsorshipTargetCountry?: ObjectiveSponsorshipTargetCountry,
 ): Promise<ActiveTurn> {
   const goal = explicitGoal ?? (content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content")
-  const selectedJobBatch = command.source === "user" && intent?.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind && intent.version === SELECTED_JOB_BATCH_PREPARATION_INTENT.version && verifiedShortlistSelection !== undefined && selectedJobPreparation === undefined && verificationRequirements === undefined
+  const selectedJobBatch = command.source === "user" && intent?.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind && intent.version === SELECTED_JOB_BATCH_PREPARATION_INTENT.version && verifiedShortlistSelection !== undefined && selectedJobPreparation === undefined && verificationRequirements === undefined && sponsorshipTargetCountry === undefined
   if ((intent?.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind || verifiedShortlistSelection !== undefined) && !selectedJobBatch) throw new Error("selected_job_batch_turn_binding_invalid")
+  if (sponsorshipTargetCountry !== undefined && (command.source !== "user" || intent?.kind !== OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind || intent.version !== OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version)) throw new Error("objective_sponsorship_target_country_turn_binding_invalid")
   const turn = await tx.agentTurn.create({
     data: {
       id: randomUUID(),
@@ -112,6 +115,7 @@ export async function createRootTurn(
         ...(intent ? { intent } : {}),
         ...(selectedJobBatch ? { verifiedShortlistSelection } : {}),
         ...(verificationRequirements !== undefined ? { verificationRequirements } : {}),
+        ...(sponsorshipTargetCountry !== undefined ? { sponsorshipTargetCountry } : {}),
       }),
       modelProfileSnapshot: json({}),
       toolPolicySnapshot: json({}),

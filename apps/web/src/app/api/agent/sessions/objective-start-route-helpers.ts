@@ -1,4 +1,5 @@
 import { AgentInputCommandSchema, assertValid, schemaVersion, type InputContentPart } from "@jobcopilot/agent-protocol"
+import { parseObjectiveSponsorshipTargetCountry, type ObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared"
 import { NextResponse } from "next/server"
 
 import { MAX_ATTACHMENT_REFS, MAX_CONTENT_PARTS, MAX_TEXT_PART_LENGTH } from "./command-route-helpers"
@@ -14,6 +15,7 @@ export type ParsedObjectiveStartCommand = {
   objective: string
   content: InputContentPart[]
   verificationRequirements?: ObjectiveVerificationRequirements | null
+  sponsorshipTargetCountry?: ObjectiveSponsorshipTargetCountry
 }
 
 type RecordBody = Record<string, unknown>
@@ -84,7 +86,7 @@ export function parseObjectiveStartBody(
   request: Request,
   sessionId: string,
 ): ParsedObjectiveStartCommand | NextResponse {
-  if (!isRecord(body) || !exactKeys(body, ["schemaVersion", "clientMessageId", "objective", "content", "verificationRequirements"])) {
+  if (!isRecord(body) || !exactKeys(body, ["schemaVersion", "clientMessageId", "objective", "content", "verificationRequirements", "sponsorshipTargetCountry"])) {
     return invalid("Unsupported or forbidden objective start field")
   }
   const clientMessageId = trimmedString(body.clientMessageId)
@@ -110,10 +112,17 @@ export function parseObjectiveStartBody(
       }
     }
   }
+  const hasSponsorshipTargetCountry = Object.hasOwn(body, "sponsorshipTargetCountry")
+  const sponsorshipTargetCountry = hasSponsorshipTargetCountry
+    ? parseObjectiveSponsorshipTargetCountry(body.sponsorshipTargetCountry) : undefined
+  if (hasSponsorshipTargetCountry && !sponsorshipTargetCountry) {
+    return invalid("Objective sponsorship target country is invalid or unsupported")
+  }
   return {
     clientMessageId,
     objective,
     content,
     ...(hasRequirements ? { verificationRequirements } : {}),
+    ...(sponsorshipTargetCountry ? { sponsorshipTargetCountry } : {}),
   }
 }

@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer"
 import { Value } from "@sinclair/typebox/value"
-import { InputContentPartSchema } from "@jobcopilot/agent-protocol"
-import { normalizeAgentLocationAllowlist } from "@jobcopilot/shared"
+import { InputContentPartSchema, OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
+import { normalizeAgentLocationAllowlist, parseObjectiveSponsorshipTargetCountry, type ObjectiveSponsorshipTargetCountry } from "@jobcopilot/shared"
 import { TASK_GRAPH_VERIFICATION_LIMITS } from "../planning/task-graph-verification.js"
 import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
 
@@ -18,6 +18,10 @@ export type RootTaskVerifierObjective = Readonly<{
 }>
 /** The opt-in is only for native-verifier derivation before its Root row exists; history stays strict. */
 export type RootTaskObjectiveOptions = Readonly<{ allowNativeFreshRootFallback?: true }>
+
+export type RootTaskSponsorshipTargetCountryResolution = Readonly<{ status: "absent" }>
+  | Readonly<{ status: "valid"; sponsorshipTargetCountry: ObjectiveSponsorshipTargetCountry }>
+  | Readonly<{ status: "invalid" }>
 
 export type RootTaskVerificationRequirement = Readonly<{ id: string; kind: "candidate_count_gte" | "finding_count_gte"; minimum: number }>
   | Readonly<{ id: string; kind: "candidate_location_in"; locations: readonly string[] }>
@@ -181,6 +185,42 @@ function requirementsEqual(left: readonly RootTaskVerificationRequirement[], rig
         && requirement.locations.every((location, itemIndex) => location === other.locations[itemIndex])
       : other.kind !== "candidate_location_in" && requirement.minimum === other.minimum
   })
+}
+
+function hasObjectiveExecutionIntent(value: unknown): boolean {
+  const intent = exactRequirementRecord(value, ["kind", "version"])
+  return intent?.kind === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.kind
+    && intent.version === OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT.version
+}
+
+/** Resolves only an explicitly persisted country on this Objective Turn; malformed presence never becomes absence. */
+export function resolveRootTaskSponsorshipTargetCountry(turnInput: unknown): RootTaskSponsorshipTargetCountryResolution {
+  const envelope = record(turnInput)
+  if (!envelope) return turnInput !== null && typeof turnInput === "object"
+    ? { status: "invalid" } : { status: "absent" }
+  const topCountry = ownDataField(envelope, "sponsorshipTargetCountry")
+  const nestedInput = ownDataField(envelope, "input")
+  if (topCountry.status === "invalid" || nestedInput.status === "invalid") return { status: "invalid" }
+  const nested = nestedInput.status === "present" ? record(nestedInput.value) : null
+  if (nestedInput.status === "present" && nested === null && nestedInput.value
+    && typeof nestedInput.value === "object") return { status: "invalid" }
+  const nestedCountry = ownDataField(nested, "sponsorshipTargetCountry")
+  if (nestedCountry.status === "invalid") return { status: "invalid" }
+  const candidates = [
+    ...(topCountry.status === "present" ? [{ value: topCountry.value, owner: envelope }] : []),
+    ...(nestedCountry.status === "present" && nested ? [{ value: nestedCountry.value, owner: nested }] : []),
+  ]
+  if (!candidates.length) return { status: "absent" }
+  const parsed = candidates.map(candidate => ({
+    target: parseObjectiveSponsorshipTargetCountry(candidate.value),
+    intent: ownDataField(candidate.owner, "intent"),
+  }))
+  if (parsed.some(value => !value.target || value.intent.status !== "present" || !hasObjectiveExecutionIntent(value.intent.value))) {
+    return { status: "invalid" }
+  }
+  const target = parsed[0]?.target
+  if (!target || parsed.some(value => value.target?.countryCode !== target.countryCode)) return { status: "invalid" }
+  return { status: "valid", sponsorshipTargetCountry: target }
 }
 
 /** Resolves only the optional persisted Turn objective block; invalid intent stays distinct from absence. */

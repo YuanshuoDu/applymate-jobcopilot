@@ -35,7 +35,16 @@ function snapshot(withHint: boolean): StepContextRequest["snapshot"] {
   } }] : [] }
 }
 
-function fixture() {
+function fixture(withCountry = false) {
+  const sponsorshipTargetCountry = withCountry ? {
+    schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1", countryCode: "IE",
+  } as const : undefined
+  const goal = "Check sponsorship scope for this Objective"
+  const turnInput = sponsorshipTargetCountry ? {
+    goal, content: [{ type: "text", text: goal }],
+    intent: { kind: "objective_task_graph_execution", version: 1 }, sponsorshipTargetCountry,
+  } : undefined
+  const rootTaskObjective = sponsorshipTargetCountry ? { goal, successCriteria: ["Keep evidence scoped"] } : undefined
   const baseBuilder = { build: vi.fn(async (request: StepContextRequest): Promise<StepContext> => ({
     schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
     inputThroughSequence: 3n, consumedInputIds: [], canonicalJson: "base-context", blocks: request.snapshot.toolObservations.map(observation => ({
@@ -46,6 +55,7 @@ function fixture() {
   const rootHistoryReader: DirectRootTaskHistoryReader = { load: vi.fn(async () => []) }
   const builder = createCanonicalTurnContextBuilder({ pool: { connect: vi.fn() } as never, store: {} as never, baseBuilder,
     scope, lease, rootTaskId: "root-1", rootAttemptCount: 2, planningEnabled: true, selectedJobMode: false,
+    ...(turnInput && rootTaskObjective ? { turnInput, rootTaskObjective } : {}),
     rootTaskHistoryDirectReader: rootHistoryReader, currentRootBudgetReader: async () => ({ kind: "turn_budget_current", status: "unavailable",
       advisoryOnly: true, pointInTime: true, notPermission: true, notReservation: true, notCompletionEvidence: true }) })
   return { builder, baseBuilder }
@@ -77,6 +87,34 @@ describe("canonical Root private sponsorship context", () => {
     expect(Object.values(progressCheckpointFromStepContext(context)).join(" ")).not.toContain(excerpt)
     expect(reader.read).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ userId: scope.userId,
       sessionId: lease.sessionId, turnId: lease.turnId, taskId: "root-1", rootTaskId: "root-1", stepId: "step-current" }), [])
+  })
+
+  it("keeps explicit Objective country scope beside current private source context without joining their authority", async () => {
+    const { builder } = fixture(true)
+    const context = await build(builder)
+    const country = context.blocks.find(block => block.id === "observation:root-task-sponsorship-target-country")
+    const source = context.blocks.find(block => block.id === "sponsorship-private-source-0")
+    const guidance = context.blocks.find(block => block.id === "sponsorship-private-guidance")?.content
+
+    expect(country).toMatchObject({
+      layer: "tool_observation", role: "data", trust: "external_untrusted",
+      content: { status: "selected", countryCode: "IE", scope: "user_selected_sponsorship_target_only",
+        notJobLocation: true, notEvidence: true, notAuthority: true },
+    })
+    expect(source).toMatchObject({
+      layer: "business", role: "data", trust: "external_untrusted", source: "current_saved_job_listing",
+      content: { sourceRef: "saved_job_listing", observation: { status: "inconclusive", reason: "interpretation_unverified",
+        sourceContext: { location: "Dublin", descriptionExcerpt: excerpt, trustBoundary: "untrusted_saved_job_listing" } } },
+    })
+    expect(guidance).toContain("not semantic sponsorship meaning or country scope")
+    expect(guidance).toContain("Do not state that sponsorship is available or unavailable, infer a country from free-form location")
+    const modelMessages = JSON.stringify(contextToModelMessages(context))
+    expect(modelMessages).toContain("countryCode")
+    expect(modelMessages).toContain("IE")
+    expect(modelMessages).toContain(excerpt)
+    const publicWait = JSON.stringify(context.blocks.find(block => block.id === "observation:wait-result-1")?.content)
+    expect(publicWait).not.toContain(excerpt)
+    expect(publicWait).not.toContain("countryCode")
   })
 
   it("discovers a consumed async wait projection without any sponsorship sidecar", async () => {
