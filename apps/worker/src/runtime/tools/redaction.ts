@@ -58,6 +58,7 @@ const PLAN_NODE_FIELDS = ["key", "taskId", "status"] as const
 const SUBAGENT_TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const SPAWN_RECEIPT_FIELDS = ["taskId", "rootTaskId", "parentTaskId", "path", "depth", "status", "replay"] as const
 const SPAWN_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+const SPONSORSHIP_REVIEW_RECEIPT_FIELDS = ["taskId", "status"] as const
 const MAX_SUBAGENT_DEPTH = 8
 const DURABLE_WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
@@ -162,6 +163,21 @@ export function prepareSubagentSpawnReceipt(
   return prepareSafeValue(safeOutput)
 }
 
+/** Preserves only the canonical auditor task ID needed by the following Root wait call. */
+export function prepareSponsorshipReviewReceipt(
+  value: unknown,
+  identity: { readonly turnId: string; readonly taskId?: string; readonly rootTaskId?: string },
+): PreparedLifecycleValue {
+  const receipt = exactObject(value, SPONSORSHIP_REVIEW_RECEIPT_FIELDS, invalidSponsorshipReviewReceipt)
+  const { taskId, status } = receipt
+  if (typeof identity.turnId !== "string" || identity.turnId.trim().length === 0
+    || typeof identity.taskId !== "string" || identity.taskId !== identity.rootTaskId
+    || !isGeneratedRootTaskId(identity.taskId, identity.turnId)
+    || typeof taskId !== "string" || !isSubagentTaskId(taskId)
+    || typeof status !== "string" || !SPAWN_STATUSES.has(status)) throw invalidSponsorshipReviewReceipt()
+  return prepareSafeValue({ taskId, status })
+}
+
 /** Validates and redacts a durable wait result before computing its canonical receipt. */
 export function prepareDurableWaitOutput(value: unknown, toolName: DurableWaitToolName, ownerKind: DurableWaitOwnerKind): PreparedLifecycleValue {
   return prepareSafeValue(redactDurableWaitOutput(value, toolName, ownerKind))
@@ -245,3 +261,4 @@ function invalidPlanReceipt(): Error {
 }
 
 function invalidScheduledPrepareLifecycleOutput(): Error { return new Error("scheduled_prepare_lifecycle_output_invalid") }
+function invalidSponsorshipReviewReceipt(): Error { return new Error("sponsorship_review_receipt_invalid") }

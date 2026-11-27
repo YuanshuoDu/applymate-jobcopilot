@@ -9,7 +9,7 @@ import { InMemoryToolLifecycleSink, ToolLifecycle, type LifecycleCall } from "./
 import { createToolResultReferenceRepository } from "./tool-result-reference-repo.js"
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { prepareScoutResultsOutput } from "./scout-results-output-redaction.js"
-import { InMemoryToolResultReferenceStore, prepareLifecycleValue } from "./redaction.js"
+import { InMemoryToolResultReferenceStore, prepareLifecycleValue, prepareSponsorshipReviewReceipt } from "./redaction.js"
 import { markScoutDelegateOutput } from "./scout-delegate-output-redaction.js"
 import { createToolResultsReadTool } from "./tool-results-read-tool.js"
 import { ToolRegistry } from "./registry.js"
@@ -760,6 +760,24 @@ describe("ToolLifecycle", () => {
     expect(followingWaitInput).toEqual({ taskIds: [spawnTaskId] })
     expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: spawnReceipt })
     expect(sink.events[0]?.payload.output).toEqual(spawnReceipt)
+  })
+
+  it("preserves only a canonical Root sponsorship review receipt and legal task status", () => {
+    const identity = { turnId: spawnTurnId, taskId: spawnRootTaskId, rootTaskId: spawnRootTaskId }
+    const queued = { taskId: spawnTaskId, status: "queued" }
+    const retrying = { taskId: spawnTaskId, status: "retrying" }
+    const replayed = { taskId: spawnTaskId, status: "completed" }
+
+    expect(prepareSponsorshipReviewReceipt(queued, identity).safe).toEqual(queued)
+    expect(prepareSponsorshipReviewReceipt(retrying, identity).safe).toEqual(retrying)
+    expect(prepareSponsorshipReviewReceipt(replayed, identity).safe).toEqual(replayed)
+    for (const invalid of [
+      { ...queued, unexpected: "private" },
+      { taskId: "child-1", status: "queued" },
+      { taskId: spawnTaskId, status: "accepted" },
+    ]) expect(() => prepareSponsorshipReviewReceipt(invalid, identity)).toThrow("sponsorship_review_receipt_invalid")
+    expect(() => prepareSponsorshipReviewReceipt(queued, { ...identity, taskId: "foreign-root" }))
+      .toThrow("sponsorship_review_receipt_invalid")
   })
 
   it("preserves the legacy spawn_subagent alias through lifecycle redaction", async () => {
