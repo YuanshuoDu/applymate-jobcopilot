@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { buildCanonicalTurnResumeState } from "./canonical-turn-wait-resume-accounting.js"
+import { PLAN_SCHEMA_REPAIR_ERROR_CODE } from "./turns/turn-execution-plan-repair.js"
 import type { RecoveredArchivedWaitControl } from "./turns/turn-execution-wait.js"
 import type { TaskGraphDenialProgress } from "./turns/turn-execution-types.js"
 
@@ -103,7 +104,53 @@ function build(input: {
     taskGraphDenialProgress: input.taskGraphDenialProgress })
 }
 
+function planRepairResume(steps: readonly Record<string, unknown>[] = [planRepairStep],
+  events: readonly Record<string, unknown>[] = planRepairEvents()) {
+  const last = steps[steps.length - 1]
+  const maxOrdinal = steps.length ? Math.max(...steps.map(step => Number(step.ordinal))) : null
+  return buildCanonicalTurnResumeState({ last: last ? { ...last, inputThroughSequence: "0", consumedInputIds: [] } : undefined,
+    maxOrdinal, steps, persistedToolCallCount: 0, items: [], events, scope })
+}
+const planRepairStep = { id: "rejected-plan-step", taskId: scope.rootTaskId, ordinal: 4, status: "completed",
+  finishReason: "tool_calls", errorCode: PLAN_SCHEMA_REPAIR_ERROR_CODE, inputTokens: 2, outputTokens: 1, estimatedCostUsd: 0.001 }
+function planRepairEvents(): Array<Record<string, unknown>> {
+  const identity = { actor: "orchestrator", userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+    taskId: scope.rootTaskId, itemId: null, correlationId: planRepairStep.id }
+  const started = { ...identity, id: "plan-started", type: "model.started", causationId: null,
+    idempotencyKey: `turn:${scope.turnId}:event:model-started:${planRepairStep.id}`, sequence: "20",
+    payload: { taskId: scope.rootTaskId, provider: "requested", model: "requested-model" } }
+  const completed = { ...identity, id: "plan-completed", type: "model.completed", causationId: started.id,
+    idempotencyKey: `turn:${scope.turnId}:event:model-completed:${planRepairStep.id}`, sequence: "21",
+    payload: { taskId: scope.rootTaskId, provider: "requested", model: "requested-model", toolCallCount: 0 } }
+  const usage = { ...identity, id: "plan-usage", type: "model.usage", causationId: completed.id,
+    idempotencyKey: `turn:${scope.turnId}:event:model-usage:${planRepairStep.id}`, sequence: "22",
+    payload: { taskId: scope.rootTaskId, provider: "routed", model: "routed-model",
+      usage: { inputTokens: 2, outputTokens: 1, estimatedCostUsd: 0.001 } } }
+  const closed = { ...identity, id: "plan-step-completed", type: "step.completed", causationId: usage.id,
+    idempotencyKey: `turn:${scope.turnId}:event:step-completed:${planRepairStep.id}`, sequence: "23",
+    payload: { stepId: planRepairStep.id, status: "completed", errorCode: PLAN_SCHEMA_REPAIR_ERROR_CODE, taskId: scope.rootTaskId } }
+  return [started, completed, usage, closed]
+}
+
 describe("canonical resume accounting for archived waits", () => {
+  it("restores a one-use plan repair until a later Root Step admits a model", () => {
+    expect(planRepairResume()?.planSchemaRepair).toEqual({
+      sourceStepId: planRepairStep.id, sourceStepOrdinal: planRepairStep.ordinal, retryPending: true,
+    })
+    const allocated = { id: "repair-attempt", taskId: scope.rootTaskId, ordinal: 5, status: "streaming",
+      finishReason: null, errorCode: null, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+    expect(planRepairResume([planRepairStep, allocated])?.planSchemaRepair).toEqual({
+      sourceStepId: planRepairStep.id, sourceStepOrdinal: planRepairStep.ordinal, retryPending: true,
+    })
+    const admission = { id: "repair-attempt-started", type: "model.started", actor: "orchestrator", userId: scope.userId,
+      sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, itemId: null,
+      correlationId: allocated.id, causationId: null, idempotencyKey: `turn:${scope.turnId}:event:model-started:${allocated.id}`,
+      sequence: "24", payload: { taskId: scope.rootTaskId, provider: "requested", model: "requested-model" } }
+    expect(planRepairResume([planRepairStep, allocated], [...planRepairEvents(), admission])?.planSchemaRepair).toEqual({
+      sourceStepId: planRepairStep.id, sourceStepOrdinal: planRepairStep.ordinal, retryPending: false,
+    })
+  })
+
   it("carries restored private denial progress without changing ordinary counters", () => {
     const progress: TaskGraphDenialProgress = { taskId: scope.rootTaskId, graphRevision: 4, verificationDigest: "a".repeat(64),
       inputThroughSequence: 8n, consumedInputIds: ["input-1"], count: 2 }

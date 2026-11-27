@@ -13,6 +13,7 @@ const planningTool: PolicyToolDescriptor = {
   name: "agent.plan", version: "1", risk: "internal_write", domain: "coordination",
   capabilities: ["coordination"], requiredCapabilities: ["coordination", "canManageChildren"],
 }
+const scoutRetirementTool: PolicyToolDescriptor = { ...planningTool, name: "agent.retire_superseded_scout" }
 const tailoringTool: PolicyToolDescriptor = { ...planningTool, name: "agent.tailor" }
 
 function coordinationTool(name: string, risk: "read" | "internal_write"): PolicyToolDescriptor {
@@ -58,11 +59,25 @@ describe("canonical root policy", () => {
     }
   })
 
+  it("allows only the exact Scout retirement action when all typed server gates are enabled", () => {
+    const enabled = createCanonicalPolicy({}, true, true, true)
+    expect(enabled.evaluate(context(scoutRetirementTool, ["coordination", "canManageChildren"])))
+      .toMatchObject({ outcome: "allow", reasonCode: "server_task_graph_scout_retirement_gate" })
+    for (const disabled of [createCanonicalPolicy({}, true, true), createCanonicalPolicy({}, true, false, true),
+      createCanonicalPolicy({}, false, true, true)]) {
+      expect(disabled.evaluate(context(scoutRetirementTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "deny" })
+    }
+    expect(enabled.evaluate(context({ ...scoutRetirementTool, name: "agent.retire_other_scout" }, ["coordination", "canManageChildren"])))
+      .toMatchObject({ outcome: "deny" })
+    expect(enabled.evaluate(context(scoutRetirementTool, ["canManageChildren"]))).toMatchObject({ outcome: "deny" })
+  })
+
   it("preserves an explicit policy denial and does not fallback over it", () => {
     const explicit: PolicySnapshot = { version: "policy.v1", rules: [{ id: "deny-coordination", roles: ["orchestrator"], domains: ["coordination"], outcome: "deny", reasonCode: "explicit_deny", reason: "Coordination is disabled by policy" }] }
-    const policy = createCanonicalPolicy(explicit, true)
+    const policy = createCanonicalPolicy(explicit, true, true, true)
     expect(policy.evaluate(context(coordinationTool("agent.spawn", "internal_write")))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
     expect(policy.evaluate(context(coordinationTool("agent.list", "read")))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
+    expect(policy.evaluate(context(scoutRetirementTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
   })
 
   it("preserves an explicit agent.plan denial when both server gates are enabled", () => {

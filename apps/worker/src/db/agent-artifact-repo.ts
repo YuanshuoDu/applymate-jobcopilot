@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from "pg"
 import { randomUUID } from "node:crypto"
+import { hasExactCorrectionDraftResumeReceiptWithClient } from "./agent-artifact-revision-resume.js"
 import {
   AgentArtifactRepositoryError, artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive, findCurrentDraftHeadWithClient, findReviewReceiptWithClient,
   saveAgentArtifactDraftWithClient, toAgentArtifactReviewRow, toAgentArtifactRow, toAgentArtifactVersionRow, withArtifactTransaction,
@@ -148,7 +149,14 @@ export function createAgentArtifactRepository(pool: Pool) {
           || review.artifactId !== input.artifactId || review.version !== input.version || review.contentHash !== input.contentHash
           || review.sourceDigest !== input.sourceDigest || review.currentSourceDigest !== input.currentSourceDigest) return null
         const head = await selectOne(client, input.userId, input.artifactId, true)
-        if (!head || head.lifecycle !== "draft" || head.jobId !== input.jobId || head.version !== input.version || head.hash !== input.contentHash) return null
+        if (!head || head.lifecycle !== "draft" || head.jobId !== input.jobId) return null
+        const predecessorIsHead = head.version === input.version && head.hash === input.contentHash
+        const exactResume = !predecessorIsHead && await hasExactCorrectionDraftResumeReceiptWithClient(client, {
+          taskFence: input.taskFence, jobId: input.jobId, artifactId: input.artifactId,
+          predecessorVersion: input.version, predecessorContentHash: input.contentHash, sourceDigest: input.sourceDigest,
+          liveHeadVersion: head.version, liveHeadHash: head.hash,
+        })
+        if (!predecessorIsHead && !exactResume) return null
         return await artifactTaskLeaseIsLive(client, input.taskFence) ? review : null
       })
     },

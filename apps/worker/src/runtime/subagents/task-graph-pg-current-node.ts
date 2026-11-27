@@ -1,5 +1,5 @@
 import { redactSensitiveText } from "@jobcopilot/shared"
-import { deriveTaskGraphReadModel } from "../planning/task-graph.js"
+import { deriveTaskGraphReadModel, TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus,
   type TaskGraphCurrentNode, type TaskGraphCurrentState } from "./task-graph-command-port.js"
 import { classifyTaskGraphStructuredOutputFailure } from "./task-graph-structured-failure-category.js"
@@ -75,7 +75,34 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       failureReason: safeText(task.failureReason, 500), ...(structuredOutputFailureCategory ? { structuredOutputFailureCategory } : {}),
     }
   })
-  return { revision: loaded.state.revision, nodes, ...(hasOrdinaryQueryFootprint ? { discoveryTurnEligibility: "ordinary" } : {}) }
+  const activeChildDeadlines = currentActiveChildDeadlines(loaded)
+  return { revision: loaded.state.revision, nodes, ...(activeChildDeadlines ? { activeChildDeadlines } : {}), ...(hasOrdinaryQueryFootprint ? { discoveryTurnEligibility: "ordinary" } : {}) }
+}
+
+const ACTIVE_CHILD_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
+function strictUtcMilliseconds(value: unknown): number | null {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return null
+  const instant = Date.parse(value)
+  return Number.isFinite(instant) && new Date(instant).toISOString() === value ? instant : null
+}
+function currentActiveChildDeadlines(loaded: LoadedGraph): NonNullable<TaskGraphCurrentState["activeChildDeadlines"]> | undefined {
+  let observedAt: string | undefined, observedInstant: number | null = null
+  const entries: Array<{ nodeKey: string; deadlineAt: string }> = []
+  for (const node of loaded.snapshot!.nodes) {
+    const task = loaded.tasks.get(node.taskId)
+    if (!task || !ACTIVE_CHILD_STATUSES.has(task.status)) continue
+    const currentObservedAt = task.deadlineObservedAt
+    if (typeof currentObservedAt !== "string") continue
+    const instant = strictUtcMilliseconds(currentObservedAt)
+    if (instant === null || observedAt !== undefined && observedAt !== currentObservedAt) return undefined
+    observedAt = currentObservedAt
+    observedInstant = instant
+    const deadlineAt = task.absoluteDeadlineAt
+    const deadlineInstant = strictUtcMilliseconds(deadlineAt)
+    if (deadlineInstant !== null && deadlineInstant > instant) entries.push({ nodeKey: node.key, deadlineAt: deadlineAt as string })
+  }
+  if (!observedAt || observedInstant === null || entries.length === 0 || entries.length > TASK_GRAPH_LIMITS.maxPersistedNodes) return undefined
+  return { revision: loaded.state!.revision, observedAt, entries }
 }
 
 function taskGraphProjectionSource(

@@ -21,7 +21,10 @@ import { AgentTreeManager } from "./subagents/manager.js"
 import { PgCoordinationStore } from "./mailbox/store.js"
 import { createPgDurableWaitPort } from "./subagents/durable-wait-store.js"
 import type { RootTaskStore } from "./subagents/root-task-store.js"
+import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-terminal-assessment.js"
+import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
+import { registerTaskGraphSupersededScoutRetirementTool } from "./tools/task-graph-retire-superseded-scout.js"
 import { registerAgentTailorTool } from "./tools/agent-tailor.js"
 import { assertCanonicalCoordinationSurface, assertCanonicalQuestionSurface, isNativeQuestionWaitEnabled } from "./turns/canonical-runtime-tool-recovery.js"
 import { failInteractiveDiscoveryUnavailable, failObjectiveTaskGraphUnavailable, objectiveTaskGraphRootToolAllowed, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
@@ -31,8 +34,6 @@ import { toolSafeDurableWaitPort } from "./tools/coordination-executor-support.j
 import type { CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import type { CanonicalSessionProjection } from "./canonical-session-projection.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
-import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-terminal-assessment.js"
-import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
 import type { DiscoveryShortlistResult } from "./subagents/discovery-shortlist.js"
 
 type TaskGraphRuntimeResult = Awaited<ReturnType<typeof taskGraphRuntimeForTurn>>
@@ -155,7 +156,10 @@ export async function prepareCanonicalTurnSetup(input: {
     coordination: input.coordinationEnabled, nativeRoot: turnCoordination.nativeOptions.enabled,
     requested: options.nativeQuestionWaitEnabled, customAdapters: !!options.turnEngineStoreFactory || !!options.toolRuntimeFactory,
   })
-  const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, input.coordinationEnabled, graph.enabled)
+  const scoutRetirementPolicyEnabled = objectiveTaskGraphMode && graph.enabled && input.coordinationEnabled
+    && input.childExecutionEnabled && input.consumeWaitOutcomes
+    && typeof options.taskGraphCommandPort?.requestSupersededScoutRetirement === "function"
+  const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, input.coordinationEnabled, graph.enabled, scoutRetirementPolicyEnabled)
   const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
   const toolCapabilities = [...new Set([...configuredCapabilities, ...(input.coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
   const lifecycle = { sink: null as ToolLifecycleSink | null, owner: null as ExecutionOwner | null, taskGraphParentAttemptCount: null as number | null, policyDecisionRecorder: null as ((decision: RuntimePolicyDecision) => Promise<void>) | null }
@@ -183,7 +187,12 @@ export async function prepareCanonicalTurnSetup(input: {
     templates: turnTaskGraphTemplates, verificationRequirements,
     turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId,
     parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null,
-    ...(selectedJobBatch ? { selectedJobBatchSlots: selectedJobBatch.slots } : {}) })
+    ...(selectedJobBatch ? { selectedJobBatchSlots: selectedJobBatch.slots } : {}),
+  })
+  registerTaskGraphSupersededScoutRetirementTool(toolRuntime.registry, objectiveTaskGraphMode, {
+    commandPort: options.taskGraphCommandPort, manager, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+    parentLeaseOwner: lease.ownerId, parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount,
+  })
   const objectiveTailorRegistered = registerAgentTailorTool(toolRuntime.registry, options.taskGraphCommandPort,
     () => options.productionFlags?.objectiveTailorEnabled === true && objectiveTaskGraphMode && state.source === "user" && state.automationRunMode !== "scheduled" && graph.enabled
       && input.coordinationEnabled && input.childExecutionEnabled

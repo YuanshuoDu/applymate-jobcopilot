@@ -3,6 +3,9 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
+import * as taskGraphVerification from "./task-graph-pg-verification.js"
 import { proveTaskGraphFailedBranchEvidence } from "./task-graph-pg-failed-branch-evidence.js"
 import { taskGraphItemId, taskGraphLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
@@ -32,8 +35,10 @@ function report(status: "passed" | "unverified", criterionId = "candidate-count"
   return { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status, reasonCode,
     criteria: [{ criterionId, status, reasonCode }], evidenceDigest: status === "passed" ? digest : null, resultDigest: status === "passed" ? digest : null }
 }
-function task(id: string, role: string, status: string, attemptCount: number, result: unknown, failureReason: string | null) {
-  return { id, role, status, attemptCount, leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: null,
+function task(id: string, role: "scout" | "analyst", status: string, attemptCount: number, result: unknown, failureReason: string | null) {
+  const template = TASK_GRAPH_TEMPLATES[role]
+  return { id, role, taskType: template.taskType, context: {}, expectedOutputSchema: template.expectedOutputSchema,
+    allowedActions: [...template.allowedActions], status, attemptCount, leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: null,
     startedAt: status === "cancelled" ? null : new Date("2026-10-24T10:00:00Z"), completedAt: new Date("2026-10-24T10:01:00Z"), closedAt: null,
     interruptRequestedAt: null, failureReason, result, confidence: null, qualityGateResult: null,
     contextSnapshotId: null, outputArtifactIds: [] }
@@ -89,6 +94,41 @@ function fixture() {
   return { graph, taskRows, events, query, client: { query } as unknown as Pick<PoolClient, "query"> }
 }
 
+function criterionMissFixture() {
+  const f = fixture(), original = f.graph.nodes[2]!, template = TASK_GRAPH_TEMPLATES.scout
+  const registeredScoutEnvelope = { role: "scout" as const, taskType: template.taskType,
+    expectedOutputSchema: template.expectedOutputSchema, allowedActions: [...template.allowedActions] }
+  const criterionVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+    criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 2 } }] }
+  f.graph = { ...f.graph, nodes: f.graph.nodes.map(node => node.key === original.key
+    ? { ...node, verification: criterionVerification, registeredScoutEnvelope } : node) }
+  const jobId = "c123456789012345678901234", evidenceId = "scout-evidence-1"
+  const structuredResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+    candidates: [{ jobId, source: "greenhouse", url: "https://jobs.example/role", evidenceIds: [evidenceId] }],
+    evidence: [{ id: evidenceId, kind: "job", ref: jobId, source: "greenhouse" }], summary: "One verified candidate" }
+  const persistedReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+    criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+    evidenceDigest: digest, resultDigest: taskGraphVerification.taskGraphResultDigest(structuredResult) }
+  f.taskRows[2]!.failureReason = "task_graph_verification_failed"
+  f.taskRows[2]!.result = { status: "completed", stepCount: 2, toolCallCount: 2, structuredResult, taskGraphVerificationReport: persistedReport }
+  const failure = f.events[2]!, payload = failure.payload, eventValue = payload.event as Row, item = payload.item as Row
+  payload.event = { ...eventValue, failureReason: "task_graph_verification_failed" }
+  payload.item = { ...item, content: f.graph }
+  failure.outboxPayload.payload = payload
+  return { ...f, structuredResult, persistedReport }
+}
+
+function mockCriterionReverification(f: ReturnType<typeof criterionMissFixture>, overrides: Readonly<{
+  report?: unknown; structuredResult?: unknown
+}> = {}) {
+  return vi.spyOn(taskGraphVerification, "reverifyFailedTaskGraphNodeEvidence").mockResolvedValue({
+    verified: false,
+    report: overrides.report ?? f.persistedReport,
+    evaluation: { status: "failed", reasonCode: "criterion_not_met", criteria: f.persistedReport.criteria },
+    structuredResult: overrides.structuredResult ?? f.structuredResult,
+  } as never)
+}
+
 describe("persisted failed TaskGraph branch evidence", () => {
   it("proves the exact typed failed Scout and transitive verified ancestors without assuming descendant status", async () => {
     const f = fixture(), sourceNodes = f.graph.nodes.filter(node => node.key === "branch-scout" || node.key === "branch-analyst")
@@ -99,6 +139,65 @@ describe("persisted failed TaskGraph branch evidence", () => {
     const taskLock = f.query.mock.calls[0]
     expect(taskLock?.[1]?.[0]).toEqual(["branch-scout-task", "foundation-a-task", "foundation-z-task"])
     expect(f.query).toHaveBeenCalledTimes(2)
+  })
+
+  it("reverifies the nonempty registered ordinary Scout result against the exact failed snapshot", async () => {
+    const f = criterionMissFixture(), verifier = mockCriterionReverification(f)
+    try {
+      const proof = await proveTaskGraphFailedBranchEvidence(f.client, { scope, snapshot: f.graph, sourceNodes: f.graph.nodes.slice(2) })
+      expect(proof?.failedSource).toMatchObject({ source: { nodeKey: "branch-scout", taskId: "branch-scout-task" }, attemptCount: 1 })
+      expect(proof?.failedSource.resultDigest).toBe(taskGraphVerification.taskGraphResultDigest(f.taskRows[2]!.result))
+      expect(proof?.failedSource.reportDigest).toBe(taskGraphVerification.taskGraphResultDigest(f.persistedReport))
+      expect(verifier).toHaveBeenCalledOnce()
+      expect(verifier).toHaveBeenCalledWith(f.client, {
+        scope: { ...scope, taskId: "branch-scout-task", attemptCount: 1 }, snapshot: f.graph, node: f.graph.nodes[2], structuredResult: f.structuredResult,
+      })
+    } finally { verifier.mockRestore() }
+  })
+
+  it("rejects an empty Scout shortfall even when its stored report claims canonical evidence", async () => {
+    const f = criterionMissFixture(), verifier = vi.spyOn(taskGraphVerification, "reverifyFailedTaskGraphNodeEvidence")
+    const emptyResult = { ...f.structuredResult, candidates: [], evidence: [] }
+    const stored = f.taskRows[2]!.result as Row
+    f.taskRows[2]!.result = { ...stored, structuredResult: emptyResult,
+      taskGraphVerificationReport: { ...f.persistedReport, resultDigest: taskGraphVerification.taskGraphResultDigest(emptyResult) } }
+    try {
+      await expect(proveTaskGraphFailedBranchEvidence(f.client, { scope, snapshot: f.graph, sourceNodes: f.graph.nodes.slice(2) })).resolves.toBeNull()
+      expect(verifier).not.toHaveBeenCalled()
+    } finally { verifier.mockRestore() }
+  })
+
+  it("rejects report drift after failed-result reverification", async () => {
+    const f = criterionMissFixture(), verifier = mockCriterionReverification(f, { report: { ...f.persistedReport, evidenceDigest: "b".repeat(64) } })
+    try {
+      await expect(proveTaskGraphFailedBranchEvidence(f.client, { scope, snapshot: f.graph, sourceNodes: f.graph.nodes.slice(2) })).resolves.toBeNull()
+      expect(verifier).toHaveBeenCalledOnce()
+    } finally { verifier.mockRestore() }
+  })
+
+  it("rejects a selected-job task context before canonical re-verification", async () => {
+    const f = criterionMissFixture(), verifier = vi.spyOn(taskGraphVerification, "reverifyFailedTaskGraphNodeEvidence")
+    f.taskRows[2]!.context = { selectedJobPreparation: { jobId: "selected-job" } }
+    try {
+      await expect(proveTaskGraphFailedBranchEvidence(f.client, { scope, snapshot: f.graph, sourceNodes: f.graph.nodes.slice(2) })).resolves.toBeNull()
+      expect(verifier).not.toHaveBeenCalled()
+    } finally { verifier.mockRestore() }
+  })
+
+  it("rejects the selected-job jobs.get compatibility envelope for criterion shortfalls", async () => {
+    const f = criterionMissFixture(), verifier = vi.spyOn(taskGraphVerification, "reverifyFailedTaskGraphNodeEvidence")
+    const source = f.graph.nodes[2]!
+    const ordinaryNode = Object.fromEntries(Object.entries(source).filter(([key]) => key !== "registeredScoutEnvelope")) as StoredTaskGraphNode
+    f.graph = { ...f.graph, nodes: f.graph.nodes.map(node => node.key === source.key ? ordinaryNode : node) }
+    f.taskRows[2]!.allowedActions = ["jobs.get"]
+    f.taskRows[2]!.context = { selectedJobPreparation: { jobId: "selected-job" } }
+    const failure = f.events[2]!, payload = failure.payload, item = payload.item as Row
+    payload.item = { ...item, content: f.graph }
+    failure.outboxPayload.payload = payload
+    try {
+      await expect(proveTaskGraphFailedBranchEvidence(f.client, { scope, snapshot: f.graph, sourceNodes: f.graph.nodes.slice(2) })).resolves.toBeNull()
+      expect(verifier).not.toHaveBeenCalled()
+    } finally { verifier.mockRestore() }
   })
 
   it("accepts verified ancestor history when an unrelated node is appended before the failed Scout", async () => {

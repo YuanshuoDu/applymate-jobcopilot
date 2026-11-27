@@ -39,7 +39,8 @@ function graph(revision: number, nodeIds: readonly string[], rows: readonly Grap
   return {
     rootTaskId: "root-task",
     item: { id: "task-graph:root-task", revision, content: {}, createdAt: new Date(0) },
-    snapshot: { nodes: nodeIds.map((taskId, nodeIndex) => ({ taskId, key: `node-${nodeIndex}`, templateId: taskTypes.get(taskId) ?? "task" })) } as unknown as TaskGraphSnapshot,
+    snapshot: { nodes: nodeIds.map((taskId, nodeIndex) => ({ taskId, key: `node-${nodeIndex}`,
+      templateId: taskTypes.get(taskId) === "job_discovery" ? "scout" : taskTypes.get(taskId) ?? "task" })) } as unknown as TaskGraphSnapshot,
     state: { revision: stateRevision } as LoadedGraph["state"],
     tasks: new Map(rows.map(task => [task.id, task])),
   } as LoadedGraph
@@ -87,6 +88,37 @@ describe("current TaskGraph final-summary binding", () => {
     expect(binding.summary.analyzedJobs).toEqual([{ jobId: "current-job", findings: [{ taskId: "current-analyst", score: 8 }] }])
     expect(binding.summary.taskOutcomes.map(outcome => outcome.taskId)).toEqual(["current-analyst", "current-scout"])
     expect(JSON.stringify(binding)).not.toMatch(/old-job|PRIVATE_ROLE_NARRATIVE|PRIVATE_ANALYST_NARRATIVE/)
+  })
+
+  it("binds an interrupted Scout as private retirement metadata and excludes its result from reduction", () => {
+    const interrupted = { ...row("retired-scout", "scout", "job_discovery", { structuredResult: scoutResult("retired-job") }),
+      status: "interrupted" as const, failureReason: "Subagent task subtree was interrupted", attemptCount: 2 }
+    const loaded = graph(9, ["retired-scout", "current-scout"], [interrupted,
+      row("current-scout", "scout", "job_discovery", { structuredResult: scoutResult("current-job") })])
+    const proof = { nodeKey: "node-0", taskId: "retired-scout", attempt: 2, interruptRequestedAt: "2026-11-19T10:00:00.000Z",
+      receiptEventId: "private-retirement-event", lifecycleEventId: "private-interrupted-event" }
+    const binding = buildTaskGraphFinalSummaryBinding(loaded, undefined, new Map([[proof.nodeKey, proof]]))!
+
+    expect(binding.members?.map(member => member.kind)).toEqual(["retired", "business"])
+    expect(binding.members?.[0]).toMatchObject({ kind: "retired", taskStatus: "interrupted", retirement: {
+      attempt: 2, interruptRequestedAt: proof.interruptRequestedAt,
+      receiptEventId: proof.receiptEventId, lifecycleEventId: proof.lifecycleEventId,
+    } })
+    expect(binding.summary.discoveredJobs).toEqual([{ jobId: "current-job", taskIds: ["current-scout"] }])
+    expect(binding.summary.taskOutcomes.map(item => item.taskId)).toEqual(["current-scout"])
+    expect(JSON.stringify(binding.summary)).not.toMatch(/retired-scout|retired-job|private-retirement-event|private-interrupted-event/)
+  })
+
+  it("rejects a retirement that does not match the exact interrupted Scout attempt", () => {
+    const interrupted = { ...row("retired-scout", "scout", "job_discovery", { structuredResult: scoutResult("retired-job") }),
+      status: "interrupted" as const, attemptCount: 2 }
+    const loaded = graph(9, ["retired-scout"], [interrupted])
+    const proof = { nodeKey: "node-0", taskId: "retired-scout", attempt: 1, interruptRequestedAt: "2026-11-19T10:00:00.000Z",
+      receiptEventId: "receipt-event", lifecycleEventId: "ack-event" }
+    expect(() => buildTaskGraphFinalSummaryBinding(loaded, undefined, new Map([[proof.nodeKey, proof]])))
+      .toThrow("task_graph_final_summary_retired_selection_invalid")
+    expect(() => buildTaskGraphFinalSummaryBinding(loaded, undefined, new Map([["unknown-node", { ...proof, nodeKey: "unknown-node" }]])))
+      .toThrow("task_graph_final_summary_retired_selection_invalid")
   })
 
   it("rejects invalid, unsupported, stale, and all-historical selections", () => {

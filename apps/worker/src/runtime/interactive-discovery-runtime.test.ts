@@ -3,13 +3,14 @@ import { describe, expect, it, vi } from "vitest"
 import { createCanonicalRootToolGuards, interactiveDiscoveryCompletionGate, objectiveTaskGraphRootToolAllowed, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
+import { interactiveDiscoveryRootToolAllowed } from "./interactive-discovery-contract.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 
 const shortlist = { schemaVersion: 1 as const, status: "completed" as const, items: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }], failures: [] }
 
 describe("interactive discovery runtime", () => {
   it("uses a closed Root objective surface and rejects hidden calls before dispatch", async () => {
-    const visible = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile"]
+    const visible = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile", "agent.retire_superseded_scout"]
       .map(name => ({ name, risk: "internal_write" }))
     for (const name of visible.map(tool => tool.name)) expect(objectiveTaskGraphRootToolAllowed({ name, risk: "read" })).toBe(true)
     expect(objectiveTaskGraphRootToolAllowed({ name: "agent.tailor" })).toBe(false)
@@ -17,6 +18,7 @@ describe("interactive discovery runtime", () => {
     for (const name of ["jobs.search", "persona.retrieve", "resume.get_base", "application.get", "agent.spawn", "spawn_subagent", "agent.followup", "scheduled.application.prepare", "tool_results.read"]) {
       expect(objectiveTaskGraphRootToolAllowed({ name, risk: "read", capabilities: ["read"] })).toBe(false)
     }
+    expect(interactiveDiscoveryRootToolAllowed("agent.retire_superseded_scout")).toBe(false)
     const routeTool = vi.fn(async (request: { call: { id: string; toolName: string } }) => ({ id: request.call.id, toolName: request.call.toolName, toolVersion: "1", status: "completed" as const, errorCode: null }))
     const validateArguments = vi.fn(() => true)
     const guards = createCanonicalRootToolGuards({ objectiveTaskGraphMode: true, objectiveRootTools: visible,

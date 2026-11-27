@@ -12,6 +12,7 @@ import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { hasNativeCoordinationEnvelope, prepareResolvedOwnerWaitLifecycleOutput, prepareVerifiedToolResultChunk } from "./lifecycle-receipt-output.js"
 import { prepareScoutDelegateLifecycleOutput } from "./scout-delegate-output-redaction.js"
 import { prepareScoutResultsOutput } from "./scout-results-output-redaction.js"
+import { prepareTaskGraphRetirementLifecycleOutput } from "./task-graph-retirement-output-redaction.js"
 import { ToolExecutionError, type ToolLifecycleFailure, type ToolLifecyclePayload } from "./types.js"
 import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
 
@@ -111,13 +112,10 @@ export class ToolLifecycle {
     }
     await this.append({ phase: "progress", eventType: "tool_call.progress", item, payload: this.payload(call, "streaming", { progress: safeProgress }) })
   }
-
   async completed(call: LifecycleCall, output: unknown, signal?: AbortSignal): Promise<unknown> { return this.result(call, "completed", null, output, signal) }
-
   async failed(call: LifecycleCall, phase: "failed" | "cancelled", errorCode: string, failure: ToolLifecycleFailure): Promise<unknown> {
     return this.result(call, phase, errorCode, failure.kind === "diagnostic" ? null : failure.output, undefined, failure.kind === "diagnostic" ? { detail: failure.detail } : undefined)
   }
-
   private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown, signal?: AbortSignal, diagnostic?: { detail: unknown }): Promise<unknown> {
     const timestamp = this.now()
     const pageCall = this.pageCalls.delete(call.id)
@@ -147,7 +145,6 @@ export class ToolLifecycle {
     this.observeDiscoveryAttempt({ call, phase, output: phase === "completed" ? discoveryObservation.output : diagnostic?.detail ?? output ?? null })
     return safeOutput
   }
-
   private async persistCompletedOutput(call: LifecycleCall, output: unknown, pageCall: boolean, discoveryObservation: { output: unknown }): Promise<unknown> {
     let prepared: ReturnType<typeof prepareLifecycleValue>
     const nativeFollowup = call.toolName === "agent.followup" && hasNativeCoordinationEnvelope(output)
@@ -184,6 +181,8 @@ export class ToolLifecycle {
       }
     } else if (call.toolName === "scout.delegate") {
       prepared = prepareScoutDelegateLifecycleOutput(output, call) ?? prepareLifecycleValue(output)
+    } else if (call.toolName === "agent.retire_superseded_scout") {
+      prepared = prepareTaskGraphRetirementLifecycleOutput(output, call) ?? prepareLifecycleValue(output)
     } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get" || call.toolName === "jobs.discover") {
       prepared = prepareSafeValue(redactJobReadOutput(call.toolName, output))
     } else if (call.toolName === "tool_results.read") {

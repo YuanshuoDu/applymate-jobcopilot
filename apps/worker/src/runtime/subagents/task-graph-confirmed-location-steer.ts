@@ -7,7 +7,7 @@ type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 export type TaskGraphConfirmedLocationSteerScope = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string }>
 export type TaskGraphConfirmedLocationSteerResult = Readonly<{ kind: "absent" | "pending" | "unavailable" }>
-  | Readonly<{ kind: "confirmed"; locations: readonly string[]; acceptedInputSequence: bigint }>
+  | Readonly<{ kind: "confirmed"; locations: readonly string[]; acceptedInputSequence: bigint; acceptedInputId: string }>
 const UNAVAILABLE: TaskGraphConfirmedLocationSteerResult = Object.freeze({ kind: "unavailable" })
 const PENDING: TaskGraphConfirmedLocationSteerResult = Object.freeze({ kind: "pending" })
 const INPUT_STATUSES = new Set(["accepted", "queued", "consumed"])
@@ -103,18 +103,34 @@ export async function readTaskGraphConfirmedLocationSteer(
   scope: TaskGraphConfirmedLocationSteerScope,
   consumedThroughSequence: bigint,
 ): Promise<TaskGraphConfirmedLocationSteerResult> {
+  return readConfirmedLocationSteer(client, scope, consumedThroughSequence)
+}
+
+/** Revalidates one historical accepted location receipt by its exact input sequence. */
+export async function readTaskGraphConfirmedLocationSteerAtSequence(
+  client: Client, scope: TaskGraphConfirmedLocationSteerScope, consumedThroughSequence: bigint, acceptedInputSequence: bigint,
+): Promise<TaskGraphConfirmedLocationSteerResult> {
+  return readConfirmedLocationSteer(client, scope, consumedThroughSequence, acceptedInputSequence)
+}
+
+async function readConfirmedLocationSteer(client: Client, scope: TaskGraphConfirmedLocationSteerScope,
+  consumedThroughSequence: bigint, exactAcceptedSequence?: bigint): Promise<TaskGraphConfirmedLocationSteerResult> {
   try {
     if (!client || typeof client.query !== "function" || !validScope(scope) || typeof consumedThroughSequence !== "bigint"
-      || consumedThroughSequence < 0n || consumedThroughSequence > MAX_SEQUENCE) return UNAVAILABLE
+      || consumedThroughSequence < 0n || consumedThroughSequence > MAX_SEQUENCE
+      || exactAcceptedSequence !== undefined && (typeof exactAcceptedSequence !== "bigint" || exactAcceptedSequence < 1n || exactAcceptedSequence > MAX_SEQUENCE)) return UNAVAILABLE
+    const exact = exactAcceptedSequence !== undefined
     const latest = await client.query<Row>(`SELECT event."id", event."sessionId", event."turnId", event."taskId", event."sequence", event."type", event."actor",
         event."correlationId", event."causationId", event."itemId", event."payload", turn."rootTaskId" AS "turnRootTaskId",
         turn."userId" AS "turnUserId", session."userId" AS "sessionUserId", turn."source" AS "turnSource", turn."executionMode" AS "turnExecutionMode"
       FROM "agent_events" AS event JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
       JOIN "agent_sessions" AS session ON session."id" = event."sessionId" AND session."userId" = turn."userId"
       WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $3
-        AND turn."userId" = $4 AND session."userId" = $4
-      ORDER BY event."sequence" DESC LIMIT 1`, [scope.sessionId, scope.turnId, OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE, scope.userId])
-    if (!latest.rows.length) return Object.freeze({ kind: "absent" })
+        AND turn."userId" = $4 AND session."userId" = $4 ${exact ? `AND event."payload"->>'acceptedInputSequence' = $5` : ""}
+      ORDER BY event."sequence" ${exact ? "ASC LIMIT 2" : "DESC LIMIT 1"}`,
+    exact ? [scope.sessionId, scope.turnId, OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE, scope.userId, exactAcceptedSequence!.toString()]
+      : [scope.sessionId, scope.turnId, OBJECTIVE_LOCATION_STEER_ACCEPTED_EVENT_TYPE, scope.userId])
+    if (!latest.rows.length) return exact ? UNAVAILABLE : Object.freeze({ kind: "absent" })
     if (latest.rows.length !== 1) return UNAVAILABLE
     const event = latest.rows[0]!, eventSequence = sequence(event.sequence), causationId = event.causationId
     const locations = canonicalLocations(event.payload)
@@ -148,7 +164,7 @@ export async function readTaskGraphConfirmedLocationSteer(
     [causationId, scope.userId, scope.sessionId, scope.turnId])
     const receipt = object(event.payload), acceptedSequence = receipt && validate(ObjectiveLocationSteerReceiptSchema, receipt)
       ? BigInt((receipt as ObjectiveLocationSteerReceipt).acceptedInputSequence) : null
-    if (accepted.rows.length !== 1 || acceptedSequence === null || eventSequence <= acceptedSequence
+    if (accepted.rows.length !== 1 || acceptedSequence === null || exact && acceptedSequence !== exactAcceptedSequence || eventSequence <= acceptedSequence
       || !acceptedInputValid(accepted.rows[0]!, scope, causationId, acceptedSequence, locations)) return UNAVAILABLE
     const input = accepted.rows[0]!
     if (input.status === "consumed") {
@@ -164,6 +180,6 @@ export async function readTaskGraphConfirmedLocationSteer(
     }
     if (acceptedSequence > consumedThroughSequence) return PENDING
     if (input.status !== "consumed") return UNAVAILABLE
-    return { kind: "confirmed", locations, acceptedInputSequence: acceptedSequence }
+    return { kind: "confirmed", locations, acceptedInputSequence: acceptedSequence, acceptedInputId: String(input.inputId) }
   } catch { return UNAVAILABLE }
 }

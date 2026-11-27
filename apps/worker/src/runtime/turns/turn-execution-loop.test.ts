@@ -4429,6 +4429,64 @@ describe("owner-agnostic turn execution loop", () => {
     await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "waiting_for_dependency", waitId })
   })
 
+  it("shows a recoverable mixed-wait rejection, then accepts a later solo Root wait", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const waitId = "wait-12345678-1234-4234-9234-123456789012"
+    const childTaskId = "subagent-00000000-0000-4000-8000-000000000004"
+    const waitOutput = {
+      waitId, status: "waiting", deadlineAt: "2099-01-01T00:00:00.000Z", matchedTaskIds: [childTaskId], taskIds: [childTaskId],
+      tasks: [{ taskId: childTaskId, status: "waiting", role: "scout", result: null, failureReason: null }],
+    }
+    let modelRound = 0
+    const model: ModelAdapter = {
+      ...root.options.model,
+      profile: { ...profile, supportsParallelTools: true },
+      async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        modelRound += 1
+        const calls = modelRound === 1
+          ? [{ id: "batch-wait", name: "agent.wait", arguments: {} }, { id: "batch-search", name: "jobs.search", arguments: { location: "Dublin" } }]
+          : [{ id: "solo-wait", name: "agent.wait", arguments: {} }]
+        for (const call of calls) yield { type: "tool_call_completed", callId: call.id, name: call.name, arguments: call.arguments }
+        yield { type: "completed", finishReason: "tool_calls" }
+      },
+    }
+    const dispatched: string[] = []
+    root.options = {
+      ...root.options,
+      model,
+      tools: [{ name: "agent.wait", version: "1" }, { name: "jobs.search", version: "1" }],
+      executeTool: async ({ call }) => {
+        dispatched.push(call.id)
+        return { id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed", output: waitOutput, errorCode: null }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId, stepCount: 2, toolCallCount: 3 })
+    expect(dispatched).toEqual(["solo-wait"])
+    expect(root.requests).toHaveLength(2)
+    const nextToolResults = root.requests[1]!.messages.flatMap(message => message.role === "tool"
+      ? message.content.filter(part => part.type === "tool_result") : [])
+    expect(nextToolResults).toHaveLength(2)
+    expect(nextToolResults.map(part => part.toolUseId)).toEqual(["batch-wait", "batch-search"])
+    for (const resultPart of nextToolResults) {
+      expect(resultPart.isError).toBe(true)
+      expect(JSON.parse(resultPart.content)).toEqual({
+        code: "dependency_wait_requires_sole_call",
+        message: "Issue the dependency wait as the only tool call in a model response.",
+      })
+    }
+    const rejectedCalls = root.events.filter(event => event.type.endsWith("tool_call.failed") && event.payload !== undefined)
+    expect(rejectedCalls.map(event => (event.payload as { toolCallId: string }).toolCallId)).toEqual(["batch-wait", "batch-search"])
+    expect(rejectedCalls.map(event => (event.payload as { errorCode: string }).errorCode)).toEqual([
+      "dependency_wait_requires_sole_call", "dependency_wait_requires_sole_call",
+    ])
+    expect(root.stepStatuses).toEqual(["completed", "waiting_for_tool"])
+    expect(root.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+  })
+
   it("rejects a child-only agent.wait alias even when its receipt uses the root ID shape", async () => {
     const child = fixture(identity("task", "child-wait", 2), {
       id: "child-agent-wait", toolName: "agent.wait", toolVersion: "1", status: "completed",
