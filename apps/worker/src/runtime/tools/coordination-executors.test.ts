@@ -30,6 +30,10 @@ import type {
   SponsorshipWaitObservation,
 } from "./coordination-types.js"
 import { ToolSchemaValidator } from "./schema-validator.js"
+import { ToolRegistry } from "./registry.js"
+import { ToolRouter } from "./router.js"
+import { InMemoryToolLifecycleSink, ToolLifecycle } from "./lifecycle.js"
+import { PolicyEngine } from "../policy/engine.js"
 import type { ToolExecutionContext } from "./types.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { SPONSORSHIP_OBSERVATION_PUBLIC_SCHEMA } from "../subagents/sponsorship-observation-contract.js"
@@ -152,6 +156,56 @@ function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionCo
 }
 
 describe("coordination executors", () => {
+  it("returns a persisted sponsorship review task ID that the following Root wait can resolve", async () => {
+    const runtime = makeRuntime()
+    const rootTaskId = "root-turn-a"
+    const reviewerTaskId = "subagent-00000000-0000-4000-8000-000000000002"
+    runtime.store.tasks.set(rootTaskId, makeTask({ id: rootTaskId, rootTaskId, parentTaskId: null, path: `/${rootTaskId}`,
+      depth: 0, role: "orchestrator", taskType: "root", status: "running" }))
+    const reviewer = makeTask({ id: reviewerTaskId, rootTaskId, parentTaskId: rootTaskId,
+      path: `/${rootTaskId}/${reviewerTaskId}`, depth: 1, role: "auditor", taskType: "native_verification", status: "retrying" })
+    runtime.store.tasks.set(reviewerTaskId, reviewer)
+    const sponsorshipReviewRequester = vi.fn(async () => ({ taskId: reviewerTaskId, status: "retrying" }))
+    const options: CoordinationRuntimeOptions = {
+      ...runtime.options,
+      nativeCoordination: { enabled: true } as never,
+      sponsorshipReviewRequester,
+    }
+    const sink = new InMemoryToolLifecycleSink()
+    const policy = new PolicyEngine({ snapshot: { version: "policy.v1", rules: ["agent.review_sponsorship", "agent.wait"].map(tool => ({
+      id: `allow-${tool}`, roles: ["orchestrator"], tools: [tool], risks: ["internal_write"], domains: ["coordination"],
+      outcome: "allow" as const, reasonCode: "root_coordination_allowed", reason: "Root coordination is enabled for this test",
+    })) } })
+    const lifecycleOwner = { kind: "turn" as const, taskId: rootTaskId, lease: { turnId: "turn-a", sessionId: "session-a",
+      ownerId: "worker-1", userId: "user-a", leaseVersion: 1,
+      leaseStartedAt: new Date("2026-11-27T11:00:00.000Z"), leaseExpiresAt: new Date("2026-11-27T13:00:00.000Z") } }
+    const router = new ToolRouter(new ToolRegistry(createCoordinationTools(options)),
+      new ToolLifecycle({ sink, resolveOwner: () => lifecycleOwner }), policy)
+    const rootContext = context({ taskId: rootTaskId, rootTaskId, actorRole: "orchestrator" })
+    const reviewCall = { id: "review-call", toolName: "agent.review_sponsorship", toolVersion: "1", input: { jobId: "c123456789012345678901234" } }
+
+    const review = await router.execute(rootContext, reviewCall)
+    expect(review).toMatchObject({ status: "completed", output: { taskId: reviewerTaskId, status: "retrying" } })
+    const persistedReview = sink.events.find(event => event.item.type === "tool_result" && event.item.toolCallId === reviewCall.id)
+    const persistedReviewOutput = persistedReview?.item.type === "tool_result" ? persistedReview.item.output : undefined
+    expect(persistedReviewOutput).toEqual({ taskId: reviewerTaskId, status: "retrying" })
+    const persistedTaskId = (persistedReviewOutput as { taskId?: unknown } | undefined)?.taskId
+    if (typeof persistedTaskId !== "string") throw new Error("persisted sponsorship review task ID was unavailable")
+
+    runtime.store.tasks.set(persistedTaskId, { ...reviewer, status: "completed", result: { status: "completed", stepCount: 1, toolCallCount: 0 } })
+    runtime.wait.wait.mockResolvedValue({ waitId: "wait-12345678-1234-4234-9234-123456789012", status: "ready",
+      deadlineAt: "2026-11-27T12:00:00.000Z", matchedTaskIds: [persistedTaskId] })
+    const waitCall = { id: "wait-call", toolName: "agent.wait", toolVersion: "1",
+      input: { idempotencyKey: "review-wait-key", taskIds: [persistedTaskId], mode: "any", timeoutMs: 30_000 } }
+    const waited = await router.execute({ ...rootContext, stepId: "wait-step" }, waitCall)
+
+    expect(waited).toMatchObject({ status: "completed", output: { status: "ready", taskIds: [persistedTaskId] } })
+    expect(runtime.wait.wait).toHaveBeenCalledWith(expect.objectContaining({ targetTaskIds: [persistedTaskId] }))
+    const persistedWait = sink.events.find(event => event.item.type === "tool_result" && event.item.toolCallId === waitCall.id)
+    expect(persistedWait?.item.type === "tool_result" ? persistedWait.item.output : undefined)
+      .toMatchObject({ status: "ready", taskIds: [persistedTaskId] })
+  })
+
   it("blocks Root spawn and follow-up after Gate proof or post-Gate plan receipt, while allowing the pre-Gate path", async () => {
     const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
     const source = makeTask({ id: "source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/source",
