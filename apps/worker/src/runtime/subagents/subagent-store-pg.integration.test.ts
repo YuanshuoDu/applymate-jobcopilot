@@ -14,6 +14,10 @@ import { recoverMissingPublishedSubagentDispatches } from "../../queue/subagent-
 import { createProductionChildExecutor } from "./production-child-runtime.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
+import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
+  NATIVE_VERIFICATION_PACKET_SCHEMA, digestNativeVerificationValue } from "./native-verification-contract.js"
+import { attachNativeVerificationReport } from "./native-verification-report.js"
+import { buildSponsorshipReviewPacket } from "./sponsorship-review-packet.js"
 import {
   createWorkerUsageAuthorizer,
   type WorkerUsageAuthorization,
@@ -46,6 +50,38 @@ vi.mock("@jobcopilot/shared/llm", () => ({ loadWorkerAiConfig: usageRouteMocks.l
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RUNTIME_ROLE = "agent_runtime_p1_test"
+
+function sponsorshipFinishEvidence(tree: TaskTreeFixture, taskId: string, userId: string) {
+  const digest = `sha256:${"a".repeat(64)}`
+  const jobId = `finish-permission-job-${suffix}`
+  const source = buildSponsorshipReviewPacket({
+    userId, sessionId: tree.sessionId, turnId: tree.turnId, rootTaskId: tree.rootTaskId, rootAttemptCount: 1,
+    scoutTaskId: tree.taskId, scoutAttempt: 1, scoutResultDigest: digest, jobId,
+    sourceReceiptDigest: digest, materialDigest: digest, targetCountryCode: "IE",
+    job: { id: jobId, company: "Example Ltd", role: "Backend Engineer", location: "Dublin", source: "greenhouse",
+      url: "https://jobs.example.test/role", description: "For this Backend Engineer role in Ireland, work visa sponsorship is available." },
+  })
+  if (!source) throw new Error("fixture_sponsorship_review_source_unavailable")
+  const controlOperationId = `native-verification-${randomUUID()}`
+  const packet = { schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA, controlOperationId, controlTaskId: taskId, ...source.content }
+  const control = {
+    schemaVersion: NATIVE_VERIFICATION_CONTROL_SCHEMA, controlOperationId, controlTaskId: taskId,
+    owner: { userId, sessionId: tree.sessionId, turnId: tree.turnId, rootTaskId: tree.rootTaskId, parentTaskId: tree.rootTaskId },
+    target: source.target, goalDigest: digestNativeVerificationValue(packet.goal),
+    criteriaDigest: digestNativeVerificationValue(packet.criteria), evidencePacketDigest: digestNativeVerificationValue(packet),
+  }
+  const citationReference = packet.evidence[0]?.referenceId
+  if (!citationReference) throw new Error("fixture_sponsorship_citation_unavailable")
+  const report = attachNativeVerificationReport(control, 1, {
+    schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
+    criteria: [
+      { criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: [citationReference] },
+      { criterionId: "criterion-2", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: [] },
+    ],
+  })
+  if (!report) throw new Error("fixture_sponsorship_report_unavailable")
+  return { control, context: { nativeVerificationPacket: packet }, report }
+}
 
 function dedicatedDisposableUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -400,6 +436,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       END IF;
     END $$`)
     await adminPool.query(`ALTER ROLE ${RUNTIME_ROLE} NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS`)
+    await adminPool.query(`REVOKE UPDATE ON "sub_agent_tasks" FROM ${RUNTIME_ROLE}`)
+    await adminPool.query(`REVOKE UPDATE ("qualityGateResult") ON "sub_agent_tasks" FROM ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT USAGE ON SCHEMA public TO ${RUNTIME_ROLE}`)
     await installTestTenantRls(adminPool)
     await adminPool.query(`GRANT EXECUTE ON FUNCTION public.app_current_user_id() TO ${RUNTIME_ROLE}`)
@@ -595,6 +633,80 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       [fenceTree!.taskId, fenceTree!.sessionId],
     )
     expect(completed.rows[0]).toMatchObject({ status: "completed", attemptCount: 2, result: { source: "current-attempt" } })
+  })
+
+  it("keeps generic finish compatible without private-column rights and fences sponsorship proof writes", async () => {
+    const tree = treeA!
+    const genericTaskId = `finish-generic-${suffix}`
+    const sponsorshipTaskId = `finish-sponsorship-${suffix}`
+    const genericOwner = `generic-finish-owner-${suffix}`
+    const sponsorshipOwner = `sponsorship-finish-owner-${suffix}`
+    const privateTextCanary = "PRIVATE-SPONSORSHIP-REVIEW-CONTENT-CANARY"
+    const evidence = sponsorshipFinishEvidence(tree, sponsorshipTaskId, userA.userId)
+    const seedRunning = async (value: { taskId: string; ownerId: string; role: string; taskType: string; context: unknown; marker: unknown }) => {
+      await adminPool!.query(`INSERT INTO "sub_agent_tasks"
+        ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status",
+         "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema",
+         "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts",
+         "leaseOwner", "leaseExpiresAt", "startedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $4, $5, 1, $6, $7, 'running', $8, '{}'::jsonb, '[]'::jsonb, '[]'::jsonb,
+          $9::jsonb, $10::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, $11,
+          clock_timestamp() + interval '5 minutes', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+        value.taskId, tree.sessionId, tree.turnId, tree.rootTaskId, `/root/${value.taskId}`, value.role, value.taskType,
+        "PostgreSQL finish column privilege regression", JSON.stringify(value.context), JSON.stringify(value.marker), value.ownerId,
+      ])
+    }
+
+    await seedRunning({ taskId: genericTaskId, ownerId: genericOwner, role: "scout", taskType: "job_discovery", context: {}, marker: {} })
+    await seedRunning({ taskId: sponsorshipTaskId, ownerId: sponsorshipOwner, role: "auditor", taskType: "native_verification",
+      context: evidence.context, marker: evidence.control })
+
+    const noPrivateColumn = await adminPool!.query<{ tableUpdate: boolean; privateColumnUpdate: boolean }>(`SELECT
+      has_table_privilege($1, 'public."sub_agent_tasks"', 'UPDATE') AS "tableUpdate",
+      has_column_privilege($1, 'public."sub_agent_tasks"', 'qualityGateResult', 'UPDATE') AS "privateColumnUpdate"`, [RUNTIME_ROLE])
+    expect(noPrivateColumn.rows[0]).toEqual({ tableUpdate: false, privateColumnUpdate: false })
+
+    await expect(ownerAStore.finish({ taskId: genericTaskId, sessionId: tree.sessionId, ownerId: genericOwner, attemptCount: 1,
+      status: "completed", result: { summary: "ordinary task finished" }, now: new Date() })).resolves.toBe("completed")
+    const generic = await adminPool!.query<{ status: string; result: unknown; qualityGateResult: unknown }>(`SELECT "status", "result", "qualityGateResult"
+      FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [genericTaskId, tree.sessionId])
+    expect(generic.rows[0]).toEqual({ status: "completed", result: { summary: "ordinary task finished" }, qualityGateResult: null })
+
+    const reviewerResult = { status: "completed", stepCount: 1, toolCallCount: 0, privateText: privateTextCanary,
+      nativeVerificationReport: evidence.report }
+    const finishSponsorship = () => ownerAStore.finish({ taskId: sponsorshipTaskId, sessionId: tree.sessionId,
+      ownerId: sponsorshipOwner, attemptCount: 1, status: "completed", result: reviewerResult, now: new Date() })
+    await expect(finishSponsorship()).rejects.toMatchObject({ code: "42501" })
+    const afterDenied = await adminPool!.query<{ status: string; leaseOwner: string; result: unknown; qualityGateResult: unknown }>(`SELECT
+      "status", "leaseOwner", "result", "qualityGateResult" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+    [sponsorshipTaskId, tree.sessionId])
+    expect(afterDenied.rows[0]).toMatchObject({ status: "running", leaseOwner: sponsorshipOwner, result: null, qualityGateResult: null })
+
+    await adminPool!.query(`GRANT UPDATE ("qualityGateResult") ON "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
+    try {
+      const exactPrivateColumn = await adminPool!.query<{ tableUpdate: boolean; privateColumnUpdate: boolean }>(`SELECT
+        has_table_privilege($1, 'public."sub_agent_tasks"', 'UPDATE') AS "tableUpdate",
+        has_column_privilege($1, 'public."sub_agent_tasks"', 'qualityGateResult', 'UPDATE') AS "privateColumnUpdate"`, [RUNTIME_ROLE])
+      expect(exactPrivateColumn.rows[0]).toEqual({ tableUpdate: false, privateColumnUpdate: true })
+      await expect(finishSponsorship()).resolves.toBe("completed")
+    } finally {
+      await adminPool!.query(`REVOKE UPDATE ("qualityGateResult") ON "sub_agent_tasks" FROM ${RUNTIME_ROLE}`)
+    }
+
+    const completedSponsorship = await adminPool!.query<{ status: string; result: unknown; qualityGateResult: unknown }>(`SELECT
+      "status", "result", "qualityGateResult" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+    [sponsorshipTaskId, tree.sessionId])
+    expect(completedSponsorship.rows[0]).toMatchObject({ status: "completed",
+      result: { status: "completed", stepCount: 1, toolCallCount: 0 }, qualityGateResult: evidence.report })
+    const publicSurfaces = await adminPool!.query<{ body: string }>(`SELECT "content"::text AS body FROM "agent_items" WHERE "taskId" = $1
+      UNION ALL SELECT "payload"::text AS body FROM "agent_events" WHERE "taskId" = $1
+      UNION ALL SELECT "payload"::text AS body FROM "agent_outbox" WHERE "aggregateId" = $2 AND "idempotencyKey" LIKE $3`,
+    [sponsorshipTaskId, tree.sessionId, `%${sponsorshipTaskId}%`])
+    const publicJson = JSON.stringify([completedSponsorship.rows[0]?.result, publicSurfaces.rows])
+    expect(publicJson).not.toContain(privateTextCanary)
+    expect(publicJson).not.toContain(evidence.control.controlOperationId)
+    expect(publicJson).not.toContain(evidence.control.evidencePacketDigest)
+    expect(JSON.stringify(completedSponsorship.rows[0]?.qualityGateResult)).toContain(evidence.control.controlOperationId)
   })
 
   it("binds claims to the currently published Bull generation and exact outbox owner tuple", async () => {

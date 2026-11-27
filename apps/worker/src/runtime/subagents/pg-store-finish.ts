@@ -13,7 +13,7 @@ import { lockScheduledGateFinish } from "./pg-store-gate-finish.js"
 import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { hasActiveSubagentDescendants } from "./pg-store-descendant-completion.js"
 import { interruptMatchingInSession } from "./pg-store-subtree-interrupt.js"
-import { parseNativeVerificationControl } from "./native-verification-contract.js"
+import { nativeVerificationControlMatchesTask, parseNativeVerificationControl } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { parseNativeVerificationReport } from "./native-verification-report.js"
 
@@ -56,6 +56,12 @@ export async function finishSubagentTask(pool: PgSubagentPool, input: FinishSuba
       const privateSponsorshipReview = markedTarget?.kind === "sponsorship_source"
       const sponsorshipControl = row.role === "auditor" && row.taskType === "native_verification"
         ? parseNativeVerificationControl(row.expectedOutputSchema) : null
+      const privateSponsorshipControl = privateSponsorshipReview && sponsorshipControl?.target.kind === "sponsorship_source"
+        && nativeVerificationControlMatchesTask(sponsorshipControl, {
+          id: String(row.id), userId: String(row.userId), sessionId: String(row.sessionId),
+          turnId: typeof row.turnId === "string" ? row.turnId : null, rootTaskId: String(row.rootTaskId),
+          parentTaskId: typeof row.parentTaskId === "string" ? row.parentTaskId : null, role: String(row.role),
+        }) ? sponsorshipControl : null
       if (row.taskType === SCHEDULED_GATE_TASK_TYPE && !await lockScheduledGateFinish(client, row, input)) return null
       const interrupted = row.interruptRequestedAt !== null && row.interruptRequestedAt !== undefined
       const retry = input.status === "failed" && !interrupted && input.retryDisposition !== "terminal" && Number(row.attemptCount) < Number(row.maxAttempts)
@@ -64,10 +70,10 @@ export async function finishSubagentTask(pool: PgSubagentPool, input: FinishSuba
       let failureReason = input.failureReason
       let privateReviewProof: unknown = null
       if (privateSponsorshipReview) {
-        const packet = sponsorshipControl ? parseNativeVerificationPacket(row.context, sponsorshipControl) : null
+        const packet = privateSponsorshipControl ? parseNativeVerificationPacket(row.context, privateSponsorshipControl) : null
         const rawReport = plainRecord(input.result)?.nativeVerificationReport
-        const report = input.status === "completed" && !interrupted && !retry && sponsorshipControl && packet && rawReport !== undefined
-          ? parseNativeVerificationReport(rawReport, sponsorshipControl, packet, input.attemptCount) : null
+        const report = input.status === "completed" && !interrupted && !retry && privateSponsorshipControl && packet && rawReport !== undefined
+          ? parseNativeVerificationReport(rawReport, privateSponsorshipControl, packet, input.attemptCount) : null
         const execution = plainRecord(input.result)
         const stepCount = execution && Number.isSafeInteger(execution.stepCount) && Number(execution.stepCount) >= 0
           ? Number(execution.stepCount) : 0
@@ -127,12 +133,15 @@ export async function finishSubagentTask(pool: PgSubagentPool, input: FinishSuba
         if (missingMessageIds.length > 0) return { status: "input_pending", messageIds: missingMessageIds }
       }
       const nextAttemptAt = retry ? computeSubagentNextAttemptAt(input.attemptCount, finishAt) : null
+      const privateProofAssignment = privateSponsorshipControl ? `, "qualityGateResult" = $11::jsonb` : ""
+      const finishUpdateValues: unknown[] = [input.taskId, input.sessionId, status, json(result, null), failureReason ?? null,
+        terminal, finishAt, input.ownerId, input.attemptCount, nextAttemptAt]
+      if (privateSponsorshipControl) finishUpdateValues.push(json(privateReviewProof, null, "sponsorship_review_proof"))
       const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
         "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
-        "qualityGateResult" = CASE WHEN $11::boolean THEN $12::jsonb ELSE "qualityGateResult" END,
         "leaseSegmentStartedAt" = CASE WHEN "absoluteDeadlineAt" IS NOT NULL THEN NULL ELSE "leaseSegmentStartedAt" END,
         "nextAttemptAt" = $10, "completedAt" = CASE WHEN $6 THEN $7::timestamp(3) ELSE NULL::timestamp(3) END,
-        "updatedAt" = $7::timestamp(3)
+        "updatedAt" = $7::timestamp(3)${privateProofAssignment}
         WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $8 AND "status" = 'running'
           AND "attemptCount" = $9 AND "leaseExpiresAt" > clock_timestamp()
           AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp())
@@ -143,9 +152,7 @@ export async function finishSubagentTask(pool: PgSubagentPool, input: FinishSuba
             WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId" AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
               AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
               AND turn."rootTaskId" = root."id" AND (turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
-                OR (turn."status" = 'interrupted' AND "sub_agent_tasks"."interruptRequestedAt" IS NOT NULL)))`,
-      [input.taskId, input.sessionId, status, json(result, null), failureReason ?? null, terminal, finishAt, input.ownerId, input.attemptCount, nextAttemptAt,
-        Boolean(privateSponsorshipReview), privateSponsorshipReview ? json(privateReviewProof, null, "sponsorship_review_proof") : null])
+              OR (turn."status" = 'interrupted' AND "sub_agent_tasks"."interruptRequestedAt" IS NOT NULL)))`, finishUpdateValues)
       if (updated.rowCount !== 1) throw new FinishFenceSignal()
       if (graph) {
         await persistGraphTransition(client, graph, finishAt)
