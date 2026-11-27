@@ -33,6 +33,20 @@ function discoveryOutput(location = "Dublin, Ireland") {
 }
 
 describe("TaskGraph canonical verification receipt validation", () => {
+  it("keeps the Worker evidence-digest export byte-compatible", () => {
+    const items = [
+      { id: "call-item-2", type: "tool_call", attempt: 2, revision: 4, content: {
+        toolCallId: "call-2", toolName: "jobs.get", toolVersion: "1", input: { jobId: "job-1" }, status: "completed", errorCode: null,
+      } },
+      { id: "result-item-2", type: "tool_result", attempt: 2, revision: 5, content: {
+        toolCallId: "call-2", output: { job: { id: "job-1", source: "greenhouse" } }, errorCode: null,
+      } },
+    ]
+    expect(taskGraphEvidenceDigest(items, new Map([["call-2", "completed" as const]]), ["ev-a"],
+      "c0de43b19aee1d9f9c33c485f1bdaeb0f3f932b4ca5efdca3565df4aca53d2d5", []))
+      .toBe("818e2566a51017cd0b2b4e1238b35692d324efb2895eea7f28816d1529566a2c")
+  })
+
   it("binds paired observations to the exact owner, task, step and attempt", () => {
     expect(validateTaskGraphVerificationItems(pair(), scope)).toHaveLength(2)
     expect(() => validateTaskGraphVerificationItems(pair().map(item => ({ ...item, taskId: "other" })), scope)).toThrow("task_graph_verification_item_invalid")

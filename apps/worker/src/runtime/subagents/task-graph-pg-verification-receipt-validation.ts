@@ -1,12 +1,11 @@
-import { createHash } from "node:crypto"
 import { Buffer } from "node:buffer"
+import { isTaskGraphEvidenceToolName } from "@jobcopilot/shared/task-graph-verification-digest"
 import { parseDurableDiscoveryReference } from "./child-durable-discovery.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
-import type { TaskGraphReplayReceipt } from "./task-graph-pg-event-validation.js"
+export { taskGraphEvidenceDigest } from "@jobcopilot/shared/task-graph-verification-digest"
 
 export type TaskGraphVerificationScope = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; taskId: string; attemptCount: number }>
 type Row = Record<string, unknown>
-const EVIDENCE_TOOLS = new Set(["jobs.search", "jobs.get", "jobs.discover", "tool_results.read", "persona.retrieve", "resume.get_base"])
 const MAX_TOTAL_BYTES = 2 * 1024 * 1024
 const MAX_OBSERVATION_BYTES = 512 * 1024
 const MAX_DURABLE_CHUNK_BYTES = 4096
@@ -48,7 +47,7 @@ export function canonicalTaskGraphReadObservations(items: readonly Row[], outcom
   let totalBytes = 0
   for (const call of items.filter(item => item.type === "tool_call")) {
     const content = call.content as Row, callId = String(content.toolCallId), toolName = String(content.toolName)
-    if (outcomes.get(callId) !== "completed" || !EVIDENCE_TOOLS.has(toolName)) continue
+    if (outcomes.get(callId) !== "completed" || !isTaskGraphEvidenceToolName(toolName)) continue
     const result = results.get(callId)?.content as Row | undefined
     if (!result || !Object.hasOwn(result, "output")) throw new Error("task_graph_verification_output_invalid")
     const output = result.output, encoded = JSON.stringify(output)
@@ -135,18 +134,6 @@ function exactRecord(value: unknown, required: readonly string[], optional: read
   if (keys.length < required.length || keys.length > allowed.size || keys.some(key => typeof key !== "string" || !allowed.has(key))) return undefined
   for (const key of keys) { const descriptor = Object.getOwnPropertyDescriptor(parsed, key); if (!descriptor?.enumerable || !("value" in descriptor)) return undefined }
   return required.every(key => Object.hasOwn(parsed, key)) ? parsed : undefined
-}
-
-export function taskGraphEvidenceDigest(items: readonly Row[], outcomes: ReadonlyMap<string, "completed" | "failed">, evidenceIds: readonly string[], resultDigest: string, replayReceipts: readonly TaskGraphReplayReceipt[]): string {
-  const byCall = new Map(items.filter(item => item.type === "tool_result").map(item => [String((item.content as Row).toolCallId), item] as const))
-  const replayByCall = new Map(replayReceipts.map(receipt => [receipt.currentCallId, receipt] as const))
-  const receipts = items.filter(item => item.type === "tool_call" && EVIDENCE_TOOLS.has(String((item.content as Row).toolName))
-    && outcomes.get(String((item.content as Row).toolCallId)) === "completed").map(call => {
-      const content = call.content as Row, result = byCall.get(String(content.toolCallId))!, output = JSON.stringify((result.content as Row).output)
-      return { attempt: Number(call.attempt), callId: content.toolCallId, toolName: content.toolName, toolVersion: content.toolVersion,
-        callItem: [call.id, Number(call.revision)], resultItem: [result.id, Number(result.revision)], replaySource: replayByCall.get(String(content.toolCallId)) ?? null, outputHash: createHash("sha256").update(output).digest("hex") }
-    }).sort((a, b) => a.attempt - b.attempt || String(a.callId).localeCompare(String(b.callId)))
-  return createHash("sha256").update(JSON.stringify({ evidenceIds: [...evidenceIds].sort(), receipts, resultDigest })).digest("hex")
 }
 
 function denseRecords(value: unknown, key: string): boolean {
