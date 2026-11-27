@@ -25,6 +25,7 @@ import type { ProductionAgentFlags } from "../production-agent-flags.js"
 import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
+import { sanitizeLifecyclePreview } from "../tools/redaction.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { consumeDurableWaitOutcomes } from "./durable-wait-consumer.js"
 import { reconcileDurableWaits } from "./durable-wait-resolver.js"
@@ -2528,6 +2529,22 @@ type SelectedJobArtifactRestartTrace = SelectedJobArtifactRestartPlan & {
   readonly artifactRef: SelectedJobArtifactReference
 }
 
+type CorrectionWriterRestartPlan = Readonly<{
+  store: PgSubagentTaskStore
+  rootTaskId: string
+  queueName: string
+  jobId: string
+  body: string
+  correctionWriter: SubagentTaskRecord
+  correctionDraftCallId: string
+  correctionReadCallId: string
+  baseArtifactId: string
+  baseHash: string
+  sourceDigest: string
+  predecessor: SelectedJobArtifactReference
+  expectedArtifactId: string
+}>
+
 type SelectedJobArtifactReviewTrace = SelectedJobArtifactRestartTrace & {
   readonly currentPreparation: Awaited<ReturnType<typeof loadSelectedJobArtifactContext>>
   readonly reviewerTask: SubagentTaskRecord
@@ -2610,6 +2627,121 @@ async function createSelectedJobTaskGraph(
     body: `AC6_PRIVATE_COVER_LETTER_${value.suffix}`,
     originalPreparation: await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId),
   }
+}
+
+async function prepareCorrectionWriterRestartPlan(
+  pool: Pool,
+  value: Fixture,
+  sources: SelectedJobFixtureSources,
+  queueName: string,
+): Promise<CorrectionWriterRestartPlan> {
+  const store = new PgSubagentTaskStore(pool, 300_000)
+  const preparation = await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId)
+  const root = await store.create({
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    role: "supervisor", taskType: "task_graph", goal: "Complete a reviewed correction Writer",
+    allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft", "artifact.version.read", "artifact.review"],
+    expectedOutputSchema: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 16, maxToolCalls: 12 } },
+    policy: defaultSubagentPolicy(),
+  })
+  const linked = await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4 AND "status" = 'waiting_for_user' AND "rootTaskId" IS NULL`, [
+    value.turnId, root.id, value.sessionId, value.userId,
+  ])
+  if (linked.rowCount !== 1) throw new Error("Correction Writer fixture root could not be linked")
+  await activateFixtureTurn(pool, value)
+  const turnLease = await claimTurnLease(pool, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+  const rootLease = await store.claim({ taskId: root.id, sessionId: value.sessionId, ownerId: value.ownerId,
+    policy: defaultSubagentPolicy(), now: new Date() })
+  if (!rootLease?.leaseOwner) throw new Error("Correction Writer fixture root could not be claimed")
+  const stepId = `p3-correction-writer-step-${value.suffix}`
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, 0, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [stepId, value.sessionId, value.turnId, root.id])
+  const commandPort = createPgTaskGraphCommandPort(pool)
+  const graphScope = {
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    rootTaskId: root.id, parentTaskId: root.id, stepId,
+    turnLeaseOwner: turnLease.ownerId, turnLeaseVersion: turnLease.leaseVersion,
+    parentLeaseOwner: value.ownerId, parentAttemptCount: rootLease.attemptCount,
+  }
+  const initial = await commandPort.appendAndSchedule({
+    scope: graphScope,
+    proposal: { expectedRevision: 0, nodes: [
+      { key: "writer-v1", templateId: "cover_letter_writer", goal: "Write the reviewed predecessor draft", successCriteria: ["Save draft v1"], dependsOn: [] },
+      { key: "reviewer-v1", templateId: "cover_letter_reviewer", goal: "Request a focused correction", successCriteria: ["Record needs_revision"], dependsOn: ["writer-v1"] },
+    ] },
+    templates: taskGraphTemplatesForSelectedJob(preparation.preparation),
+  })
+  const initialIds = new Map(initial.nodes.map(node => [node.key, node.taskId] as const))
+  const initialTask = async (key: string, ownerId: string) => {
+    const taskId = initialIds.get(key)
+    if (!taskId) throw new Error(`Correction Writer fixture is missing ${key}`)
+    const task = await store.claim({ taskId, sessionId: value.sessionId, ownerId, policy: defaultSubagentPolicy(), now: new Date() })
+    if (!task?.leaseOwner) throw new Error(`Correction Writer fixture could not claim ${key}`)
+    return task
+  }
+  const artifacts = createArtifactToolStore(pool)
+  const base = await resolveCoverLetterBase(artifacts, value.userId, sources.jobId)
+  const baseArtifactId = base.artifactId, baseHash = base.baseHash
+  const predecessorBody = `AC6_CORRECTION_WRITER_PREDECESSOR_${value.suffix}`
+  const predecessorInput = { baseArtifactId, baseHash, content: predecessorBody, constraints: { maxWords: 160 } }
+  const writerOwner = `p3-correction-writer-v1-${value.suffix}`
+  const writer = await initialTask("writer-v1", writerOwner)
+  const writerScope = { ...preparation.preparation, userId: value.userId, sessionId: value.sessionId, taskId: writer.id,
+    toolCallId: `p3-correction-predecessor:${writer.attemptCount}`, taskFence: selectedJobTaskFence(writer, writerOwner, writer.attemptCount) }
+  const predecessorVersion = await artifacts.writeDraft(writerScope, {
+    ...predecessorInput, requestHash: selectedJobDraftRequestHash(writerScope, predecessorInput),
+  })
+  const predecessor: SelectedJobArtifactReference = {
+    artifactId: predecessorVersion.artifactId, version: predecessorVersion.version,
+    contentHash: predecessorVersion.contentHash, sourceDigest: predecessorVersion.sourceDigest,
+  }
+  await store.finish({ taskId: writer.id, sessionId: value.sessionId, ownerId: writerOwner, attemptCount: writer.attemptCount,
+    status: "completed", result: { status: "completed", finalText: "Predecessor draft saved", finalItemId: null,
+      stepCount: 1, toolCallCount: 1, structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: predecessor } }, now: new Date() })
+
+  const reviewerOwner = `p3-correction-reviewer-v1-${value.suffix}`
+  const reviewer = await initialTask("reviewer-v1", reviewerOwner)
+  const reviewCallId = `p3-correction-review:${reviewer.attemptCount}`
+  const findings = [{ id: "opening", code: "revise_opening", severity: "warning", message: "Make the opening more specific.",
+    artifactHash: predecessor.contentHash, evidence: [{ artifactHash: predecessor.contentHash, path: "opening", summary: "Use a more targeted opening." }] }]
+  const reviewInput = { artifactRef: predecessor, decision: "needs_revision", findings }
+  const reviewerScope = { ...preparation.preparation, userId: value.userId, sessionId: value.sessionId, taskId: reviewer.id,
+    toolCallId: reviewCallId, taskFence: selectedJobTaskFence(reviewer, reviewerOwner, reviewer.attemptCount) }
+  const reviewHash = hashArtifactContent({ artifactRef: predecessor, currentSourceDigest: preparation.preparation.sourceDigest,
+    status: "needs_revision", findings, evidenceRefs: preparation.preparation.evidenceRefs })
+  await artifacts.saveReview({ userId: value.userId, sessionId: value.sessionId, jobId: sources.jobId,
+    artifactId: predecessor.artifactId, version: predecessor.version, contentHash: predecessor.contentHash,
+    sourceDigest: predecessor.sourceDigest, currentSourceDigest: preparation.preparation.sourceDigest,
+    status: "needs_revision", findings, evidenceRefs: [...preparation.preparation.evidenceRefs], taskId: reviewer.id,
+    toolCallId: reviewCallId, requestHash: selectedJobTaskReceiptRequestHash("artifact.review", reviewerScope, reviewInput),
+    reviewHash, taskFence: reviewerScope.taskFence })
+  await store.finish({ taskId: reviewer.id, sessionId: value.sessionId, ownerId: reviewerOwner, attemptCount: reviewer.attemptCount,
+    status: "completed", result: { status: "completed", finalText: "Review requested one correction", finalItemId: null,
+      stepCount: 1, toolCallCount: 2, structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed",
+        artifactRef: predecessor, reviewStatus: "needs_revision", reviewHash } }, now: new Date() })
+
+  const current = await commandPort.readCurrent({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    rootTaskId: root.id, parentTaskId: root.id, turnLeaseOwner: turnLease.ownerId, turnLeaseVersion: turnLease.leaseVersion,
+    parentLeaseOwner: value.ownerId, parentAttemptCount: rootLease.attemptCount })
+  const correction = await commandPort.appendAndSchedule({
+    scope: graphScope,
+    proposal: { expectedRevision: current.revision, nodes: [
+      { key: "writer-v2", templateId: "cover_letter_writer", goal: "Apply the exact Reviewer correction", successCriteria: ["Persist and return one correction draft"], dependsOn: ["reviewer-v1"] },
+    ] },
+    templates: taskGraphTemplatesForSelectedJob(preparation.preparation),
+  })
+  const correctionId = correction.nodes.find(node => node.key === "writer-v2")?.taskId
+  if (!correctionId) throw new Error("Correction Writer fixture did not create its correction task")
+  const correctionWriter = await store.get(correctionId, value.sessionId)
+  if (!correctionWriter || correctionWriter.status !== "queued") throw new Error("Correction Writer fixture task is not ready")
+  return { store, rootTaskId: root.id, queueName, jobId: sources.jobId,
+    body: `AC6_CORRECTION_WRITER_RESUMED_${value.suffix}`, correctionWriter,
+    correctionDraftCallId: "p3-correction-draft",
+    correctionReadCallId: "p3-correction-predecessor-read",
+    baseArtifactId, baseHash, sourceDigest: preparation.preparation.sourceDigest,
+    predecessor, expectedArtifactId: predecessor.artifactId }
 }
 
 async function prepareSelectedJobTerminalCase(pool: Pool, value: Fixture) {
@@ -2751,6 +2883,14 @@ function selectedJobSettlement(line: string, taskId: string): RecordValue {
   if (!line.startsWith(prefix)) throw new Error("Selected-job Worker settlement marker did not match its task")
   const value = record(JSON.parse(line.slice(prefix.length)) as unknown)
   if (!value) throw new Error("Selected-job Worker settlement marker was not an object")
+  return value
+}
+
+function correctionWriterSettlement(line: string, taskId: string, generation: number): RecordValue {
+  const prefix = `P3_CORRECTION_WRITER_SETTLED ${taskId} ${generation} `
+  if (!line.startsWith(prefix)) throw new Error("Correction Writer generation settlement marker did not match")
+  const value = record(JSON.parse(line.slice(prefix.length)) as unknown)
+  if (!value || value.dispatchGeneration !== generation) throw new Error("Correction Writer settlement generation was invalid")
   return value
 }
 
@@ -4594,7 +4734,7 @@ async function expectGroundedTaskGraphFinalCopies(
   expect(final?.summary).toBe(finalResponse.summary)
 }
 
-type FixtureProcessScope = Readonly<{ sessionId: string; turnId: string; selectedQueueName?: string }>
+type FixtureProcessScope = Readonly<{ sessionId: string; turnId: string; selectedQueueName?: string; selectedTaskIds?: readonly string[] }>
 type FixtureQueueJobIdentity = Readonly<{
   queueName: string
   kind: "turn"
@@ -4694,7 +4834,7 @@ async function removeExactFixtureQueueJob(
   rawIdentity: unknown,
   queue: FixtureCleanupQueue,
   redisConnection: FixtureRedisConnection,
-  proof: Readonly<{ allWorkersExited: boolean; exactSigkillOwner: boolean }>,
+  proof: Readonly<{ allWorkersExited: boolean; exactSigkillOwner: boolean; exactSubagentSigkillOwner?: boolean }>,
 ): Promise<"absent" | "removed"> {
   const identity = parseFixtureQueueJobIdentity(rawIdentity)
   if (!identity || queue.name !== identity.queueName) throw new Error("Fixture queue job identity is unrecognized")
@@ -4709,9 +4849,8 @@ async function removeExactFixtureQueueJob(
   const removableStates = new Set(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active", "prioritized"])
   if (!removableStates.has(state)) throw new Error("Fixture queue job state is unrecognized")
   if (state === "active") {
-    if (identity.kind !== "turn" || !proof.exactSigkillOwner) {
-      throw new Error("Active fixture job has no exact exited SIGKILL owner proof")
-    }
+    const exactOwner = identity.kind === "turn" ? proof.exactSigkillOwner : proof.exactSubagentSigkillOwner === true
+    if (!exactOwner) throw new Error("Active fixture job has no exact exited SIGKILL owner proof")
     await redisConnection.del(queue.toKey(identity.jobId) + ":lock")
   }
   await job.remove()
@@ -4732,7 +4871,8 @@ function fixtureProcessScopes(value: Record<string, unknown>): FixtureProcessSco
   if (typeof selectedJob?.sessionId === "string" && selectedJob.sessionId.trim()
     && typeof selectedJob.turnId === "string" && selectedJob.turnId.trim()
     && typeof selectedJob.queueName === "string" && selectedJob.queueName.trim()) {
-    scopes.push({ sessionId: selectedJob.sessionId, turnId: selectedJob.turnId, selectedQueueName: selectedJob.queueName })
+    scopes.push({ sessionId: selectedJob.sessionId, turnId: selectedJob.turnId, selectedQueueName: selectedJob.queueName,
+      ...(typeof selectedJob.correctionWriterTaskId === "string" ? { selectedTaskIds: [selectedJob.correctionWriterTaskId] } : {}) })
   }
   return scopes
 }
@@ -4741,17 +4881,55 @@ function processFixtureProvesExactSigkill(
   child: ProcessFixtureChild,
   identity: FixtureQueueJobIdentity,
 ): boolean {
-  if (!processFixtureExited(child) || child.terminationSignal !== "SIGKILL" || child.signalCode !== "SIGKILL"
-    || !child.fixtureScopes?.some(scope => scope.sessionId === identity.sessionId && scope.turnId === identity.turnId)) return false
-  if (identity.kind === "turn") return child.staleBullJobKeys?.has(fixtureJobIdentityKey(identity.queueName, identity.jobId)) ?? false
-  // A started-task marker lacks the Bull dispatch generation, so it cannot authorize lock removal.
-  return false
+  if (!processFixtureExited(child) || child.terminationSignal !== "SIGKILL" || child.signalCode !== "SIGKILL") return false
+  const hasScope = child.fixtureScopes?.some(scope => fixtureProcessScopeMatchesIdentity(scope, identity)) ?? false
+  return hasScope && (child.staleBullJobKeys?.has(fixtureJobIdentityKey(identity.queueName, identity.jobId)) ?? false)
+}
+
+function fixtureProcessScopeMatchesIdentity(scope: FixtureProcessScope, identity: FixtureQueueJobIdentity): boolean {
+  if (scope.sessionId !== identity.sessionId || scope.turnId !== identity.turnId) return false
+  return identity.kind === "turn"
+    || scope.selectedQueueName === identity.queueName && scope.selectedTaskIds?.includes(identity.taskId) === true
+}
+
+function fixtureQueueCleanupOwnershipDiagnostic(input: {
+  readonly index: number
+  readonly queueLabel: string | undefined
+  readonly identity: FixtureQueueJobIdentity
+  readonly workers: Iterable<ProcessFixtureChild>
+  readonly allWorkersExited: boolean
+}): RecordValue {
+  const queueLabels = new Set(["turn queue", "subagent queue", "selected-job subagent queue", "correction Writer subagent queue"])
+  const queueLabel = diagnosticEnum(input.queueLabel, queueLabels) ?? "other"
+  const key = fixtureJobIdentityKey(input.identity.queueName, input.identity.jobId)
+  let matchingScopeWorkers = 0, matchingExitedSigkillWorkers = 0, exactJobWitnesses = 0
+  for (const child of input.workers) {
+    if (!(child.fixtureScopes?.some(scope => fixtureProcessScopeMatchesIdentity(scope, input.identity)) ?? false)) continue
+    matchingScopeWorkers += 1
+    if (!processFixtureExited(child) || child.terminationSignal !== "SIGKILL" || child.signalCode !== "SIGKILL") continue
+    matchingExitedSigkillWorkers += 1
+    if (child.staleBullJobKeys?.has(key)) exactJobWitnesses += 1
+  }
+  return {
+    stage: "active_job_missing_exact_sigkill_owner", index: diagnosticBoundedCount(input.index), queueLabel,
+    kind: input.identity.kind, generation: diagnosticBoundedCount(input.identity.generation),
+    currentGeneration: input.identity.currentGeneration, allWorkersExited: input.allWorkersExited,
+    matchingScopeWorkers: diagnosticBoundedCount(matchingScopeWorkers),
+    matchingExitedSigkillWorkers: diagnosticBoundedCount(matchingExitedSigkillWorkers),
+    exactJobWitnesses: diagnosticBoundedCount(exactJobWitnesses),
+  }
 }
 
 function noteFixtureSigkillTurnJob(child: ProcessFixtureChild, queueName: string, jobId: string): void {
   child.terminationSignal = "SIGKILL"
   child.staleBullJobKeys ??= new Set()
   child.staleBullJobKeys.add(fixtureJobIdentityKey(queueName, jobId))
+}
+
+function noteFixtureSigkillSubagentJob(child: ProcessFixtureChild, queueName: string, taskId: string): void {
+  child.terminationSignal = "SIGKILL"
+  child.staleBullJobKeys ??= new Set()
+  child.staleBullJobKeys.add(fixtureJobIdentityKey(queueName, subagentDispatchJobId(taskId, 0)))
 }
 
 function fixtureDispatchGenerations(attemptValue: unknown, publishedAt: Date | string | null): Array<{ generation: number; currentGeneration: boolean }> {
@@ -4778,6 +4956,8 @@ async function readExactFixtureQueueJobs(
   childQueueName: string,
   selectedJobQueueName: string | undefined,
   selectedJobSessionId: string,
+  correctionWriterQueueName: string | undefined,
+  correctionWriterSessionId: string,
 ): Promise<FixtureQueueJobIdentity[]> {
   const identities: FixtureQueueJobIdentity[] = []
   for (const owner of owners) {
@@ -4829,7 +5009,8 @@ async function readExactFixtureQueueJobs(
         throw new Error("Fixture subagent dispatch does not match its owner row")
       }
       const queueName = owner.sessionId === selectedJobSessionId && selectedJobQueueName
-        ? selectedJobQueueName : childQueueName
+        ? selectedJobQueueName : owner.sessionId === correctionWriterSessionId && correctionWriterQueueName
+          ? correctionWriterQueueName : childQueueName
       for (const { generation, currentGeneration } of fixtureDispatchGenerations(row.attemptCount, row.publishedAt)) {
         identities.push({ queueName, kind: "subagent", jobId: subagentDispatchJobId(row.taskId, generation),
           sessionId: owner.sessionId, turnId: owner.turnId, taskId: row.taskId, rootTaskId: row.rootTaskId,
@@ -4909,7 +5090,8 @@ function processDiscoveryTurnWorkerDiagnostics(
 }
 
 function startTaskGraphRestartWorker(
-  mode: "park-parent" | "resume-parent" | "park-discovery" | "resume-discovery" | "crash-archived-wait" | "resume-archived-wait" | "worker2-input-guard-self-test",
+  mode: "park-parent" | "resume-parent" | "park-discovery" | "resume-discovery" | "crash-archived-wait" | "resume-archived-wait"
+    | "correction-writer-worker-one" | "correction-writer-worker-two" | "worker2-input-guard-self-test",
   value: Record<string, unknown>,
   envOverrides: Record<string, string> = {},
 ): ProcessFixtureChild {
@@ -5209,6 +5391,64 @@ async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, ti
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error("Timed out waiting for " + prefix + "; " + processFixtureDiagnostics(child))
+}
+
+async function correctionWriterReceiptTimeoutDiagnostics(input: {
+  pool: Pool; worker: ProcessFixtureChild; userId: string; sessionId: string; turnId: string; rootTaskId: string
+  taskId: string; jobId: string; ownerId: string; toolCallId: string; artifactId: string; sourceDigest: string; previousHash: string
+}): Promise<string> {
+  const modelEntered = input.worker.output.includes("P3_CORRECTION_WRITER_MODEL_ENTERED attempt=1")
+  const draftEmitted = input.worker.output.includes("P3_CORRECTION_WRITER_DRAFT_EMITTED attempt=1")
+  let client: PoolClient | undefined
+  try {
+    client = await input.pool.connect()
+    await client.query("BEGIN READ ONLY")
+    await client.query("SET LOCAL statement_timeout = '2000ms'")
+    const task = await client.query<{ status: string; attemptCount: number; ownerMatches: boolean; leaseActive: boolean }>(
+      `SELECT task."status", task."attemptCount", task."leaseOwner" = $7 AS "ownerMatches", task."leaseExpiresAt" > NOW() AS "leaseActive"
+       FROM "sub_agent_tasks" AS task
+       JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $2
+       JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+         AND turn."rootTaskId" = task."rootTaskId"
+       WHERE task."id" = $1 AND task."sessionId" = $3 AND task."turnId" = $4
+         AND task."rootTaskId" = $5 AND task."parentTaskId" = $5
+         AND task."context"->'selectedJobPreparation'->>'jobId' = $6`,
+      [input.taskId, input.userId, input.sessionId, input.turnId, input.rootTaskId, input.jobId, input.ownerId])
+    const receipts = await client.query<{ draftCall: boolean; draftResult: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM "agent_items" item JOIN "agent_steps" step
+          ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+        WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND step."attempt" = 1
+          AND item."type" = 'tool_call' AND item."content"->>'toolCallId' = $4 AND item."content"->>'toolName' = 'cover_letter.draft') AS "draftCall",
+       EXISTS (SELECT 1 FROM "agent_items" item JOIN "agent_steps" step
+          ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+        WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND step."attempt" = 1
+          AND item."type" = 'tool_result' AND item."content"->>'toolCallId' = $4 AND item."content"->>'errorCode' IS NULL
+          AND item."content"->'output'->'artifactRef'->>'artifactId' = $5
+          AND item."content"->'output'->'artifactRef'->>'version' = '2'
+          AND item."content"->'output'->'artifactRef'->>'sourceDigest' = $6) AS "draftResult"`,
+      [input.sessionId, input.turnId, input.taskId, input.toolCallId, input.artifactId, input.sourceDigest])
+    const artifact = await client.query<{ present: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM "agent_artifact_version" WHERE "userId" = $1 AND "sessionId" = $2 AND "jobId" = $3
+        AND "taskId" = $4 AND "toolCallId" = $5 AND "artifactId" = $6 AND "version" = 2
+        AND "sourceDigest" = $7 AND "previousHash" = $8) AS "present"`,
+      [input.userId, input.sessionId, input.jobId, input.taskId, input.toolCallId, input.artifactId, input.sourceDigest, input.previousHash])
+    await client.query("COMMIT")
+    const row = task.rows[0]
+    const allowedStatuses = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+    const taskStatus = row && allowedStatuses.has(row.status) ? row.status : "missing_or_unknown"
+    const attemptCount = row && Number.isSafeInteger(row.attemptCount) && row.attemptCount >= 0 && row.attemptCount <= 3
+      ? String(row.attemptCount) : "unknown"
+    const bool = (value: unknown) => value === true ? "true" : "false"
+    const claimActive = taskStatus === "running" && row?.ownerMatches === true && row.leaseActive === true
+    return `taskStatus=${taskStatus} attemptCount=${attemptCount} ownerMatches=${bool(row?.ownerMatches)} leaseActive=${bool(row?.leaseActive)} claimActive=${bool(claimActive)} `
+      + `draftCall=${bool(receipts.rows[0]?.draftCall)} draftResult=${bool(receipts.rows[0]?.draftResult)} artifactVersion=${bool(artifact.rows[0]?.present)} `
+      + `modelEntered=${bool(modelEntered)} draftEmitted=${bool(draftEmitted)}`
+  } catch {
+    await client?.query("ROLLBACK").catch(() => undefined)
+    return `diagnostic=unavailable modelEntered=${modelEntered} draftEmitted=${draftEmitted}`
+  } finally {
+    client?.release()
+  }
 }
 
 function waitForProcessExit(child: ProcessFixtureChild, timeoutMs = 10_000): Promise<void> {
@@ -8488,6 +8728,72 @@ describe("TaskGraph exact fixture queue cleanup", () => {
     expect(job.remove).not.toHaveBeenCalled()
   })
 
+  it("matches the exact selected queue scope after the outer scope and rejects other queues or tasks", () => {
+    const subagentIdentity: FixtureQueueJobIdentity = {
+      queueName: "fixture-subagent-queue", kind: "subagent", jobId: subagentDispatchJobId("cleanup-task", 2),
+      sessionId: identity.sessionId, turnId: identity.turnId, taskId: "cleanup-task", rootTaskId: "cleanup-root",
+      ownerId: identity.ownerId, generation: 2, currentGeneration: false,
+    }
+    const selectedScope: FixtureProcessScope = {
+      sessionId: identity.sessionId, turnId: identity.turnId,
+      selectedQueueName: subagentIdentity.queueName, selectedTaskIds: [subagentIdentity.taskId],
+    }
+    const otherQueue = { ...subagentIdentity, queueName: "foreign-subagent-queue" }
+    const otherTask = { ...subagentIdentity, taskId: "foreign-task", jobId: subagentDispatchJobId("foreign-task", 2) }
+    const child = {
+      exitCode: 0, signalCode: "SIGKILL", terminationSignal: "SIGKILL",
+      fixtureScopes: [{ sessionId: identity.sessionId, turnId: identity.turnId }, selectedScope],
+      staleBullJobKeys: new Set([
+        fixtureJobIdentityKey(subagentIdentity.queueName, subagentIdentity.jobId),
+        fixtureJobIdentityKey(otherQueue.queueName, otherQueue.jobId),
+        fixtureJobIdentityKey(otherTask.queueName, otherTask.jobId),
+      ]),
+    } as unknown as ProcessFixtureChild
+    expect(processFixtureProvesExactSigkill(child, subagentIdentity)).toBe(true)
+    expect(fixtureQueueCleanupOwnershipDiagnostic({ index: 1, queueLabel: "correction Writer subagent queue",
+      identity: subagentIdentity, workers: [child], allWorkersExited: true })).toMatchObject({
+      matchingScopeWorkers: 1, matchingExitedSigkillWorkers: 1, exactJobWitnesses: 1,
+    })
+    expect(processFixtureProvesExactSigkill(child, otherQueue)).toBe(false)
+    expect(processFixtureProvesExactSigkill(child, otherTask)).toBe(false)
+  })
+
+  it("permits active subagent cleanup only with an exact task and Bull-generation SIGKILL witness", async () => {
+    const subagentIdentity: FixtureQueueJobIdentity = {
+      queueName: "fixture-subagent-queue", kind: "subagent", jobId: subagentDispatchJobId("cleanup-task", 2),
+      sessionId: identity.sessionId, turnId: identity.turnId, taskId: "cleanup-task", rootTaskId: "cleanup-root",
+      ownerId: identity.ownerId, generation: 2, currentGeneration: false,
+    }
+    const child = {
+      exitCode: 0, signalCode: "SIGKILL", terminationSignal: "SIGKILL",
+      fixtureScopes: [{ sessionId: identity.sessionId, turnId: identity.turnId,
+        selectedQueueName: subagentIdentity.queueName, selectedTaskIds: [subagentIdentity.taskId] }],
+      staleBullJobKeys: new Set([fixtureJobIdentityKey(subagentIdentity.queueName, subagentIdentity.jobId)]),
+    } as unknown as ProcessFixtureChild
+    expect(processFixtureProvesExactSigkill(child, subagentIdentity)).toBe(true)
+    const job: FixtureCleanupJob = {
+      id: subagentIdentity.jobId, name: "subagent",
+      data: { taskId: subagentIdentity.taskId, sessionId: subagentIdentity.sessionId,
+        rootTaskId: subagentIdentity.rootTaskId, ownerId: subagentIdentity.ownerId },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const queue: FixtureCleanupQueue = {
+      name: subagentIdentity.queueName,
+      toKey: jobId => `bull:${subagentIdentity.queueName}:${jobId}`,
+      getJob: vi.fn(async jobId => jobId === subagentIdentity.jobId ? job : undefined),
+    }
+    const redisConnection = { del: vi.fn(async () => 1) }
+    await expect(removeExactFixtureQueueJob(subagentIdentity, queue, redisConnection, {
+      allWorkersExited: true, exactSigkillOwner: true,
+    })).rejects.toThrow("Active fixture job has no exact exited SIGKILL owner proof")
+    expect(redisConnection.del).not.toHaveBeenCalled()
+    await expect(removeExactFixtureQueueJob(subagentIdentity, queue, redisConnection, {
+      allWorkersExited: true, exactSigkillOwner: false, exactSubagentSigkillOwner: true,
+    })).resolves.toBe("removed")
+    expect(redisConnection.del).toHaveBeenCalledWith(`bull:${subagentIdentity.queueName}:${subagentIdentity.jobId}:lock`)
+    expect(job.remove).toHaveBeenCalledTimes(1)
+  })
+
   it("preserves fixture owner rows if any queue identity cleanup fails", () => {
     const failuresBeforeQueueCleanup = 3
     const failuresAfterFailedRemoval = failuresBeforeQueueCleanup + 1
@@ -8908,6 +9214,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const stopOwner = fixture()
   const restartOwner = fixture()
   const artifactOwner = fixture()
+  const correctionOwner = fixture()
   const cancelledOwner = fixture()
   const discoveryOwner = fixture()
   const discoveryFailureOwner = fixture()
@@ -8937,12 +9244,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     sessionId: `000-root-recovery-scan-session-${rootRecoveryScanSeed.suffix}`,
   }
   let artifactOwnerSources: SelectedJobFixtureSources | undefined
+  let correctionOwnerSources: SelectedJobFixtureSources | undefined
   let pool: Pool | undefined
   let redis: Redis | undefined
   let bootstrap: ProductionWorkerBootstrap | undefined
   let turnQueueName: string | undefined
   let childQueueName: string | undefined
   let selectedJobQueueName: string | undefined
+  let correctionWriterQueueName: string | undefined
 
   beforeAll(async () => {
     // Keep in-process fixture Workers aligned with restart subprocesses. A closed Worker can leave its queue-wide
@@ -8970,6 +9279,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, restartOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, artifactOwner, "waiting_for_user")
     artifactOwnerSources = await seedSelectedJobSources(pool, artifactOwner)
+    await seed(pool, correctionOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+    correctionOwnerSources = await seedSelectedJobSources(pool, correctionOwner)
     await seed(pool, cancelledOwner, "waiting_for_user")
     await seed(pool, discoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryFailureOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
@@ -9019,7 +9330,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         cleanupFailures.push("bootstrap close: " + (error instanceof Error ? error.stack ?? error.message : String(error)))
       }
     }
-    const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
+    const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, correctionOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner,
       locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, replanApplicabilityOwner, supersededReadOnlyScoutOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
@@ -9034,7 +9345,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       let identities: FixtureQueueJobIdentity[] | null = null
       try {
         identities = await readExactFixtureQueueJobs(pool, fixtureOwners, turnQueueName, childQueueName,
-          selectedJobQueueName, artifactOwner.sessionId)
+          selectedJobQueueName, artifactOwner.sessionId, correctionWriterQueueName, correctionOwner.sessionId)
       } catch (error: unknown) {
         cleanupFailures.push("derive exact fixture queue identities: " + (error instanceof Error ? error.stack ?? error.message : String(error)))
       }
@@ -9042,6 +9353,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { name: turnQueueName, label: "turn queue" },
         { name: childQueueName, label: "subagent queue" },
         ...(selectedJobQueueName ? [{ name: selectedJobQueueName, label: "selected-job subagent queue" }] : []),
+        ...(correctionWriterQueueName ? [{ name: correctionWriterQueueName, label: "correction Writer subagent queue" }] : []),
       ]
       for (const spec of queueSpecs) {
         await attempt("create " + spec.label, async () => {
@@ -9059,15 +9371,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
       if (identities) for (const [index, identity] of identities.entries()) {
         await attempt("remove exact fixture queue job " + index, async () => {
-          const queue = queues.find(candidate => candidate.name === identity.queueName)?.queue
+          const queueSpec = queues.find(candidate => candidate.name === identity.queueName)
+          const queue = queueSpec?.queue
           if (!queue || !readyQueues.has(identity.queueName)) throw new Error("Exact fixture queue is unavailable")
           const staleLockWorkerExited = [...fixtureProcessChildren].some(child =>
             processFixtureProvesExactSigkill(child, identity))
-          await removeExactFixtureQueueJob(identity, {
-            name: queue.name,
-            toKey: jobId => queue.toKey(jobId),
-            getJob: async jobId => await queue.getJob(jobId) as unknown as FixtureCleanupJob | undefined,
-          }, redis!, { allWorkersExited: allFixtureWorkersExited, exactSigkillOwner: staleLockWorkerExited })
+          try {
+            await removeExactFixtureQueueJob(identity, {
+              name: queue.name,
+              toKey: jobId => queue.toKey(jobId),
+              getJob: async jobId => await queue.getJob(jobId) as unknown as FixtureCleanupJob | undefined,
+            }, redis!, {
+              allWorkersExited: allFixtureWorkersExited,
+              exactSigkillOwner: identity.kind === "turn" && staleLockWorkerExited,
+              exactSubagentSigkillOwner: identity.kind === "subagent" && staleLockWorkerExited,
+            })
+          } catch (error: unknown) {
+            if (error instanceof Error && error.message === "Active fixture job has no exact exited SIGKILL owner proof") {
+              cleanupFailures.push("fixture queue ownership diagnostic " + JSON.stringify(fixtureQueueCleanupOwnershipDiagnostic({
+                index, queueLabel: queueSpec?.label, identity, workers: fixtureProcessChildren,
+                allWorkersExited: allFixtureWorkersExited,
+              })))
+            }
+            throw error
+          }
         })
       }
       const closedQueues = new Set<Queue>()
@@ -10598,6 +10925,347 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       publishedAt: expect.any(Date),
       payload: { turnId: owner.turnId, sessionId: owner.sessionId },
     })
+  }, 90_000)
+
+  it("reclaims a correction Writer after its exact draft receipt commits before terminal output", async () => {
+    if (!correctionOwnerSources || !redis) throw new Error("Correction Writer fixture sources or Redis were not initialized")
+    const value = correctionOwner
+    correctionWriterQueueName = `agent-subagents-correction-restart-${value.suffix}`
+    const plan = await prepareCorrectionWriterRestartPlan(pool!, value, correctionOwnerSources, correctionWriterQueueName)
+    const queue = new Queue(plan.queueName, { connection: redis, skipVersionCheck: true })
+    const dispatchJobId = subagentDispatchJobId(plan.correctionWriter.id, 0)
+    let dispatchOwnerId: string | undefined
+    const selectedJob = {
+      correctionWriterMode: true,
+      pauseAfterCorrectionReceipt: true,
+      queueName: plan.queueName,
+      userId: value.userId,
+      sessionId: value.sessionId,
+      turnId: value.turnId,
+      rootTaskId: plan.rootTaskId,
+      jobId: plan.jobId,
+      writerTaskId: plan.correctionWriter.id,
+      correctionWriterTaskId: plan.correctionWriter.id,
+      correctionDraftCallId: plan.correctionDraftCallId,
+      correctionReadCallId: plan.correctionReadCallId,
+      predecessorRef: plan.predecessor,
+      baseArtifactId: plan.baseArtifactId,
+      baseHash: plan.baseHash,
+      body: plan.body,
+      expectedVersion: 2,
+      expectedArtifactId: plan.expectedArtifactId,
+      sourceDigest: plan.sourceDigest,
+    }
+    let workerOne: ProcessFixtureChild | undefined
+    let workerTwo: ProcessFixtureChild | undefined
+    let success = false
+    try {
+      const reviewContext = record(record(plan.correctionWriter.context)?.taskGraphDependencyResults)
+      const reviewItems = Array.isArray(reviewContext?.items) ? reviewContext.items.map(record) : []
+      expect(reviewItems).toHaveLength(1)
+      expect(reviewItems[0]).toMatchObject({ dependencyKey: "reviewer-v1", role: "reviewer", taskStatus: "completed",
+        result: { reviewStatus: "needs_revision", artifactRef: plan.predecessor } })
+
+      const { dispatchPendingSubagentOutbox } = await import("../../queue/subagent-queue.js")
+      await expect(dispatchPendingSubagentOutbox(pool!, queue, 10, value.sessionId)).resolves.toBe(1)
+      const dispatch = await pool!.query<{ attemptCount: number; publishedAt: Date | null; payload: unknown }>(
+        `SELECT "attemptCount", "publishedAt", "payload" FROM "agent_outbox"
+         WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, `subagent-dispatch:${plan.correctionWriter.id}`])
+      expect(dispatch.rows).toHaveLength(1)
+      const dispatchPayload = parseSubagentJobPayload(dispatch.rows[0]?.payload)
+      expect(dispatch.rows[0]).toMatchObject({ attemptCount: 1, publishedAt: expect.any(Date) })
+      expect(dispatchPayload).toMatchObject({ taskId: plan.correctionWriter.id, sessionId: value.sessionId,
+        rootTaskId: plan.rootTaskId, ownerId: expect.any(String) })
+      if (!dispatchPayload?.ownerId) throw new Error("Correction Writer dispatch owner is unavailable")
+      dispatchOwnerId = dispatchPayload.ownerId
+      const initialBullJob = await queue.getJob(dispatchJobId)
+      expect(initialBullJob).toMatchObject({ id: dispatchJobId, name: "subagent",
+        data: { taskId: plan.correctionWriter.id, sessionId: value.sessionId, rootTaskId: plan.rootTaskId, ownerId: dispatchOwnerId } })
+      workerOne = startTaskGraphRestartWorker("correction-writer-worker-one", { ...value, selectedJob })
+      await waitForProcessLine(workerOne, `P3_SELECTED_JOB_QUEUE_READY ${plan.queueName}`)
+      await waitForProcessLine(workerOne, "P3_CORRECTION_WRITER_RESTART_READY worker_one")
+      const firstDelivery = await waitForProcessLine(workerOne,
+        `P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} 0 `, 30_000)
+      expect(firstDelivery).toBe(`P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} 0 ${workerOne.pid}`)
+      try {
+        await waitForProcessLine(workerOne, `P3_CORRECTION_WRITER_POST_DRAFT_STEP_GATE ${plan.correctionWriter.id} 1`, 30_000)
+      } catch {
+        const progress = await correctionWriterReceiptTimeoutDiagnostics({
+          pool: pool!, worker: workerOne, userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+          rootTaskId: plan.rootTaskId, taskId: plan.correctionWriter.id, jobId: plan.jobId, ownerId: dispatchOwnerId,
+          toolCallId: plan.correctionDraftCallId, artifactId: plan.expectedArtifactId, sourceDigest: plan.sourceDigest,
+          previousHash: plan.predecessor.contentHash,
+        })
+        throw new Error("Correction Writer receipt barrier missed; " + progress)
+      }
+
+      const firstAttempt = await pool!.query<{ status: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null }>(
+        `SELECT "status", "attemptCount", "leaseOwner", "leaseExpiresAt" FROM "sub_agent_tasks"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4`,
+        [plan.correctionWriter.id, value.sessionId, value.turnId, plan.rootTaskId],
+      )
+      expect(firstAttempt.rows).toHaveLength(1)
+      expect(firstAttempt.rows[0]).toMatchObject({ status: "running", attemptCount: 1, leaseOwner: dispatchOwnerId })
+      expect(firstAttempt.rows[0]?.leaseExpiresAt?.getTime()).toBeGreaterThan(Date.now())
+      const draft = await pool!.query<{
+        artifactId: string; version: number; contentHash: string; sourceDigest: string; previousHash: string | null;
+        taskId: string; toolCallId: string;
+      }>(`SELECT "artifactId", "version", "contentHash", "sourceDigest", "previousHash", "taskId", "toolCallId"
+          FROM "agent_artifact_version" WHERE "taskId" = $1 AND "toolCallId" = $2`,
+        [plan.correctionWriter.id, plan.correctionDraftCallId])
+      expect(draft.rows).toHaveLength(1)
+      const committedRef = { artifactId: draft.rows[0]!.artifactId, version: draft.rows[0]!.version,
+        contentHash: draft.rows[0]!.contentHash, sourceDigest: draft.rows[0]!.sourceDigest }
+      expect(draft.rows[0]).toMatchObject({ artifactId: plan.expectedArtifactId, version: 2,
+        contentHash: hashArtifactContent(plan.body), sourceDigest: plan.sourceDigest, previousHash: plan.predecessor.contentHash,
+        taskId: plan.correctionWriter.id, toolCallId: plan.correctionDraftCallId })
+
+      const receiptItems = await pool!.query<{
+        type: string; status: string; stepId: string; attempt: number; content: RecordValue;
+      }>(`SELECT item."type", item."status", item."stepId", step."attempt", item."content"
+          FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId"
+            AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+          WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+            AND item."content"->>'toolCallId' = $4 AND item."type" IN ('tool_call', 'tool_result')
+          ORDER BY item."type"`, [value.sessionId, value.turnId, plan.correctionWriter.id, plan.correctionDraftCallId])
+      expect(receiptItems.rows).toHaveLength(2)
+      const call = receiptItems.rows.find(row => row.type === "tool_call")
+      const result = receiptItems.rows.find(row => row.type === "tool_result")
+      const sanitizedDraftPreview = record(sanitizeLifecyclePreview({
+        baseArtifactId: plan.baseArtifactId,
+        baseHash: plan.baseHash,
+        content: plan.body,
+        constraints: { maxWords: 160 },
+      }))
+      expect(sanitizedDraftPreview).toEqual({
+        baseArtifactId: plan.baseArtifactId,
+        baseHash: plan.baseHash,
+        content: "[REDACTED]",
+        constraints: { maxWords: 160 },
+      })
+      const expectedPersistedDraftInput = {
+        baseArtifactId: sanitizedDraftPreview?.baseArtifactId,
+        baseHash: sanitizedDraftPreview?.baseHash,
+      }
+      const persistedDraftInput = record(record(call?.content)?.input)
+      expect(call).toMatchObject({ status: "completed", attempt: 1, content: {
+        toolCallId: plan.correctionDraftCallId, toolName: "cover_letter.draft", status: "completed", errorCode: null,
+        input: expectedPersistedDraftInput,
+      } })
+      expect(persistedDraftInput).toEqual(expectedPersistedDraftInput)
+      expect(Object.prototype.hasOwnProperty.call(persistedDraftInput ?? {}, "content")).toBe(false)
+      expect(Object.prototype.hasOwnProperty.call(persistedDraftInput ?? {}, "constraints")).toBe(false)
+      expect(result).toMatchObject({ status: "completed", attempt: 1, stepId: call?.stepId,
+        content: { toolCallId: plan.correctionDraftCallId, errorCode: null, output: { artifactRef: committedRef } } })
+
+      const predecessorReadItems = await pool!.query<{
+        type: string; status: string; stepId: string; attempt: number; content: RecordValue;
+      }>(`SELECT item."type", item."status", item."stepId", step."attempt", item."content"
+          FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId"
+            AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+          WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+            AND item."content"->>'toolCallId' = $4 AND item."type" IN ('tool_call', 'tool_result')
+          ORDER BY item."type"`, [value.sessionId, value.turnId, plan.correctionWriter.id, plan.correctionReadCallId])
+      expect(predecessorReadItems.rows).toHaveLength(2)
+      const predecessorReadCall = predecessorReadItems.rows.find(row => row.type === "tool_call")
+      const predecessorReadResult = predecessorReadItems.rows.find(row => row.type === "tool_result")
+      const readInput = record(record(predecessorReadCall?.content)?.input)
+      const readInputRef = record(readInput?.artifactRef)
+      const readOutput = record(record(predecessorReadResult?.content)?.output)
+      const readOutputRef = record(readOutput?.artifactRef)
+      expect(Boolean(predecessorReadCall && predecessorReadResult
+        && predecessorReadCall.status === "completed" && predecessorReadResult.status === "completed"
+        && predecessorReadCall.attempt === 1 && predecessorReadResult.attempt === 1
+        && predecessorReadCall.stepId === predecessorReadResult.stepId
+        && predecessorReadCall.content.toolName === "artifact.version.read"
+        && predecessorReadCall.content.status === "completed" && predecessorReadCall.content.errorCode === null
+        && Object.keys(readInputRef ?? {}).sort().join(",") === "artifactId,contentHash,sourceDigest,version"
+        && readInputRef?.artifactId === plan.predecessor.artifactId && readInputRef?.version === plan.predecessor.version
+        && readInputRef?.contentHash === plan.predecessor.contentHash && readInputRef?.sourceDigest === plan.predecessor.sourceDigest
+        && predecessorReadResult.content.errorCode === null
+        && Object.keys(readOutputRef ?? {}).sort().join(",") === "artifactId,contentHash,sourceDigest,version"
+        && readOutputRef?.artifactId === plan.predecessor.artifactId && readOutputRef?.version === plan.predecessor.version
+        && readOutputRef?.contentHash === plan.predecessor.contentHash && readOutputRef?.sourceDigest === plan.predecessor.sourceDigest)).toBe(true)
+      const predecessorReadOrder = await pool!.query<{
+        toolCallId: string; itemType: string; eventType: string; sequence: string;
+      }>(`SELECT item."content"->>'toolCallId' AS "toolCallId", item."type" AS "itemType",
+                 event."type" AS "eventType", event."sequence"::text AS "sequence"
+          FROM "agent_items" AS item JOIN "agent_events" AS event ON event."itemId" = item."id"
+            AND event."sessionId" = item."sessionId" AND event."turnId" = item."turnId" AND event."taskId" = item."taskId"
+          WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+            AND item."content"->>'toolCallId' = ANY($4::text[])
+            AND ((item."type" = 'tool_result' AND event."type" = 'item.completed')
+              OR (item."type" = 'tool_call' AND event."type" = 'tool_call.started'))`,
+        [value.sessionId, value.turnId, plan.correctionWriter.id, [plan.correctionReadCallId, plan.correctionDraftCallId]])
+      const predecessorReadCompletedSequence = predecessorReadOrder.rows.find(row =>
+        row.toolCallId === plan.correctionReadCallId && row.itemType === "tool_result" && row.eventType === "item.completed")?.sequence
+      const correctionDraftStartedSequence = predecessorReadOrder.rows.find(row =>
+        row.toolCallId === plan.correctionDraftCallId && row.itemType === "tool_call" && row.eventType === "tool_call.started")?.sequence
+      expect(Boolean(predecessorReadCompletedSequence && correctionDraftStartedSequence
+        && BigInt(predecessorReadCompletedSequence) < BigInt(correctionDraftStartedSequence))).toBe(true)
+
+      const draftStepBoundary = await pool!.query<{
+        stepStatus: string; stepCompletedEvent: boolean; unsettledModel: boolean; unsettledToolCall: boolean;
+      }>(`SELECT step."status" AS "stepStatus",
+          EXISTS (SELECT 1 FROM "agent_events" AS completed
+            WHERE completed."sessionId" = step."sessionId" AND completed."turnId" = step."turnId" AND completed."taskId" = step."taskId"
+              AND completed."type" = 'step.completed' AND completed."correlationId" = step."id") AS "stepCompletedEvent",
+          EXISTS (SELECT 1 FROM "agent_events" AS started
+            WHERE started."sessionId" = step."sessionId" AND started."turnId" = step."turnId" AND started."taskId" = step."taskId"
+              AND started."type" = 'model.started' AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled
+                WHERE settled."sessionId" = started."sessionId" AND settled."turnId" = started."turnId" AND settled."taskId" = started."taskId"
+                  AND settled."correlationId" = started."correlationId" AND settled."type" IN ('model.completed', 'model.failed'))) AS "unsettledModel",
+          EXISTS (SELECT 1 FROM "agent_events" AS started
+            WHERE started."sessionId" = step."sessionId" AND started."turnId" = step."turnId" AND started."taskId" = step."taskId"
+              AND started."type" = 'tool_call.started' AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled
+                WHERE settled."sessionId" = started."sessionId" AND settled."turnId" = started."turnId" AND settled."taskId" = started."taskId"
+                  AND settled."correlationId" = started."correlationId"
+                  AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))) AS "unsettledToolCall"
+         FROM "agent_steps" AS step WHERE step."sessionId" = $1 AND step."turnId" = $2 AND step."taskId" = $3
+           AND step."id" = $4`, [value.sessionId, value.turnId, plan.correctionWriter.id, call?.stepId])
+      expect(draftStepBoundary.rows).toEqual([{ stepStatus: "completed", stepCompletedEvent: true, unsettledModel: false, unsettledToolCall: false }])
+
+      const firstPid = workerOne.pid
+      if (firstPid === undefined) throw new Error("Correction Writer first Worker has no process ID")
+      noteFixtureSigkillSubagentJob(workerOne, plan.queueName, plan.correctionWriter.id)
+      const firstExit = waitForProcessExit(workerOne)
+      expect(workerOne.kill("SIGKILL")).toBe(true)
+      await firstExit
+      expect(workerOne.signalCode).toBe("SIGKILL")
+      expect(processFixtureExited(workerOne)).toBe(true)
+
+      const expiryDeadline = Date.now() + 12_000
+      let leaseExpired = false
+      while (Date.now() < expiryDeadline) {
+        const lease = await pool!.query<{ status: string; leaseExpiresAt: Date | null }>(
+          `SELECT "status", "leaseExpiresAt" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+          [plan.correctionWriter.id, value.sessionId])
+        if (lease.rows[0]?.status !== "running") throw new Error("Correction Writer left running before lease expiry")
+        if (lease.rows[0]?.leaseExpiresAt && lease.rows[0]!.leaseExpiresAt!.getTime() <= Date.now()) {
+          leaseExpired = true
+          break
+        }
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      expect(leaseExpired).toBe(true)
+      const abandonedBullJob = await queue.getJob(dispatchJobId)
+      expect(abandonedBullJob?.id).toBe(dispatchJobId)
+      expect(await abandonedBullJob?.getState()).toBe("active")
+      const recovered = await recoverExpiredSubagentTasks(pool!, {
+        now: new Date(), limit: 10, sessionId: value.sessionId, turnId: value.turnId,
+      })
+      expect(recovered.map(task => task.id)).toEqual([plan.correctionWriter.id])
+      expect(recovered[0]).toMatchObject({ status: "queued", attemptCount: 1, leaseOwner: null })
+      const nextAttemptAt = recovered[0]?.nextAttemptAt
+      expect(nextAttemptAt).toBeInstanceOf(Date)
+      while (nextAttemptAt instanceof Date && Date.now() < nextAttemptAt.getTime()) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(50, nextAttemptAt.getTime() - Date.now())))
+      }
+      const queuedAfterRecovery = await plan.store.get(plan.correctionWriter.id, value.sessionId)
+      expect(queuedAfterRecovery).toMatchObject({ status: "queued", attemptCount: 1, leaseOwner: null })
+
+      expect(await dispatchPendingSubagentOutbox(pool!, queue, 10, value.sessionId)).toBe(1)
+      const republishedDispatch = await pool!.query<{ attemptCount: number; publishedAt: Date | null; payload: unknown }>(
+        `SELECT "attemptCount", "publishedAt", "payload" FROM "agent_outbox"
+         WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, `subagent-dispatch:${plan.correctionWriter.id}`])
+      expect(republishedDispatch.rows).toHaveLength(1)
+      expect(republishedDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      const republishedPayload = parseSubagentJobPayload(republishedDispatch.rows[0]?.payload)
+      expect(republishedPayload).toEqual(dispatchPayload)
+      expect(republishedPayload).toMatchObject({ taskId: plan.correctionWriter.id, sessionId: value.sessionId,
+        rootTaskId: plan.rootTaskId, ownerId: dispatchOwnerId })
+      const republishedGeneration = (republishedDispatch.rows[0]?.attemptCount ?? 0) - 1
+      expect(republishedGeneration).toBeGreaterThan(0)
+      const republishedJobId = subagentDispatchJobId(plan.correctionWriter.id, republishedGeneration)
+      expect(republishedJobId).not.toBe(dispatchJobId)
+      const republishedBullJob = await queue.getJob(republishedJobId)
+      expect(republishedBullJob).toMatchObject({ id: republishedJobId, name: "subagent",
+        data: { taskId: plan.correctionWriter.id, sessionId: value.sessionId, rootTaskId: plan.rootTaskId, ownerId: dispatchOwnerId } })
+
+      const resumeSelectedJob = {
+        correctionWriterMode: true,
+        queueName: plan.queueName,
+        userId: value.userId,
+        sessionId: value.sessionId,
+        turnId: value.turnId,
+        rootTaskId: plan.rootTaskId,
+        jobId: plan.jobId,
+        writerTaskId: plan.correctionWriter.id,
+        correctionWriterTaskId: plan.correctionWriter.id,
+        correctionDraftCallId: plan.correctionDraftCallId,
+        expectedVersion: 2,
+        expectedArtifactId: plan.expectedArtifactId,
+        sourceDigest: plan.sourceDigest,
+      }
+      workerTwo = startTaskGraphRestartWorker("correction-writer-worker-two", { ...value, selectedJob: resumeSelectedJob })
+      expect(workerTwo.pid).not.toBe(firstPid)
+      await waitForProcessLine(workerTwo, `P3_SELECTED_JOB_QUEUE_READY ${plan.queueName}`)
+      await waitForProcessLine(workerTwo, "P3_CORRECTION_WRITER_RESTART_READY worker_two")
+      const secondDelivery = await waitForProcessLine(workerTwo,
+        `P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} ${republishedGeneration} `, 30_000)
+      expect(secondDelivery).toBe(`P3_CORRECTION_WRITER_BULL_DELIVERY ${plan.correctionWriter.id} ${republishedGeneration} ${workerTwo.pid}`)
+      const settledLine = await waitForProcessLine(workerTwo,
+        `P3_CORRECTION_WRITER_SETTLED ${plan.correctionWriter.id} ${republishedGeneration} `, 30_000)
+      const settlement = correctionWriterSettlement(settledLine, plan.correctionWriter.id, republishedGeneration)
+      expect(settlement).toMatchObject({ role: "writer", attemptCount: 2, managerStatus: "completed", childStatus: "completed",
+        ownerId: dispatchOwnerId, observations: { reviewFeedbackIncluded: true, draftReceiptReplayed: true } })
+      const resumedRef = selectedJobArtifactReference(settlement.artifactRef)
+      expect(resumedRef).toEqual(committedRef)
+
+      const completedTask = await plan.store.get(plan.correctionWriter.id, value.sessionId)
+      const completedEnvelope = record(completedTask?.result)
+      const completedStructured = record(completedEnvelope?.structuredResult)
+      expect(completedTask).toMatchObject({ status: "completed", attemptCount: 2 })
+      expect(completedStructured?.artifactRef).toEqual(committedRef)
+      const versions = await pool!.query<{ version: number; taskId: string; toolCallId: string; previousHash: string | null }>(
+        `SELECT "version", "taskId", "toolCallId", "previousHash" FROM "agent_artifact_version"
+         WHERE "artifactId" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "jobId" = $4 ORDER BY "version"`,
+        [plan.expectedArtifactId, value.userId, value.sessionId, plan.jobId])
+      expect(versions.rows).toEqual([
+        expect.objectContaining({ version: 1, toolCallId: expect.any(String) }),
+        { version: 2, taskId: plan.correctionWriter.id, toolCallId: plan.correctionDraftCallId, previousHash: plan.predecessor.contentHash },
+      ])
+      const exactTaskVersionCount = await pool!.query<{ count: number }>(
+        `SELECT COUNT(*)::int AS "count" FROM "agent_artifact_version" WHERE "taskId" = $1`, [plan.correctionWriter.id])
+      expect(exactTaskVersionCount.rows[0]?.count).toBe(1)
+      const replayedReceiptCount = await pool!.query<{ count: number }>(
+        `SELECT COUNT(*)::int AS "count" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+           AND "content"->>'toolCallId' = $4 AND "type" IN ('tool_call', 'tool_result')`,
+        [value.sessionId, value.turnId, plan.correctionWriter.id, plan.correctionDraftCallId])
+      expect(replayedReceiptCount.rows[0]?.count).toBe(2)
+      const completedBullJob = await queue.getJob(republishedJobId)
+      expect(completedBullJob?.id).toBe(republishedJobId)
+      expect(completedBullJob?.data).toMatchObject({ taskId: plan.correctionWriter.id, sessionId: value.sessionId,
+        rootTaskId: plan.rootTaskId, ownerId: dispatchOwnerId })
+      const completionDeadline = Date.now() + 5_000
+      while (await completedBullJob?.getState() !== "completed" && Date.now() < completionDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      expect(await completedBullJob?.getState()).toBe("completed")
+      const finalDispatch = await pool!.query<{ attemptCount: number; publishedAt: Date | null; payload: unknown }>(
+        `SELECT "attemptCount", "publishedAt", "payload" FROM "agent_outbox"
+         WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, `subagent-dispatch:${plan.correctionWriter.id}`])
+      expect(finalDispatch.rows).toHaveLength(1)
+      expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: republishedGeneration + 1, publishedAt: expect.any(Date) })
+      expect(parseSubagentJobPayload(finalDispatch.rows[0]?.payload)).toEqual(dispatchPayload)
+      success = true
+    } finally {
+      if (workerOne && !processFixtureExited(workerOne)) {
+        noteFixtureSigkillSubagentJob(workerOne, plan.queueName, plan.correctionWriter.id)
+        await killProcessFixture(workerOne)
+      }
+      if (workerTwo && !processFixtureExited(workerTwo)) {
+        if (success) await stopProcessFixture(workerTwo)
+        else {
+          noteFixtureSigkillSubagentJob(workerTwo, plan.queueName, plan.correctionWriter.id)
+          await killProcessFixture(workerTwo)
+        }
+      }
+      await queue.close()
+    }
   }, 90_000)
 
   it("restores the TaskGraph after a real Worker restart and completes a follow-up plan", async () => {
