@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { AgentExecutionCancelledError, refreshAgentExecutionAttempt } from "../execution-control"
+import { readRootOutputTokenBudgetSnapshot } from "../control-plane/root-output-token-budget"
 
 export type V2TurnSource = "user" | "automation" | "system"
 
@@ -149,7 +150,7 @@ export async function ensureV2TurnInTransaction(
       startedAt,
       modelProfileSnapshot: {},
       toolPolicySnapshot: {},
-      budgetSnapshot: {},
+      budgetSnapshot: readRootOutputTokenBudgetSnapshot(),
     },
     select: { id: true },
   })

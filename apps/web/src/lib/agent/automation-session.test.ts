@@ -102,6 +102,21 @@ describe("ensureAutomationTurn", () => {
     }))
   })
 
+  it("persists the optional server-owned budget on a new automation Turn", async () => {
+    const previous = process.env.AGENT_ROOT_MAX_OUTPUT_TOKENS
+    process.env.AGENT_ROOT_MAX_OUTPUT_TOKENS = "24"
+    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({ id: "turn_budget" }) } }
+    try {
+      await ensureAutomationTurn(db, runInput("manual"))
+      expect(db.agentTurn.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ budgetSnapshot: { limits: { maxOutputTokens: 24 } } }),
+      }))
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_ROOT_MAX_OUTPUT_TOKENS
+      else process.env.AGENT_ROOT_MAX_OUTPUT_TOKENS = previous
+    }
+  })
+
   it("stores a validated versioned snapshot only on a newly created scheduled Turn", async () => {
     const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({ id: "turn_scheduled" }) } }
 

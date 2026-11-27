@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { ensureV2Turn } from "./v2-turn"
 import { AgentExecutionCancelledError } from "../execution-control"
@@ -66,6 +66,8 @@ const input = {
 }
 
 describe("ensureV2Turn", () => {
+  afterEach(() => vi.unstubAllEnvs())
+
   it("locks the open session before reusing the active root Turn", async () => {
     const { db, tx } = mockDb({ activeTurn: { id: "turn_active" } })
 
@@ -108,6 +110,26 @@ describe("ensureV2Turn", () => {
       }),
       select: { id: true },
     })
+  })
+
+  it("persists the optional server-owned budget on a new V2 Turn", async () => {
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", "48")
+    const { db, tx } = mockDb()
+
+    await ensureV2Turn(db as never, input)
+
+    expect(tx.agentTurn.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ budgetSnapshot: { limits: { maxOutputTokens: 48 } } }),
+    }))
+  })
+
+  it("rejects an invalid server budget before creating a V2 Turn", async () => {
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", "48.5")
+    const { db, tx } = mockDb()
+
+    await expect(ensureV2Turn(db as never, input))
+      .rejects.toMatchObject({ code: "root_output_token_budget_configuration_invalid" })
+    expect(tx.agentTurn.create).not.toHaveBeenCalled()
   })
 
   it("does not create a replacement Turn when Stop cancelled the execution first", async () => {

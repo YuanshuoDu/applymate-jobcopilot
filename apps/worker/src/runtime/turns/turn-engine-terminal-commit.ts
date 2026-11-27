@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
+import { parseRootOutputTokenBudget, ROOT_OUTPUT_TOKEN_BUDGET_ENV } from "@jobcopilot/shared/root-output-token-budget"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertSessionTerminalAdmission, revokeSessionTerminalAdmissionsForClient, type SessionTerminalAdmission } from "../session-gate.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
@@ -42,7 +43,8 @@ function discoveryIntent(turnInput: unknown): { kind: "interactive_discovery_sho
   return { kind: "interactive_discovery_shortlist", version: 1 }
 }
 
-async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, source: unknown, turnInput: unknown, row: Row, now: Date): Promise<void> {
+async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, source: unknown, turnInput: unknown, row: Row,
+  budgetSnapshot: ReturnType<typeof parseRootOutputTokenBudget>, now: Date): Promise<void> {
   const content = row.content
   const clientMessageId = row.clientMessageId
   if (!Array.isArray(content) || typeof clientMessageId !== "string" || !clientMessageId.trim() || typeof source !== "string" || !source.trim()) throw conflict("follow-up root input")
@@ -55,8 +57,8 @@ async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, s
   const intent = discoveryIntent(turnInput)
   const root = { goal: text || "Process the provided content", content, clientMessageId, ...(intent ? { intent } : {}) }
   await client.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
-    VALUES ($1, $2, $3, 'queued', $4, $5::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6)`,
-  [successorId, owner.sessionId, owner.userId, source, json(root), now])
+    VALUES ($1, $2, $3, 'queued', $4, $5::jsonb, '{}'::jsonb, '{}'::jsonb, $6::jsonb, $7)`,
+  [successorId, owner.sessionId, owner.userId, source, json(root), json(budgetSnapshot), now])
   const moved = await client.query(`UPDATE "agent_inputs" SET "targetTurnId" = $1
     WHERE "id" = $2 AND "sessionId" = $3 AND "userId" = $4 AND "targetTurnId" IS NOT DISTINCT FROM $5
       AND "delivery" = 'follow_up' AND "status" IN ('accepted', 'queued') AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL`,
@@ -186,6 +188,9 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" IS NOT NULL AND "delivery" = 'follow_up'
         AND "status" IN ('accepted', 'queued') AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL
       ORDER BY "acceptedSequence" ASC, "id" ASC LIMIT 1 FOR UPDATE`, [owner.sessionId, owner.userId])).rows[0]
+    const pendingFollowUpBudget = pendingFollowUp
+      ? parseRootOutputTokenBudget(process.env[ROOT_OUTPUT_TOKEN_BUDGET_ENV])
+      : undefined
     const prior = await client.query<Row>(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3 FOR UPDATE`,
       [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-completed:${input.stepId}`])
     if (!prior.rows[0]) throw conflict(`completed step event ${input.stepId}`)
@@ -236,7 +241,9 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
           AND "leaseOwnerId" = $10 AND "leaseVersion" = $11 AND "leaseExpiresAt" > ${finalizationGuard ? "clock_timestamp()" : "$5"}`,
       [input.response, input.usage.inputTokens, input.usage.outputTokens, input.usage.estimatedCostUsd, input.now, owner.turnId, owner.sessionId, owner.userId, owner.taskId, owner.ownerId, owner.leaseVersion])
       if (updatedTurn.rowCount !== 1) throw conflict(`turn ${owner.turnId} completion`)
-      if (pendingFollowUp) await promoteFollowUp(client, owner, turnRow.source, turnRow.input, pendingFollowUp, input.now)
+      if (pendingFollowUp && pendingFollowUpBudget) {
+        await promoteFollowUp(client, owner, turnRow.source, turnRow.input, pendingFollowUp, pendingFollowUpBudget, input.now)
+      }
     }
     const terminalEvent = saved[saved.length - 1]
     if (!terminalEvent || terminalEvent.type !== "turn.completed" || !(await updateRootObjectiveHistoryProjection(client,

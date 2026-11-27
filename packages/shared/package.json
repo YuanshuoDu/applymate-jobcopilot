@@ -26,6 +26,10 @@
       "types": "./dist/feature-flags.d.ts",
       "default": "./dist/feature-flags.js"
     },
+    "./root-output-token-budget": {
+      "types": "./dist/root-output-token-budget.d.ts",
+      "default": "./dist/root-output-token-budget.js"
+    },
     "./safe-ai-endpoint": {
       "types": "./dist/safe-ai-endpoint.d.ts",
       "default": "./dist/safe-ai-endpoint.js"

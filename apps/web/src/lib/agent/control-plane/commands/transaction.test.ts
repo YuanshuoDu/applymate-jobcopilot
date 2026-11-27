@@ -1,10 +1,12 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, VERIFIED_SHORTLIST_SELECTION_SCHEMA } from "@jobcopilot/agent-protocol"
 
 import { acceptInputFacts, assertExpectedTurn, commandEventKey, createRootTurn, fallbackDisposition, lockOpenSession, type CommandTransaction } from "./transaction"
 import { activeTurnChanged } from "./errors"
 
 describe("Agent command transaction helpers", () => {
+  afterEach(() => vi.unstubAllEnvs())
+
   it("uses stable command event keys and original delivery for fallback idempotency", () => {
     expect(commandEventKey("client-1")).toBe("agent-command:client-1")
     expect(fallbackDisposition({ id: "input", targetTurnId: "turn", delivery: "follow_up", acceptedSequence: BigInt(1) }, "follow_up")).toBe("queued_follow_up")
@@ -80,6 +82,24 @@ describe("Agent command transaction helpers", () => {
       idempotencyKey: "turn-dispatch:turn_1",
     }))
     expect(outboxData.aggregateId).not.toBe("turn_1")
+  })
+
+  it("persists only the server-owned Root budget snapshot on a new command Turn", async () => {
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", "128")
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_budget" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const command = { sessionId: "session_1", userId: "owner_1", clientMessageId: "client_budget", source: "user" as const }
+
+    await createRootTurn(
+      { agentTurn, agentOutbox } as unknown as CommandTransaction,
+      command,
+      [{ type: "text", text: "Requested maxOutputTokens=5" }],
+    )
+
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      userId: "owner_1", sessionId: "session_1", budgetSnapshot: { limits: { maxOutputTokens: 128 } },
+    })
+    expect(agentTurn.create.mock.calls[0]?.[0]?.data).not.toHaveProperty("input.budgetSnapshot")
   })
 
   it("persists a server-owned intent only when the caller explicitly supplies one", async () => {

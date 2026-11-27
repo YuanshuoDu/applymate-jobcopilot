@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
@@ -27,6 +27,7 @@ beforeEach(() => {
   updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true)
   terminalSteeringReadMock.mockReset().mockResolvedValue({ unresolvedInputs: [] })
 })
+afterEach(() => vi.unstubAllEnvs())
 
 const now = new Date("2026-09-25T10:00:00.000Z")
 const owner = {
@@ -120,8 +121,8 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
         return { rows: found.slice(0, 1), rowCount: Math.min(found.length, 1) }
       }
       if (sql.includes('INSERT INTO "agent_turns"')) {
-        const [id, sessionId, userId, source, value, updatedAt] = values ?? []
-        successors.set(String(id), { id, sessionId, userId, source, status: "queued", input: JSON.parse(String(value)), updatedAt })
+        const [id, sessionId, userId, source, value, budgetSnapshot, updatedAt] = values ?? []
+        successors.set(String(id), { id, sessionId, userId, source, status: "queued", input: JSON.parse(String(value)), budgetSnapshot: JSON.parse(String(budgetSnapshot)), updatedAt })
         return { rows: [{ id }], rowCount: 1 }
       }
       if (sql.includes('UPDATE "agent_inputs"')) {
@@ -268,6 +269,7 @@ describe("atomic Turn terminal commit", () => {
   })
 
   it("completes the Turn and promotes only the oldest pending session follow-up atomically", async () => {
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", "80")
     const fake = makePool([
       { id: "later", sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId, acceptedSequence: 8 },
       { id: "first", sessionId: owner.sessionId, userId: owner.userId, turnId: "older-turn", acceptedSequence: 4, clientMessageId: "message-first", content: [{ type: "text", text: "First request" }] },
@@ -302,7 +304,9 @@ describe("atomic Turn terminal commit", () => {
     const successorInsert = fake.calls.find(({ sql }) => sql.includes('INSERT INTO "agent_turns"'))
     expect(fake.successors.size).toBe(1)
     expect(successorInsert?.sql).toContain('"updatedAt"')
-    expect(successorInsert?.values?.[5]).toBe(input.now)
+    expect(successorInsert?.values?.[5]).toBe(JSON.stringify({ limits: { maxOutputTokens: 80 } }))
+    expect(successorInsert?.values?.[6]).toBe(input.now)
+    expect(successor?.budgetSnapshot).toEqual({ limits: { maxOutputTokens: 80 } })
     expect(successor?.updatedAt).toEqual(input.now)
     expect(successor?.updatedAt).toBeInstanceOf(Date)
     expect(successor).toMatchObject({ status: "queued", sessionId: owner.sessionId, userId: owner.userId, source: "user", input: { goal: "First request", clientMessageId: "message-first" } })
@@ -318,6 +322,28 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.calls.filter(({ sql }) => sql.includes('INSERT INTO "agent_turns"'))).toHaveLength(1)
     expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "agent_inputs"'))).toHaveLength(1)
     expect(fake.calls.some(({ sql }) => /(?:UPDATE|DELETE) "(?:agent_items|agent_events)"/.test(sql))).toBe(false)
+  })
+
+  it("rejects an invalid Worker setting before any terminal or successor writes when a follow-up will execute", async () => {
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", "80.5")
+    const fake = makePool([{ id: "follow-up", sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId }])
+
+    await expect(commitTurnTerminal(fake.pool, input))
+      .rejects.toMatchObject({ code: "root_output_token_budget_configuration_invalid" })
+
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+    expect(fake.calls.some(({ sql }) => sql === "COMMIT")).toBe(false)
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox|turns)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.successors.size).toBe(0)
+    expect(fake.followUps[0]?.targetTurnId).toBe(owner.turnId)
+  })
+
+  it("does not consult the optional Worker setting when no successor Turn is being created", async () => {
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", "invalid")
+    const fake = makePool()
+
+    await expect(commitTurnTerminal(fake.pool, input)).resolves.toMatchObject({ status: "completed" })
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_turns"/.test(sql))).toBe(false)
   })
 
   it("terminalizes an exact uncertain Fill Turn after its derived Session wait and preserves queued follow-up replay", async () => {
