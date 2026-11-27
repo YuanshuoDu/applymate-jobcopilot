@@ -17,7 +17,7 @@ function failedSummary(taskId = "task-a", role = "scout") {
   return reduceTaskGraphFinalSummary({ graphRevision, nodes: [{ kind: "business", taskId, role, taskStatus: "failed" }] })
 }
 
-function member(taskId = "task-a", overrides: Partial<TaskGraphFinalSummaryMember> = {}): TaskGraphFinalSummaryMember {
+function member(taskId = "task-a", overrides: Partial<Exclude<TaskGraphFinalSummaryMember, { kind: "retired" }>> = {}): TaskGraphFinalSummaryMember {
   return { nodeIndex: 0, nodeKey: "node-a", templateId: "scout", taskId, role: "scout", taskType: "scout", taskStatus: "failed", kind: "business", ...overrides }
 }
 

@@ -91,7 +91,7 @@ export type TurnEngineStore = {
   updateStep(input: {
     owner: ExecutionOwnerFence
     stepId: string
-    status: "completed" | "failed" | "interrupted" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user"
+    status: "streaming" | "completed" | "failed" | "interrupted" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user"
     finishReason: string | null
     errorCode: string | null
     inputTokens: number
@@ -213,6 +213,8 @@ export type TurnResumeState = {
   readonly consumedInputIds: readonly string[]
   /** Latest validated same-Turn agenda receipt; private recovery input, never model context. */
   readonly cognitiveAgendaReceipt?: CognitiveAgendaReceipt
+  /** Root-only server receipt; retryPending survives until the correction model attempt starts. */
+  readonly planSchemaRepair?: Readonly<{ sourceStepId: string; sourceStepOrdinal: number; retryPending: boolean }>
   readonly usage: {
     readonly inputTokens: number
     readonly outputTokens: number

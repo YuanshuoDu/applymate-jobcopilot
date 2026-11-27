@@ -3,6 +3,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/lib/i18n'
+import type { SessionPauseBlocker } from './session-pause-blocker-projection'
 
 export type AgentSessionControlStatus = 'running' | 'pausing' | 'paused' | 'resuming'
 export type AgentSessionControlAction = 'pause' | 'resume'
@@ -26,8 +27,40 @@ export interface AgentSessionPauseResumeControlProps {
   readonly sessionId: string
   readonly sessionStatus: AgentSessionControlStatus | null
   readonly activeTurn: AgentSessionControlTurn | null
+  readonly pauseBlocker?: SessionPauseBlocker | null
   readonly onPause: (command: AgentSessionControlCommand) => Promise<void>
   readonly onResume: (command: AgentSessionControlCommand) => Promise<void>
+}
+
+const PAUSE_BLOCKER_COPY = {
+  en: {
+    label: 'Pause is waiting on',
+    step: 'A step still needs to settle.',
+    external_operation: 'An external operation is still active.',
+    child_task: 'A child task is still active.',
+    recovery: 'Waiting for the agent to confirm its state.',
+  },
+  zh: {
+    label: '暂停仍在等待',
+    step: '仍有步骤需要完成。',
+    external_operation: '外部操作仍在进行。',
+    child_task: '子任务仍在运行。',
+    recovery: '正在等待 Agent 确认当前状态。',
+  },
+} as const
+
+function visiblePauseBlockerLabels(
+  sessionStatus: AgentSessionControlStatus | null,
+  activeTurnId: string | null,
+  blocker: SessionPauseBlocker | null | undefined,
+  lang: string,
+): readonly string[] {
+  if (sessionStatus !== 'pausing' || !activeTurnId || blocker?.turnId !== activeTurnId) return []
+  const copy = lang === 'zh' ? PAUSE_BLOCKER_COPY.zh : PAUSE_BLOCKER_COPY.en
+  return [...new Set(blocker.reasons)].flatMap(reason => {
+    const label = copy[reason]
+    return typeof label === 'string' ? [label] : []
+  })
 }
 
 export function parseAgentSessionControlStatus(value: unknown): AgentSessionControlStatus | null {
@@ -114,8 +147,8 @@ function isAcceptedControl(value: unknown, sessionId: string, turnId: string, ac
     && (row.disposition === 'requested' || row.disposition === 'duplicate')
 }
 
-export function AgentSessionPauseResumeControl({ sessionId, sessionStatus, activeTurn, onPause, onResume }: AgentSessionPauseResumeControlProps) {
-  const { t } = useI18n()
+export function AgentSessionPauseResumeControl({ sessionId, sessionStatus, activeTurn, pauseBlocker, onPause, onResume }: AgentSessionPauseResumeControlProps) {
+  const { t, lang } = useI18n()
   const [pendingRequest, setPendingRequest] = useState<{ key: string; token: number } | null>(null)
   const [errorKey, setErrorKey] = useState<string | null>(null)
   const messageRef = useRef<{ key: string; id: string } | null>(null)
@@ -136,6 +169,7 @@ export function AgentSessionPauseResumeControl({ sessionId, sessionStatus, activ
   const statusLabel = sessionStatus === 'running' ? t('agent.running')
     : sessionStatus === 'paused' ? t('agent.paused')
       : sessionStatus === 'pausing' ? `${t('agent.pause')}…` : `${t('agent.resume')}…`
+  const pauseBlockerLabels = visiblePauseBlockerLabels(sessionStatus, activeTurn.id, pauseBlocker, lang)
 
   const requestControl = () => {
     if (!action || pending || pendingTokenRef.current !== null) return
@@ -158,7 +192,12 @@ export function AgentSessionPauseResumeControl({ sessionId, sessionStatus, activ
 
   return (
     <section aria-label="Session controls" data-agent-session-control="true" style={panelStyle}>
-      <div role="status" aria-live="polite" data-agent-session-durable-status={sessionStatus}>{statusLabel}</div>
+      <div role="status" aria-live="polite" data-agent-session-durable-status={sessionStatus}>
+        {statusLabel}
+        {pauseBlockerLabels.length > 0 && <ul aria-label={lang === 'zh' ? PAUSE_BLOCKER_COPY.zh.label : PAUSE_BLOCKER_COPY.en.label} data-agent-session-pause-blockers="true" style={pauseBlockerStyle}>
+          {pauseBlockerLabels.map(label => <li key={label}>{label}</li>)}
+        </ul>}
+      </div>
       {action && <button type="button" onClick={requestControl} disabled={pending} aria-busy={pending} style={buttonStyle}>
         {pending ? 'Sending…' : t(action === 'pause' ? 'agent.pause' : 'agent.resume')}
       </button>}
@@ -168,5 +207,6 @@ export function AgentSessionPauseResumeControl({ sessionId, sessionStatus, activ
 }
 
 const panelStyle: React.CSSProperties = { display: 'grid', gap: 6, padding: '8px 12px', borderBottom: '1px solid var(--border)' }
+const pauseBlockerStyle: React.CSSProperties = { margin: 0, paddingLeft: 18, color: 'var(--text-muted)', fontSize: 11 }
 const buttonStyle: React.CSSProperties = { justifySelf: 'start', border: '1px solid var(--border)', borderRadius: 7, padding: '7px 10px', color: 'var(--text)', background: 'var(--bg-secondary)', cursor: 'pointer', font: 'inherit', fontSize: 11, fontWeight: 600 }
 const errorStyle: React.CSSProperties = { margin: 0, color: 'var(--c-danger)', fontSize: 11 }

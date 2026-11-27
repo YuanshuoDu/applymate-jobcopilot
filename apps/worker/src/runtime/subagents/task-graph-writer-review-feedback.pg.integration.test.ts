@@ -5,7 +5,7 @@ import { Pool, type PoolClient } from "pg"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { PgArtifactToolStore } from "../tools/artifact-store-pg.js"
-import type { ArtifactToolRevisionContext, ArtifactToolScope, ArtifactVersionRef } from "../tools/artifact-tools.js"
+import type { ArtifactToolDraftInput, ArtifactToolRevisionContext, ArtifactToolScope, ArtifactVersionRef } from "../tools/artifact-tools.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient } from "./selected-job-artifact-context.js"
 
 const CI_DATABASE = "applymate_agent_brain_ci"
@@ -143,6 +143,63 @@ async function createFixture(): Promise<Fixture> {
   }
 }
 
+type CorrectionDraftReceiptFixture = Readonly<{
+  readonly callId: string
+  readonly input: ArtifactToolDraftInput
+  readonly version: Awaited<ReturnType<PgArtifactToolStore["writeDraft"]>>
+  readonly artifactRef: ArtifactVersionRef
+}>
+
+async function createCorrectionDraftReceipt(fixture: Fixture, options: {
+  readonly result?: "completed" | "failed" | "missing"
+  readonly wrongOutput?: boolean
+} = {}): Promise<CorrectionDraftReceiptFixture> {
+  const callId = `correction-draft-${randomUUID()}`
+  const input = {
+    baseArtifactId: fixture.baseId,
+    baseHash: fixture.baseHash,
+    content: "Corrected draft after exact review feedback",
+    constraints: {},
+    expectedPreviousVersion: fixture.artifactRef.version,
+    expectedPreviousHash: fixture.artifactRef.contentHash,
+  }
+  const scope = { ...fixture.scope, toolCallId: callId }
+  const version = await store!.writeDraft(scope, { ...input, requestHash: hashArtifactContent({ callId, input }) })
+  const artifactRef: ArtifactVersionRef = {
+    artifactId: version.artifactId, version: version.version, contentHash: version.contentHash, sourceDigest: version.sourceDigest,
+  }
+  const persistedInput = {
+    baseArtifactId: input.baseArtifactId, baseHash: input.baseHash,
+  }
+  const stepId = `task:${fixture.writerTaskId}:step:0:attempt:1`
+  const callItemId = `task:${fixture.writerTaskId}:item:tool-call:${callId}:attempt:1`
+  const resultItemId = `task:${fixture.writerTaskId}:item:tool-result:${callId}:attempt:1`
+  await testPool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status")
+    VALUES ($1, $2, $3, $4, 0, 1, 'completed')`, [stepId, fixture.sessionId, fixture.turnId, fixture.writerTaskId])
+  await testPool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', NULL, 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+    callItemId, fixture.sessionId, fixture.turnId, stepId, fixture.writerTaskId,
+    JSON.stringify({ toolCallId: callId, toolName: "cover_letter.draft", toolVersion: "1", status: "completed", errorCode: null, input: persistedInput }),
+  ])
+  if (options.result !== "missing") {
+    const output = options.wrongOutput ? { artifactRef: { ...artifactRef, version: artifactRef.version + 1 } } : { artifactRef }
+    await testPool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, $5, 'tool_result', $6, NULL, 1, $7::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+      resultItemId, fixture.sessionId, fixture.turnId, stepId, fixture.writerTaskId,
+      options.result === "failed" ? "failed" : "completed",
+      JSON.stringify({ toolCallId: callId, output: options.result === "failed" ? null : output, errorCode: options.result === "failed" ? "tool_execution_failed" : null }),
+    ])
+  }
+  return { callId, input, version, artifactRef }
+}
+
+async function resumeWriterFence(fixture: Fixture): Promise<ArtifactToolScope> {
+  const leaseOwner = `writer-reclaimed-${randomUUID()}`
+  await testPool!.query(`UPDATE "sub_agent_tasks" SET "leaseOwner" = $2, "attemptCount" = 2,
+      "leaseExpiresAt" = clock_timestamp() + interval '10 minutes' WHERE "id" = $1`, [fixture.writerTaskId, leaseOwner])
+  return { ...fixture.scope, toolCallId: "writer-review-feedback", taskFence: { ...fixture.writerFence, leaseOwner, attemptCount: 2 } }
+}
+
 describeWithPostgres("Writer review feedback persistence on disposable PostgreSQL", () => {
   beforeAll(async () => {
     testPool = scopedPool(admin!)
@@ -178,6 +235,15 @@ describeWithPostgres("Writer review feedback persistence on disposable PostgreSQ
         "leaseOwner" text, "leaseExpiresAt" timestamptz,
         "attemptCount" integer NOT NULL DEFAULT 1, "interruptRequestedAt" timestamptz, "context" jsonb NOT NULL,
         "absoluteDeadlineAt" TIMESTAMP(3), "leaseSegmentStartedAt" TIMESTAMP(3)
+      )`,
+      `CREATE TABLE "agent_steps" (
+        "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "taskId" text NOT NULL,
+        "ordinal" integer NOT NULL, "attempt" integer NOT NULL, "status" text NOT NULL
+      )`,
+      `CREATE TABLE "agent_items" (
+        "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "stepId" text,
+        "taskId" text, "type" text NOT NULL, "status" text NOT NULL, "phase" text, "revision" integer NOT NULL DEFAULT 0,
+        "content" jsonb NOT NULL, "startedAt" timestamptz, "completedAt" timestamptz, "updatedAt" timestamptz NOT NULL DEFAULT now()
       )`,
       `CREATE TABLE "agent_artifact" (
         "id" text PRIMARY KEY, "userId" text NOT NULL, "jobId" text NOT NULL, "artifactType" text NOT NULL,
@@ -241,6 +307,62 @@ describeWithPostgres("Writer review feedback persistence on disposable PostgreSQ
     await expect(store!.readRevisionReview(fixture.scope, fixture.revision)).resolves.toBeNull()
     await testPool!.query(`UPDATE "sub_agent_tasks" SET "leaseOwner" = $2, "attemptCount" = 2, "leaseExpiresAt" = clock_timestamp() + interval '10 minutes' WHERE "id" = $1`, [fixture.writerTaskId, `reclaimed-${randomUUID()}`])
     await expect(store!.readRevisionReview(fixture.scope, fixture.revision)).resolves.toBeNull()
+  })
+
+  it("resumes an exact committed correction draft receipt under the next Writer lease without another version", async () => {
+    const fixture = await createFixture()
+    const receipt = await createCorrectionDraftReceipt(fixture)
+    const retryScope = await resumeWriterFence(fixture)
+
+    const review = await store!.readRevisionReview(retryScope, fixture.revision)
+    expect(review).toMatchObject({
+      taskId: fixture.reviewerTaskId, reviewHash: fixture.revision.reviewHash, status: "needs_revision",
+      artifactId: fixture.artifactRef.artifactId, version: fixture.artifactRef.version,
+      contentHash: fixture.artifactRef.contentHash, sourceDigest: fixture.sourceDigest, currentSourceDigest: fixture.sourceDigest,
+    })
+    const callItem = await testPool!.query<{ input: Record<string, unknown> }>(`SELECT "content"->'input' AS "input" FROM "agent_items" WHERE "id" = $1`, [
+      `task:${fixture.writerTaskId}:item:tool-call:${receipt.callId}:attempt:1`,
+    ])
+    expect(callItem.rows[0]?.input).toEqual({
+      baseArtifactId: fixture.baseId, baseHash: fixture.baseHash,
+    })
+
+    const replayed = await store!.writeDraft({ ...retryScope, toolCallId: receipt.callId }, {
+      ...receipt.input, requestHash: hashArtifactContent({ callId: receipt.callId, input: receipt.input }),
+    })
+    expect(replayed).toMatchObject({ id: receipt.version.id, version: receipt.version.version, contentHash: receipt.version.contentHash,
+      previousHash: fixture.artifactRef.contentHash, taskId: fixture.writerTaskId, toolCallId: receipt.callId })
+    const versions = await testPool!.query<{ version: number }>(`SELECT "version" FROM "agent_artifact_version" WHERE "artifactId" = $1 ORDER BY "version"`, [receipt.artifactRef.artifactId])
+    expect(versions.rows.map(row => Number(row.version))).toEqual([1, 2])
+    const head = await store!.read(fixture.userId, receipt.artifactRef.artifactId)
+    expect(head).toMatchObject({ lifecycle: "draft", version: 2, hash: receipt.artifactRef.contentHash })
+  })
+
+  it.each([
+    ["missing tool result", { result: "missing" as const }],
+    ["failed tool result", { result: "failed" as const }],
+    ["result for a different artifact reference", { wrongOutput: true }],
+  ])("fails closed for a correction successor with %s", async (_label, options) => {
+    const fixture = await createFixture()
+    await createCorrectionDraftReceipt(fixture, options)
+    const retryScope = await resumeWriterFence(fixture)
+    await expect(store!.readRevisionReview(retryScope, fixture.revision)).resolves.toBeNull()
+  })
+
+  it("fails closed when the correction successor was recorded for another Writer task", async () => {
+    const fixture = await createFixture()
+    const receipt = await createCorrectionDraftReceipt(fixture)
+    await testPool!.query(`UPDATE "agent_artifact_version" SET "taskId" = $2 WHERE "id" = $1`, [receipt.version.id, `foreign-writer-${randomUUID()}`])
+    const retryScope = await resumeWriterFence(fixture)
+    await expect(store!.readRevisionReview(retryScope, fixture.revision)).resolves.toBeNull()
+  })
+
+  it("fails closed when selected source changes after the correction successor was committed", async () => {
+    const fixture = await createFixture()
+    await createCorrectionDraftReceipt(fixture)
+    const retryScope = await resumeWriterFence(fixture)
+    await testPool!.query(`UPDATE "Job" SET "description" = 'Changed after correction draft commit' WHERE "id" = $1`, [fixture.jobId])
+    await expect(store!.readRevisionReview(retryScope, fixture.revision)).resolves.toBeNull()
   })
 
   it("fails closed when selected sources drift after preparation and before revision receipt lookup", async () => {

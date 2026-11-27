@@ -4,7 +4,6 @@ import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 import { createWorkerUsageAuthorizer } from "../../queue/ai-usage-bridge.js"
 import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import { createWorkerToolRuntime } from "../tools/index.js"
-import { createArtifactToolStore } from "../tools/artifact-tools.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
@@ -15,7 +14,8 @@ import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
 import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
 import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.js"
-import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
+import { readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
+import { createArtifactToolStoreForChild, loadSelectedJobArtifactContextForChild } from "./scheduled-draft-writer-source.js"
 import { assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedbackFrame, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext, type TaskGraphWriterReviewDependency, type TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
@@ -124,12 +124,11 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     }
     await assertPersistedWriterReviewDependency(pool, task, lease, writerReviewDependency)
   }
-  const selectedJobArtifactContext = selectedJob
-    ? await loadSelectedJobArtifactContext(pool, task.userId, selectedJob)
-    : undefined
+  const selectedJobSource = selectedJob ? await loadSelectedJobArtifactContextForChild(pool, task.userId, selectedJob, task.role === "writer" ? lease.context : undefined) : undefined
+  const selectedJobArtifactContext = selectedJobSource?.context
   const selectedJobPreparation = selectedJobArtifactContext?.preparation
   const artifacts = selectedJobPreparation && (task.role === "writer" || task.role === "reviewer")
-    ? createArtifactToolStore(pool, readSelectedJobSourceDigestWithClient)
+    ? createArtifactToolStoreForChild(pool, readSelectedJobSourceDigestWithClient, selectedJobSource)
     : undefined
   let writerReviewRevision: WriterReviewRevision | undefined
   if (writerReviewDependency) {
