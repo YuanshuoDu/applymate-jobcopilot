@@ -7,6 +7,7 @@ const input = {
   featureKey: "agent", provider: "minimax", model: "MiniMax-M3", attemptId: "provider-attempt-1", requestedOutputTokens: 256,
 }
 const protocolInput = { ...input, startProtocolVersion: 1 as const }
+const classifiedProtocolInput = { ...protocolInput, outputBudgetClassificationVersion: 1 as const }
 
 function response(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } })
@@ -37,6 +38,119 @@ describe("Worker AI usage bridge", () => {
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: protocolInput })
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ operation: "start", input: { ...protocolInput, operationId: "agent-usage-1" } })
     expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toEqual(expect.objectContaining({ operation: "settle", input: expect.objectContaining({ operationId: "agent-usage-1", userId: "user-1", provider: "minimax", model: "MiniMax-M3" }) }))
+  })
+
+  it("does not accept an input field as classification opt-in", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null }))
+      .mockResolvedValueOnce(response({ status: "started", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null }))
+      .mockResolvedValueOnce(response({ status: "released" }))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+
+    const reservation = await authorizer({ ...input, outputBudgetClassificationVersion: 1 } as never)
+    await reservation.start()
+    await reservation.release?.()
+
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: protocolInput })
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ operation: "start", input: { ...protocolInput, operationId: "agent-usage-1" } })
+    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toEqual({ operation: "release", input: protocolInput })
+  })
+
+  it("opts in only on authorize and keeps start and release request shapes version-stable", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null, outputBudgetClassificationVersion: 1 }))
+      .mockResolvedValueOnce(response({ status: "started", startProtocolVersion: 1, outputReservationRequired: false, maxOutputTokens: null }))
+      .mockResolvedValueOnce(response({ status: "released" }))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher, outputBudgetClassificationVersion: 1 })
+
+    const reservation = await authorizer(input)
+    await reservation.start()
+    await reservation.release?.()
+
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: classifiedProtocolInput })
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ operation: "start", input: { ...protocolInput, operationId: "agent-usage-1" } })
+    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toEqual({ operation: "release", input: protocolInput })
+  })
+
+  it("accepts an older Web success response that does not echo the optional classification version", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 }))
+      .mockResolvedValueOnce(response({ status: "started", startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 }))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher, outputBudgetClassificationVersion: 1 })
+
+    const reservation = await authorizer(input)
+    await expect(reservation.start()).resolves.toBe(128)
+
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: classifiedProtocolInput })
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ operation: "start", input: { ...protocolInput, operationId: "agent-usage-1" } })
+  })
+
+  it("keeps an older Web 429 denial unclassified and does not retry or release it", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ code: "output_budget_exhausted", error: "private server detail" }, 429))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher, outputBudgetClassificationVersion: 1 })
+
+    let caught: unknown
+    try { await authorizer(input) } catch (error: unknown) { caught = error }
+    expect(caught).toBeInstanceOf(UsageBridgeError)
+    expect(caught).toMatchObject({ code: "output_budget_exhausted", retryable: false, outputBudgetDisposition: undefined })
+    expect(String(caught)).not.toContain("private server detail")
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: classifiedProtocolInput })
+  })
+
+  it("does not consume a classified response when the bridge has not opted in", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({
+      code: "output_budget_exhausted", outputBudgetClassificationVersion: 1, outputBudgetDisposition: "settled_exhausted",
+    }, 429))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+
+    let caught: unknown
+    try { await authorizer(input) } catch (error: unknown) { caught = error }
+    expect(caught).toMatchObject({ code: "output_budget_exhausted", outputBudgetDisposition: undefined })
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: protocolInput })
+  })
+
+  it.each([
+    "configured_zero_limit",
+    "settled_exhausted",
+    "active_reservation_hold",
+  ] as const)("attaches the bounded v1 disposition %s only to a matching authorize 429", async disposition => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({
+      code: "output_budget_exhausted", error: "private server detail",
+      outputBudgetClassificationVersion: 1, outputBudgetDisposition: disposition,
+    }, 429))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher, outputBudgetClassificationVersion: 1 })
+
+    let caught: unknown
+    try { await authorizer(input) } catch (error: unknown) { caught = error }
+    expect(caught).toBeInstanceOf(UsageBridgeError)
+    expect(caught).toMatchObject({ code: "output_budget_exhausted", retryable: false, outputBudgetDisposition: disposition })
+    expect(String(caught)).not.toContain("private server detail")
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { name: "unsupported version", status: 429, code: "output_budget_exhausted", version: 2, disposition: "settled_exhausted" },
+    { name: "unknown disposition", status: 429, code: "output_budget_exhausted", version: 1, disposition: "future_state" },
+    { name: "non-budget code", status: 429, code: "ai_credits_exhausted", version: 1, disposition: "settled_exhausted" },
+    { name: "non-429 status", status: 403, code: "output_budget_exhausted", version: 1, disposition: "settled_exhausted" },
+  ])("does not classify $name", async ({ status, code, version, disposition }) => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({
+      code, error: "private server detail", outputBudgetClassificationVersion: version, outputBudgetDisposition: disposition,
+    }, status))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher, outputBudgetClassificationVersion: 1 })
+
+    let caught: unknown
+    try { await authorizer(input) } catch (error: unknown) { caught = error }
+    expect(caught).toBeInstanceOf(UsageBridgeError)
+    expect(caught).toMatchObject({ outputBudgetDisposition: undefined })
+    expect(String(caught)).not.toContain("private server detail")
+    expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it("does not negotiate unsupported classification versions", () => {
+    expect(() => createWorkerUsageAuthorizer({ outputBudgetClassificationVersion: 2 as unknown as 1 })).toThrow(RangeError)
   })
 
   it("releases the identical route identity through an idempotent pre-provider operation", async () => {
