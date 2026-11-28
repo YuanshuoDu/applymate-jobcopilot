@@ -5,6 +5,7 @@ import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.
 import type { ScheduledPrepareOwner } from "../tools/scheduled-application-prepare.js"
 import { scheduledTaskGraphStableContinuationKey, type ScheduledTaskGraphContinuationBinding,
   scheduledTaskGraphContinuationKeyVersion, type ScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
+import { isCanonicalAnalyzeSourceFenceTimestamp, scheduledAnalyzeSourceFingerprintRows } from "../turns/turn-question-scheduled-source-fingerprint.js"
 
 type Row = Record<string, unknown>
 
@@ -62,15 +63,17 @@ export function scheduledPrepareCheckpointDigest(
       || !stringArray(row.missingKeywords) || typeof row.recommendation !== "string" || row.recommendation.length > 8192) return null
     const required = ["job", "score", "matchedKeywords", "missingKeywords", "recommendation"], allowed = [...required, "analysisFenceAt"]
     if (Object.keys(row).some(key => !allowed.includes(key)) || required.some(key => !Object.hasOwn(row, key))
-      || Object.hasOwn(row, "analysisFenceAt") && (typeof row.analysisFenceAt !== "string" || !Number.isFinite(Date.parse(row.analysisFenceAt)))) return null
+      || Object.hasOwn(row, "analysisFenceAt") && !isCanonicalAnalyzeSourceFenceTimestamp(row.analysisFenceAt)) return null
     seen.add(job.id); rows.push({ jobId: job.id, score: row.score, matchedKeywords: [...row.matchedKeywords],
       missingKeywords: [...row.missingKeywords], recommendation: row.recommendation,
       ...(Object.hasOwn(row, "analysisFenceAt") ? { analysisFenceAt: row.analysisFenceAt } : {}) })
   }
+  const sourceFingerprints = scheduledAnalyzeSourceFingerprintRows([...seen], state.scheduledTaskGraphAnalyzeSourceFingerprints)
+  if (!sourceFingerprints) return null
   return createHash("sha256").update(JSON.stringify({
     owner: [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount],
     snapshotDigest: receipt.snapshotDigest, evidenceDigest: receipt.evidenceDigest, analyzeGraphRevision: receipt.analyzeGraphRevision,
-    analysisFailed: state.analysisFailed, scoredJobs: rows,
+    analysisFailed: state.analysisFailed, sourceFingerprints, scoredJobs: rows,
   }), "utf8").digest("hex")
 }
 

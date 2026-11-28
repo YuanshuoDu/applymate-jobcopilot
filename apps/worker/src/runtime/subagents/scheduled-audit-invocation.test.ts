@@ -85,6 +85,7 @@ function checkpointState(nextStage: string, report?: unknown) {
   return { nextStage, scoutedJobs: [{ id: "job-1", userId: owner.userId }],
     scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 80, matchedKeywords: ["TypeScript"],
       missingKeywords: [], recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }],
+    scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) } },
     analysisFailed: 0, scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
       key: continuationKey, owner: { ...attestation.owner, executionId: owner.executionId,
         executionAttemptCount: owner.executionAttemptCount }, snapshotDigest, graphRevision: 7, evidenceDigest: evidence.evidenceDigest },

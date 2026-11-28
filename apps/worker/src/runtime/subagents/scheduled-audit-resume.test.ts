@@ -65,6 +65,7 @@ function gateContinuationFixture(options: Readonly<{ requireApproval?: boolean; 
   const executionState = { nextStage: "gate", analysisFailed: 0,
     scoutedJobs: [{ id: "job-1", userId: scope.userId }],
     scoredJobs: [{ job: { id: "job-1", userId: scope.userId }, score: 80, matchedKeywords: [], missingKeywords: [], recommendation: "Eligible" }],
+    scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) } },
     scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
       key: rawContinuationKey, owner: gateEvidenceOwner, snapshotDigest: gateSnapshotDigest, graphRevision: 4, evidenceDigest: "e".repeat(64) },
     scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: rawContinuationKey,
