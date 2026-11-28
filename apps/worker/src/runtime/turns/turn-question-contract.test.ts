@@ -75,7 +75,8 @@ describe("native user question contract", () => {
   it("reconstructs a stable wait binding from persisted Analyze evidence without a Prepare receipt", () => {
     const state = { nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: "user-1" }],
       scoredJobs: [{ job: { id: "job-1", userId: "user-1" }, score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
-        recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }], analysisFailed: 0,
+        recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }],
+      scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) } }, analysisFailed: 0,
       scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
         key: scheduledReceipt.continuationKey, owner: scheduledReceipt.owner, snapshotDigest: scheduledReceipt.snapshotDigest,
         graphRevision: scheduledReceipt.analyzeGraphRevision, evidenceDigest: scheduledReceipt.evidenceDigest } }
@@ -95,7 +96,8 @@ describe("native user question contract", () => {
       finalStepId: "step-final-9", finalStepOrdinal: 9 })
     const projection = { owner: ["user-1", "session-1", "turn-1", "root-1", 2, "execution-1", 3],
       snapshotDigest: scheduledReceipt.snapshotDigest, evidenceDigest: scheduledReceipt.evidenceDigest, analyzeGraphRevision: 7,
-      analysisFailed: 0, scoredJobs: [{ jobId: "job-1", score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
+      analysisFailed: 0, sourceFingerprints: [["job-1", "agent-harness.v2.analyze-source-input.v1", "e".repeat(64)]],
+      scoredJobs: [{ jobId: "job-1", score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
         recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }] }
     expect(evidence.checkpointDigest).toBe(createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex"))
     expect(rotatedEvidence.checkpointDigest).toBe(evidence.checkpointDigest)

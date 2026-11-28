@@ -15,7 +15,9 @@ import { gateDecisionsFromOutput, parseGateDecisions, restoreGateOutput, schedul
   scheduledTaskGraphPipelineStageOrder as stageOrder, type ScheduledTaskGraphGateDecisions } from "./scheduled-taskgraph-gate-choice-evidence"
 import type { PipelineCtx } from "./pipeline-context"
 import type { PipelineCheckpointState } from "./types"
-import { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } from "./scheduled-taskgraph-source-change-task-cleanup"
+import { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent, scheduledSourceChangeTaskClaims }
+  from "./scheduled-taskgraph-source-change-task-cleanup"
+import { isAnalyzeSourceChangedError } from "./stages/analyze-model-input"
 
 export { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity }
 export { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } from "./scheduled-taskgraph-source-change-task-cleanup"
@@ -194,11 +196,18 @@ export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraph
   }
 
   const checkpointDigest = scheduledTaskGraphAnalyzeCheckpointDigest(checkpoint)
-  const saved = checkpointDigest && checkpoint.nextStage === "prepare"
+  const saved = checkpoint.nextStage === "prepare"
     ? await saveScheduledTaskGraphCheckpoint({ expectedState, state: checkpoint, owner, key: continuationKey, claimToken,
       assertOwnerCurrent: async tx => {
-        await assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent(tx, input.context, checkpoint)
-        return scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key: continuationKey, claimToken })
+        try { await assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent(tx, input.context, checkpoint) }
+        catch (error) {
+          if (isAnalyzeSourceChangedError(error)
+            && !sourceChangeClaimsMatchCurrentCandidates(error, checkpoint, owner.userId, input.ownedJobs)) {
+            throw new AgentExecutionCancelledError()
+          }
+          throw error
+        }
+        return Boolean(checkpointDigest) && await scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key: continuationKey, claimToken })
       } }) : false
   if (!checkpointDigest || !saved) throw new AgentExecutionCancelledError()
   input.onStateChange(checkpoint)
@@ -209,6 +218,19 @@ export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraph
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+function sourceChangeClaimsMatchCurrentCandidates(error: unknown, state: unknown, userId: string, jobs: readonly Job[]): boolean {
+  const claims = scheduledSourceChangeTaskClaims(error, state), candidates = new Set<string>()
+  if (!claims?.length) return false
+  for (const job of jobs) {
+    if (job.userId !== userId || !validId(job.id) || candidates.has(job.id)) return false
+    candidates.add(job.id)
+  }
+  return claims.every(claim => candidates.has(claim.jobId))
+}
+function validId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/.test(value)
 }
 function sameCanonicalJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
 function canonicalJson(value: unknown): string {

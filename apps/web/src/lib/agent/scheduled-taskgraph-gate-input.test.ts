@@ -137,6 +137,7 @@ function artifactRows(kind: 'resume' | 'cover_letter', ref = reference(kind === 
 function setup() {
   const analyzeCheckpoint = {
     nextStage: 'prepare', scoutedJobs: [{ ...jobRow, coverLetter: null }], analysisFailed: 0,
+    scheduledTaskGraphAnalyzeSourceFingerprints: { [jobRow.id]: { version: 'agent-harness.v2.analyze-source-input.v1', digest: 'e'.repeat(64) } },
     scoredJobs: [{ job: { ...jobRow, coverLetter: null }, score: 87, matchedKeywords: ['TypeScript'], missingKeywords: ['Kubernetes'],
       recommendation: 'Tailor the resume.', analysisFenceAt: '2026-10-19T12:00:00.123Z' }],
     scheduledTaskGraphContinuation: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key: `scheduled-taskgraph:sha256:${'f'.repeat(64)}`,
@@ -621,7 +622,8 @@ describe('scheduled TaskGraph Gate input reload', () => {
 
   it('accepts a verified zero-eligible result without loading materials', async () => {
     const { input, result, analyzeAttestation } = setup()
-    const emptyCheckpoint = { ...(input.analyzeCheckpoint as Record<string, unknown>), scoutedJobs: [], scoredJobs: [], analysisFailed: 0 }
+    const emptyCheckpoint = { ...(input.analyzeCheckpoint as Record<string, unknown>), scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphAnalyzeSourceFingerprints: {} }
     const emptyResult = { ...result, jobs: [], materials: [], checkpointDigest: scheduledTaskGraphAnalyzeCheckpointDigest(emptyCheckpoint)! }
     const proof = makeProof(emptyResult, analyzeAttestation.evidenceDigest)
     mocks.tasks.mockResolvedValue(taskRows(proof, analyzeAttestation))

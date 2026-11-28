@@ -29,9 +29,15 @@ describe("scheduled Prepare runtime context", () => {
       evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64), analyzeGraphRevision: 2, prepareScheduleRevision: 3 } as ScheduledTaskGraphContinuationReceipt
     const marker = { owner, key: receipt.continuationKey, snapshotDigest: receipt.snapshotDigest, graphRevision: 2, evidenceDigest: receipt.evidenceDigest }
     const state = { nextStage: "prepare", scheduledTaskGraphContinuation: marker, analysisFailed: 0,
+      scheduledTaskGraphAnalyzeSourceFingerprints: { j1: { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) } },
       scoutedJobs: [{ id: "j1", userId: "u" }], scoredJobs: [{ job: { id: "j1", userId: "u" }, score: 80,
         matchedKeywords: [], missingKeywords: [], recommendation: "" }] }
-    expect(scheduledPrepareCheckpointDigest(state, receipt, receipt.continuationKey, ["j1"])).toMatch(/^[a-f0-9]{64}$/)
+    const digest = scheduledPrepareCheckpointDigest(state, receipt, receipt.continuationKey, ["j1"])
+    expect(digest).toMatch(/^[a-f0-9]{64}$/)
+    expect(scheduledPrepareCheckpointDigest({ ...state, scheduledTaskGraphAnalyzeSourceFingerprints: {
+      j1: { version: "agent-harness.v2.analyze-source-input.v1", digest: "f".repeat(64) } } }, receipt, receipt.continuationKey, ["j1"])).not.toBe(digest)
+    expect(scheduledPrepareCheckpointDigest({ ...state, scheduledTaskGraphAnalyzeSourceFingerprints: {} }, receipt, receipt.continuationKey, ["j1"])).toBeNull()
+    expect(scheduledPrepareCheckpointDigest({ ...state, scoredJobs: [{ ...state.scoredJobs[0]!, analysisFenceAt: "2026-10-19T12:00:00+00:00" }] }, receipt, receipt.continuationKey, ["j1"])).toBeNull()
     expect(scheduledPrepareCheckpointDigest(state, receipt, "other", ["j1"])).toBeNull()
     expect(scheduledPrepareCheckpointDigest({ ...state, scoutedJobs: [...state.scoutedJobs, { id: "j2", userId: "u" }], analysisFailed: 1 },
       receipt, receipt.continuationKey, ["j1"])).toBeNull()

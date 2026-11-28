@@ -28,7 +28,9 @@ const checkpointOwner = { userId: scope.userId, sessionId: scope.sessionId, turn
   rootAttemptCount: 1, turnLeaseOwnerId: "turn-owner", turnLeaseVersion: 3, executionId: "execution-1", executionAttemptCount: 2 }
 const checkpointState = { nextStage: "gate", scoutedJobs: Array.from({ length: 60 }, (_, index) => ({ id: `job-${index + 1}`, userId: scope.userId })),
   scoredJobs: Array.from({ length: 60 }, (_, index) => ({ job: { id: `job-${index + 1}`, userId: scope.userId }, score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
-    recommendation: "Prepared candidate.", analysisFenceAt: "2026-10-23T12:00:00.000Z" })), analysisFailed: 0,
+    recommendation: "Prepared candidate.", analysisFenceAt: "2026-10-23T12:00:00.000Z" })),
+  scheduledTaskGraphAnalyzeSourceFingerprints: Object.fromEntries(Array.from({ length: 60 }, (_, index) => [`job-${index + 1}`,
+    { version: "agent-harness.v2.analyze-source-input.v1", digest: String(index + 1).padStart(64, "0") }])), analysisFailed: 0,
   scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
     key: "scheduled-taskgraph:sha256:" + "a".repeat(64), snapshotDigest, evidenceDigest: "b".repeat(64), graphRevision: 2, owner: checkpointOwner } }
 const checkpointEvidence = scheduledGateCheckpointEvidence(checkpointState)!

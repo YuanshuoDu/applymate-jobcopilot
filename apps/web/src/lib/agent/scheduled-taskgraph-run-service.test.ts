@@ -282,6 +282,31 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     expect(mocks.save).toHaveBeenCalledTimes(1)
   }, 30_000)
 
+  it("does not expose source-change claims for foreign or malformed persisted score provenance", async () => {
+    const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
+      ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
+    const { scheduledTaskGraphAnalyzeSourceFingerprints: _discarded, ...legacy } = checkpoint
+    const foreign = { ...job, id: "foreign_job" } as Job
+    const cases = [
+      { ...legacy, scoutedJobs: [...(legacy.scoutedJobs ?? []), foreign], scoredJobs: [{ ...score, job: foreign }] },
+      { ...legacy, scoredJobs: [{ ...score, analysisFenceAt: "not-a-canonical-fence" }] },
+    ]
+
+    for (const state of cases) {
+      mocks.save.mockImplementation(async (saveInput: { assertOwnerCurrent: (tx: unknown) => Promise<boolean> }) =>
+        saveInput.assertOwnerCurrent({ fence: "source_fenced" }))
+      let observed: unknown
+      try {
+        await runScheduledTaskGraphAnalyzeOnly({ owner, snapshot, attestation: baseAttestation, continuationKey: key,
+          claimToken, ownedJobs: [job], context: context(), state, onStateChange: vi.fn() })
+      } catch (error) { observed = error }
+
+      expect(isAnalyzeSourceChangedError(observed)).toBe(false)
+      expect(mocks.save).not.toHaveBeenCalled()
+      expect(mocks.validateSources).not.toHaveBeenCalled()
+    }
+  }, 30_000)
+
   it("source-fences the current Resume for a valid zero-score checkpoint without requiring an empty map", async () => {
     const empty = { nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
       scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner,

@@ -11,10 +11,14 @@ describe("scheduled Turn question evidence", () => {
   it("reconstructs and binds v2 Analyze evidence under the same exact continuation version", () => {
     const state = { nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: owner.userId }],
       scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 80, matchedKeywords: [], missingKeywords: [], recommendation: "Review" }],
+      scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) } },
       analysisFailed: 0, scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
         key: v2Key, owner, snapshotDigest: `sha256:${"b".repeat(64)}`, graphRevision: 7, evidenceDigest: "c".repeat(64) } }
     const evidence = scheduledAnalyzeCheckpointEvidence(state)
     expect(evidence).not.toBeNull()
+    expect(scheduledAnalyzeCheckpointEvidence({ ...state, scheduledTaskGraphAnalyzeSourceFingerprints: {} })).toBeNull()
+    expect(scheduledAnalyzeCheckpointEvidence({ ...state, scheduledTaskGraphAnalyzeSourceFingerprints: {
+      "job-1": { version: "agent-harness.v2.analyze-source-input.v1", digest: "f".repeat(64) } } })?.checkpointDigest).not.toBe(evidence?.checkpointDigest)
     expect(scheduledPipelineContinuationKeyVersion(evidence?.continuationKey)).toBe("v2")
     const binding = buildTurnQuestionScheduledChoiceBinding({ receipt: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1",
       owner, continuationKey: evidence!.continuationKey, snapshotDigest: evidence!.snapshotDigest, evidenceDigest: evidence!.evidenceDigest,

@@ -57,6 +57,8 @@ function prepared(overrides: Partial<typeof snapshot> = {}, liveOwner: Scheduled
   const jobs = ids.map(id => job(id))
   const prior = buildScheduledTaskGraphPrepareCheckpoint({ owner: liveOwner, snapshot: policySnapshot, attestation: policyAttestation, ownedJobs: jobs, analyzeResult: analyzeResult(jobs) })
   const persisted = JSON.parse(JSON.stringify(prior.checkpoint)) as Record<string, unknown>
+  persisted.scheduledTaskGraphAnalyzeSourceFingerprints = Object.fromEntries((persisted.scoredJobs as ScoredJob[]).map((row, index) =>
+    [row.job.id, { version: 'agent-harness.v2.analyze-source-input.v1', digest: String(index + 1).repeat(64) }]))
   const claim = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: prior.continuationKey, claimToken: 'claim-secret', owner: { ...liveOwner },
     claimedAt: '2026-10-19T12:00:00.123Z', leaseExpiresAt: '2099-10-19T12:10:00.123Z' }
   persisted.scheduledTaskGraphClaim = claim
@@ -123,8 +125,8 @@ function retainPreparedJobs(value: ReturnType<typeof prepared>, selected: readon
 }
 
 describe('scheduled TaskGraph Prepare to Gate checkpoint', () => {
-  it('pins the historical v1 stable Prepare receipt key', () => {
-    expect(prepared().proof.receipt.continuationKey).toBe('scheduled-taskgraph:sha256:f9a20f940e39838c1453450b8f745fe3d14100575443add46cffdfd156963a39')
+  it('pins the fingerprint-bound v1 stable Prepare receipt key', () => {
+    expect(prepared().proof.receipt.continuationKey).toBe('scheduled-taskgraph:sha256:6082ab57af8adac2831883817b4b16370ff28847395d1c1e5b45b23bfd5332a4')
   })
 
   it('rejects a v2 Prepare receipt key when its Analyze continuation remains v1', () => {
@@ -218,13 +220,30 @@ describe('scheduled TaskGraph Prepare to Gate checkpoint', () => {
     ['unaccounted Analyze candidate', { ...prepared().persisted, analysisFailed: 0, scoredJobs: (prepared().persisted.scoredJobs as object[]).slice(0, 1) }],
     ['out of range score', { ...prepared().persisted, scoredJobs: (prepared().persisted.scoredJobs as object[]).map((row, index) => index ? row : { ...row, score: 101 }) }],
     ['unexpected score metadata', { ...prepared().persisted, scoredJobs: (prepared().persisted.scoredJobs as object[]).map(row => ({ ...row, coverLetter: 'must not be hashed' })) }],
+    ['missing source fingerprint', { ...prepared().persisted, scheduledTaskGraphAnalyzeSourceFingerprints: {} }],
+    ['extra source fingerprint', { ...prepared().persisted, scheduledTaskGraphAnalyzeSourceFingerprints: {
+      ...(prepared().persisted.scheduledTaskGraphAnalyzeSourceFingerprints as object), extra: { version: 'agent-harness.v2.analyze-source-input.v1', digest: 'a'.repeat(64) } } }],
   ])('returns no digest for %s', (_name, value) => expect(scheduledTaskGraphAnalyzeCheckpointDigest(value)).toBeNull())
 
   it('accepts an unscored Analyze candidate when the checkpoint explicitly counts its failure', () => {
     const value = prepared()
     value.persisted.analysisFailed = 1
     value.persisted.scoredJobs = (value.persisted.scoredJobs as object[]).slice(0, 1)
+    const fingerprints = value.persisted.scheduledTaskGraphAnalyzeSourceFingerprints as Record<string, unknown>
+    const retainedJobId = ((value.persisted.scoredJobs as ScoredJob[])[0]!).job.id
+    value.persisted.scheduledTaskGraphAnalyzeSourceFingerprints = { [retainedJobId]: fingerprints[retainedJobId] }
     expect(scheduledTaskGraphAnalyzeCheckpointDigest(value.persisted)).toMatch(/^[a-f0-9]{64}$/)
+  })
+
+  it('binds the sorted Web source fingerprints into the Analyze checkpoint digest', () => {
+    const value = prepared(), original = scheduledTaskGraphAnalyzeCheckpointDigest(value.persisted)
+    const changed = { ...value.persisted, scheduledTaskGraphAnalyzeSourceFingerprints: {
+      ...value.persisted.scheduledTaskGraphAnalyzeSourceFingerprints as Record<string, unknown>,
+      [ids[0]!]: { version: 'agent-harness.v2.analyze-source-input.v1', digest: 'f'.repeat(64) } } }
+    expect(scheduledTaskGraphAnalyzeCheckpointDigest(changed)).not.toBe(original)
+    const empty = { ...value.persisted, scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphAnalyzeSourceFingerprints: {} }
+    expect(scheduledTaskGraphAnalyzeCheckpointDigest(empty)).toMatch(/^[a-f0-9]{64}$/)
   })
 
   it('keeps Analyze digest and stable receipt key across a lease-only rebind', () => {
@@ -232,6 +251,9 @@ describe('scheduled TaskGraph Prepare to Gate checkpoint', () => {
     const reacquired = prepared({}, { ...owner, turnLeaseOwnerId: 'lease-owner-2', turnLeaseVersion: 8 })
     expect(scheduledTaskGraphAnalyzeCheckpointDigest(reacquired.persisted)).toBe(scheduledTaskGraphAnalyzeCheckpointDigest(original.persisted))
     expect(reacquired.proof.receipt.continuationKey).toBe(original.proof.receipt.continuationKey)
+    const reverseFingerprints = { ...original.persisted, scheduledTaskGraphAnalyzeSourceFingerprints: Object.fromEntries(
+      Object.entries(original.persisted.scheduledTaskGraphAnalyzeSourceFingerprints as Record<string, unknown>).reverse()) }
+    expect(scheduledTaskGraphAnalyzeCheckpointDigest(reverseFingerprints)).toBe(scheduledTaskGraphAnalyzeCheckpointDigest(original.persisted))
 
     const changedLineage = JSON.parse(JSON.stringify(original.persisted)) as Record<string, unknown>
     ;((changedLineage.scheduledTaskGraphContinuation as { owner: { executionAttemptCount: number } }).owner).executionAttemptCount += 1

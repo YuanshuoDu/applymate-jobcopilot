@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { scheduledPipelineContinuationKeyVersion } from "@jobcopilot/agent-protocol"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "../subagents/scheduled-taskgraph-continuation-receipt.js"
+import { scheduledAnalyzeSourceFingerprintRows } from "./turn-question-scheduled-source-fingerprint.js"
 
 export const TURN_SCHEDULED_PREPARE_CHOICE_SCHEMA = "agent-harness.v2.scheduled-prepare-choice-wait.v1" as const
 export const TURN_SCHEDULED_PREPARE_CHOICE_STAGE = "scheduled_prepare" as const
@@ -74,9 +75,11 @@ export function scheduledAnalyzeCheckpointEvidence(value: unknown): Readonly<{
     seen.add(job.id); rows.push({ jobId: job.id, score: row.score, matchedKeywords: [...row.matchedKeywords as string[]],
       missingKeywords: [...row.missingKeywords as string[]], recommendation: row.recommendation, ...(hasFence ? { analysisFenceAt: row.analysisFenceAt } : {}) })
   }
+  const sourceFingerprints = scheduledAnalyzeSourceFingerprintRows([...seen], state.scheduledTaskGraphAnalyzeSourceFingerprints)
+  if (!sourceFingerprints) return null
   const projection = { owner: [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId,
     owner.executionAttemptCount], snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest,
-      analyzeGraphRevision: marker.graphRevision, analysisFailed: state.analysisFailed, scoredJobs: rows }
+      analyzeGraphRevision: marker.graphRevision, analysisFailed: state.analysisFailed, sourceFingerprints, scoredJobs: rows }
   try {
     const checkpointDigest = createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")
     const continuationKey = scheduledTaskGraphStableContinuationKey({ owner, continuationKey: marker.key,

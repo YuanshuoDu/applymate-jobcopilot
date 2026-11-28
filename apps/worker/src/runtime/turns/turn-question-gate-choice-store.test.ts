@@ -48,7 +48,8 @@ const checkpointOwner = { userId: owner.userId, sessionId: owner.sessionId, turn
   executionId: "execution-1", executionAttemptCount: 3 }
 const checkpointState = { nextStage: "gate", scoutedJobs: [{ id: "job-1", userId: owner.userId }],
   scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 81, matchedKeywords: ["TypeScript"], missingKeywords: [],
-    recommendation: "Continue.", analysisFenceAt: "2026-10-23T12:00:00.000Z" }], analysisFailed: 0,
+    recommendation: "Continue.", analysisFenceAt: "2026-10-23T12:00:00.000Z" }],
+  scheduledTaskGraphAnalyzeSourceFingerprints: { "job-1": { version: "agent-harness.v2.analyze-source-input.v1", digest: "e".repeat(64) } }, analysisFailed: 0,
   scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
     key: "scheduled-taskgraph:sha256:" + "a".repeat(64), snapshotDigest, evidenceDigest: "b".repeat(64), graphRevision: 9, owner: checkpointOwner } }
 const checkpointEvidence = scheduledGateCheckpointEvidence(checkpointState)!
