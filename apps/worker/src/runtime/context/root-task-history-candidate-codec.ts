@@ -8,6 +8,7 @@ import type { SubagentTaskStatus } from "../subagents/types.js"
 import { parseRootTaskHistoryNodeLesson, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
 import { projectRootTaskHistoryDiscoveryFootprint, type RootTaskHistoryDiscoveryFootprint } from "./root-task-history-discovery-footprint.js"
 import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
+import { parseRootTaskHistoryBranchReplacementEpisode, type RootTaskHistoryBranchReplacementEpisode } from "./root-task-history-branch-replacement-history.js"
 import * as rootTaskHistoryPlanShape from "./root-task-history-plan-shape.js"
 import { parseRootTaskHistoryChronologyXid8 } from "./root-task-history-chronology-witness.js"
 
@@ -25,6 +26,7 @@ export type RootTaskHistoryCandidate = Readonly<{
   sourceTurnId: string; sourceRootTaskId: string; terminalSequence: bigint; terminalXid8?: bigint
   terminalWitnessEventId?: string; sourceSessionDiffers: boolean; safeNodes: readonly RootTaskHistoryCandidateNode[]
   lessonsBySourceOrdinal?: readonly (RootTaskHistoryNodeLesson | undefined)[]
+  branchReplacementEpisode?: RootTaskHistoryBranchReplacementEpisode
   planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape; identity: string
 }>
 
@@ -119,6 +121,7 @@ function projectNode(value: unknown): Omit<RootTaskHistorySafeNode, "lesson" | "
 export function parseRootTaskHistoryCandidate(value: unknown, crossSession: boolean): RootTaskHistoryCandidate | null {
   const item = record(value), locality = item && ownDataProperty(item, "sourceSessionDiffers")
   const terminalXid8 = item && ownDataProperty(item, "terminalXid8"), witnessEventId = item && ownDataProperty(item, "terminalWitnessEventId")
+  const branchReplacementEpisode = item && ownDataProperty(item, "branchReplacementEpisode")
   if (!item || !locality || !boundedText(item.sourceTurnId) || !boundedText(item.sourceRootTaskId)
     || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n
     || (crossSession && ((locality.present && typeof locality.value !== "boolean")
@@ -127,10 +130,12 @@ export function parseRootTaskHistoryCandidate(value: unknown, crossSession: bool
     || (!crossSession && locality.present && locality.value !== false)) return null
   const hasSourceSessionDiffers = locality.present
   const sourceSessionDiffers = crossSession && (!hasSourceSessionDiffers || locality.value !== false)
-  const hasOrdinals = Object.hasOwn(item, "sourceNodeOrdinals"), hasLessons = Object.hasOwn(item, "nodeLessons"), hasOutputs = Object.hasOwn(item, "reportedOutputs")
+  const hasOrdinals = Object.hasOwn(item, "sourceNodeOrdinals"), hasLessons = Object.hasOwn(item, "nodeLessons"), hasOutputs = Object.hasOwn(item, "reportedOutputs"),
+    hasBranchReplacementEpisode = Object.hasOwn(item, "branchReplacementEpisode")
   const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence", ...(hasSourceSessionDiffers ? ["sourceSessionDiffers"] : []),
     ...(terminalXid8?.present ? ["terminalXid8"] : []), ...(witnessEventId?.present ? ["terminalWitnessEventId"] : []),
-    ...(hasOrdinals ? ["sourceNodeOrdinals"] : []), ...(hasLessons ? ["nodeLessons"] : []), ...(hasOutputs ? ["reportedOutputs"] : [])].sort().join(",")
+    ...(hasOrdinals ? ["sourceNodeOrdinals"] : []), ...(hasLessons ? ["nodeLessons"] : []), ...(hasOutputs ? ["reportedOutputs"] : []),
+    ...(hasBranchReplacementEpisode ? ["branchReplacementEpisode"] : [])].sort().join(",")
   if (!exact(item, keys)) return null
   const graph = record(item.taskGraph), graphTurn = graph && ownDataProperty(graph, "discoveryTurnEligibility")
   if (!graph || !graphTurn || !exact(graph, ["nodes", "revision", ...(graphTurn.present ? ["discoveryTurnEligibility"] : [])].sort().join(","))
@@ -151,13 +156,16 @@ export function parseRootTaskHistoryCandidate(value: unknown, crossSession: bool
   const safeNodes = (nodes as RootTaskHistoryCandidateNode[]).sort((left, right) =>
     compare(left.projection.taskKind, right.projection.taskKind) || compare(left.projection.status, right.projection.status)
       || compare(JSON.stringify(left.projection), JSON.stringify(right.projection)))
+  const safeEpisode = !sourceSessionDiffers && branchReplacementEpisode?.present
+    && Object.getOwnPropertyDescriptor(item, "branchReplacementEpisode")?.enumerable
+    ? parseRootTaskHistoryBranchReplacementEpisode(branchReplacementEpisode.value) ?? undefined : undefined
   return {
     sourceTurnId: item.sourceTurnId, sourceRootTaskId: item.sourceRootTaskId,
     terminalSequence: item.terminalSequence,
     ...(terminalXid8?.present ? { terminalXid8: parseRootTaskHistoryChronologyXid8(terminalXid8.value) } : {}),
     ...(witnessEventId?.present ? { terminalWitnessEventId: witnessEventId.value as string } : {}),
     sourceSessionDiffers, ...(lessons ? { lessonsBySourceOrdinal: lessons } : {}),
-    ...(planShape ? { planShape } : {}),
+    ...(safeEpisode ? { branchReplacementEpisode: safeEpisode } : {}), ...(planShape ? { planShape } : {}),
     safeNodes, identity: JSON.stringify([item.sourceTurnId, item.sourceRootTaskId]),
   }
 }

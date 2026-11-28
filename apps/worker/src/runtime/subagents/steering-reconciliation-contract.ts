@@ -1,11 +1,7 @@
 import { Buffer } from "node:buffer"
-import { executionKey } from "../turns/turn-execution-types.js"
 import { normalizeRootPlanCriteria } from "./root-plan-criteria.js"
-import {
-  parseTaskGraphFailedBranchReconciliationReceipt,
-  taskGraphFailedBranchReconciliationOperationKey,
-  TASK_GRAPH_FAILED_BRANCH_RECONCILIATION_SCHEMA_VERSION,
-} from "@jobcopilot/agent-protocol/task-graph-failed-branch-reconciliation"
+import { parseTaskGraphFailedBranchReconciliationReceipt, taskGraphFailedBranchReconciliationOperationKey,
+  TASK_GRAPH_FAILED_BRANCH_RECONCILIATION_SCHEMA_VERSION } from "@jobcopilot/agent-protocol/task-graph-failed-branch-reconciliation"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 import { parseTaskGraphSupersessionRelation, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import { parseTaskGraphBranchRepairRelation, TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, type TaskGraphBranchRepairRelation } from "./task-graph-pg-branch-repair-relation.js"
@@ -28,7 +24,6 @@ export const STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS = 128
 const MAX_BYTES = 16 * 1024
 const MAX_SEQUENCE = 9_223_372_036_854_775_807n
 type Row = Record<string, unknown>
-
 export type SteeringReconciliationReceipt = Readonly<{
   schemaVersion: typeof STEERING_RECONCILIATION_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION
     | typeof STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION
@@ -48,6 +43,7 @@ export type SteeringReconciliationReceipt = Readonly<{
   operationalFailure?: TaskGraphOperationalFailedBranchRelation
 }>
 export type SteeringReconciliationScope = TaskGraphReadScope & Readonly<{ stepId?: string; rootInputId?: string | null }>
+export type SteeringReconciliationDurableScope = Pick<TaskGraphReadScope, "userId" | "sessionId" | "turnId" | "rootTaskId" | "parentTaskId">
 export type SteeringReconciliationOperation = Readonly<{
   scope: TaskGraphExecutionScope
   decision: "keep" | "revise"
@@ -88,7 +84,6 @@ export type PreparedSteeringReconciliation = Readonly<{
   idempotencyKey: string
   receipt: SteeringReconciliationReceipt
 }>
-
 function record(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const prototype = Object.getPrototypeOf(value)
@@ -114,6 +109,10 @@ export function steeringReconciliationSequence(value: unknown): bigint | null {
   const parsed = BigInt(value)
   return parsed <= MAX_SEQUENCE ? parsed : null
 }
+export function validSteeringReconciliationDurableScope(scope: SteeringReconciliationDurableScope, stepId: string): boolean {
+  return [scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, stepId].every(steeringReconciliationId)
+    && scope.parentTaskId === scope.rootTaskId
+}
 export function validSteeringReconciliationScope(scope: SteeringReconciliationScope): boolean {
   return [scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.turnLeaseOwner, scope.parentLeaseOwner].every(steeringReconciliationId)
     && scope.parentTaskId === scope.rootTaskId && Number.isSafeInteger(scope.turnLeaseVersion) && scope.turnLeaseVersion >= 1
@@ -123,9 +122,14 @@ export function validSteeringReconciliationScope(scope: SteeringReconciliationSc
 }
 export function steeringReconciliationIdempotencyKey(scope: TaskGraphExecutionScope, callId: string): string | null {
   if (!validSteeringReconciliationScope(scope) || !steeringReconciliationId(callId)) return null
-  return taskGraphFailedBranchReconciliationOperationKey(scope, callId, taskGraphProtocolCodecs)
+  return steeringReconciliationDurableIdempotencyKey(scope, scope.stepId, callId)
 }
-export function validSteeringReconciliationToolCall(event: Row, item: Row, scope: TaskGraphReadScope, stepId: string,
+export function steeringReconciliationDurableIdempotencyKey(scope: SteeringReconciliationDurableScope, stepId: string, callId: string): string | null {
+  if (!validSteeringReconciliationDurableScope(scope, stepId) || !steeringReconciliationId(callId)) return null
+  return taskGraphFailedBranchReconciliationOperationKey({ userId: scope.userId, sessionId: scope.sessionId,
+    turnId: scope.turnId, rootTaskId: scope.rootTaskId, stepId }, callId, taskGraphProtocolCodecs)
+}
+function validSteeringReconciliationToolCallIdentity(event: Row, item: Row, scope: SteeringReconciliationDurableScope, stepId: string,
   decision: "keep" | "revise", expectedRevision: number, replaceUnstartedNodeKey?: string, replaceBranch?: TaskGraphBranchReplacement,
   replaceOperationalFailure?: TaskGraphOperationalFailureReplacement): boolean {
   const call = record(event.payload), content = record(item.content), input = record(content?.input)
@@ -157,15 +161,11 @@ export function validSteeringReconciliationToolCall(event: Row, item: Row, scope
     && (replaceOperationalFailure === undefined ? !Object.hasOwn(input ?? {}, "replaceOperationalFailure")
       : parsedOperational?.ok === true && expectedOperational?.ok === true
         && JSON.stringify(parsedOperational.value) === JSON.stringify(expectedOperational.value))
-  const scoped: TaskGraphExecutionScope = { ...scope, stepId }
-  const executionIdentity = { kind: "turn" as const, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
-    taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, ownerId: scope.turnLeaseOwner,
-    leaseVersion: scope.turnLeaseVersion, leaseExpiresAt: new Date(0) }
-  return Boolean(steeringReconciliationId(callId) && validSteeringReconciliationScope(scoped)
+  return Boolean(steeringReconciliationId(callId) && validSteeringReconciliationDurableScope(scope, stepId)
     && (decision === "revise" || replaceUnstartedNodeKey === undefined)
     && event.type === "tool_call.started" && event.actor === "orchestrator" && event.taskId === scope.rootTaskId
     && event.itemId === item.id && event.correlationId === callId
-    && event.idempotencyKey === `${executionKey(executionIdentity)}:event:tool-started:${callId}`
+    && event.idempotencyKey === `turn:${scope.turnId}:event:tool-started:${callId}`
     && call && Object.keys(call).sort().join(",") === "taskId,toolCallId,toolName"
     && call.toolCallId === callId && call.toolName === toolName && call.taskId === scope.rootTaskId
     && item.stepId === stepId && item.taskId === scope.rootTaskId && item.type === "tool_call"
@@ -178,6 +178,20 @@ export function validSteeringReconciliationToolCall(event: Row, item: Row, scope
         : replaceUnstartedNodeKey === undefined
         || input.nodes.length === 1 && steeringReconciliationId(replaceUnstartedNodeKey)
           && replacement !== null && exact(replacement, ["nodeKey"]) && replacement.nodeKey === replaceUnstartedNodeKey)))
+}
+export function validSteeringReconciliationToolCall(event: Row, item: Row, scope: TaskGraphReadScope, stepId: string,
+  decision: "keep" | "revise", expectedRevision: number, replaceUnstartedNodeKey?: string, replaceBranch?: TaskGraphBranchReplacement,
+  replaceOperationalFailure?: TaskGraphOperationalFailureReplacement): boolean {
+  const scoped: TaskGraphExecutionScope = { ...scope, stepId }
+  return validSteeringReconciliationScope(scoped)
+    && validSteeringReconciliationToolCallIdentity(event, item, scope, stepId, decision, expectedRevision,
+      replaceUnstartedNodeKey, replaceBranch, replaceOperationalFailure)
+}
+/** Validates only the durable identity of a historical failed-branch replacement call. */
+export function validHistoricalFailedBranchReplacementToolCall(event: Row, item: Row, scope: SteeringReconciliationDurableScope,
+  stepId: string, expectedRevision: number, replaceBranch: TaskGraphBranchReplacement): boolean {
+  return validSteeringReconciliationDurableScope(scope, stepId)
+    && validSteeringReconciliationToolCallIdentity(event, item, scope, stepId, "revise", expectedRevision, undefined, replaceBranch)
 }
 export function parseSteeringReconciliationReceipt(value: unknown, expected?: SteeringReconciliationScope): SteeringReconciliationReceipt | null {
   try {

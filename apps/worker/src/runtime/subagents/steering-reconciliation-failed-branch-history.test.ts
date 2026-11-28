@@ -3,7 +3,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
-import { assertTaskGraphFailedBranchRepairHistory } from "./steering-reconciliation-failed-branch-history.js"
+import { assertTaskGraphFailedBranchRepairHistory, verifyHistoricalFailedBranchReplacementMemory } from "./steering-reconciliation-failed-branch-history.js"
 import { steeringReconciliationIdempotencyKey } from "./steering-reconciliation-contract.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import { taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION,
@@ -127,6 +127,9 @@ function fixture() {
     leaseExpiresAt: null, nextAttemptAt: null, startedAt: null, completedAt: new Date(0), closedAt: null,
     interruptRequestedAt: null, failureReason: null, result: null, confidence: null, qualityGateResult: null,
     contextSnapshotId: null, outputArtifactIds: [], sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId }
+  const failedScout = { id: "scout-old-task", role: "scout", status: "failed", failureReason: "task_graph_verification_unverified",
+    result: { taskGraphVerificationReport: { status: "unverified", reasonCode: "result_invalid", evidenceDigest: null, resultDigest: null } },
+    sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId }
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
     if (sql.includes("tool_call.started")) return { rows: [callRow], rowCount: 1 }
     if (sql.includes('event."id" = ANY($5::text[])')) {
@@ -140,6 +143,7 @@ function fixture() {
         BigInt(String(right.sequence)) > BigInt(String(left.sequence)) ? 1 : -1)[0]
       return { rows: latest ? [{ ...latest, sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId }] : [], rowCount: latest ? 1 : 0 }
     }
+    if (sql.includes('SELECT task."id", task."role", task."status", task."failureReason", task."result"')) return { rows: [failedScout], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_sessions"')) return { rows: [cancelledTask], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" task WHERE')) return { rows: [{ id: "analyst-old-task", hasExecutionEvidence: false,
       hasWaitEvidence: false, hasDispatch: false }], rowCount: 1 }
@@ -148,7 +152,7 @@ function fixture() {
   const client = { query } as unknown as Pick<PoolClient, "query">
   const evidence = { failedSource: relation.failedSource, verifiedExternalDependencies: relation.verifiedExternalDependencies }
   prove.mockReset().mockResolvedValue(evidence)
-  return { client, query, callRow, events, relation, receiptEvent: { id: "reconciliation-event", sequence: 14n,
+  return { client, query, callRow, events, relation, failedScout, receiptEvent: { id: "reconciliation-event", sequence: 14n,
     stepId: scope.stepId, idempotencyKey: operationKey } }
 }
 
@@ -158,6 +162,24 @@ describe("persisted failed-branch repair history", () => {
     await expect(assertTaskGraphFailedBranchRepairHistory(f.client, scope, f.relation, f.receiptEvent))
       .resolves.toEqual(receipt)
     expect(f.query).toHaveBeenCalledTimes(5)
+    expect(prove).toHaveBeenCalledWith(f.client, expect.objectContaining({ snapshot: before, sourceNodes: expect.any(Array) }))
+  })
+
+  it("omits the episode for any verifier cause other than the verified result-invalid category", async () => {
+    const f = fixture()
+    const taskResult = f.failedScout.result as Row
+    ;(taskResult.taskGraphVerificationReport as Row).reasonCode = "criterion_not_met"
+    await expect(verifyHistoricalFailedBranchReplacementMemory(f.client, {
+      userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId,
+    }, f.relation, f.receiptEvent)).rejects.toThrow("steering_reconciliation_failed_branch_event_invalid")
+  })
+
+  it("reuses the exact proof through a historical identity that has no live lease fields", async () => {
+    const f = fixture(), durableScope = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+      rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId }
+    await expect(verifyHistoricalFailedBranchReplacementMemory(f.client, durableScope, f.relation, f.receiptEvent))
+      .resolves.toEqual({ reason: "result_invalid", sourceTemplateIds: ["scout", "analyst"], successorTemplateIds: ["scout", "analyst"] })
+    expect(f.query).toHaveBeenCalledTimes(6)
     expect(prove).toHaveBeenCalledWith(f.client, expect.objectContaining({ snapshot: before, sourceNodes: expect.any(Array) }))
   })
 

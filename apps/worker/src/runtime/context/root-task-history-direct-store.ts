@@ -2,6 +2,10 @@ import type pg from "pg"
 import { currentTaskGraph, loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
 import { projectLoadedRootTaskHistoryGraph, type LoadedRootTaskHistoryGraphProjection } from "./root-task-history-lesson-projection.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
+import { projectRootTaskHistoryBranchReplacementEpisode } from "./root-task-history-branch-replacement-history.js"
+import { STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
+  parseSteeringReconciliationReceipt, steeringReconciliationDurableIdempotencyKey, steeringReconciliationId } from "../subagents/steering-reconciliation-contract.js"
+import { verifyHistoricalFailedBranchReplacementMemory } from "../subagents/steering-reconciliation-failed-branch-history.js"
 import { mergeRootTaskHistorySearchFootprintSources, projectRootTaskHistorySearchFootprintContext,
   type RootTaskHistorySearchFootprintContext, type RootTaskHistorySearchFootprintSource } from "./root-task-history-search-footprint-context.js"
 import { readRootTaskHistoryCandidates, readRootTaskHistoryFootprintCandidates, type RootTaskHistoryCandidate } from "./root-task-history-source-store.js"
@@ -31,6 +35,55 @@ const SCOPE_ERRORS = new Set([
 function graphEvidenceError(value: unknown): boolean {
   return value instanceof Error && !databaseError(value) && !SCOPE_ERRORS.has(value.message)
     && /^task_graph_[a-z0-9_]+$/.test(value.message)
+}
+
+function historicalPayload(value: unknown): unknown {
+  if (typeof value !== "string") return value
+  try { return JSON.parse(value) as unknown } catch { return null }
+}
+
+function positiveSequence(value: unknown): bigint | null {
+  if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/.test(value)) return null
+  const parsed = BigInt(value)
+  return parsed <= 9_223_372_036_854_775_807n ? parsed : null
+}
+
+async function branchReplacementEpisodeForCandidate(client: Client, input: RootTaskHistoryFenceInput,
+  source: RootTaskHistoryCandidate): Promise<ValidatedRootTaskHistoryOutcome["branchReplacementEpisode"]> {
+  if (source.sessionId !== input.lease.sessionId) return undefined
+  const scope = { userId: input.lease.userId, sessionId: source.sessionId, turnId: source.turnId,
+    rootTaskId: source.rootTaskId, parentTaskId: source.rootTaskId }
+  const result = await client.query<Record<string, unknown>>(`SELECT event."id", event."sequence"::text AS "sequence", event."itemId", event."taskId",
+      event."type", event."actor", event."correlationId", event."causationId", event."idempotencyKey", event."payload",
+      session."userId" AS "sessionUserId", turn."userId" AS "turnUserId", turn."rootTaskId" AS "turnRootTaskId",
+      outbox."idempotencyKey" AS "outboxIdempotencyKey"
+    FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId" AND session."userId" = $4
+      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+        AND turn."userId" = $4 AND turn."rootTaskId" = $3
+      LEFT JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $5
+      AND event."payload"->>'schemaVersion' = $6 AND event."sequence" < $7::bigint
+    ORDER BY event."sequence" DESC, event."id" DESC LIMIT 2`, [scope.sessionId, scope.turnId, scope.rootTaskId,
+    scope.userId, STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
+    source.terminalSequence.toString()])
+  const row = result.rows[0], receipt = parseSteeringReconciliationReceipt(historicalPayload(row?.payload))
+  const relation = receipt?.failedBranch, sequence = positiveSequence(row?.sequence), nextSequence = positiveSequence(result.rows[1]?.sequence)
+  if (result.rows.length < 1 || !row || !steeringReconciliationId(row.id) || !receipt || !relation || !sequence
+    || sequence === nextSequence || sequence >= source.terminalSequence
+    || row.sessionUserId !== scope.userId || row.turnUserId !== scope.userId || row.turnRootTaskId !== scope.rootTaskId
+    || row.itemId !== null || row.taskId !== scope.rootTaskId || row.type !== STEERING_RECONCILIATION_EVENT_TYPE
+    || row.actor !== "orchestrator" || row.correlationId !== scope.turnId || row.causationId !== receipt.stepId
+    || row.outboxIdempotencyKey !== null || receipt.sessionId !== scope.sessionId || receipt.turnId !== scope.turnId
+    || receipt.rootTaskId !== scope.rootTaskId || relation.operationKey !== row.idempotencyKey
+    || row.idempotencyKey !== steeringReconciliationDurableIdempotencyKey(scope, receipt.stepId, relation.agentPlanCall.callId)) return undefined
+  const receiptEvent = { id: row.id, sequence, stepId: receipt.stepId, idempotencyKey: String(row.idempotencyKey) }
+  try {
+    const witness = await verifyHistoricalFailedBranchReplacementMemory(client, scope, relation, receiptEvent)
+    return projectRootTaskHistoryBranchReplacementEpisode(witness) ?? undefined
+  } catch (error: unknown) {
+    if (error instanceof Error && (error.message === "steering_reconciliation_failed_branch_event_invalid" || graphEvidenceError(error))) return undefined
+    throw error
+  }
 }
 
 async function lockEligibleSourceSession(client: Client, sessionId: string, userId: string): Promise<boolean> {
@@ -101,13 +154,17 @@ export function createPgDirectRootTaskHistoryStore(pool: Pool) {
       if (graphLoads >= GRAPH_LOAD_LIMIT) break
       graphLoads += 1
       const graph = await graphForCandidate(client, input, source)
-      if (graph) outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
-        terminalSequence: source.terminalSequence,
-        ...(source.terminalXid8 ? { terminalXid8: source.terminalXid8 } : {}),
-        ...(source.terminalWitnessEventId ? { terminalWitnessEventId: source.terminalWitnessEventId } : {}),
-        ...(input.crossSessionRootTaskHistoryEnabled === true ? { sourceSessionDiffers: source.sessionId !== input.lease.sessionId } : {}),
-        taskGraph: graph.taskGraph, sourceNodeOrdinals: graph.sourceNodeOrdinals,
-        ...(graph.nodeLessons ? { nodeLessons: graph.nodeLessons } : {}), ...(graph.reportedOutputs ? { reportedOutputs: graph.reportedOutputs } : {}) })
+      if (graph) {
+        const branchReplacementEpisode = await branchReplacementEpisodeForCandidate(client, input, source)
+        outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
+          terminalSequence: source.terminalSequence,
+          ...(source.terminalXid8 ? { terminalXid8: source.terminalXid8 } : {}),
+          ...(source.terminalWitnessEventId ? { terminalWitnessEventId: source.terminalWitnessEventId } : {}),
+          ...(input.crossSessionRootTaskHistoryEnabled === true ? { sourceSessionDiffers: source.sessionId !== input.lease.sessionId } : {}),
+          taskGraph: graph.taskGraph, sourceNodeOrdinals: graph.sourceNodeOrdinals,
+          ...(graph.nodeLessons ? { nodeLessons: graph.nodeLessons } : {}), ...(graph.reportedOutputs ? { reportedOutputs: graph.reportedOutputs } : {}),
+          ...(branchReplacementEpisode ? { branchReplacementEpisode } : {}) })
+      }
     }
     return outcomes
   }
