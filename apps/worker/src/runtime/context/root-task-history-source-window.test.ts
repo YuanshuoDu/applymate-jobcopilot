@@ -12,9 +12,12 @@ describe("root task history cross-session source window", () => {
     const result = buildRootTaskHistoryCrossSessionWindow(baseInput)
     const sql = result.sql
     const count = sql.indexOf('COUNT(*) OVER (PARTITION BY event."id")')
+    const graphExists = sql.indexOf('graph_item."type" = \'task_graph\'')
     const limit = sql.indexOf("LIMIT $9")
 
     expect(count).toBeGreaterThan(0)
+    expect(graphExists).toBeGreaterThanOrEqual(0)
+    expect(graphExists).toBeLessThan(limit)
     expect(limit).toBeGreaterThan(count)
     for (const predicate of [
       'event."sessionId" <> $1', 'source_session."userId" = $2',
@@ -23,6 +26,7 @@ describe("root task history cross-session source window", () => {
       "jsonb_build_array(turn.\"source\", 'none') = $8::jsonb",
       'dispatch."payload" = jsonb_build_object', 'terminal_dispatch."payload" = jsonb_build_object',
       'turn."userId" = $2', 'event."taskId" = turn."rootTaskId"', 'task."status" = turn."status"',
+      'graph_item."taskId" = turn."rootTaskId"', 'graph_turn."userId" = $2', 'graph_session."userId" = $2',
       "NOT (turn.\"input\" ? 'selectedJobPreparation')", "AND event.\"type\" = CASE turn.\"status\"",
     ]) {
       expect(sql.indexOf(predicate)).toBeGreaterThanOrEqual(0)
@@ -72,6 +76,7 @@ describe("root task history cross-session source window", () => {
       "(turn.\"input\"->'intent')->'version' = '1'::jsonb",
       "jsonb_build_array(turn.\"source\", 'objective_task_graph_execution', 1) = $8::jsonb",
       'source_session."userId" = $2', '(witness.payload->>\'xid8\')::numeric < $4::numeric',
+      'graph_item."type" = \'task_graph\'', 'graph_item."taskId" = turn."rootTaskId"',
       'turn."objectiveDigest" = $6', 'turn."objectiveIndexSemanticsVersion" = $7',
     ]) {
       expect(sql).toContain(predicate)

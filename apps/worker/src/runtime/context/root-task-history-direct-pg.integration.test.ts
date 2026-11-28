@@ -255,13 +255,16 @@ function queryRecords(rows: readonly unknown[] | undefined): Array<Record<string
 }
 
 type SafeExplainNode = Readonly<{
-  depth: number; nodeType: string; relation?: string; index?: string; joinType?: string; planRows?: number; totalCost?: number
+  depth: number; nodeType: string; relation?: string; index?: string; joinType?: string
+  planRows?: number; totalCost?: number; actualRows?: number; actualLoops?: number; rowsRemovedByFilter?: number
 }>
 
-function safeExplainNodes(value: unknown): SafeExplainNode[] {
-  if (!Array.isArray(value)) return []
-  const root = value[0] && typeof value[0] === "object" && !Array.isArray(value[0])
-    ? (value[0] as Record<string, unknown>).Plan : undefined
+type SafeExplainPlan = Readonly<{ planningMs?: number; executionMs?: number; nodes: readonly SafeExplainNode[] }>
+
+function safeExplainPlan(value: unknown): SafeExplainPlan {
+  if (!Array.isArray(value) || !value[0] || typeof value[0] !== "object" || Array.isArray(value[0])) return { nodes: [] }
+  const explain = value[0] as Record<string, unknown>
+  const root = explain.Plan
   const pending: Array<Readonly<{ node: unknown; depth: number }>> = [{ node: root, depth: 0 }]
   const result: SafeExplainNode[] = []
   while (pending.length > 0 && result.length < 128) {
@@ -283,12 +286,24 @@ function safeExplainNodes(value: unknown): SafeExplainNode[] {
       ...(safeText("Join Type") ? { joinType: safeText("Join Type") } : {}),
       ...(safeNumber("Plan Rows") !== undefined ? { planRows: safeNumber("Plan Rows") } : {}),
       ...(safeNumber("Total Cost") !== undefined ? { totalCost: safeNumber("Total Cost") } : {}),
+      ...(safeNumber("Actual Rows") !== undefined ? { actualRows: safeNumber("Actual Rows") } : {}),
+      ...(safeNumber("Actual Loops") !== undefined ? { actualLoops: safeNumber("Actual Loops") } : {}),
+      ...(safeNumber("Rows Removed by Filter") !== undefined
+        ? { rowsRemovedByFilter: safeNumber("Rows Removed by Filter") } : {}),
     })
     if (Array.isArray(node.Plans)) {
       for (const child of [...node.Plans].reverse()) pending.push({ node: child, depth: current.depth + 1 })
     }
   }
-  return result
+  const safeTopNumber = (key: string): number | undefined => {
+    const candidate = explain[key]
+    return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined
+  }
+  return {
+    ...(safeTopNumber("Planning Time") !== undefined ? { planningMs: safeTopNumber("Planning Time") } : {}),
+    ...(safeTopNumber("Execution Time") !== undefined ? { executionMs: safeTopNumber("Execution Time") } : {}),
+    nodes: result,
+  }
 }
 
 type SameSessionPageObservation = Readonly<{
@@ -323,6 +338,7 @@ type Source = Readonly<{
   }>[]
   failureChildren?: readonly Readonly<{ key: string; templateId: string; role: string; taskType: string; failureReason: string }>[]
   turnSource?: string; turnExecutionMode?: "canonical_task_graph"; terminalCreatedAt?: Date
+  persistTaskGraph?: boolean
   searchFootprint?: Readonly<{ role: string; location: string; atsSource: "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio" }>
 }>
 
@@ -759,10 +775,16 @@ async function insertSource(source: Source): Promise<void> {
       child.goal, JSON.stringify(child.successCriteria), JSON.stringify(child.allowedActions), JSON.stringify(child.expectedOutputSchema),
       child.result === null ? null : JSON.stringify(child.result), child.failureReason])
   }
-  await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
-    VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-      ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-  [taskGraphItemId(source.rootTaskId), source.sessionId, source.turnId, source.rootTaskId, JSON.stringify(graph), source.finalItemId])
+  if (source.persistTaskGraph === false) {
+    await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [source.finalItemId, source.sessionId, source.turnId, source.rootTaskId])
+  } else {
+    await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+        ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [taskGraphItemId(source.rootTaskId), source.sessionId, source.turnId, source.rootTaskId, JSON.stringify(graph), source.finalItemId])
+  }
   const startSequence = source.startSequence * SOURCE_SEQUENCE_STRIDE
   const duplicateStepReceipt = source.stepReceipt === "duplicate"
   const itemStartedOffset = duplicateStepReceipt ? 3 : 2
@@ -1051,6 +1073,38 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       duplicateStepReceipt.turnId].includes(item.sourceTurnId))).toBe(false)
   })
 
+  it("filters roots without their exact TaskGraph item before the raw and graph-load bounds", async () => {
+    const graphless: Source[] = Array.from({ length: 8 }, (_, index): Source => ({
+      turnId: `root-history-graphless-turn-${index}-${suffix}`,
+      rootTaskId: `root-history-graphless-root-${index}-${suffix}`,
+      childId: `root-history-graphless-child-${index}-${suffix}`,
+      finalItemId: `root-history-graphless-final-${index}-${suffix}`,
+      sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria },
+      startSequence: 1_000 + index * 8, persistTaskGraph: false,
+    }))
+    try {
+      for (const source of graphless) await insertSource(source)
+
+      const pageTurnIds: string[] = [], graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values, rows) => {
+        if (sql.includes("WITH terminal_window AS MATERIALIZED (")) {
+          pageTurnIds.push(...queryRecords(rows).filter(row => row.isPageWatermark === false && typeof row.turnId === "string")
+            .map(row => row.turnId as string))
+        }
+        if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date() }
+      const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
+
+      expect(pageTurnIds.some(turnId => graphless.some(source => source.turnId === turnId))).toBe(false)
+      expect(graphLoads).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+    } finally {
+      await deleteSourceFixtures(graphless)
+    }
+  }, 60_000)
+
   it("advances an empty strict-validation page and finds valid same-session history after 64 raw rows", async () => {
     const invalidSources = strictInvalidStepReceiptSources("page-invalid-first-window", 64, 400)
     try {
@@ -1307,8 +1361,13 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
           const queryValues = [...query.values, baseWitnessId, duplicateWitnessFixtureManifest()]
           if (stage === "manual_page_first") {
             const explain = await manualClient.query<{ "QUERY PLAN": unknown }>(
-              `EXPLAIN (FORMAT JSON, COSTS TRUE) ${querySql}`, queryValues)
-            console.info(`[root-history-keyset-pg-explain] ${JSON.stringify(safeExplainNodes(explain.rows[0]?.["QUERY PLAN"]))}`)
+              `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, COSTS TRUE, TIMING FALSE) ${querySql}`, queryValues)
+            const safePlan = safeExplainPlan(explain.rows[0]?.["QUERY PLAN"])
+            const graphItemNodes = safePlan.nodes.filter(node => node.relation === "agent_items"
+              || node.index?.startsWith("agent_items_")).slice(0, 16)
+            console.info(`[root-history-keyset-pg-explain-analyze] ${JSON.stringify({
+              planningMs: safePlan.planningMs, executionMs: safePlan.executionMs, graphItemNodes,
+            })}`)
           }
           const result = await manualClient.query<Record<string, unknown>>(
             querySql, queryValues)

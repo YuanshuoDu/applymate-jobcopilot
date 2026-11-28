@@ -7239,17 +7239,23 @@ describe("persisted TaskGraph wait scope", () => {
       id: "foreign-wait", status: "waiting", suspendedAt: new Date(), idempotencyKey: "same-key",
       userId: expectedScope.userId, sessionId: expectedScope.sessionId, turnId: "turn-1", parentTaskId: "foreign-parent",
     }
+    let foreignParentReturned = false
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
       expect(sql).toContain('AND "parentTaskId" = $4 AND "idempotencyKey" = $5 LIMIT 1')
       expect(values).toEqual([expectedScope.userId, expectedScope.sessionId, "turn-1", expectedScope.parentTaskId, "same-key"])
       const matched = values?.[3] === foreignWait.parentTaskId
+      foreignParentReturned = true
       return { rows: matched ? [foreignWait] : [], rowCount: matched ? 1 : 0 } as QueryResult<ScopedPersistedTaskWaitRow>
     })
     const pool = { query } as unknown as Pool
-
-    await expect(waitForPersistedTaskWait(pool, "turn-1", "same-key", 1, undefined, undefined, undefined, expectedScope))
-      .rejects.toThrow("Follow-up parent wait was not durably suspended")
-    expect(query).toHaveBeenCalledTimes(1)
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => foreignParentReturned ? 1 : 0)
+    try {
+      await expect(waitForPersistedTaskWait(pool, "turn-1", "same-key", 1, undefined, undefined, undefined, expectedScope))
+        .rejects.toThrow("Follow-up parent wait was not durably suspended")
+      expect(query).toHaveBeenCalledTimes(1)
+    } finally {
+      dateNowSpy.mockRestore()
+    }
   })
 })
 
@@ -15058,6 +15064,63 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootTaskId = "", replacementTaskId: string | undefined
     let scoutSearchCalls = 0, seattleHeld = false, dublinHeld = false
     let adapterStage = "not_started", proofKind = "not_read", requestHasConfirmation = false, requestHasDublin = false
+    let postReviseWaitDiagnostics: RecordValue = { observed: false }
+    let postReviseListDiagnostics: RecordValue = { observed: false }
+    const safeWaitProjectionDiagnostic = (request: HarnessModelRequest): RecordValue => {
+      const call = toolUseFromRequest(request, postReviseWaitCallId)
+      const input = record(call?.input)
+      const expectedTaskIds = [seattleTaskId, ...(replacementTaskId ? [replacementTaskId] : [])]
+      const requestedTaskIds = stringIds(input?.taskIds)
+      const original = record(latestToolResult(request, postReviseWaitCallId))
+      const hasWaitId = typeof original?.waitId === "string" && original.waitId.length > 0
+      const resolved = hasWaitId ? record(latestToolResult(request, `wait:${original!.waitId as string}`)) : null
+      const resolvedTasks = Array.isArray(resolved?.tasks) ? resolved.tasks : []
+      const resolvedTargetIds = stringIds(resolved?.targetTaskIds ?? resolved?.taskIds)
+      const resolvedMatchedIds = stringIds(resolved?.matchedTaskIds, true)
+      const statuses = (tasks: unknown): string[] => Array.isArray(tasks)
+        ? tasks.slice(0, 8).map(task => diagnosticEnum(record(task)?.status, TASK_DIAGNOSTIC_STATUSES) ?? "other")
+        : []
+      return {
+        callFound: call !== null,
+        callNameMatches: call?.name === "agent.wait",
+        modeAll: input?.mode === "all",
+        requestTaskCount: requestedTaskIds ? diagnosticBoundedCount(requestedTaskIds.length) : null,
+        requestTaskIdsMatchExpected: requestedTaskIds !== null && sameUniqueIds(requestedTaskIds, expectedTaskIds),
+        originalFound: original !== null,
+        originalStatus: original ? diagnosticEnum(original.status, TOOL_RESULT_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+        originalTaskCount: Array.isArray(original?.taskIds) ? diagnosticBoundedCount(original.taskIds.length) : null,
+        originalMatchedCount: Array.isArray(original?.matchedTaskIds) ? diagnosticBoundedCount(original.matchedTaskIds.length) : null,
+        waitIdPresent: hasWaitId,
+        resolvedFound: resolved !== null,
+        resolvedStatus: resolved ? diagnosticEnum(resolved.status, TOOL_RESULT_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+        resolvedTaskCount: Array.isArray(resolved?.tasks) ? diagnosticBoundedCount(resolved.tasks.length) : null,
+        resolvedMatchedCount: Array.isArray(resolved?.matchedTaskIds) ? diagnosticBoundedCount(resolved.matchedTaskIds.length) : null,
+        resolvedTargetIdsMatchExpected: resolvedTargetIds !== null && sameUniqueIds(resolvedTargetIds, expectedTaskIds),
+        resolvedMatchedIdsMatchExpected: resolvedMatchedIds !== null && sameUniqueIds(resolvedMatchedIds, expectedTaskIds),
+        expectedSeattleInterrupted: resolvedTasks.some(task => record(task)?.taskId === seattleTaskId
+          && record(task)?.status === "interrupted"),
+        expectedReplacementCompleted: typeof replacementTaskId === "string" && resolvedTasks.some(task =>
+          record(task)?.taskId === replacementTaskId && record(task)?.status === "completed"),
+        resolvedTaskStatuses: statuses(resolvedTasks),
+      }
+    }
+    const safeListProjectionDiagnostic = (request: HarnessModelRequest): RecordValue => {
+      const output = record(latestToolResult(request, postReviseListCallId))
+      const tasks = Array.isArray(output?.tasks) ? output.tasks : null
+      const seattle = tasks?.map(record).find(task => task?.taskId === seattleTaskId) ?? null
+      return {
+        resultFound: output !== null,
+        taskCount: tasks ? diagnosticBoundedCount(tasks.length) : null,
+        taskStatuses: tasks ? tasks.slice(0, 8).map(task =>
+          diagnosticEnum(record(task)?.status, TASK_DIAGNOSTIC_STATUSES) ?? "other") : [],
+        seattlePresent: seattle !== null,
+        seattleStatus: seattle ? diagnosticEnum(seattle.status, TASK_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+        expectedSeattleInterrupted: Boolean(tasks?.some(task => record(task)?.taskId === seattleTaskId
+          && record(task)?.status === "interrupted")),
+        expectedReplacementCompleted: Boolean(replacementTaskId && tasks?.some(task => record(task)?.taskId === replacementTaskId
+          && record(task)?.status === "completed")),
+      }
+    }
     let preRetirementGuards: {
       acceptedPlanMatchesReplacement: boolean | null
       replacementHeld: boolean | null
@@ -15074,6 +15137,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       persistedGraphUnique: null, persistedGraphRevisionMatches: null, retirementToolAvailable: null,
       seattleTaskMatchesOriginalLease: null, seattleLeaseStillLive: null, noSeattleDescendants: null, seattleHeld: null,
     }
+    const safeFailureDiagnostic = (): RecordValue => ({
+      adapterStage: diagnosticEnum(adapterStage, new Set([
+        "not_started", "stream_entered", "initial_plan", "initial_wait", "replacement_plan",
+        "refresh_before_retirement", "retire_superseded_scout", "post_revise_wait",
+        "refresh_after_retirement_wait", "final_after_retirement_refresh", "unexpected_graph_state",
+      ])) ?? "other",
+      proofKind: diagnosticEnum(proofKind, new Set(["not_read", "absent", "pending", "unavailable", "confirmed"])) ?? "other",
+      flags: {
+        initialWaitIssued, reviseAttempted, retirementAttempted, postReviseWaitIssued, postReviseListIssued,
+        receiptObserved, confirmationVisible, dublinVisible, requestHasConfirmation, requestHasDublin,
+        retirementResultObserved, retirementLeaseAtRequestVerified, seattleHeld, dublinHeld,
+      },
+      preRetirementGuards,
+      postReviseWait: postReviseWaitDiagnostics,
+      postReviseList: postReviseListDiagnostics,
+    })
     let originalSeattleLease: { id: string; status: string; role: string; attemptCount: number; leaseOwner: string | null;
       leaseExpiresAt: Date | null; leaseSegmentStartedAt: Date | null; interruptRequestedAt: Date | null } | null = null
     let releaseSeattle!: () => void
@@ -15297,6 +15376,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
           if (postReviseWaitIssued) {
             const taskIds = [seattleTaskId, ...(typeof replacement?.taskId === "string" ? [replacement.taskId] : [])]
+            postReviseWaitDiagnostics = { observed: true, ...safeWaitProjectionDiagnostic(request) }
             const outcome = repairWaitOutcomeFromRequest(request, postReviseWaitCallId, taskIds)
             const taskStatuses = new Map<string, string>()
             for (const rawTask of Array.isArray(outcome.tasks) ? outcome.tasks : []) {
@@ -15318,6 +15398,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             adapterStage = "final_after_retirement_refresh"
+            postReviseListDiagnostics = { observed: true, ...safeListProjectionDiagnostic(request) }
             const listing = record(latestToolResult(request, postReviseListCallId))
             const listedTasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
             if (!listedTasks.some(task => task?.taskId === seattleTaskId && task?.status === "interrupted")
@@ -15858,6 +15939,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         expect(loaded.item?.revision).toBeGreaterThanOrEqual(acceptedRevision!)
         await checkpoint.query("COMMIT")
       } finally { await checkpoint.query("ROLLBACK").catch(() => undefined); checkpoint.release() }
+    } catch (error: unknown) {
+      try {
+        const diagnostic = JSON.stringify(safeFailureDiagnostic())
+        if (Buffer.byteLength(diagnostic, "utf8") <= 4 * 1024) {
+          process.stderr.write(`[p3-1240-superseded-scout-failure] ${diagnostic}\n`)
+        } else {
+          process.stderr.write("[p3-1240-superseded-scout-failure] {\"diagnostic\":\"over_limit\"}\n")
+        }
+      } catch { /* Keep diagnostics from changing the fixture's failure. */ }
+      throw error
     } finally {
       releaseSeattle()
       releaseDublin()
