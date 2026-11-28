@@ -105,9 +105,22 @@ describe("scheduled pipeline HTTP handoff", () => {
     [400, "scheduled_pipeline_request_invalid"], [401, "scheduled_pipeline_unauthorized"],
     [403, "scheduled_pipeline_entitlement_required"], [403, "scheduled_pipeline_ai_unavailable"],
     [429, "scheduled_pipeline_ai_budget_exhausted"], [409, "scheduled_pipeline_claim_conflict"],
+    [409, "scheduled_pipeline_source_changed"],
   ])("maps typed pre-claim HTTP %i to a terminal blocked result", async (status, errorCode) => {
     await expect(postScheduledPipelineContinuation(input, new AbortController().signal,
       vi.fn<typeof fetch>(async () => reply(status, { status: "blocked", errorCode })))).resolves.toEqual({ status: "blocked", errorCode })
+  })
+
+  it.each([400, 500])("keeps source-change HTTP %i retryable", async status => {
+    await expect(postScheduledPipelineContinuation(input, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(status, { status: "blocked", errorCode: "scheduled_pipeline_source_changed" }))))
+      .rejects.toThrow("scheduled_pipeline_handoff_retryable")
+  })
+
+  it("keeps an unknown typed HTTP 409 retryable", async () => {
+    await expect(postScheduledPipelineContinuation(input, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(409, { status: "blocked", errorCode: "scheduled_pipeline_unknown" }))))
+      .rejects.toThrow("scheduled_pipeline_handoff_retryable")
   })
 
   it.each([

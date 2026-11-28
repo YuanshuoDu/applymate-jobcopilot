@@ -9,17 +9,55 @@ import { buildScheduledTaskGraphPrepareCheckpoint, scheduledTaskGraphContinuatio
 import { isScheduledTaskGraphOwnerCurrent, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "./scheduled-taskgraph-pipeline-fence"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot"
 import { scheduledTaskGraphExecuteGateCompletionProof } from "./scheduled-taskgraph-gate-rpc"
-import { loadScheduledTaskGraphResumeGateInput, scheduledTaskGraphGateResumeOwnerIsCurrent,
-  validateScheduledTaskGraphAuditPrepareSource, type ScheduledTaskGraphGateResumeInput } from "./scheduled-taskgraph-audit-action"
+import { loadScheduledTaskGraphResumeGateInput, scheduledTaskGraphGateResumeOwnerIsCurrent, scheduledTaskGraphRunCheckpointIsCurrent,
+  validateScheduledTaskGraphAuditPrepareSource, type ScheduledTaskGraphGateResumeInput, type ScheduledTaskGraphRunInput } from "./scheduled-taskgraph-audit-action"
 import { gateDecisionsFromOutput, parseGateDecisions, restoreGateOutput, scheduledTaskGraphPipelineStage as pipelineStage,
   scheduledTaskGraphPipelineStageOrder as stageOrder, type ScheduledTaskGraphGateDecisions } from "./scheduled-taskgraph-gate-choice-evidence"
 import type { PipelineCtx } from "./pipeline-context"
 import type { PipelineCheckpointState } from "./types"
+import { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } from "./scheduled-taskgraph-source-change-task-cleanup"
 
 export { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity }
+export { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } from "./scheduled-taskgraph-source-change-task-cleanup"
 
 export type ScheduledTaskGraphAnalyzeCheckpointProof = Readonly<{ status: "analyze_checkpointed"; continuationKey: string; checkpointDigest: string; claimTokenDigest: string; executionId: string; executionAttemptCount: number }>
 export type ScheduledTaskGraphAnalyzeOnlyInput = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[]; context: PipelineCtx; state: unknown; onStateChange: (state: unknown) => void }>
+
+function resumeCheckpoint(value: unknown): PipelineCheckpointState | undefined {
+  const state = record(value), stages = ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]
+  return state && typeof state.nextStage === "string" && stages.includes(state.nextStage) ? state as unknown as PipelineCheckpointState : undefined
+}
+
+export async function prepareRunResumeState(input: {
+  executionState: unknown; scheduledState: unknown; scheduled?: ScheduledTaskGraphRunInput
+  assertScheduledOwnerCurrent: (tx: Prisma.TransactionClient) => Promise<boolean>
+  assertScheduledAnalyzeSourcesCurrent?: (tx: Prisma.TransactionClient) => Promise<void>
+}): Promise<{ scheduledState: unknown; resumeState: PipelineCheckpointState | undefined }> {
+  const resumeState = resumeCheckpoint(input.executionState), scheduledState = input.scheduledState, scheduled = input.scheduled
+  if (scheduled?.prepareProof === undefined) return { scheduledState, resumeState }
+  const gateProof = scheduledTaskGraphExecuteGateCompletionProof(scheduled.gateCompletionProof)
+  const gate = gateProof?.gate as { taskId: string; attemptCount: number } | undefined
+  const proofInput = { owner: scheduled.owner, snapshot: scheduled.snapshot, analyzeCheckpoint: scheduledState,
+    analyzeAttestation: scheduled.attestation, prepareProof: scheduled.prepareProof,
+    ...(gate ? { gate: { ...gate, phase: "completed" as const, completionProof: scheduled.gateCompletionProof } } : {}) }
+  const gateResumeState = await buildScheduledTaskGraphGateResumeState({
+    owner: scheduled.owner, snapshot: scheduled.snapshot, attestation: scheduled.attestation,
+    continuationKey: scheduled.continuationKey, claimToken: scheduled.claimToken, ownedJobs: scheduled.ownedJobs,
+    persistedCheckpoint: scheduledState, prepareProof: scheduled.prepareProof,
+    ...(scheduled.action === "scheduled_audit_execute" ? { auditActor: scheduled.auditActor } : {}),
+    ...(scheduled.gateCompletionProof !== undefined ? { gateCompletionProof: scheduled.gateCompletionProof } : {}),
+    ...(scheduled.scheduledWaitId ? { scheduledWaitId: scheduled.scheduledWaitId } : {}) })
+  const safeCheckpoint = serializeScheduledTaskGraphCheckpoint(gateResumeState)
+  const saved = safeCheckpoint && await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state: safeCheckpoint,
+    owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken,
+    assertOwnerCurrent: async tx => {
+      await input.assertScheduledAnalyzeSourcesCurrent?.(tx)
+      return scheduledTaskGraphRunCheckpointIsCurrent({ scheduled, proofInput, tx,
+        assertOwnerCurrent: input.assertScheduledOwnerCurrent })
+    } })
+  if (!saved) throw new AgentExecutionCancelledError()
+  return { scheduledState: safeCheckpoint, resumeState: gateResumeState }
+}
 
 /** Rebuilds a private Gate/Execute state from a verified Worker proof and owner-scoped artifact rows. */
 export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTaskGraphGateResumeInput): Promise<PipelineCheckpointState> {
@@ -67,6 +105,8 @@ export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTas
     ...(typeof persisted?.autonomous === "boolean" ? { autonomous: persisted.autonomous } : {}),
     ...(Array.isArray(persisted?.customAgentResults) ? { customAgentResults: persisted.customAgentResults as PipelineCheckpointState["customAgentResults"] } : {}),
     ...(persisted?.executeOutput && typeof persisted.executeOutput === "object" ? { executeOutput: persisted.executeOutput as PipelineCheckpointState["executeOutput"] } : {}),
+    ...(persisted && Object.hasOwn(persisted, "scheduledTaskGraphAnalyzeSourceFingerprints")
+      ? { scheduledTaskGraphAnalyzeSourceFingerprints: persisted.scheduledTaskGraphAnalyzeSourceFingerprints } : {}),
     scheduledTaskGraphPreparedArtifacts: artifactRefs,
     ...(snapshot.requireApproval ? { scheduledTaskGraphScheduledWaitId: input.scheduledWaitId! } : {}),
     ...(decisions ? { scheduledTaskGraphGateDecisions: decisions } : {}),
@@ -104,7 +144,7 @@ export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraph
   }
 
   const ownedJobs = input.ownedJobs.map(job => ({ ...job, coverLetter: null }))
-  let checkpoint: PipelineCheckpointState
+  let checkpoint: PipelineCheckpointState, expectedState: unknown = input.state
   const existing = record(input.state)
   if (existing?.scheduledTaskGraphContinuation !== undefined) {
     const prior = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot: input.snapshot,
@@ -149,19 +189,18 @@ export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraph
       },
     })
     checkpoint = analyze.checkpoint
-    if (!scheduledTaskGraphAnalyzeCheckpointDigest(checkpoint) || checkpoint.nextStage !== "prepare"
-      || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) throw new AgentExecutionCancelledError()
-    const saved = await saveScheduledTaskGraphCheckpoint({ expectedState: analyze.persistedState, state: checkpoint,
-      owner, key: continuationKey, claimToken,
-      assertOwnerCurrent: tx => scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key: continuationKey, claimToken }) })
-    if (!saved) throw new AgentExecutionCancelledError()
+    expectedState = analyze.persistedState
+    if (!scheduledTaskGraphAnalyzeCheckpointDigest(checkpoint) || checkpoint.nextStage !== "prepare") throw new AgentExecutionCancelledError()
   }
 
   const checkpointDigest = scheduledTaskGraphAnalyzeCheckpointDigest(checkpoint)
-  if (!checkpointDigest || checkpoint.nextStage !== "prepare"
-    || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) {
-    throw new AgentExecutionCancelledError()
-  }
+  const saved = checkpointDigest && checkpoint.nextStage === "prepare"
+    ? await saveScheduledTaskGraphCheckpoint({ expectedState, state: checkpoint, owner, key: continuationKey, claimToken,
+      assertOwnerCurrent: async tx => {
+        await assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent(tx, input.context, checkpoint)
+        return scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key: continuationKey, claimToken })
+      } }) : false
+  if (!checkpointDigest || !saved) throw new AgentExecutionCancelledError()
   input.onStateChange(checkpoint)
   const claimTokenDigest = `sha256:${createHash("sha256").update(claimToken, "utf8").digest("hex")}`
   return { status: "analyze_checkpointed", continuationKey, checkpointDigest, claimTokenDigest,

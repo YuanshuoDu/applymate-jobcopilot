@@ -16,6 +16,23 @@ export const SCHEDULED_GATE_BASE_RESUME = { basics: { name: "Scheduled Fixture C
 const CHECKPOINT_PATH = "@/lib/agent/scheduled-taskgraph-gate-checkpoint"
 const DB_PATH = "@/lib/db"
 const BROKER_PATH = "@/lib/agent/broker/store"
+const SCHEDULED_PREPARE_DIAGNOSTIC_ERROR_CODES = [
+  "scheduled_pipeline_owner_mismatch", "scheduled_pipeline_turn_stale", "scheduled_pipeline_mode_mismatch",
+  "scheduled_pipeline_root_mismatch", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_attestation_invalid",
+  "scheduled_pipeline_snapshot_mismatch", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_jobs_mismatch",
+  "scheduled_pipeline_claim_conflict", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_request_invalid",
+  "scheduled_pipeline_unauthorized", "scheduled_pipeline_account_unavailable", "scheduled_pipeline_entitlement_required",
+  "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_ai_budget_exhausted", "scheduled_pipeline_source_changed",
+  "scheduled_pipeline_gate_checkpoint_missing", "scheduled_pipeline_wait_identity_mismatch",
+  "scheduled_pipeline_analyze_checkpoint_invalid",
+] as const
+type ScheduledPrepareDiagnosticErrorCode = typeof SCHEDULED_PREPARE_DIAGNOSTIC_ERROR_CODES[number]
+  | "fixture_unrecognized_blocked_code" | "fixture_unexpected_handoff_status" | "fixture_claim_token_missing"
+
+function scheduledPrepareDiagnosticErrorCode(value: string): ScheduledPrepareDiagnosticErrorCode {
+  return (SCHEDULED_PREPARE_DIAGNOSTIC_ERROR_CODES as readonly string[]).includes(value)
+    ? value as ScheduledPrepareDiagnosticErrorCode : "fixture_unrecognized_blocked_code"
+}
 
 export async function digestScheduledAnalyzeCheckpoint(value: unknown): Promise<string> {
   const checkpoint = await import(CHECKPOINT_PATH) as unknown as {
@@ -155,7 +172,7 @@ export async function resumePrepareChoice(pool: Pool, seed: ScheduledGatePrepare
     const owner: ScheduledAutomationPipelineOwner = { ...input.owner, turnLeaseOwnerId: resumed.owner.turnLeaseOwnerId,
       turnLeaseVersion: resumed.owner.turnLeaseVersion }
     const handoff = await rebindClaimAndPost(pool, owner, input.attestation, input.executionOwner, input.continuationKey)
-    if (handoff.status !== "analyze_checkpointed") throw new Error("scheduled_prepare_rebind_handoff_invalid")
+    if (handoff.status !== "analyze_checkpointed") throw new Error(`scheduled_prepare_rebind_handoff_invalid:${handoff.errorCode}`)
     return { ...resumed, owner: resumed.owner, handoff: handoff.proof, claimToken: handoff.claimToken }
   } finally {
     await web.db.$disconnect()
@@ -165,7 +182,7 @@ export async function resumePrepareChoice(pool: Pool, seed: ScheduledGatePrepare
 async function rebindClaimAndPost(pool: Pool, owner: ScheduledAutomationPipelineOwner,
   attestation: ScheduledAutomationPipelineAttestation, executionOwner: ScheduledGatePrepareSeedFixture["executionOwner"],
   continuationKey: string): Promise<{ status: "analyze_checkpointed"; proof: ScheduledPipelineAnalyzeCheckpointProof; claimToken: string }
-  | { status: "blocked" }> {
+  | { status: "blocked"; errorCode: ScheduledPrepareDiagnosticErrorCode }> {
   let claimToken = ""
   const oldUrl = process.env.AGENT_WEB_URL, oldSecret = process.env.AGENT_WORKER_SECRET
   process.env.AGENT_WEB_URL = "http://scheduled-gate-prepare.integration.invalid"
@@ -189,7 +206,10 @@ async function rebindClaimAndPost(pool: Pool, owner: ScheduledAutomationPipeline
     const route = await vi.importActual<{ POST(request: Request): Promise<Response> }>("@/app/api/internal/agent-runtime/scheduled-pipeline/route")
     const fetcher: typeof fetch = async (input, init) => route.POST(new Request(input, init))
     const result = await postScheduledPipelineContinuation({ owner, attestation }, new AbortController().signal, fetcher)
-    return result.status === "analyze_checkpointed" && claimToken.length > 0 ? { ...result, claimToken } : { status: "blocked" }
+    if (result.status === "blocked") return { status: "blocked", errorCode: scheduledPrepareDiagnosticErrorCode(result.errorCode) }
+    if (result.status !== "analyze_checkpointed") return { status: "blocked", errorCode: "fixture_unexpected_handoff_status" }
+    if (claimToken.length === 0) return { status: "blocked", errorCode: "fixture_claim_token_missing" }
+    return { ...result, claimToken }
   } finally {
     vi.doUnmock(runPath); vi.doUnmock(routerPath); vi.doUnmock(entitlementsPath); vi.resetModules()
     if (oldUrl === undefined) delete process.env.AGENT_WEB_URL; else process.env.AGENT_WEB_URL = oldUrl

@@ -13,6 +13,7 @@ import { completedScheduledTaskGraphReport, rebindScheduledTaskGraphAnalysisStat
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint";
 import { loadDurableScheduledTaskGraphWait, loadScheduledTaskGraphWaitQuestion, priorScheduledTaskGraphContinuation, readScheduledTaskGraphWaitMarker, rebindScheduledTaskGraphWaitState, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from "@/lib/agent/scheduled-taskgraph-pipeline-fence";
 import { hasEffectiveEntitlement, isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements";
+import { isAnalyzeSourceChangedError, isScheduledTaskGraphAnalyzeProofUntrusted, isScheduledTaskGraphSourceChangeTerminal, renewExpiredScheduledAnalyzeClaim, respondToScheduledTaskGraphAnalyzeSourceChange } from "@/lib/agent/scheduled-taskgraph-source-change-terminal";
 import { parseScheduledTaskGraphAttestation, scheduledTaskGraphAttestationCandidates } from "@/lib/agent/scheduled-taskgraph-attestation-candidates";
 import { blocked, claimLeaseIsActive, claimLeaseIsValidAndExpired, completedResponse, hasMarkerlessScoutState, hasPrepareCheckpoint, isWaitResult, json, mapCheckpointError, matchingTurnSnapshot, parseScheduledTaskGraphPipelineRequest, record, reportLeaseIsCurrent, safeCount, validId, type ScheduledTaskGraphPipelineBody, type ScheduledTaskGraphStoredExecution } from "@/lib/agent/scheduled-taskgraph-pipeline-request";
 export const maxDuration = 300;
@@ -29,11 +30,11 @@ async function completedReportLeaseIsCurrent(owner: ScheduledTaskGraphRequestOwn
   const turn = await readTurnLease(owner);
   return Boolean(turn && reportLeaseIsCurrent(turn, owner));
 }
-async function loadExecution(owner: ScheduledTaskGraphRequestOwner): Promise<ScheduledTaskGraphStoredExecution | null> {
+async function loadExecution(owner: ScheduledTaskGraphRequestOwner): Promise<(ScheduledTaskGraphStoredExecution & { error: string | null }) | null> {
   return db.agentExecution.findFirst({
     where: { userId: owner.userId, sessionId: owner.sessionId },
-    select: { id: true, status: true, attemptCount: true, state: true },
-  }) as Promise<ScheduledTaskGraphStoredExecution | null>;
+    select: { id: true, status: true, attemptCount: true, state: true, error: true },
+  }) as Promise<(ScheduledTaskGraphStoredExecution & { error: string | null }) | null>;
 }
 async function canonicalQuestionItemMissing(owner: ScheduledTaskGraphRequestOwner, waitId: string): Promise<boolean> {
   return waitId.startsWith(`agent-question:${owner.turnId}:canonical:`)
@@ -78,15 +79,19 @@ export async function POST(request: Request): Promise<Response> {
   const execution = await loadExecution(owner);
   if (!execution || !safeCount(execution.attemptCount)) return blocked(409, "scheduled_pipeline_execution_mismatch");
   const executionOwner: ScheduledTaskGraphPipelineOwner = { ...owner, executionId: execution.id, executionAttemptCount: execution.attemptCount };
+  if (isScheduledTaskGraphSourceChangeTerminal({ owner: executionOwner, status: execution.status, error: execution.error, state: execution.state })) return blocked(409, "scheduled_pipeline_source_changed");
   const auditCurrent = auditAction ? await scheduledAuditChildIsCurrent(executionOwner, auditAction.auditActor) : false;
   if (auditAction ? !auditCurrent : !scheduledRootIsCurrent(root, owner)) return blocked(409, auditAction ? "scheduled_pipeline_audit_child_fenced" : "scheduled_pipeline_turn_stale");
-  let key: string;
-  try {
+  let key: string, liveSnapshotDigest: string; try { liveSnapshotDigest = scheduledAutomationSnapshotDigest(snapshot);
+    if (liveSnapshotDigest !== record(attestation)?.snapshotDigest) return blocked(409, "scheduled_pipeline_snapshot_mismatch");
     key = scheduledTaskGraphContinuationKey(executionOwner, attestation);
-    if (scheduledAutomationSnapshotDigest(snapshot) !== record(attestation)?.snapshotDigest) return blocked(409, "scheduled_pipeline_snapshot_mismatch");
   } catch (error) { return blocked(409, mapCheckpointError(error)); }
-  const ids = candidates(attestation);
-  if (!ids) return blocked(409, "scheduled_pipeline_attestation_invalid");
+  const ids = candidates(attestation); if (!ids) return blocked(409, "scheduled_pipeline_attestation_invalid");
+  if (isScheduledTaskGraphAnalyzeProofUntrusted(execution.state, ids)) {
+    const state = record(execution.state), continuation = record(state?.scheduledTaskGraphContinuation);
+    if (state?.scheduledTaskGraphContinuation !== undefined && continuation?.snapshotDigest !== liveSnapshotDigest) return blocked(409, "scheduled_pipeline_snapshot_mismatch");
+    return respondToScheduledTaskGraphAnalyzeSourceChange({ owner: executionOwner, attestationSnapshotDigest: liveSnapshotDigest, allowPriorLease: true, currentTurn: { leaseOwnerId: turn.leaseOwnerId, leaseVersion: turn.leaseVersion } });
+  }
   const jobs = await db.job.findMany({ where: { userId: owner.userId, id: { in: ids } } }) as Job[];
   if (jobs.length !== ids.length || new Set(jobs.map(job => job.id)).size !== ids.length) return blocked(409, "scheduled_pipeline_jobs_mismatch");
   const state = record(execution.state), storedWaitId = state?.scheduledTaskGraphScheduledWaitId,
@@ -117,8 +122,8 @@ export async function POST(request: Request): Promise<Response> {
   let waitQuestion: Awaited<ReturnType<typeof loadScheduledTaskGraphWaitQuestion>> = null;
   if (state?.scheduledTaskGraphWait !== undefined && !wait) return blocked(409, "scheduled_pipeline_claim_conflict");
   if (wait) {
-    const currentWaitOwner = wait.key === key && scheduledTaskGraphOwnerMatches(wait.owner, executionOwner);
-    const prior = currentWaitOwner ? null : priorScheduledTaskGraphContinuation({ state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
+    const currentWaitOwner = wait.key === key && scheduledTaskGraphOwnerMatches(wait.owner, executionOwner),
+      prior = currentWaitOwner ? null : priorScheduledTaskGraphContinuation({ state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
     if (!currentWaitOwner
       && !(prior && wait.key === prior.key && scheduledTaskGraphOwnerMatches(wait.owner, prior.owner))) return blocked(409, "scheduled_pipeline_claim_conflict");
     const currentTurn = auditAction ? await scheduledAuditChildIsCurrent(executionOwner, auditAction.auditActor)
@@ -159,12 +164,9 @@ export async function POST(request: Request): Promise<Response> {
     return scheduledTaskGraphClaimMatches(execution.state, key, executionOwner)
       ? blocked(500, "scheduled_pipeline_execution_failed") : blocked(409, "scheduled_pipeline_execution_mismatch");
   }
-  const existingClaim = record(state.scheduledTaskGraphClaim);
-  const currentClaimToken = existingClaim?.claimToken;
+  const existingClaim = record(state.scheduledTaskGraphClaim), currentClaimToken = existingClaim?.claimToken;
   if (auditAction && (!scheduledTaskGraphClaimMatches(state, key, executionOwner) || !validId(currentClaimToken))) return blocked(409, "scheduled_pipeline_claim_conflict");
-  let claimedState: Record<string, unknown>;
-  let resumeQuestionId: string | undefined;
-  let claimToken: string = randomUUID();
+  let claimedState: Record<string, unknown>, resumeQuestionId: string | undefined, claimToken: string = randomUUID();
   if (wait) {
     if (!waitQuestion?.answered) return blocked(409, "scheduled_pipeline_analysis_interrupted");
     const rebind = rebindScheduledTaskGraphWaitState({ state, owner: executionOwner, key, claimToken,
@@ -183,7 +185,11 @@ export async function POST(request: Request): Promise<Response> {
       if (!claimLeaseIsValidAndExpired(existingClaim, key, executionOwner)) return blocked(409, "scheduled_pipeline_claim_conflict");
       const markerlessScout = hasMarkerlessScoutState(state);
       if (!hasPrepareCheckpoint(state, key, executionOwner) && !markerlessScout) return blocked(409, "scheduled_pipeline_analysis_interrupted");
-      claimedState = { ...state, scheduledTaskGraphClaim: { ...existingClaim, claimToken, claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() } };
+      if (!validId(currentClaimToken)) return blocked(409, "scheduled_pipeline_claim_conflict");
+      const nextState = renewExpiredScheduledAnalyzeClaim({ state, owner: executionOwner, key,
+        currentClaimToken, claimToken, candidateJobIds: ids });
+      if (!nextState) return blocked(409, "scheduled_pipeline_claim_conflict");
+      claimedState = nextState;
     }
   } else if (existingClaim) {
     const claimedAt = new Date().toISOString(), leaseExpiresAt = new Date(Date.now() + 600_000).toISOString();
@@ -244,5 +250,5 @@ export async function POST(request: Request): Promise<Response> {
     if ("status" in result && result.status === "analyze_checkpointed") return json(200, result, responseWaitId);
     if ("status" in result && result.status === "gate_checkpointed") return json(200, result);
     return completedResponse(result, responseWaitId, parsed.action);
-  } catch { return blocked(500, "scheduled_pipeline_execution_failed"); }
+  } catch (error) { return isAnalyzeSourceChangedError(error) ? respondToScheduledTaskGraphAnalyzeSourceChange({ owner: executionOwner, key, claimToken, sourceChangeError: error, attestationSnapshotDigest: String(record(attestation)?.snapshotDigest) }) : blocked(500, "scheduled_pipeline_execution_failed"); }
 }

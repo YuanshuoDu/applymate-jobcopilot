@@ -1,19 +1,92 @@
 import { Prisma, type Job } from '@prisma/client'
 import { db } from '@/lib/db'
 import { AgentExecutionCancelledError } from './execution-control'
-import { rebindScheduledTaskGraphClaimForLease, scheduledTaskGraphAuditChildOwnerIsCurrent, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from './scheduled-taskgraph-pipeline-fence'
+import { scheduledTaskGraphAuditChildOwnerIsCurrent, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from './scheduled-taskgraph-pipeline-fence'
 import { buildScheduledTaskGraphPrepareCheckpoint, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import type { ScheduledTaskGraphAuditActor } from './scheduled-taskgraph-audit-child-fence'
 import { hasScheduledTaskGraphGateProof } from './scheduled-taskgraph-approval-fence'
 import { AnalyzeRecoveryPersistenceError, runAnalyze, type AnalyzeRecoveryHooks } from './stages/analyze'
+import { isAnalyzeSourceFingerprint, type AnalyzeSourceFingerprint } from './stages/analyze-model-input'
 import type { AnalyzeOutput, PipelineCheckpointState, PipelineCtx, ScoredJob, StageResult } from './types'
 
-const JOURNAL_SCHEMA = 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v1'
-const MAX_AMBIGUOUS_ATTEMPTS = 2
-const OWNER_KEYS = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount'] as const
+import { MAX_SCHEDULED_TASKGRAPH_ANALYSIS_ATTEMPTS, readScheduledTaskGraphAnalysisJournalState,
+  serializeScheduledTaskGraphAnalysisJournalState, isStructurallySafeScorelessV1AnalyzeJournal,
+  SCHEDULED_TASKGRAPH_ANALYSIS_JOURNAL_SCHEMA } from './scheduled-taskgraph-analysis-journal-state'
+
+export { isStructurallySafeScorelessV1AnalyzeJournal, rebindScheduledTaskGraphAnalysisJournalForLease, rebindScheduledTaskGraphAnalysisStateForLease } from './scheduled-taskgraph-analysis-journal-state'
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+const PARTIAL_OWNER_KEYS = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount'] as const
+function validPartialId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.trim() === value }
+function validPartialOwner(value: unknown): value is ScheduledTaskGraphPipelineOwner {
+  const owner = record(value)
+  return Boolean(owner && Object.keys(owner).length === PARTIAL_OWNER_KEYS.length
+    && PARTIAL_OWNER_KEYS.every(key => Object.hasOwn(owner, key))
+    && [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.turnLeaseOwnerId, owner.executionId].every(validPartialId)
+    && Number.isSafeInteger(owner.rootAttemptCount) && Number(owner.rootAttemptCount) > 0
+    && Number.isSafeInteger(owner.turnLeaseVersion) && Number(owner.turnLeaseVersion) > 0
+    && Number.isSafeInteger(owner.executionAttemptCount) && Number(owner.executionAttemptCount) >= 0)
+}
+function partialCandidateIds(state: Record<string, unknown>): string[] | null {
+  if (!Array.isArray(state.scoutedJobs)) return null
+  const ids = state.scoutedJobs.map(job => record(job)?.id)
+  return ids.every(validPartialId) && new Set(ids).size === ids.length ? ids : null
+}
+function validPartialClaim(claim: Record<string, unknown>): boolean {
+  return Object.keys(claim).sort().join(',') === 'claimToken,claimedAt,key,leaseExpiresAt,owner,schemaVersion'
+    && claim.schemaVersion === 'agent-harness.v2.scheduled-pipeline-claim.v1'
+    && validPartialId(claim.key) && validPartialId(claim.claimToken)
+    && typeof claim.claimedAt === 'string' && Number.isFinite(Date.parse(claim.claimedAt))
+    && typeof claim.leaseExpiresAt === 'string' && Number.isFinite(Date.parse(claim.leaseExpiresAt))
+}
+
+/** Structural preflight only; ownership, attestation, and CAS remain with the route. */
+export function isStructurallySafeScorelessScheduledAnalyzePartial(value: unknown): boolean {
+  if (isStructurallySafeScorelessV1AnalyzeJournal(value)) return true
+  const state = record(value), journal = record(state?.scheduledTaskGraphAnalyzeJournal)
+  const claim = record(state?.scheduledTaskGraphClaim), owner = record(journal?.owner)
+  const candidates = state && partialCandidateIds(state)
+  const key = journal?.key
+  if (!state || !journal || !claim || !owner || !validPartialOwner(owner) || !candidates
+    || journal.schemaVersion !== SCHEDULED_TASKGRAPH_ANALYSIS_JOURNAL_SCHEMA
+    || !validPartialClaim(claim) || claim.key !== key || !scheduledTaskGraphOwnerMatches(claim.owner, owner)
+    || !scheduledTaskGraphClaimMatches(state, String(key), owner, String(claim.claimToken))
+    || !validPartialId(key) || state.nextStage !== 'scout' || state.scheduledTaskGraphContinuation !== undefined
+    || state.scheduledTaskGraphWait !== undefined || state.scheduledTaskGraphAnalyzeSourceFingerprints !== undefined
+    || !Array.isArray(state.scoredJobs) || state.scoredJobs.length !== 0) return false
+  try {
+    readScheduledTaskGraphAnalysisJournalState({ state, jobsById: new Map(), candidateIds: new Set(candidates), key, owner })
+    return true
+  } catch { return false }
+}
+
+/** Pure v1 empty-journal migration; caller must persist the result with an exact-state CAS. */
+export function upgradeScorelessV1AnalyzeJournalForSameLeaseExpiredClaim(input: {
+  state: unknown; owner: ScheduledTaskGraphPipelineOwner; key: string; currentClaimToken: string; claimToken: string
+  candidateJobIds: readonly string[]; now: string; claimedAt: string; leaseExpiresAt: string
+}): Record<string, unknown> | null {
+  const state = record(input.state), journal = record(state?.scheduledTaskGraphAnalyzeJournal)
+  const claim = record(state?.scheduledTaskGraphClaim), candidates = state && partialCandidateIds(state)
+  const now = Date.parse(input.now), claimedAt = Date.parse(input.claimedAt), expiresAt = Date.parse(input.leaseExpiresAt)
+  const candidateSet = new Set(input.candidateJobIds)
+  if (!isStructurallySafeScorelessV1AnalyzeJournal(state) || !state || !journal || !claim || !candidates
+    || !validPartialOwner(input.owner) || !validPartialClaim(claim) || journal.key !== input.key || claim.key !== input.key
+    || !scheduledTaskGraphOwnerMatches(journal.owner, input.owner) || !scheduledTaskGraphOwnerMatches(claim.owner, input.owner)
+    || !scheduledTaskGraphClaimMatches(state, input.key, input.owner, input.currentClaimToken)
+    || candidates.length !== candidateSet.size || candidateSet.size !== input.candidateJobIds.length
+    || input.candidateJobIds.some(id => !validPartialId(id) || !candidateSet.has(id))
+    || candidates.some(id => !candidateSet.has(id)) || claim.claimToken !== input.currentClaimToken
+    || !Number.isFinite(now) || Date.parse(String(claim.leaseExpiresAt)) > now
+    || !validPartialId(input.claimToken) || input.claimToken === input.currentClaimToken
+    || !Number.isFinite(claimedAt) || !Number.isFinite(expiresAt) || claimedAt > now || expiresAt <= now) return null
+  return { ...state,
+    scheduledTaskGraphClaim: { ...claim, claimToken: input.claimToken, claimedAt: input.claimedAt, leaseExpiresAt: input.leaseExpiresAt },
+    scheduledTaskGraphAnalyzeJournal: { schemaVersion: SCHEDULED_TASKGRAPH_ANALYSIS_JOURNAL_SCHEMA,
+      key: input.key, owner: { ...input.owner }, attemptsByJob: { ...record(journal.attemptsByJob) }, failedJobIds: [], sourceFingerprintsByJob: {} },
+  }
 }
 
 export function completedScheduledTaskGraphReport(input: {
@@ -42,48 +115,19 @@ export async function runScheduledTaskGraphAnalyze(input: {
   if (jobsById.size !== jobs.length || jobs.some(job => job.userId !== input.owner.userId)) throw new AgentExecutionCancelledError()
   let state: unknown = input.state
   if (!scheduledTaskGraphClaimMatches(state, input.key, input.owner, input.claimToken)) throw new AgentExecutionCancelledError()
-  let scoredJobs: ScoredJob[] = [], attempts: Record<string, number> = {}, failedIds = new Set<string>()
-  const stateRow = record(state), rawJournal = stateRow?.scheduledTaskGraphAnalyzeJournal
-  if (rawJournal !== undefined) {
-    const journal = record(rawJournal), rawAttempts = record(journal?.attemptsByJob)
-    if (!journal || Object.keys(journal).sort().join(',') !== 'attemptsByJob,failedJobIds,key,owner,schemaVersion'
-      || journal.schemaVersion !== JOURNAL_SCHEMA || journal.key !== input.key || !sameOwner(journal.owner, input.owner)
-      || !rawAttempts || !Array.isArray(journal.failedJobIds) || stateRow?.nextStage !== 'scout' || !Array.isArray(stateRow.scoredJobs)) {
-      throw new AgentExecutionCancelledError()
-    }
-    for (const [id, count] of Object.entries(rawAttempts)) {
-      if (!candidateIds.has(id) || !Number.isSafeInteger(count) || Number(count) < 1 || Number(count) > MAX_AMBIGUOUS_ATTEMPTS) throw new AgentExecutionCancelledError()
-      attempts[id] = Number(count)
-    }
-    if (journal.failedJobIds.some(id => typeof id !== 'string' || !candidateIds.has(id))
-      || new Set(journal.failedJobIds).size !== journal.failedJobIds.length || stateRow.analysisFailed !== journal.failedJobIds.length) {
-      throw new AgentExecutionCancelledError()
-    }
-    failedIds = new Set(journal.failedJobIds as string[])
-    for (const raw of stateRow.scoredJobs) {
-      const score = record(raw), rawJob = record(score?.job), id = rawJob?.id
-      if (!score || typeof id !== 'string' || !candidateIds.has(id) || scoredJobs.some(row => row.job.id === id)
-        || failedIds.has(id) || (attempts[id] ?? 0) < 1 || !Number.isSafeInteger(score.score) || Number(score.score) < 0 || Number(score.score) > 100
-        || !stringList(score.matchedKeywords) || !stringList(score.missingKeywords) || typeof score.recommendation !== 'string' || !realFence(score.analysisFenceAt)) {
-        throw new AgentExecutionCancelledError()
-      }
-      scoredJobs.push({ ...score, job: jobsById.get(id)! } as unknown as ScoredJob)
-    }
-    if (scoredJobs.length + failedIds.size > jobs.length) throw new AgentExecutionCancelledError()
-  }
+  const restored = readScheduledTaskGraphAnalysisJournalState({ state, jobsById, candidateIds, key: input.key, owner: input.owner })
+  let { scoredJobs, attemptsByJob: attempts, failedJobIds: failedIds, sourceFingerprintsByJob } = restored
   let writeQueue = Promise.resolve()
   const writeJournal = (change: () => boolean | void, tx?: Prisma.TransactionClient) => {
     const write = writeQueue.then(async () => {
       if (change() === false) return
-      const next = { ...(record(state) ?? {}), nextStage: 'scout' as const, scoutedJobs: jobs, scoredJobs,
-        analysisFailed: failedIds.size, scheduledTaskGraphAnalyzeJournal: {
-          schemaVersion: JOURNAL_SCHEMA, key: input.key, owner: { ...input.owner }, attemptsByJob: { ...attempts }, failedJobIds: [...failedIds],
-        } }
+      const next = serializeScheduledTaskGraphAnalysisJournalState({ state, key: input.key, owner: input.owner,
+        jobs, scoredJobs, attemptsByJob: attempts, failedJobIds: failedIds, sourceFingerprintsByJob })
       if (!scheduledTaskGraphClaimMatches(next, input.key, input.owner, input.claimToken)) throw new AgentExecutionCancelledError()
       const expectedState = state
       let persistedState: PipelineCheckpointState
       try {
-        persistedState = JSON.parse(JSON.stringify(next)) as PipelineCheckpointState
+        persistedState = next
         await input.persist(persistedState, expectedState, tx)
       }
       catch (error) {
@@ -95,7 +139,7 @@ export async function runScheduledTaskGraphAnalyze(input: {
     writeQueue = write
     return write
   }
-  if (rawJournal === undefined) await writeJournal(() => true)
+  if (!restored.hasJournal) await writeJournal(() => true)
   const scoredIds = new Set(scoredJobs.map(row => row.job.id))
   const pendingJobs = jobs.filter(job => !scoredIds.has(job.id) && !failedIds.has(job.id))
   const recovery: AnalyzeRecoveryHooks = {
@@ -104,12 +148,21 @@ export async function runScheduledTaskGraphAnalyze(input: {
       let allowed = false
       await writeJournal(() => {
         const count = attempts[jobId] ?? 0
-        if (count >= MAX_AMBIGUOUS_ATTEMPTS) return false
+        if (count >= MAX_SCHEDULED_TASKGRAPH_ANALYSIS_ATTEMPTS) return false
         attempts[jobId] = count + 1; allowed = true; return true
       })
       if (!allowed) throw new Error('Analyze recovery retry limit reached before a durable score was recorded.')
     },
-    onScoredJob: async (scored, tx) => { await writeJournal(() => { scoredJobs.push(scored); return true }, tx) },
+    sourceFingerprintsByJob,
+    onScoredJob: async (scored, tx, sourceFingerprint) => {
+      await writeJournal(() => {
+        if (!candidateIds.has(scored.job.id) || scoredJobs.some(row => row.job.id === scored.job.id)
+          || failedIds.has(scored.job.id) || !isAnalyzeSourceFingerprint(sourceFingerprint)) throw new AgentExecutionCancelledError()
+        scoredJobs.push(scored)
+        sourceFingerprintsByJob[scored.job.id] = sourceFingerprint
+        return true
+      }, tx)
+    },
     onScoreFailure: async jobId => { await writeJournal(() => { failedIds.add(jobId); return true }) },
     ...(input.assertScoreOwnerCurrent ? { assertScoreOwnerCurrent: input.assertScoreOwnerCurrent } : {}),
   }
@@ -119,59 +172,11 @@ export async function runScheduledTaskGraphAnalyze(input: {
   const prepared = buildScheduledTaskGraphPrepareCheckpoint({ owner: input.owner, snapshot: input.snapshot,
     attestation: input.attestation, ownedJobs: jobs, analyzeResult: analysis, existingCheckpoint: state })
   if (prepared.alreadyPersisted || prepared.continuationKey !== input.key) throw new AgentExecutionCancelledError()
-  const checkpoint = { ...prepared.checkpoint } as PipelineCheckpointState & Record<string, unknown>
+  const checkpoint = { ...prepared.checkpoint,
+    scheduledTaskGraphAnalyzeSourceFingerprints: { ...sourceFingerprintsByJob },
+  } as PipelineCheckpointState & Record<string, unknown>
   delete checkpoint.scheduledTaskGraphAnalyzeJournal
   return { analysis, checkpoint, persistedState: state as PipelineCheckpointState }
-}
-
-/** Rebind a partial Analyze journal together with a scheduled claim after Turn lease rollover. */
-export function rebindScheduledTaskGraphAnalysisJournalForLease(input: {
-  state: unknown; owner: ScheduledTaskGraphPipelineOwner; key: string
-}): Record<string, unknown> | null {
-  const state = record(input.state), journal = record(state?.scheduledTaskGraphAnalyzeJournal)
-  const claim = record(state?.scheduledTaskGraphClaim), priorOwner = parseJournalOwner(journal?.owner)
-  const scoutedJobs = state?.scoutedJobs, scoredJobs = state?.scoredJobs
-  const attemptsByJob = record(journal?.attemptsByJob), failedJobIds = journal?.failedJobIds
-  if (!state || !journal || !claim || !priorOwner || !attemptsByJob || !Array.isArray(scoutedJobs)
-    || !Array.isArray(scoredJobs) || !Array.isArray(failedJobIds) || state.nextStage !== 'scout'
-    || state.scheduledTaskGraphContinuation !== undefined || Object.keys(journal).sort().join(',') !== 'attemptsByJob,failedJobIds,key,owner,schemaVersion'
-    || journal.schemaVersion !== JOURNAL_SCHEMA || journal.key !== claim.key || !validId(claim.key) || !validId(claim.claimToken)
-    || !sameExactOwner(claim.owner, priorOwner)
-    || !scheduledTaskGraphClaimMatches(state, String(claim.key), priorOwner, typeof claim.claimToken === 'string' ? claim.claimToken : undefined)
-    || !sameStableOwnerForRebind(priorOwner, input.owner) || !validId(input.key)) return null
-
-  const candidateIds = new Set(scoutedJobs.map(row => record(row)?.id).filter((id): id is string => typeof id === 'string'))
-  if (candidateIds.size !== scoutedJobs.length) return null
-  const failed = new Set<string>()
-  for (const id of failedJobIds) {
-    if (typeof id !== 'string' || !candidateIds.has(id) || failed.has(id)) return null
-    failed.add(id)
-  }
-  if (!Number.isSafeInteger(state.analysisFailed) || state.analysisFailed !== failed.size) return null
-  for (const [id, count] of Object.entries(attemptsByJob)) {
-    if (!candidateIds.has(id) || !Number.isSafeInteger(count) || Number(count) < 1 || Number(count) > MAX_AMBIGUOUS_ATTEMPTS) return null
-  }
-  const scoredIds = new Set<string>()
-  for (const raw of scoredJobs) {
-    const row = record(raw), job = record(row?.job), id = job?.id
-    if (typeof id !== 'string' || !candidateIds.has(id) || scoredIds.has(id) || failed.has(id)
-      || (attemptsByJob[id] as number | undefined) === undefined || !Number.isSafeInteger(row?.score)
-      || Number(row?.score) < 0 || Number(row?.score) > 100 || !stringList(row?.matchedKeywords)
-      || !stringList(row?.missingKeywords) || typeof row?.recommendation !== 'string' || !realFence(row?.analysisFenceAt)) return null
-    scoredIds.add(id)
-  }
-  if (scoredIds.size + failed.size > candidateIds.size) return null
-  return { ...journal, key: input.key, owner: { ...input.owner } }
-}
-
-export function rebindScheduledTaskGraphAnalysisStateForLease(input: {
-  state: unknown; owner: ScheduledTaskGraphPipelineOwner; key: string; claimToken: string; ownedJobs: readonly Job[]
-  snapshot: unknown; attestation: unknown; claimedAt: string; leaseExpiresAt: string
-}): Record<string, unknown> | null {
-  const rebound = rebindScheduledTaskGraphClaimForLease(input)
-  if (!rebound || record(input.state)?.scheduledTaskGraphAnalyzeJournal === undefined) return rebound
-  const journal = rebindScheduledTaskGraphAnalysisJournalForLease(input)
-  return journal ? { ...rebound, scheduledTaskGraphAnalyzeJournal: journal } : null
 }
 
 /** Locks and verifies every durable owner row inside the score write transaction. */
@@ -241,27 +246,4 @@ export async function isScheduledTaskGraphAuditChildOwnerCurrent(input: Schedule
   catch { return false }
 }
 
-function sameOwner(value: unknown, expected: ScheduledTaskGraphPipelineOwner): boolean {
-  const owner = record(value), fields = Object.keys(expected) as Array<keyof ScheduledTaskGraphPipelineOwner>
-  return Boolean(owner && Object.keys(owner).length === fields.length && fields.every(field => owner[field] === expected[field]))
-}
-function parseJournalOwner(value: unknown): ScheduledTaskGraphPipelineOwner | null {
-  const owner = record(value)
-  if (!owner || Object.keys(owner).sort().join(',') !== [...OWNER_KEYS].sort().join(',')
-    || !OWNER_KEYS.every(key => Object.hasOwn(owner, key))) return null
-  return owner as unknown as ScheduledTaskGraphPipelineOwner
-}
-function sameExactOwner(value: unknown, expected: ScheduledTaskGraphPipelineOwner): boolean {
-  const owner = parseJournalOwner(value)
-  return Boolean(owner && OWNER_KEYS.every(key => owner[key] === expected[key]))
-}
-function sameStableOwnerForRebind(previous: ScheduledTaskGraphPipelineOwner, current: ScheduledTaskGraphPipelineOwner): boolean {
-  return previous.userId === current.userId && previous.sessionId === current.sessionId && previous.turnId === current.turnId
-    && previous.rootTaskId === current.rootTaskId && previous.rootAttemptCount === current.rootAttemptCount
-    && previous.executionId === current.executionId && previous.executionAttemptCount === current.executionAttemptCount
-    && Number.isSafeInteger(previous.turnLeaseVersion) && previous.turnLeaseVersion < current.turnLeaseVersion
-}
-function stringList(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === 'string') }
-function realFence(value: unknown): value is string { return typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
-function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.trim() === value }
 function safeCount(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) >= 0 }

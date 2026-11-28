@@ -1217,14 +1217,15 @@ function diagnosticRootFailureCode(value: unknown): string {
 
 async function rootFailureDiagnostic(pool: Pool, turnId: string): Promise<RecordValue> {
   try {
-    const result = await pool.query<{ errorCode: string | null; final: unknown }>(
-      `SELECT event."payload"->>'errorCode' AS "errorCode", event."payload"->'final' AS "final"
+    const config: QueryConfig<unknown[]> & { query_timeout: number } = {
+      text: `SELECT event."payload"->>'errorCode' AS "errorCode", event."payload"->'final' AS "final"
        FROM "agent_events" AS event JOIN "agent_turns" AS turn
          ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
        WHERE event."turnId" = $1 AND event."type" = 'turn.failed' AND event."taskId" = turn."rootTaskId"
        ORDER BY event."sequence" DESC LIMIT 1`,
-      [turnId],
-    )
+      values: [turnId], query_timeout: ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+    }
+    const result = await pool.query<{ errorCode: string | null; final: unknown }>(config)
     const row = result.rows[0]
     const final = record(row?.final)
     return {
@@ -1236,6 +1237,135 @@ async function rootFailureDiagnostic(pool: Pool, turnId: string): Promise<Record
         : "missing",
       blockerPresent: typeof final?.blocker === "string",
       blockerCode: typeof final?.blocker === "string" ? diagnosticRootFailureCode(final.blocker) : "missing",
+    }
+  } catch {
+    return { available: false }
+  }
+}
+
+async function cohortRepairFailureDiagnostics(
+  pool: Pool,
+  turnId: string,
+  toolCallIds: readonly string[],
+): Promise<RecordValue> {
+  try {
+    const stepQuery: QueryConfig<unknown[]> & { query_timeout: number } = {
+      text: `SELECT "status", "errorCode" FROM "agent_steps"
+             WHERE "turnId" = $1 ORDER BY "ordinal" DESC, "attempt" DESC LIMIT 4`,
+      values: [turnId], query_timeout: ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+    }
+    const toolItemQuery: QueryConfig<unknown[]> & { query_timeout: number } = {
+      text: `SELECT item."type", item."status",
+                    COALESCE(call."content"->>'toolName', item."content"->>'toolName') AS "toolName",
+                    item."content"->'output'->>'status' AS "outputStatus",
+                    item."content"->>'errorCode' AS "errorCode"
+             FROM "agent_items" AS item
+             LEFT JOIN "agent_items" AS call
+               ON call."turnId" = item."turnId" AND call."type" = 'tool_call'
+              AND call."content"->>'toolCallId' = item."content"->>'toolCallId'
+             WHERE item."turnId" = $1 AND item."type" IN ('tool_call', 'tool_result')
+               AND item."content"->>'toolCallId' = ANY($2::text[])
+             ORDER BY item."createdAt" DESC LIMIT 8`,
+      values: [turnId, [...toolCallIds]], query_timeout: ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+    }
+    const [steps, toolItems] = await Promise.all([
+      pool.query<{ status: string; errorCode: string | null }>(stepQuery),
+      pool.query<{ type: string; status: string | null; toolName: string | null; outputStatus: string | null; errorCode: string | null }>(toolItemQuery),
+    ])
+    return {
+      available: true,
+      stepCount: diagnosticBoundedCount(steps.rows.length),
+      steps: steps.rows.map(row => ({
+        status: diagnosticEnum(row.status, STEP_DIAGNOSTIC_STATUSES) ?? "other",
+        errorCode: diagnosticErrorCode(row.errorCode) ?? "none",
+      })),
+      toolItemCount: diagnosticBoundedCount(toolItems.rows.length),
+      toolItems: toolItems.rows.map(row => ({
+        type: diagnosticEnum(row.type, TOOL_ITEM_TYPES) ?? "other",
+        status: diagnosticEnum(row.status, ITEM_DIAGNOSTIC_STATUSES) ?? "none",
+        toolName: diagnosticEnum(row.toolName, TOOL_DIAGNOSTIC_NAMES) ?? "other",
+        outputStatus: row.toolName === "agent.wait"
+          ? diagnosticEnum(row.outputStatus, TOOL_RESULT_DIAGNOSTIC_STATUSES) ?? "other"
+          : row.toolName === "agent.plan" && row.outputStatus === "accepted" ? "accepted" : "other",
+        errorCode: diagnosticErrorCode(row.errorCode) ?? "none",
+      })),
+    }
+  } catch {
+    return { available: false }
+  }
+}
+
+function cohortWaitOutcomeRequestDiagnostic(request: HarnessModelRequest, expectedTaskCount: number): RecordValue {
+  const waitResults = request.messages.flatMap(message => message.content.flatMap(part =>
+    part.type === "tool_result" && part.toolUseId.startsWith("wait:") ? [part] : []))
+  const waitOutcomes = waitResults.map(part => {
+    if (typeof part.content !== "string") return null
+    try { return record(JSON.parse(part.content) as unknown) } catch { return null }
+  })
+  return {
+    waitResultCount: diagnosticBoundedCount(waitResults.length),
+    readyWaitResultCount: diagnosticBoundedCount(waitOutcomes.filter(outcome => outcome?.status === "ready").length),
+    waitResults: waitResults.slice(0, 4).map(part => {
+      let outcome: RecordValue | null = null
+      if (typeof part.content === "string") {
+        try { outcome = record(JSON.parse(part.content) as unknown) } catch { /* Keep only bounded parse metadata. */ }
+      }
+      const tasks = Array.isArray(outcome?.tasks) ? outcome.tasks : null
+      return {
+        contentIsString: typeof part.content === "string",
+        parsedOutcome: outcome !== null,
+        status: outcome ? diagnosticEnum(outcome.status, TOOL_RESULT_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+        waitIdPresent: typeof outcome?.waitId === "string",
+        taskCount: tasks ? diagnosticBoundedCount(tasks.length) : 0,
+        expectedTaskCountMatches: tasks?.length === expectedTaskCount,
+      }
+    }),
+  }
+}
+
+function cohortWaitObservationDiagnostic(observations: readonly { id: string; content: unknown }[]): RecordValue {
+  const waitResults = observations.filter(item => item.id.startsWith("wait-result:"))
+  return {
+    waitResultCount: diagnosticBoundedCount(waitResults.length),
+    readyWaitResultCount: diagnosticBoundedCount(waitResults.filter(item => record(record(item.content)?.output)?.status === "ready").length),
+  }
+}
+
+function cohortWaitObservationBlockDiagnostic(blocks: readonly { layer: string; content: unknown }[]): RecordValue {
+  const waitBlocks = blocks.filter(block => block.layer === "tool_observation" && record(block.content)?.toolName === "agent.wait")
+  return {
+    waitBlockCount: diagnosticBoundedCount(waitBlocks.length),
+    readyWaitBlockCount: diagnosticBoundedCount(waitBlocks.filter(block => record(record(block.content)?.output)?.status === "ready").length),
+  }
+}
+
+async function cohortWaitBoundaryDiagnostics(pool: Pool, turnId: string, idempotencyKey: string): Promise<RecordValue> {
+  try {
+    const config: QueryConfig<unknown[]> & { query_timeout: number } = {
+      text: `SELECT wait."status", wait."suspendedAt" IS NOT NULL AS "suspended",
+                    wait."resolvedAt" IS NOT NULL AS "resolved", wait."consumedAt" IS NOT NULL AS "consumed",
+                    jsonb_array_length(wait."targetTaskIds") AS "targetCount",
+                    jsonb_array_length(wait."matchedTaskIds") AS "matchedCount",
+                    step."status" AS "stepStatus", step."attempt" AS "stepAttempt"
+             FROM "agent_wait_conditions" AS wait
+             LEFT JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."turnId" = wait."turnId"
+             WHERE wait."turnId" = $1 AND wait."idempotencyKey" = $2 LIMIT 1`,
+      values: [turnId, idempotencyKey], query_timeout: ANALYST_WAIT_DIAGNOSTIC_QUERY_TIMEOUT_MS,
+    }
+    const result = await pool.query<{
+      status: string; suspended: boolean; resolved: boolean; consumed: boolean; targetCount: number; matchedCount: number;
+      stepStatus: string | null; stepAttempt: number | null;
+    }>(config)
+    const row = result.rows[0]
+    return {
+      available: true,
+      found: Boolean(row),
+      status: row ? diagnosticEnum(row.status, WAIT_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+      suspended: row?.suspended === true, resolved: row?.resolved === true, consumed: row?.consumed === true,
+      targetCount: row ? diagnosticBoundedCount(row.targetCount) : 0,
+      matchedCount: row ? diagnosticBoundedCount(row.matchedCount) : 0,
+      stepStatus: row?.stepStatus ? diagnosticEnum(row.stepStatus, STEP_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+      stepAttempt: row?.stepAttempt === null || row?.stepAttempt === undefined ? 0 : diagnosticBoundedCount(row.stepAttempt),
     }
   } catch {
     return { available: false }
@@ -9354,6 +9484,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   let pool: Pool | undefined
   let redis: Redis | undefined
   let bootstrap: ProductionWorkerBootstrap | undefined
+  let cohortContextBuilderDiagnosticSpies: Array<{ mockRestore(): void }> | undefined
   let turnQueueName: string | undefined
   let childQueueName: string | undefined
   let selectedJobQueueName: string | undefined
@@ -9417,6 +9548,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   }, 15_000)
 
   afterEach(async () => {
+    for (const spy of cohortContextBuilderDiagnosticSpies ?? []) spy.mockRestore()
+    cohortContextBuilderDiagnosticSpies = undefined
     if (bootstrap) await bootstrap.close()
     bootstrap = undefined
   })
@@ -17950,6 +18083,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let targetScriptedModelRequestCount = 0
     let rootFailureStage = "not_started"
     let lastModelRequestScope: RecordValue | null = null
+    let initialWaitOutcomeDiagnostic: RecordValue | null = null
+    const waitLoadDiagnostics: RecordValue[] = []
+    const waitBoundaryDiagnostics: RecordValue[] = []
+    const recordWaitBoundaryDiagnostic = (diagnostic: RecordValue) => {
+      if (waitBoundaryDiagnostics.length === 12) waitBoundaryDiagnostics.shift()
+      waitBoundaryDiagnostics.push(diagnostic)
+    }
     let initialTaskIds: string[] = []
     let targetTaskId = "", downstreamTaskId = "", repairTaskId = ""
     let failedCoverageObserved = false, repairAccepted = false, repairPassed = false, downstreamCompleted = false
@@ -17970,10 +18110,90 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         rootMatchKnown: false, rootMatchesFixture: null, roleMatchKnown: false, roleMatchesExpected: false,
       },
     }
+    const originalContextBuilderBuild = StepContextBuilder.prototype.build
+    const originalContextBuilderBuildInTransaction = StepContextBuilder.prototype.buildInTransaction
+    const contextBuilderBuildSpy = vi.spyOn(StepContextBuilder.prototype, "build")
+      .mockImplementation(async function (this: StepContextBuilder, request) {
+        const execution = rootExecution
+        const consumeWaitOutcomes = flags.consumeWaitOutcomes === true
+        if (request.turnId === value.turnId && execution >= 2) {
+          recordWaitBoundaryDiagnostic({
+            execution: diagnosticBoundedCount(execution), stage: "context_builder_snapshot", consumeWaitOutcomes,
+            ...cohortWaitObservationDiagnostic(request.snapshot.toolObservations),
+          })
+        }
+        const context = await originalContextBuilderBuild.call(this, request)
+        if (request.turnId === value.turnId && execution >= 2) {
+          recordWaitBoundaryDiagnostic({
+            execution: diagnosticBoundedCount(execution), stage: "tool_observation_block", consumeWaitOutcomes,
+            ...cohortWaitObservationBlockDiagnostic(context.blocks),
+          })
+        }
+        return context
+      })
+    const contextBuilderBuildInTransactionSpy = vi.spyOn(StepContextBuilder.prototype, "buildInTransaction")
+      .mockImplementation(async function (this: StepContextBuilder, transaction, request) {
+        const execution = rootExecution
+        const consumeWaitOutcomes = flags.consumeWaitOutcomes === true
+        if (request.turnId === value.turnId && execution >= 2) {
+          recordWaitBoundaryDiagnostic({
+            execution: diagnosticBoundedCount(execution), stage: "context_builder_snapshot", consumeWaitOutcomes,
+            ...cohortWaitObservationDiagnostic(request.snapshot.toolObservations),
+          })
+        }
+        const context = await originalContextBuilderBuildInTransaction.call(this, transaction, request)
+        if (request.turnId === value.turnId && execution >= 2) {
+          recordWaitBoundaryDiagnostic({
+            execution: diagnosticBoundedCount(execution), stage: "tool_observation_block", consumeWaitOutcomes,
+            ...cohortWaitObservationBlockDiagnostic(context.blocks),
+          })
+        }
+        return context
+      })
+    cohortContextBuilderDiagnosticSpies = [contextBuilderBuildSpy, contextBuilderBuildInTransactionSpy]
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: authorizeUnreservedUsage,
+      stateLoader: async (statePool, lease, now, loaderOptions) => {
+        const state = await loadCanonicalTurnState(statePool, lease, now, loaderOptions)
+        if (lease.turnId === value.turnId) {
+          const waitResults = state.snapshot.toolObservations.filter(item => item.id.startsWith("wait-result:"))
+          const execution = rootExecution + 1
+          const consumeWaitOutcomes = loaderOptions?.consumeWaitOutcomes === true
+          if (execution >= 2) {
+            const waitObservation = cohortWaitObservationDiagnostic(state.snapshot.toolObservations)
+            const waitKey = rootFailureStage === "repair_wait" ? repairWaitKey : initialWaitKey
+            const waitBoundary = consumeWaitOutcomes && waitObservation.waitResultCount === 0
+              ? await cohortWaitBoundaryDiagnostics(statePool as Pool, value.turnId, waitKey)
+              : undefined
+            recordWaitBoundaryDiagnostic({
+              execution: diagnosticBoundedCount(execution), stage: "state_loader_return", consumeWaitOutcomes,
+              ...waitObservation,
+              ...(waitBoundary === undefined ? {} : { waitBoundary }),
+            })
+          }
+          const diagnostic: RecordValue = {
+            rootExecution: diagnosticBoundedCount(rootExecution), rootFailureStage,
+            consumeWaitOutcomes: loaderOptions?.consumeWaitOutcomes === true,
+            waitResultCount: diagnosticBoundedCount(waitResults.length),
+            waitResults: waitResults.slice(0, 4).map(item => {
+              const content = record(item.content), output = record(content?.output)
+              const tasks = Array.isArray(output?.tasks) ? output.tasks : null
+              return {
+                toolName: diagnosticEnum(content?.toolName, TOOL_DIAGNOSTIC_NAMES) ?? "other",
+                status: diagnosticEnum(content?.status, ITEM_DIAGNOSTIC_STATUSES) ?? "other",
+                outputStatus: diagnosticEnum(output?.status, TOOL_RESULT_DIAGNOSTIC_STATUSES) ?? "other",
+                waitCallIdPresent: typeof content?.toolCallId === "string" && content.toolCallId.startsWith("wait:"),
+                taskCount: tasks ? diagnosticBoundedCount(tasks.length) : 0,
+              }
+            }),
+          }
+          if (waitLoadDiagnostics.length === 4) waitLoadDiagnostics.shift()
+          waitLoadDiagnostics.push(diagnostic)
+        }
+        return state
+      },
       modelRuntimeFactory: async ({ userId: factoryUserId, state }) => {
         const stateRootTaskId = typeof state.rootTaskId === "string" && state.rootTaskId.length > 0
           ? state.rootTaskId : null
@@ -18026,6 +18246,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const scriptExecution = execution
             targetScriptedModelRequestCount += 1
             round += 1
+            if (scriptExecution >= 2) {
+              recordWaitBoundaryDiagnostic({
+                execution: diagnosticBoundedCount(scriptExecution), stage: "final_request_messages",
+                consumeWaitOutcomes: flags.consumeWaitOutcomes === true,
+                ...cohortWaitOutcomeRequestDiagnostic(request, scriptExecution === 2 ? 1 : 2),
+              })
+            }
             const graph = currentGraphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
             const scout = nodes.find(node => node?.key === "scout")
             const analysis = nodes.find(node => node?.key === "analysis")
@@ -18057,7 +18284,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (scriptExecution === 2 && round === 1) {
               rootFailureStage = "initial_wait_resume"
+              initialWaitOutcomeDiagnostic = cohortWaitOutcomeRequestDiagnostic(request, 1)
               const outcome = waitOutcomeFromRequest(request, 1)
+              rootFailureStage = "initial_wait_status"
               expect(outcome.status).toBe("ready")
               const failedTask = record(outcome.tasks[0])
               rootFailureStage = "failed_task_shape"
@@ -18209,15 +18438,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
     const coverageWaitFailureDiagnostic = async (stage: "initial_wait" | "repair_wait"): Promise<string> => {
       const rootTurn = await analystWaitDiagReadRootTurn(pool!, value.turnId, repairWaitDiagnostic)
+      const waitKey = stage === "initial_wait" ? initialWaitKey : repairWaitKey
+      const [rootFailure, planWaitReceipts, waitBoundary] = await Promise.all([
+        rootFailureDiagnostic(pool!, value.turnId),
+        cohortRepairFailureDiagnostics(pool!, value.turnId, [planCallId, initialWaitCallId, repairPlanCallId, repairWaitCallId]),
+        cohortWaitBoundaryDiagnostics(pool!, value.turnId, waitKey),
+      ])
       return boundedDiagnostic(JSON.stringify({
         stage, rootTurn,
+        rootFailure, planWaitReceipts, waitBoundary,
         rootExecution: diagnosticBoundedCount(rootExecution), rootFailureStage,
         targetRootPresent: targetRootTaskId !== null,
         lastModelRequestScope,
         targetScriptedModelRequestCount: diagnosticBoundedCount(targetScriptedModelRequestCount),
         failedCoverageObserved, repairAccepted, repairWaitCallPrepared,
+        initialWaitOutcome: initialWaitOutcomeDiagnostic,
+        waitLoads: waitLoadDiagnostics, waitBoundaries: waitBoundaryDiagnostics,
         wait: analystWaitDiagProjection(repairWaitDiagnosticState),
-      }), 2_400)
+      }), 4_000)
     }
     await turnQueueModule.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
     try {

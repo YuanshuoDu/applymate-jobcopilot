@@ -588,35 +588,44 @@ describe("production child runtime", () => {
         return { id: row.id }
       }),
     }
+    let nextMaterializerTransactionId = 1000
     const databaseFixture = {
       job: jobDelegate,
-      $transaction: async <T>(callback: (transaction: Record<string, unknown>) => Promise<T>): Promise<T> => callback({
-        job: jobDelegate,
-        $executeRaw: async () => 1,
-        $executeRawUnsafe: async () => 1,
-        $queryRaw: async <R>(query: { sql: string }): Promise<R> => {
-          const sql = query.sql
-          if (sql.includes('FROM "agent_sessions"')) return [{ id: "session-1", status: "running" }] as R
-          if (sql.includes('FROM "agent_turns"')) return [{
-            id: "turn-1", sessionId: "session-1", userId: ownerUserId, rootTaskId: "root-1", status: "in_progress",
-            source: "automation", input: turnInput,
-          }] as R
-          if (sql.includes('FROM "agent_steps"')) return [{ id: "scout-step" }] as R
-          if (sql.includes("clock_timestamp()")) return [{ status: "running", interruptRequestedAt: null, closedAt: null,
-            leaseOwner: "worker-1", attemptCount: 1, live: true }] as R
-          if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("'scout'")) return [{
-            id: "scout-task", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
-            role: "scout", taskType: "job_discovery", status: "running", interruptRequestedAt: null, closedAt: null,
-            leaseOwner: "worker-1", attemptCount: 1, allowedActions: ["jobs.discover"],
-          }] as R
-          if (sql.includes('FROM "sub_agent_tasks"')) return [{
-            id: "root-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null,
-            role: "orchestrator", taskType: "root", status: "running", interruptRequestedAt: null, closedAt: null,
-            leaseOwner: null, attemptCount: 1, allowedActions: ["agent.plan"],
-          }] as R
-          throw new Error(`unexpected materializer fixture query: ${sql}`)
-        },
-      }),
+      $transaction: async <T>(callback: (transaction: Record<string, unknown>) => Promise<T>): Promise<T> => {
+        const transactionId = String(nextMaterializerTransactionId++)
+        return callback({
+          job: jobDelegate,
+          $executeRaw: async () => 1,
+          $executeRawUnsafe: async () => 1,
+          $queryRaw: async <R>(query: unknown): Promise<R> => {
+            const sql = Array.isArray(query)
+              ? query.map((part: unknown) => typeof part === "string" ? part : "").join("?")
+              : typeof query === "object" && query !== null && "sql" in query && typeof query.sql === "string"
+                ? query.sql
+                : ""
+            if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return [{ transaction_id: transactionId }] as R
+            if (sql.includes('FROM "agent_sessions"')) return [{ id: "session-1", status: "running" }] as R
+            if (sql.includes('FROM "agent_turns"')) return [{
+              id: "turn-1", sessionId: "session-1", userId: ownerUserId, rootTaskId: "root-1", status: "in_progress",
+              source: "automation", input: turnInput,
+            }] as R
+            if (sql.includes('FROM "agent_steps"')) return [{ id: "scout-step" }] as R
+            if (sql.includes("clock_timestamp()")) return [{ status: "running", interruptRequestedAt: null, closedAt: null,
+              leaseOwner: "worker-1", attemptCount: 1, live: true }] as R
+            if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("'scout'")) return [{
+              id: "scout-task", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+              role: "scout", taskType: "job_discovery", status: "running", interruptRequestedAt: null, closedAt: null,
+              leaseOwner: "worker-1", attemptCount: 1, allowedActions: ["jobs.discover"],
+            }] as R
+            if (sql.includes('FROM "sub_agent_tasks"')) return [{
+              id: "root-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null,
+              role: "orchestrator", taskType: "root", status: "running", interruptRequestedAt: null, closedAt: null,
+              leaseOwner: null, attemptCount: 1, allowedActions: ["agent.plan"],
+            }] as R
+            throw new Error(`unexpected materializer fixture query: ${sql}`)
+          },
+        })
+      },
       agentSession: { findFirst: vi.fn(async () => ({ id: "session-1" })) },
       agentTurn: { findFirst: vi.fn(async () => ({
         id: "turn-1", sessionId: "session-1", userId: ownerUserId, rootTaskId: "root-1",

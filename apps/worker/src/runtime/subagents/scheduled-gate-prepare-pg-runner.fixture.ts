@@ -59,15 +59,17 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
     executionOwner.executionId, executionOwner.executionAttemptCount)
   const claimToken = `scheduled-gate-prepare-claim-${randomUUID()}`
   const claimOwner = { ...seed.ownerV1, ...executionOwner }
-  const checkpointState = analyzeCheckpoint(seed, claimOwner, claimToken, initialContinuationKey, attestationV1)
+  const resumeId = `scheduled-gate-resume-${seed.ids.turnId}`
+  await pool.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "createdAt", "updatedAt")
+    VALUES ($1, $2, 'Fixture Base Resume', $3::jsonb, 'base', 'manual', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+  [resumeId, seed.ids.userId, JSON.stringify(SCHEDULED_GATE_BASE_RESUME)])
+  const sourceFingerprintsByJob = await readAnalyzeSourceFingerprints(pool, seed, resumeId)
+  const checkpointState = analyzeCheckpoint(seed, claimOwner, claimToken, initialContinuationKey, attestationV1, sourceFingerprintsByJob)
   const checkpointDigest = await digestScheduledAnalyzeCheckpoint(checkpointState)
   await pool.query(`INSERT INTO "agent_executions"
     ("id", "userId", "sessionId", "status", "checkpoint", "state", "attemptCount", "startedAt", "createdAt", "updatedAt")
     VALUES ($1, $2, $3, 'running', 'prepare', $4::jsonb, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [executionOwner.executionId, seed.ids.userId, seed.ids.sessionId, JSON.stringify(checkpointState)])
-  await pool.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "createdAt", "updatedAt")
-    VALUES ($1, $2, 'Fixture Base Resume', $3::jsonb, 'base', 'manual', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-  [`scheduled-gate-resume-${seed.ids.turnId}`, seed.ids.userId, JSON.stringify(SCHEDULED_GATE_BASE_RESUME)])
   const prepare = await runScheduledGatePrepareRootQuestion({ pool, seed, owner: seed.ownerV1, attestation: attestationV1,
     continuationKey: initialContinuationKey, checkpointDigest, claimToken, bridge })
   const resumed = await resumePrepareChoice(pool, seed, { owner: seed.ownerV1 as ScheduledGatePrepareOwner,
@@ -117,14 +119,46 @@ function createBridge(pool: Pool, seed: ScheduledGatePrepareSeedFixture) {
 }
 
 function analyzeCheckpoint(seed: ScheduledGatePrepareSeedFixture, owner: ScheduledAutomationPipelineOwner,
-  claimToken: string, continuationKey: string, attestation: ScheduledAutomationPipelineAttestation): Record<string, unknown> {
+  claimToken: string, continuationKey: string, attestation: ScheduledAutomationPipelineAttestation,
+  sourceFingerprintsByJob: Readonly<Record<string, Readonly<{ version: string; digest: string }>>>): Record<string, unknown> {
   const lease = seed.turnLeaseV1
   const selectedJobRecords = seed.jobRecords.filter(job => seed.selectedJobIds.includes(job.id))
   return { nextStage: "prepare", scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1",
     key: continuationKey, claimToken, owner, claimedAt: lease.leaseStartedAt.toISOString(), leaseExpiresAt: lease.leaseExpiresAt.toISOString() },
     scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: continuationKey,
       owner, snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision, evidenceDigest: attestation.evidenceDigest },
-    scoutedJobs: selectedJobRecords, scoredJobs: seed.scoredJobs, analysisFailed: 0 }
+    scoutedJobs: selectedJobRecords, scoredJobs: seed.scoredJobs, analysisFailed: 0,
+    scheduledTaskGraphAnalyzeSourceFingerprints: sourceFingerprintsByJob }
+}
+async function readAnalyzeSourceFingerprints(pool: Pool, seed: ScheduledGatePrepareSeedFixture, resumeId: string):
+  Promise<Readonly<Record<string, Readonly<{ version: string; digest: string }>>>> {
+  const scoredJobIds = seed.scoredJobs.map(scored => scored.job.id)
+  if (new Set(scoredJobIds).size !== scoredJobIds.length) throw new Error("scheduled_gate_prepare_scored_job_ids_invalid")
+  const sourceJobsResult = await pool.query<{ id: string; userId: string; company: string; role: string; location: string | null;
+    description: string | null; source: string | null; url: string | null }>(`SELECT "id", "userId", "company", "role", "location", "description", "source", "url"
+      FROM "Job" WHERE "userId"=$1 AND "id"=ANY($2::text[])`, [seed.ids.userId, scoredJobIds])
+  const sourceJobsById = new Map(sourceJobsResult.rows.map(job => [job.id, job]))
+  if (sourceJobsById.size !== scoredJobIds.length) throw new Error("scheduled_gate_prepare_scored_job_source_missing")
+  const resumeResult = await pool.query<{ id: string; content: unknown }>(`SELECT "id", "content" FROM "Resume"
+    WHERE "id"=$1 AND "userId"=$2 AND "isDefault"=true`, [resumeId, seed.ids.userId])
+  const resume = resumeResult.rows[0]
+  if (!resume) throw new Error("scheduled_gate_prepare_default_resume_missing")
+  const analyzeSourceModulePath = "@/lib/agent/stages/analyze-model-input"
+  const analyzeSourceModule = await import(analyzeSourceModulePath) as unknown as {
+    createAnalyzeSourceFingerprint(input: { userId: string; jobId: string
+      job: { company: string; role: string; location: string | null; description: string | null; source: string | null; url: string | null }
+      resumeId: string; resumeText: string }): { version: string; digest: string }
+  }
+  const resumeTypesModulePath = "@/lib/agent/types"
+  const resumeTypesModule = await import(resumeTypesModulePath) as unknown as { resumeToText(content: unknown): string }
+  const resumeText = resumeTypesModule.resumeToText(resume.content).slice(0, 2000)
+  return Object.fromEntries(scoredJobIds.map(jobId => {
+    const job = sourceJobsById.get(jobId)
+    if (!job) throw new Error("scheduled_gate_prepare_scored_job_source_missing")
+    return [jobId, analyzeSourceModule.createAnalyzeSourceFingerprint({ userId: seed.ids.userId, jobId,
+      job: { company: job.company, role: job.role, location: job.location, description: job.description, source: job.source, url: job.url },
+      resumeId: resume.id, resumeText })]
+  }))
 }
 async function runPrepare(pool: Pool, redisUrl: string, seed: ScheduledGatePrepareSeedFixture,
   owner: ScheduledAutomationPipelineOwner, turnOwner: TurnExecutionOwnerFence,

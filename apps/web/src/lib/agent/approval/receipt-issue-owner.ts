@@ -12,10 +12,17 @@ export type PreparedApprovalReceipt = {
   payload?: Prisma.InputJsonValue
 }
 
+/** Internal callback pair for the scheduled Gate receipt transaction only. */
+export type ScheduledReceiptSourceHooks = {
+  acquireFence: (tx: Prisma.TransactionClient, userId: string) => Promise<void>
+  validateFinalSource: (tx: Prisma.TransactionClient, scope: ApprovalScopeInput) => Promise<void>
+}
+
 export type ReceiptIssueOwnerInput = {
   executionAttempt?: { id: string; attemptCount: number }
   signal?: AbortSignal
   prepareInTransaction?: (tx: Prisma.TransactionClient) => Promise<PreparedApprovalReceipt>
+  scheduledSourceHooks?: ScheduledReceiptSourceHooks
 }
 
 export async function prepareReceiptIssueInTransaction(

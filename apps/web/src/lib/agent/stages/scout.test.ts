@@ -3,6 +3,7 @@ import type { PipelineCtx } from '../types'
 
 const mocks = vi.hoisted(() => ({
   findMany: vi.fn(),
+  applicationTaskFindMany: vi.fn(),
   create: vi.fn(),
   activityCreate: vi.fn(),
   discoverJobs: vi.fn(),
@@ -15,6 +16,7 @@ vi.mock('@/lib/db', () => ({
   db: {
     $transaction: mocks.transaction,
     job: { findMany: mocks.findMany, create: mocks.create },
+    applicationTask: { findMany: mocks.applicationTaskFindMany },
     activity: { create: mocks.activityCreate },
   },
 }))
@@ -59,6 +61,7 @@ describe('runScout', () => {
   beforeEach(() => {
     vi.resetAllMocks()
     mocks.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([savedJob])
+    mocks.applicationTaskFindMany.mockResolvedValue([])
     mocks.activityCreate.mockResolvedValue({})
     mocks.create.mockResolvedValue({ id: 'job_1' })
     mocks.refreshExecutionAttempt.mockResolvedValue(true)
@@ -132,6 +135,28 @@ describe('runScout', () => {
     expect(mocks.activityCreate).not.toHaveBeenCalled()
     expect(mocks.transactionCommits).toBe(0)
     expect(mocks.findMany).toHaveBeenCalledOnce()
+  })
+
+  it('bypasses the same-day scored-job exclusion only for the owner-scoped source-change marker', async () => {
+    const today = new Date()
+    const staleScore = { ...savedJob, score: 82, updatedAt: today }
+    const alreadyScored = { ...savedJob, id: 'job_2', company: 'Other Co', score: 91, updatedAt: today }
+    mocks.findMany.mockReset()
+    mocks.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([staleScore, alreadyScored])
+    mocks.applicationTaskFindMany.mockResolvedValue([{ jobId: staleScore.id }])
+    mocks.discoverJobs.mockResolvedValue([])
+
+    const result = await runScout(context())
+
+    expect(result).toMatchObject({ ok: true, data: { jobs: [staleScore] } })
+    expect(mocks.applicationTaskFindMany).toHaveBeenCalledWith({
+      where: { userId: 'user_1', jobId: { in: ['job_1', 'job_2'] }, status: 'failed', checkpoint: 'analyze_source_changed' },
+      select: { jobId: true },
+    })
+    expect(mocks.findMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ userId: 'user_1', status: 'saved' }),
+      orderBy: [{ score: 'asc' }, { createdAt: 'desc' }],
+    }))
   })
 
   it('rolls back discovery writes if the signal aborts during persistence', async () => {

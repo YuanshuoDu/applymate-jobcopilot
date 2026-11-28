@@ -1,8 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomBytes } from 'node:crypto'
-import { Prisma, PrismaClient } from '@prisma/client'
+import { PrismaClient } from '@prisma/client'
 import { NextRequest } from 'next/server'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { acquireSourceMaterialFence } from '@/lib/agent/source-material-fence'
 
 // This opt-in test only accepts an explicitly named, disposable loopback DB.
 // No existing application database or migrations are touched.
@@ -11,44 +12,70 @@ const disposable = process.env.DESCRIPTION_CAS_PG_TEST_DISPOSABLE
 const enabled = Boolean(configuredUrl || disposable)
 if (enabled) {
   let parsed: URL
-  try { parsed = new URL(configuredUrl ?? '') } catch { throw new Error('Invalid disposable description CAS test configuration') }
+  try { parsed = new URL(configuredUrl ?? '') } catch { throw new Error('Invalid disposable Job route test configuration') }
   if (disposable !== 'true' || !['postgres:', 'postgresql:'].includes(parsed.protocol)
     || parsed.hostname !== '127.0.0.1' || parsed.pathname !== '/applymate_description_cas_test'
     || !parsed.username || parsed.search || parsed.hash) {
-    throw new Error('Description CAS integration requires the explicitly marked disposable loopback database')
+    throw new Error('Job route integration requires the explicitly marked disposable loopback database')
   }
 }
 
-type Barrier = { arrive: () => void; wait: Promise<void> }
-type RequestScope = { client: PrismaClient; userId: string; barrier?: Barrier }
+type RequestScope = { userId: string }
+type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void }
+function deferred<T>(): Deferred<T> {
+  let resolve: (value: T) => void = () => {}
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
+}
+
 const scope = new AsyncLocalStorage<RequestScope>()
 function currentScope(): RequestScope {
   const current = scope.getStore()
   if (!current) throw new Error('Missing test request scope')
   return current
 }
-function barrierFor(count: number) {
-  let arrived = 0
-  let signalReached: () => void = () => {}
-  let release: () => void = () => {}
-  const reached = new Promise<void>(resolve => { signalReached = resolve })
-  const wait = new Promise<void>(resolve => { release = resolve })
-  return { reached, release, barrier: { arrive: () => { if (++arrived === count) signalReached() }, wait } }
-}
+
 async function within<T>(promise: Promise<T>, ms = 10_000): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined
   try {
-    return await Promise.race([promise, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('Description CAS test timed out')), ms) })])
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('Job route test timed out')), ms)
+    })])
   } finally { if (timeout) clearTimeout(timeout) }
 }
 
+async function expectBlocked<T>(promise: Promise<T>) {
+  const state = await Promise.race([
+    promise.then(() => 'settled', () => 'settled'),
+    new Promise<'blocked'>(resolve => setTimeout(() => resolve('blocked'), 100)),
+  ])
+  expect(state).toBe('blocked')
+}
+
+async function waitForDatabaseLockWait(admin: PrismaClient) {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    const rows = await admin.$queryRawUnsafe<Array<{ count: number }>>(`
+      SELECT count(*)::int AS count
+      FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid()
+        AND datname = current_database()
+        AND wait_event_type = 'Lock'
+    `)
+    if ((rows[0]?.count ?? 0) > 0) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error('Job route did not reach the expected PostgreSQL row-lock wait')
+}
+
 const integration = enabled ? describe : describe.skip
-integration('conditional job description PATCH with PostgreSQL', () => {
+integration('Job PATCH and DELETE source fence with PostgreSQL', () => {
   let admin: PrismaClient
   let clientA: PrismaClient
   let clientB: PrismaClient
   let schemaCreated = false
   let PATCH: typeof import('./route').PATCH
+  let DELETE: typeof import('./route').DELETE
   let routeDb: PrismaClient
   let ownsGlobalPrisma = false
   const originalDatabaseUrl = process.env.DATABASE_URL
@@ -68,8 +95,6 @@ integration('conditional job description PATCH with PostgreSQL', () => {
     await clientB.$connect()
     await clientA.$executeRawUnsafe(`CREATE TYPE "${schema}"."JobStatus" AS ENUM ('saved', 'applied', 'interview', 'offer', 'rejected')`)
     await clientA.$executeRawUnsafe(`CREATE TYPE "${schema}"."JobWorkflowState" AS ENUM ('draft', 'ready_to_apply', 'queued', 'submitting', 'submitted')`)
-    // findUnique returns all scalar fields, so this mirrors the complete Job
-    // scalar shape; relationships and unrelated tables are intentionally absent.
     await clientA.$executeRawUnsafe(`CREATE TABLE "${schema}"."Job" (
       "id" TEXT PRIMARY KEY, "userId" TEXT NOT NULL, "company" TEXT NOT NULL,
       "logo" TEXT, "role" TEXT NOT NULL, "location" TEXT,
@@ -88,28 +113,15 @@ integration('conditional job description PATCH with PostgreSQL', () => {
       ok: (value: unknown, status = 200) => Response.json(value, { status }),
       err: (message: string, status = 400) => Response.json({ error: message }, { status }),
     }))
-    // The route runs unchanged. Only authentication and the wrapper that pauses
-    // after the real ownership read are instrumented; Prisma writes are real.
-    // Load the real database module only after redirecting it to this isolated
-    // schema. Never reuse a global Prisma singleton from another test.
     if ((globalThis as unknown as { prisma?: unknown }).prisma || process.env.RLS_RUNTIME_MODE === 'on') {
-      throw new Error('Description CAS test requires an isolated Prisma runtime with RLS disabled')
+      throw new Error('Job route test requires an isolated Prisma runtime with RLS disabled')
     }
     process.env.DATABASE_URL = schemaUrl.toString()
     routeDb = (await import('@/lib/db')).db
     ownsGlobalPrisma = Boolean((globalThis as unknown as { prisma?: unknown }).prisma)
-    const delegate = routeDb.job
-    // Spies only coordinate the two real clients and reads. No query is faked:
-    // each operation invokes the real generated Prisma delegate for its scope.
-    vi.spyOn(delegate, 'findUnique').mockImplementation((async (args: Prisma.JobFindUniqueArgs) => {
-      const request = currentScope()
-      const row = await request.client.job.findUnique(args)
-      if (request.barrier) { request.barrier.arrive(); await request.barrier.wait }
-      return row
-    }) as unknown as typeof delegate.findUnique)
-    vi.spyOn(delegate, 'updateMany').mockImplementation(((args: Prisma.JobUpdateManyArgs) =>
-      currentScope().client.job.updateMany(args)) as unknown as typeof delegate.updateMany)
-    PATCH = (await import('./route')).PATCH
+    const route = await import('./route')
+    PATCH = route.PATCH
+    DELETE = route.DELETE
   }, 30_000)
 
   beforeEach(async () => {
@@ -117,7 +129,6 @@ integration('conditional job description PATCH with PostgreSQL', () => {
   })
 
   afterAll(async () => {
-    vi.restoreAllMocks()
     vi.doUnmock('@/lib/api-helpers')
     await routeDb?.$disconnect()
     if (ownsGlobalPrisma) delete (globalThis as unknown as { prisma?: unknown }).prisma
@@ -126,54 +137,135 @@ integration('conditional job description PATCH with PostgreSQL', () => {
     else process.env.DATABASE_URL = originalDatabaseUrl
     await clientA?.$disconnect()
     await clientB?.$disconnect()
-    // schema is generated locally from hex and only the validated DB is used.
     if (schemaCreated) await admin.$executeRawUnsafe(`DROP SCHEMA "${schema}" CASCADE`)
     await admin?.$disconnect()
   }, 30_000)
 
-  function invoke(client: PrismaClient, userId: string, description: string, expected: string | null, barrier?: Barrier) {
-    const req = new NextRequest('http://localhost/api/jobs/job-1', {
+  function invokePatch(userId: string, description: string, expected: string | null) {
+    const request = new NextRequest('http://localhost/api/jobs/job-1', {
       method: 'PATCH', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ description, expectedEmptyDescription: expected }),
     })
-    return scope.run({ client, userId, barrier }, () => PATCH(req, { params: Promise.resolve({ id: 'job-1' }) }))
-  }
-  async function seed(description: string | null) {
-    await clientA.job.create({ data: { id: 'job-1', userId: 'owner-a', company: 'Fixture', role: 'Engineer', description, notes: 'preserve me' } })
+    return scope.run({ userId }, () => PATCH(request, { params: Promise.resolve({ id: 'job-1' }) }))
   }
 
-  it.each([null, '', ' \t\n '])('allows one winner against exact original value %j', async expected => {
-    await seed(expected)
-    const gate = barrierFor(2)
-    const first = invoke(clientA, 'owner-a', 'Description A', expected, gate.barrier)
-    const second = invoke(clientB, 'owner-a', 'Description B', expected, gate.barrier)
+  function invokeDelete(userId: string) {
+    const request = new NextRequest('http://localhost/api/jobs/job-1', { method: 'DELETE' })
+    return scope.run({ userId }, () => DELETE(request, { params: Promise.resolve({ id: 'job-1' }) }))
+  }
+
+  function holdFence(userId: string) {
+    const acquired = deferred<void>()
+    const release = deferred<void>()
+    const transaction = clientA.$transaction(async tx => {
+      await acquireSourceMaterialFence(tx, [userId])
+      acquired.resolve()
+      await release.promise
+    })
+    return { acquired: acquired.promise, release: () => release.resolve(), transaction }
+  }
+
+  async function seed(owner: string, description: string | null = null) {
+    await clientA.job.create({
+      data: { id: 'job-1', userId: owner, company: 'Fixture', role: 'Engineer', description, notes: 'preserve me' },
+    })
+  }
+
+  it('holds the same-user fence through conditional description PATCH commit', async () => {
+    await seed('owner-a')
+    const holder = holdFence('owner-a')
+    let request: ReturnType<typeof invokePatch> | undefined
     try {
-      await within(gate.reached)
-      gate.release()
-      const responses = await within(Promise.all([first, second]))
-      expect(responses.map(response => response.status).sort()).toEqual([200, 409])
-      const winner = responses[0].status === 200 ? 'Description A' : 'Description B'
+      await within(holder.acquired)
+      request = invokePatch('owner-a', 'Updated description', null)
+      await expectBlocked(request)
+      expect((await clientB.job.findUniqueOrThrow({ where: { id: 'job-1' } })).description).toBeNull()
+      holder.release()
+      expect((await within(request)).status).toBe(200)
       const row = await clientB.job.findUniqueOrThrow({ where: { id: 'job-1' } })
-      expect(row.description).toBe(winner)
-      expect(row.userId).toBe('owner-a')
+      expect(row.description).toBe('Updated description')
       expect(row.notes).toBe('preserve me')
-    } finally { gate.release(); await within(Promise.allSettled([first, second])) }
+    } finally {
+      holder.release()
+      await within(Promise.allSettled(request ? [holder.transaction, request] : [holder.transaction]))
+    }
   }, 25_000)
 
-  it('rejects the original owner when ownership changes after the real read', async () => {
-    await seed(null)
-    const gate = barrierFor(1)
-    const request = invoke(clientA, 'owner-a', 'Should not be saved', null, gate.barrier)
+  it.each([null, '', ' \t\n '])('serializes two conditional description PATCH requests with one winner for %j', async expected => {
+    await seed('owner-a', expected)
+    const first = invokePatch('owner-a', 'Description A', expected)
+    const second = invokePatch('owner-a', 'Description B', expected)
+
+    const responses = await within(Promise.all([first, second]))
+
+    expect(responses.map(response => response.status).sort()).toEqual([200, 409])
+    const winningResponse = responses.find(response => response.status === 200)
+    if (!winningResponse) throw new Error('Expected one conditional description PATCH winner')
+    const winner = await winningResponse.json() as { description: string }
+    const row = await clientB.job.findUniqueOrThrow({ where: { id: 'job-1' } })
+    expect(row.description).toBe(winner.description)
+    expect(row.userId).toBe('owner-a')
+    expect(row.notes).toBe('preserve me')
+  }, 25_000)
+
+  it('rejects an owner change committed after the scoped read and before conditional update', async () => {
+    await seed('owner-a')
+    const rowLocked = deferred<void>()
+    const allowOwnerChange = deferred<void>()
+    const blocker = clientA.$transaction(async tx => {
+      await tx.job.update({ where: { id: 'job-1' }, data: { notes: 'owner transfer in progress' } })
+      rowLocked.resolve()
+      await allowOwnerChange.promise
+      await tx.job.update({ where: { id: 'job-1' }, data: { userId: 'owner-b' } })
+    })
+    let request: ReturnType<typeof invokePatch> | undefined
     try {
-      await within(gate.reached)
-      await clientB.job.updateMany({ where: { id: 'job-1', userId: 'owner-a' }, data: { userId: 'owner-b' } })
-      gate.release()
+      await within(rowLocked.promise)
+      request = invokePatch('owner-a', 'Must not be saved', null)
+      await waitForDatabaseLockWait(admin)
+      allowOwnerChange.resolve()
       expect((await within(request)).status).toBe(409)
       const row = await clientB.job.findUniqueOrThrow({ where: { id: 'job-1' } })
       expect(row.userId).toBe('owner-b')
       expect(row.description).toBeNull()
-      expect(row.notes).toBe('preserve me')
-      expect((await invoke(clientA, 'owner-a', 'Still not saved', null)).status).toBe(404)
-    } finally { gate.release(); await within(Promise.allSettled([request])) }
+      expect(row.notes).toBe('owner transfer in progress')
+      const retry = await within(invokePatch('owner-a', 'Still not saved', null))
+      expect(retry.status).toBe(404)
+      const afterRetry = await clientB.job.findUniqueOrThrow({ where: { id: 'job-1' } })
+      expect(afterRetry.userId).toBe('owner-b')
+      expect(afterRetry.description).toBeNull()
+      expect(afterRetry.notes).toBe('owner transfer in progress')
+    } finally {
+      allowOwnerChange.resolve()
+      await within(Promise.allSettled(request ? [blocker, request] : [blocker]))
+    }
   }, 25_000)
+
+  it('holds the same-user fence through DELETE commit and keeps tenant isolation', async () => {
+    await seed('owner-a')
+    const holder = holdFence('owner-a')
+    let request: ReturnType<typeof invokeDelete> | undefined
+    try {
+      await within(holder.acquired)
+      request = invokeDelete('owner-a')
+      await expectBlocked(request)
+      expect(await clientB.job.findUnique({ where: { id: 'job-1' } })).not.toBeNull()
+      holder.release()
+      expect((await within(request)).status).toBe(200)
+      expect(await clientB.job.findUnique({ where: { id: 'job-1' } })).toBeNull()
+    } finally {
+      holder.release()
+      await within(Promise.allSettled(request ? [holder.transaction, request] : [holder.transaction]))
+    }
+  }, 25_000)
+
+  it('returns 404 and leaves another tenant job unchanged', async () => {
+    await seed('owner-b')
+
+    const response = await within(invokeDelete('owner-a'))
+
+    expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({ error: 'Not found' })
+    expect((await clientB.job.findUniqueOrThrow({ where: { id: 'job-1' } })).userId).toBe('owner-b')
+  })
 })
