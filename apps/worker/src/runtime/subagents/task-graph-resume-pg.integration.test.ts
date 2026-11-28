@@ -5162,6 +5162,23 @@ async function readExactFixtureQueueJobs(
 const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-process-restart.fixture.mjs", import.meta.url))
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
 const DISCOVERY_TURN_WORKER_MARKER = "P3_DISCOVERY_TURN_WORKER "
+const SCOUT_HISTORY_RESUME_FAILURE_PREFIX = "P3_DISCOVERY_SCOUT_RESUME_FAILURE "
+const SCOUT_HISTORY_RESUME_STAGES = new Set([
+  "repair_consumed_wait_sources", "read_durable_wait", "load_attempt_history",
+])
+const SCOUT_HISTORY_RESUME_CATEGORIES = new Set([
+  "wait_invalid", "wait_conflict", "wait_scope_error", "child_resume_owner_mismatch", "child_resume_lease_expired",
+  "child_resume_step_lineage", "child_resume_usage_overflow", "child_resume_step_limit", "child_resume_item_limit",
+  "child_resume_wait_step_lineage", "child_resume_wait_tool_call_conflict", "child_resume_invalid_shape",
+  "database_deadlock", "database_serialization", "database_lock", "database_cancelled", "database_permission",
+  "database_error", "other",
+])
+const SCOUT_HISTORY_RESUME_VALIDATION_STAGES = new Set([
+  "lease_fence", "source_ordinal", "wait_state", "wait_result_shape", "target_scope", "resolved_outcome", "tool_call",
+  "call_binding", "receipt_pair", "receipt_identity", "receipt_ids", "receipt_deadline", "input_target_ids",
+  "output_target_ids", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set",
+  "wait_record_shape", "provenance_marker", "source_lifecycle", "reconciliation",
+])
 const DISCOVERY_TURN_WORKER_NAMES = new Set(["worker2", "worker3"])
 const DISCOVERY_TURN_WORKER_EVENTS = new Set(["observer_attached", "active", "completed", "failed", "error", "stalled"])
 const DISCOVERY_TURN_WORKER_ERROR_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "AbortError", "TimeoutError", "ConnectionError", "MaxRetriesPerRequestError", "ReplyError", "other"])
@@ -5522,6 +5539,51 @@ async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, ti
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error("Timed out waiting for " + prefix + "; " + processFixtureDiagnostics(child))
+}
+
+function scoutHistoryResumeFailureDiagnostics(output: readonly string[]): RecordValue {
+  let markerCount = 0
+  const markers: string[] = []
+  for (const line of output) {
+    if (!line.startsWith(SCOUT_HISTORY_RESUME_FAILURE_PREFIX)) continue
+    markerCount += 1
+    markers.push(line)
+    if (markers.length > 4) markers.shift()
+  }
+  const events = markers.map(line => {
+    try {
+      const source = record(JSON.parse(line.slice(SCOUT_HISTORY_RESUME_FAILURE_PREFIX.length)) as unknown)
+      if (!source || Object.keys(source).sort().join(",") !== "category,stage,validationStage") return { diagnosticUnavailable: true }
+      const stage = diagnosticEnum(source.stage, SCOUT_HISTORY_RESUME_STAGES)
+      const category = diagnosticEnum(source.category, SCOUT_HISTORY_RESUME_CATEGORIES)
+      const validationStage = source.validationStage === null
+        ? null : diagnosticEnum(source.validationStage, SCOUT_HISTORY_RESUME_VALIDATION_STAGES)
+      if (!stage || !category || source.validationStage !== null && !validationStage) return { diagnosticUnavailable: true }
+      return { stage, category, validationStage }
+    } catch { return { diagnosticUnavailable: true } }
+  })
+  return {
+    markerCount: Math.min(markerCount, 100),
+    events,
+    ...(markerCount > markers.length ? { truncated: true } : {}),
+  }
+}
+
+async function waitForScoutHistoryResumeLine(child: ProcessFixtureChild, timeoutMs: number): Promise<string> {
+  const resumedPrefix = "P3_DISCOVERY_SCOUT_HISTORY_RESUMED "
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const resumed = child.output.find(line => line.startsWith(resumedPrefix))
+    if (resumed) return resumed
+    if (child.output.some(line => line.startsWith(SCOUT_HISTORY_RESUME_FAILURE_PREFIX))) {
+      throw new Error("Scout history resume loader failed before model continuation")
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error("Worker exited before Scout history resume marker; " + processFixtureDiagnostics(child))
+    }
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error("Timed out waiting for Scout history resume marker; " + processFixtureDiagnostics(child))
 }
 
 async function correctionWriterReceiptTimeoutDiagnostics(input: {
@@ -7255,6 +7317,31 @@ describe("persisted TaskGraph wait scope", () => {
 })
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("projects Scout resume failures through a closed stage and category allowlist", () => {
+    const projected = scoutHistoryResumeFailureDiagnostics([
+      `${SCOUT_HISTORY_RESUME_FAILURE_PREFIX}${JSON.stringify({
+        stage: "read_durable_wait", category: "wait_scope_error", validationStage: "receipt_identity",
+      })}`,
+      `${SCOUT_HISTORY_RESUME_FAILURE_PREFIX}${JSON.stringify({
+        stage: "read_durable_wait", category: "private failure", validationStage: "receipt_identity", taskId: "private-task-id",
+      })}`,
+      `${SCOUT_HISTORY_RESUME_FAILURE_PREFIX}${JSON.stringify({
+        stage: "private stage", category: "wait_scope_error", validationStage: "receipt_identity",
+      })}`,
+    ])
+
+    expect(projected).toEqual({
+      markerCount: 3,
+      events: [
+        { stage: "read_durable_wait", category: "wait_scope_error", validationStage: "receipt_identity" },
+        { diagnosticUnavailable: true },
+        { diagnosticUnavailable: true },
+      ],
+    })
+    expect(JSON.stringify(projected)).not.toContain("private")
+    expect(JSON.stringify(projected)).not.toContain("taskId")
+  })
+
   it("projects restart child markers through the safe diagnostic allowlists", () => {
     const outcome = latestProcessFixtureJsonDiagnostic([
       `P3_CHILD_OUTCOME ${JSON.stringify({ role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing", hasResult: false, hasStructuredResult: false, phase: "child_outcome", leaseUserMatchesFixture: true, leaseSessionMatchesFixture: false, leaseTurnMatchesFixture: true, taskId: "private task", prompt: "private" })}`,
@@ -14828,6 +14915,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             scoutSettledMarkerCount: Math.min(worker.output.filter(line => line.startsWith(settledPrefix)).length, 100),
             stderrLineCount: Math.min(worker.errors.length, 100),
           },
+          resumeLoaderFailure: scoutHistoryResumeFailureDiagnostics(worker.output),
         }
       } catch {
         return { snapshotAvailable: false }
@@ -14998,12 +15086,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForProcessLine(workerThree, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
       let resumedLine: string
       try {
-        resumedLine = await waitForProcessLine(workerThree, "P3_DISCOVERY_SCOUT_HISTORY_RESUMED ", 180_000)
+        resumedLine = await waitForScoutHistoryResumeLine(workerThree, 180_000)
       } catch (error) {
         const checkpoint = await scoutHistoryResumeFailureCheckpoint(
           scoutTaskIdForCleanup!, rootTaskId!, before.reference, workerThree,
         )
-        const failureKind = processLineWaitFailureKind(error, "P3_DISCOVERY_SCOUT_HISTORY_RESUMED ")
+        const failureKind = workerThree.output.some(line => line.startsWith(SCOUT_HISTORY_RESUME_FAILURE_PREFIX))
+          ? "resume_loader_rejected" : processLineWaitFailureKind(error, "P3_DISCOVERY_SCOUT_HISTORY_RESUMED ")
         throw new Error(`Resumed Scout history wait failed (${failureKind}); safe checkpoint=${JSON.stringify(checkpoint)}`)
       }
       const resumed = record(JSON.parse(resumedLine.slice("P3_DISCOVERY_SCOUT_HISTORY_RESUMED ".length)))

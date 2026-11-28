@@ -2028,6 +2028,17 @@ async function runDiscoverySecondWorker() {
   const historySupport = historyModule ? historyModule.createScoutHistoryRestartSupport({
     candidateJobId: ids.jobId, paddingJobId: ids.paddingJobId,
   }) : undefined
+  const resumeLoaderModule = historySupport ? await import("./production-child-resume-loaders.ts") : undefined
+  const defaultResumeLoader = resumeLoaderModule?.createProductionChildResumeLoaders(pool).resumeLoader
+  const resumeLoader = historySupport ? async lease => {
+    const isHistoryScoutAttempt = lease.role === "scout" && lease.goal === discoveryScoutGoal && lease.attemptCount === 2
+      && lease.sessionId === ids.sessionId && lease.turnId === ids.turnId
+    if (!isHistoryScoutAttempt) return defaultResumeLoader?.(lease)
+    const observed = resumeLoaderModule.createProductionChildResumeLoaders(pool, diagnostic => {
+      say("P3_DISCOVERY_SCOUT_RESUME_FAILURE " + JSON.stringify(diagnostic))
+    })
+    return observed.resumeLoader?.(lease)
+  } : undefined
   const historyTurnStoreModule = historySupport ? await import("../turns/turn-engine-store.ts") : undefined
   const historyTurnStore = historyTurnStoreModule?.createPgTurnEngineStore(pool)
   const finalReadBatchEmitted = new Map()
@@ -2052,6 +2063,7 @@ async function runDiscoverySecondWorker() {
   } : undefined
   const executeChild = createProductionChildExecutor({
     pool, authorizeUsage: async () => noReservationUsageAuthorization(),
+    ...(resumeLoader ? { resumeLoader } : {}),
     ...(turnStore ? { turnStore } : {}),
     ...(historySupport ? { jobDiscoveryClient: historySupport.client } : {}),
     modelRuntimeFactory({ task }) {
