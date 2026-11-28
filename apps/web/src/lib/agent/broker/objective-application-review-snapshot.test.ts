@@ -21,6 +21,7 @@ const setId = (sessionId: string, turnId: string) => `objective-review-${createH
   .update(`objective-application-review-set.v1\0${sessionId}\0${turnId}`).digest("hex").slice(0, 40)}`
 
 vi.mock("@jobcopilot/agent-protocol", () => ({
+  TASK_GRAPH_FINAL_ARTIFACT_MANIFEST_SCHEMA: "agent-harness.v2.task-graph-sources.v4",
   hashApprovalScope: vi.fn(async () => hash), objectiveApplicationApprovalSetItemId: vi.fn((id: string) => `item:${id}`),
   parseObjectiveApplicationApprovalSet: vi.fn(() => ({ setId: setId("session-1", "review-turn"), sourceTurnId: "source-turn",
     intentHash: selectionHash, expiresAt: "2099-01-01T00:00:00.000Z", members: [{ slotOrdinal: 1, approvalId: `objective-review:${setId("session-1", "review-turn")}:1` }] })),

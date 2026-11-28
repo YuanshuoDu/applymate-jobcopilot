@@ -26,7 +26,7 @@ type ObjectiveWavePhaseProof = Readonly<{
     fillTurnStatus: "completed"
     jobStatus: "applied"
     jobWorkflowState: "submitted"
-    fillAttemptCount: 1
+    fillAttemptCount: number
     submitAttemptCount: 1
     resultReceiptCount: 1
     executionSettlementCount: 1
@@ -213,7 +213,8 @@ function parsePhaseProof(value: unknown): ObjectiveWavePhaseProof {
       || taskIds.has(application.applicationTaskId) || turnIds.has(application.fillTurnId)
       || application.applicationStatus !== "submitted" || application.checkpoint !== "submission_verified"
       || application.fillTurnStatus !== "completed" || application.jobStatus !== "applied"
-      || application.jobWorkflowState !== "submitted" || application.fillAttemptCount !== 1
+      || application.jobWorkflowState !== "submitted" || typeof application.fillAttemptCount !== "number"
+      || !Number.isSafeInteger(application.fillAttemptCount) || application.fillAttemptCount < 1
       || application.submitAttemptCount !== 1 || application.resultReceiptCount !== 1
       || application.executionSettlementCount !== 1) {
       throw new Error("objective_wave_rate_limit_phase_invalid")
