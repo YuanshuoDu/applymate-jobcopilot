@@ -1,10 +1,12 @@
 import type { SubagentTaskStatus } from "../subagents/types.js"
+import type { ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import type { TaskGraphNativeDelegationMetadata } from "../subagents/task-graph-native-state.js"
 import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "./task-graph-verification.js"
 import { isValidTaskGraphRepairRelation } from "./task-graph-repair-relation.js"
 import { isTaskGraphBlocking, isTaskGraphEventType, isTaskGraphTerminal, sameTaskGraphEvent, taskGraphEventAllowed, taskGraphNextStatus } from "./task-graph-transition-rules.js"
 import { createScheduledPostGateTaskGraphAppender, hasScheduledTaskGraphPackageRefsShape, parseScheduledTaskGraphPackageRefs,
   parseTaskGraphProposalRepairOf, taskGraphProposalTextArray as textArray } from "./scheduled-post-gate-task-graph-append.js"
+import { appendObjectiveTailorTaskGraphProposalWithValidator } from "./objective-tailor-task-graph-append.js"
 import { TASK_GRAPH_BRANCH_KEY_MAX_LENGTH, TASK_GRAPH_MAX_PROPOSAL_NODES } from "@jobcopilot/agent-protocol/task-graph-failed-branch-reconciliation"
 export { isValidTaskGraphRepairRelation } from "./task-graph-repair-relation.js"
 export type TaskGraphNodeStatus = SubagentTaskStatus
@@ -18,7 +20,7 @@ export type TaskGraphNodeProposal = Readonly<{
 }>
 export type TaskGraphProposal = Readonly<{ expectedRevision: number; nodes: readonly TaskGraphNodeProposal[] }>
 export type TaskGraphNode = TaskGraphNodeProposal & Readonly<{ depth: number; status: TaskGraphNodeStatus; taskId?: string; failureReason?: string; verificationDisposition?: TaskGraphVerificationDisposition }>
-export type TaskGraphState = Readonly<{ revision: number; nodes: readonly TaskGraphNode[]; appliedEvents: readonly TaskGraphEvent[]; repairSatisfiedNodeKeys?: readonly string[]; repairPendingNodeKeys?: readonly string[] }>
+export type TaskGraphState = Readonly<{ revision: number; nodes: readonly TaskGraphNode[]; appliedEvents: readonly TaskGraphEvent[]; repairSatisfiedNodeKeys?: readonly string[]; repairPendingNodeKeys?: readonly string[]; objectiveTailor?: ObjectiveTailorGraph }>
 export type TaskGraphValidationOptions = Readonly<{ registeredTemplateIds: ReadonlySet<string>; maxNodes: number; maxDepth: number }>
 /** Generic proposal limits stay separate from the larger persisted scheduled graph limit. */
 export const TASK_GRAPH_LIMITS = {
@@ -110,9 +112,10 @@ export function createInitialTaskGraphState(): TaskGraphState {
 export function validateTaskGraphProposal(value: unknown, state: TaskGraphState, options: TaskGraphValidationOptions): TaskGraphValidationResult { return validateTaskGraphProposalWithinLimit(value, state, options, TASK_GRAPH_LIMITS.maxNodes, TASK_GRAPH_LIMITS.maxNodes) }
 
 function validateTaskGraphProposalWithinLimit(
-  value: unknown, state: TaskGraphState, options: TaskGraphValidationOptions, hardMaxNodes: number, maxAddedNodes: number,
+  value: unknown, state: TaskGraphState, options: TaskGraphValidationOptions, hardMaxNodes: number, maxAddedNodes: number, allowObjectiveTailorState = false,
 ): TaskGraphValidationResult {
   if (!integer(state?.revision, 0) || !Array.isArray(state.nodes) || !Array.isArray(state.appliedEvents)) return fail("invalid_state", "state", "TaskGraph state is malformed")
+  if (!allowObjectiveTailorState && Object.hasOwn(state, "objectiveTailor")) return fail("invalid_state", "state.objectiveTailor", "Generic TaskGraph appends cannot extend Objective Tailor state")
   if (!options || typeof options.registeredTemplateIds?.has !== "function" || !integer(options.maxNodes, 1) || !integer(options.maxDepth, 1)) return fail("invalid_options", "options", "Registered templates and positive node/depth limits are required")
   const maxNodes = Math.min(options.maxNodes, hardMaxNodes)
   const maxDepth = Math.min(options.maxDepth, TASK_GRAPH_LIMITS.maxDepth)
@@ -164,6 +167,12 @@ export function appendTaskGraphProposal(state: TaskGraphState, value: unknown, o
   const validation = validateTaskGraphProposal(value, state, options)
   if (!validation.ok) return validation
   return { ok: true, state: { revision: state.revision + 1, nodes: [...state.nodes, ...validation.addedNodes], appliedEvents: state.appliedEvents, repairSatisfiedNodeKeys: state.repairSatisfiedNodeKeys, repairPendingNodeKeys: state.repairPendingNodeKeys }, addedNodes: validation.addedNodes }
+}
+
+export function appendObjectiveTailorTaskGraphProposal(state: TaskGraphState, value: unknown, options: TaskGraphValidationOptions, nextMarker: unknown): TaskGraphAppendResult {
+  return appendObjectiveTailorTaskGraphProposalWithValidator(state, value, options, nextMarker,
+    (proposal, current, limits, hardMaxNodes, maxAddedNodes) =>
+      validateTaskGraphProposalWithinLimit(proposal, current, limits, hardMaxNodes, maxAddedNodes, true))
 }
 
 /** Appends the bounded server-owned suffix after a scheduled Gate, up to the persisted graph ceiling. */

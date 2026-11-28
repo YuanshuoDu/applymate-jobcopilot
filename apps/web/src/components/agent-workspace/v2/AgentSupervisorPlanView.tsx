@@ -7,6 +7,7 @@ import { useI18n } from '@/lib/i18n'
 import { taskGraphPlanLabel } from '@/lib/task-graph-plan-labels'
 
 import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
+import { ObjectiveTailorProgress, objectiveTailorProgressRequestForTurn, objectiveTailorTurnForCurrentView } from './ObjectiveTailorProgress'
 import type { SelectedJobBatchCommandResult } from './selected-job-batch-command'
 import type { VerifiedShortlistPreparationRequest } from './VerifiedShortlistPreparation'
 import { resolveCurrentSelectedJobBatchTurn, SelectedJobBatchPlanProgress } from './SelectedJobBatchPlanProgress'
@@ -61,6 +62,9 @@ export function AgentSupervisorPlanView({
   const currentBatch = resolveCurrentSelectedJobBatchTurn(turns, sessionId, activeTurnProjection)
   const planTurnId = selection.kind === 'selected' ? turnId : currentPreparationTurnId
   const planIdentity = selectedTaskGraphIdentity(items, sessionId, planTurnId)
+  const tailorTurnId = selection.kind === 'selected' ? turnId
+    : selection.kind === 'current' ? objectiveTailorTurnForCurrentView(activeTurnProjection, currentPreparationTurnId) : null
+  const tailorProgress = objectiveTailorProgressRequestForTurn(items, sessionId, tailorTurnId)
   const selectionIdentity = JSON.stringify([sessionId, selection.kind, selectedNodeId ?? null, turnId,
     planIdentity?.graphItemId ?? null, planIdentity?.rootTaskId ?? null, planIdentity?.revision ?? null])
   const selectionEpoch = useRef({ identity: selectionIdentity, value: 0 })
@@ -94,6 +98,7 @@ export function AgentSupervisorPlanView({
   const currentTasks = [...currentGraphTasks.filter(task => task.sessionId === sessionId), ...tasks.filter(task => task.sessionId === sessionId)]
 
   if (selection.kind === 'current') return <>
+    {tailorProgress && <ObjectiveTailorProgress request={tailorProgress} lifecycleRevision={lifecycleRevision} />}
     {batchTurnId && <SelectedJobBatchPlanProgress sessionId={sessionId} turnId={batchTurnId} expectedGraph={batchGraph} active={batchIsActive} lifecycleRevision={lifecycleRevision} />}
     <TaskGraphPlanPanel sessionId={sessionId} items={items} tasks={currentTasks} ledger={currentLedger}
       discoveryShortlist={currentDiscoveryShortlist} selectedPreparationTurnId={currentPreparationTurnId} selectionKey={selectionKey}
@@ -124,6 +129,7 @@ export function AgentSupervisorPlanView({
           selectedPreparationTurnId={turnId} selectionKey={selectionKey} onPrepareBatch={onPrepareBatch}
           onBatchStarted={focusBatch}
         />}
+    {tailorProgress && <ObjectiveTailorProgress request={tailorProgress} lifecycleRevision={lifecycleRevision} />}
     {batchTurnId && <SelectedJobBatchPlanProgress sessionId={sessionId} turnId={batchTurnId} expectedGraph={batchGraph} active={batchIsActive} lifecycleRevision={lifecycleRevision} />}
   </section>
 }

@@ -20,6 +20,7 @@ const reconciliationMocks = vi.hoisted(() => ({
   scheduledPrepare: vi.fn(), scheduledAuditAppend: vi.fn(), scheduledAuditCompletion: vi.fn(), scheduledAuditInvocation: vi.fn(),
   scheduledAuditResumeContext: vi.fn(), scheduledGateVerification: vi.fn(),
   operationalFailureReplacement: vi.fn(),
+  tailorCorrection: vi.fn(),
   scoutRetirement: vi.fn(),
 }))
 vi.mock("./steering-reconciliation-ledger.js", () => ({
@@ -32,6 +33,7 @@ vi.mock("./task-graph-pg-scout-retirement.js", () => ({ requestSupersededScoutRe
 vi.mock("./task-graph-pg-operational-failure-replacement.js", () => ({
   scheduleTaskGraphOperationalFailureReplacement: reconciliationMocks.operationalFailureReplacement,
 }))
+vi.mock("./pg-task-graph-objective-tailor-correction.js", () => ({ appendObjectiveTailorCorrection: reconciliationMocks.tailorCorrection }))
 vi.mock("./pg-scheduled-task-graph-prepare-command.js", () => ({ appendScheduledPrepare: reconciliationMocks.scheduledPrepare }))
 vi.mock("./pg-scheduled-task-graph-audit-command.js", () => ({ appendScheduledAudit: reconciliationMocks.scheduledAuditAppend,
   verifyScheduledAuditCompletion: reconciliationMocks.scheduledAuditCompletion,
@@ -312,6 +314,15 @@ function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template"
 
 describe("createPgTaskGraphCommandPort", () => {
   beforeEach(() => { vi.clearAllMocks() })
+  it("routes Objective correction through the dedicated atomic service without changing the public scope", async () => {
+    const fake = fakePool(scheduleInput()), input = { scope: scheduleInput().scope, expectedRevision: 6, correctionSlotId: "tailor-3" }
+    const receipt = { status: "accepted" as const, revision: 7, nodes: [], readyTaskIds: [] }
+    reconciliationMocks.tailorCorrection.mockResolvedValue(receipt)
+    const port = createPgTaskGraphCommandPort(fake.pool)
+    await expect(port.appendObjectiveTailorCorrection!(input)).resolves.toBe(receipt)
+    expect(reconciliationMocks.tailorCorrection).toHaveBeenCalledWith(fake.pool, input)
+  })
+
   it("routes the private superseded Scout request through its store command", async () => {
     const fake = fakePool(scheduleInput()), input = { scope: scheduleInput().scope, expectedRevision: 4,
       taskId: "task-old", callId: "retire-call" }

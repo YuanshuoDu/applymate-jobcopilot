@@ -36,6 +36,23 @@ function content(nodes: unknown[], schemaVersion = graphVersion, extra: Record<s
   return { schemaVersion, nodes, ...extra }
 }
 
+function objectiveTailorSnapshot() {
+  const source = (role: 'scout' | 'analyst', key: string, taskId: string, dependsOn: string[]) => ({ key, taskId, templateId: role,
+    goal: 'PRIVATE_SOURCE_GOAL', successCriteria: ['PRIVATE_SOURCE_CRITERION'], dependsOn, depth: role === 'scout' ? 1 : 2,
+    verificationDisposition: 'typed', verification: { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role,
+      criteria: [{ id: role === 'scout' ? 'candidate-count' : 'finding-count',
+        check: { kind: role === 'scout' ? 'candidate_count_gte' : 'finding_count_gte', minimum: 1 } }] } })
+  return { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+    source('scout', 'scout-key', secondChildTaskId, []), source('analyst', 'analyst-key', childTaskId, ['scout-key']),
+    { key: 'writer-key', taskId: 'subagent-12345678-1234-4234-8234-abcdefabcdef', templateId: 'cover_letter_writer',
+      goal: 'PRIVATE_DRAFT', successCriteria: ['PRIVATE'], dependsOn: ['analyst-key'], depth: 3, verificationDisposition: 'specialized' },
+    { key: 'reviewer-key', taskId: 'subagent-abcdefab-cdef-4234-8234-123456789012', templateId: 'cover_letter_reviewer',
+      goal: 'PRIVATE_REVIEW', successCriteria: ['PRIVATE'], dependsOn: ['writer-key'], depth: 4, verificationDisposition: 'specialized' },
+  ], objectiveTailor: { schemaVersion: 'agent-harness.v2.objective-tailor-graph.v1', sourceNodeCount: 2, slots: [
+    { slotId: 'tailor-1', sourceAnalystNodeKey: 'analyst-key', writerNodeKey: 'writer-key', reviewerNodeKey: 'reviewer-key' },
+  ] } }
+}
+
 describe("agent stream redaction", () => {
   it("redacts credential-shaped strings", () => {
     expect(redactStreamString("Bearer very-secret-token sk-12345678")).toBe("Bearer [REDACTED] [REDACTED]")
@@ -351,21 +368,32 @@ describe("agent stream redaction", () => {
   })
 
   it("streams only a canonical TaskGraph source manifest beside the ordinary final answer", () => {
+    const objectiveTailorFinalOutcomes = { schemaVersion: 'agent-harness.v2.objective-tailor-final-outcomes.v1', slots: [
+      { ordinal: 1, status: 'ready' }, { ordinal: 2, status: 'rejected' },
+    ] }
     const source = { sourceKey: canonicalTaskGraphSourceKey("final-item", 3, 0), nodeIndex: 0,
       role: "scout", taskStatus: "completed", resultState: "missing" }
     const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 3, sources: [source] }
     const payload = { itemId: "final-item", status: "completed", content: {
       text: "Safe answer", final: { response: "Safe answer" }, taskGraphSources: manifest,
+      objectiveTailorFinalOutcomes,
       taskId: "PRIVATE_TASK_ID", rawResult: "PRIVATE_RAW_RESULT",
     } }
     const projected = redactStreamEventPayload("item.completed", payload, { ...identity, itemId: "final-item" })
-    expect(projected).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer", taskGraphSources: manifest } })
+    expect(projected).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer", taskGraphSources: manifest, objectiveTailorFinalOutcomes } })
     expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_TASK_ID|PRIVATE_RAW_RESULT|sessionId|graphItemId/)
 
     const malformed = redactStreamEventPayload("item.completed", { ...payload, content: {
       ...payload.content, taskGraphSources: { ...manifest, sources: [{ ...source, sourceKey: `src_${"A".repeat(43)}` }] },
     } }, { ...identity, itemId: "final-item" })
-    expect(malformed).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer" } })
+    expect(malformed).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer", objectiveTailorFinalOutcomes } })
+
+    const invalidSidecar = redactStreamEventPayload('item.completed', { ...payload, content: {
+      ...payload.content, objectiveTailorFinalOutcomes: { ...objectiveTailorFinalOutcomes, privateProof: 'PRIVATE' },
+    } }, { ...identity, itemId: 'final-item' })
+    expect(invalidSidecar).toEqual({ itemId: 'final-item', status: 'completed', content: { text: 'Safe answer', taskGraphSources: manifest } })
+    const nonFinal = redactStreamEventPayload('item.delta', { content: { objectiveTailorFinalOutcomes: objectiveTailorFinalOutcomes } }, identity)
+    expect(JSON.stringify(nonFinal)).not.toContain('objectiveTailorFinalOutcomes')
   })
 
   it("preserves a V3 opaque artifact-version proof without exposing artifact identity", () => {
@@ -418,6 +446,32 @@ describe("agent stream redaction", () => {
       item: { content: unknown }
     }
     expect(malformedEvent.item.content).toBe("[REDACTED]")
+  })
+
+  it('streams only a marked wave hint on proposal and matching lifecycle events', () => {
+    const snapshot = objectiveTailorSnapshot()
+    const proposal = redactStreamEventPayload('item.started', {
+      kind: 'proposal', fingerprint: 'PRIVATE_FINGERPRINT', receipt: { privateProof: 'PRIVATE_PROOF' }, revision: 23, item: item(snapshot, { revision: 23 }),
+    }, identity) as { item: { content: unknown; taskId: string } }
+    const hint = { objectiveTailorProgressHint: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-progress-hint.v1', sourceNodeCount: 2, slotCount: 1,
+    } }
+    expect(proposal.item.content).toEqual(hint)
+    expect(proposal.item.taskId).toBe(rootTaskId)
+    expect(JSON.stringify(proposal)).not.toMatch(/PRIVATE_|writer-key|reviewer-key|analyst-key|jobId|digest|receipt|fingerprint/)
+
+    const lifecycle = redactStreamEventPayload('item.delta', {
+      kind: 'lifecycle', event: { type: 'task.completed', nodeKey: 'analyst-key', privateProof: 'PRIVATE_EVENT_PROOF' }, revision: 24,
+      item: item(snapshot, { revision: 24 }),
+    }, childIdentity) as { item: { content: unknown } }
+    expect(lifecycle.item.content).toEqual(hint)
+    expect(JSON.stringify(lifecycle)).not.toMatch(/analyst-key|PRIVATE_EVENT_PROOF|event/)
+
+    const wrongTask = redactStreamEventPayload('item.delta', {
+      kind: 'lifecycle', event: { type: 'task.completed', nodeKey: 'analyst-key' }, revision: 24,
+      item: item(snapshot, { revision: 24 }),
+    }, { ...childIdentity, taskId: secondChildTaskId }) as { item: { content: unknown } }
+    expect(wrongTask.item.content).toBe('[REDACTED]')
   })
 
   it("preserves legacy TaskGraph identifiers with surrounding whitespace when generic redaction leaves them unchanged", () => {

@@ -62,6 +62,8 @@ export type TurnExecutionOptions = {
   readonly actorRole?: PolicyRole
   readonly capabilities?: readonly string[]
   readonly validateToolArguments?: (toolName: string, input: unknown) => boolean | string
+  /** Exact server-selected version for each fresh model call; legacy callers default to v1. */
+  readonly toolVersionForCall?: (toolName: string) => string | undefined
   readonly signal?: AbortSignal
   readonly maxSteps?: number
   readonly now?: () => Date

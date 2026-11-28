@@ -28,8 +28,10 @@ import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-l
 import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "./context/root-task-goal-criteria-context.js"
 import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./context/task-graph-objective-progress.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
+import { OBJECTIVE_TAILOR_WAVE_CATALOG_OBSERVATION_ID } from "./canonical-turn-objective-tailor-wave-context.js"
 import { mergeTaskGraphCurrentObservation, OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID } from "./canonical-turn-task-graph-context.js"
 import { OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA } from "./subagents/objective-tailor-candidate.js"
+import { OBJECTIVE_TAILOR_WAVE_CATALOG_SCHEMA } from "./subagents/objective-tailor-candidate-v2.js"
 import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
 import type { DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
 import type { DirectRootTaskHistoryLoadInput } from "./context/root-task-history-direct-store.js"
@@ -318,6 +320,9 @@ describe("canonical Turn context builder", () => {
     const catalog = { schemaVersion: OBJECTIVE_TAILOR_CANDIDATE_CATALOG_SCHEMA, graphRevision: 7,
       candidates: [{ candidateRef: `otc1_${"b".repeat(64)}`, title: "Engineer", company: "Example", score: 8 }] }
     const reader = vi.fn(async (_scope: TaskGraphReadScope) => catalog)
+    const waveCatalog = { schemaVersion: OBJECTIVE_TAILOR_WAVE_CATALOG_SCHEMA, graphRevision: 7,
+      candidates: [{ candidateRef: `otc2_${"c".repeat(64)}`, title: "Wave Engineer", company: "Example", score: 9 }] }
+    const waveReader = vi.fn(async (_scope: TaskGraphReadScope) => waveCatalog)
     let captured: StepContextRequest["snapshot"] | undefined
     const baseBuilder = { build: vi.fn(async request => {
       captured = request.snapshot
@@ -325,20 +330,22 @@ describe("canonical Turn context builder", () => {
         stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}" }
     }) }
     const turnInput = { goal: "Find roles", intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
-    const build = async (objectiveTaskGraphMode: boolean, selectedJobMode: boolean, inputValue: unknown = turnInput) => {
+    const build = async (objectiveTaskGraphMode: boolean, selectedJobMode: boolean, inputValue: unknown = turnInput,
+      objectiveTailorToolVersion?: "1" | "2") => {
       const inputStore = store([])
       const builder = createCanonicalTurnContextBuilder({
         pool: { connect: async () => { throw new Error("injected catalog reader avoids database access") } } as unknown as Pick<pg.Pool, "connect">,
         store: inputStore, baseBuilder, scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
         turnInput: inputValue, rootTaskObjective: { goal: "Find roles", successCriteria: [] }, planningEnabled: true,
-        selectedJobMode, objectiveTaskGraphMode, readObjectiveTailorCatalog: reader,
+        selectedJobMode, objectiveTaskGraphMode, objectiveTailorToolVersion, readObjectiveTailorCatalog: reader,
+        readObjectiveTailorWaveCatalog: waveReader,
         rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget,
       })
       return builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "tailor-step",
         snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [], taskGraphRevision: 7 } })
     }
 
-    await build(true, false)
+    await build(true, false, turnInput, "1")
     const observation = captured?.toolObservations.find(item => item.id === OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID)
     expect(observation?.content).toEqual({ kind: "objective_tailor_candidate_catalog", catalog })
     expect(reader).toHaveBeenCalledOnce()
@@ -348,10 +355,18 @@ describe("canonical Turn context builder", () => {
 
     reader.mockClear()
     await build(false, false)
-    await build(true, true)
-    await build(true, false, { goal: "Batch", intent: SELECTED_JOB_BATCH_PREPARATION_INTENT })
+    await build(true, false)
+    await build(true, true, turnInput, "1")
+    await build(true, false, { goal: "Batch", intent: SELECTED_JOB_BATCH_PREPARATION_INTENT }, "1")
     expect(reader).not.toHaveBeenCalled()
+    expect(waveReader).not.toHaveBeenCalled()
     expect(captured?.toolObservations.some(item => item.id === OBJECTIVE_TAILOR_CANDIDATE_CATALOG_OBSERVATION_ID)).toBe(false)
+
+    await build(true, false, turnInput, "2")
+    const waveObservation = captured?.toolObservations.find(item => item.id === OBJECTIVE_TAILOR_WAVE_CATALOG_OBSERVATION_ID)
+    expect(waveObservation?.content).toEqual({ kind: "objective_tailor_wave_candidate_catalog", catalog: waveCatalog })
+    expect(waveReader).toHaveBeenCalledOnce()
+    expect(reader).not.toHaveBeenCalled()
   })
 
   it("derives the private Root goal revision from the persisted Turn and matching Root objective", () => {

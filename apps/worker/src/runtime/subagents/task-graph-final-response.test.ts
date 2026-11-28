@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest"
 import { appendTaskGraphFollowUpSuggestions, buildGroundedTaskGraphFinalResponse } from "./task-graph-final-response.js"
 import { ROLE_RESULT_SCHEMA, type ArtifactVersionReference } from "./role-results.js"
 import { reduceTaskGraphFinalSummary, type TaskGraphFinalSummary, type TaskGraphFinalSummaryNode } from "./task-graph-final-summary.js"
-import type { TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
+import { readBoundObjectiveTailorFinalOutcome, readResolvedRepairTaskIds, type TaskGraphFinalSummaryBinding } from "./task-graph-final-summary-binding.js"
 import type { SelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import { taskGraphItemId } from "./task-graph-snapshot.js"
 
 const digest = (value: string) => `sha256:${value.repeat(64)}`
 const artifactRef: ArtifactVersionReference = { artifactId: "private-cover-letter-1", version: 2, contentHash: digest("a"), sourceDigest: digest("b") }
@@ -107,6 +108,35 @@ describe("grounded TaskGraph final response", () => {
 
     const ordinary = buildGroundedTaskGraphFinalResponse(currentBinding(structuredSummary()))
     expect(ordinary).not.toContain("Per-Job preparation outcomes:")
+  })
+
+  it("renders only fixed Objective Tailor slot outcomes and preserves source repair evidence", () => {
+    const summary = reduceTaskGraphFinalSummary({ graphRevision: 12, nodes: [
+      node("source-scout", "scout", "completed"), node("source-analyst", "analyst", "failed", {
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+        findings: [{ jobId: "source-job", score: 8, evidenceIds: ["source-evidence"] }],
+        evidence: [{ id: "source-evidence", kind: "job", ref: "source-job", source: "synthetic" }], summary: "PRIVATE_SOURCE_SUMMARY",
+      }),
+    ] })
+    const base = currentBinding(summary)
+    const projection = { schemaVersion: "agent-harness.v2.objective-tailor-final-outcome.v1" as const,
+      graphRevision: 12, rootAttemptCount: 2, graphDigest: "a".repeat(64), sourceNodeCount: 2,
+      sourceGraphDigest: "b".repeat(64), sourceStatusDigest: "c".repeat(64),
+      slots: [{ ordinal: 1, status: "ready" as const, evidenceDigest: "d".repeat(64) },
+        { ordinal: 2, status: "needs_revision" as const, evidenceDigest: "e".repeat(64) }] }
+    const bound = { ...base, graphItemId: taskGraphItemId(base.rootTaskId!), resolvedRepairTaskIds: ["source-analyst"],
+      objectiveTailorFinalOutcome: projection }
+    expect(readBoundObjectiveTailorFinalOutcome(bound)).not.toBeNull()
+    expect(readResolvedRepairTaskIds(bound)).toEqual(new Set(["source-analyst"]))
+    const response = buildGroundedTaskGraphFinalResponse(bound)
+
+    expect(response).toContain("Objective Tailor review: 1 ready (review passed and source current), 1 not ready (1 needs revision).")
+    expect(response).toContain("Per-slot review: slot 1 ready, slot 2 needs revision.")
+    expect(response).not.toContain("Inspect the reported Analysis task outcome.")
+    expect(response).not.toMatch(/source-analyst|graphDigest|sha256:|Application submitted/)
+    const invalid = { ...bound, objectiveTailorFinalOutcome: { ...projection, graphRevision: 13 } }
+    expect(buildGroundedTaskGraphFinalResponse(invalid)).toContain("Task-reported results are unavailable.")
+    expect(buildGroundedTaskGraphFinalResponse(invalid)).not.toContain("Objective Tailor review:")
   })
 
   it("labels only gate-bound repaired failures while preserving counts and legacy output", () => {

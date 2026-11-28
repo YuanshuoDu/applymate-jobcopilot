@@ -15,6 +15,7 @@ import { failedInteractiveDiscoveryShortlist, interactiveDiscoveryRootToolAllowe
 import { selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
 import type { DiscoveryShortlistResult } from "./subagents/discovery-shortlist.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { objectiveTailorVersionFromRootTools } from "./canonical-turn-objective-tailor-mode.js"
 
 type Row = Record<string, unknown>
 const OBJECTIVE_TASK_GRAPH_CONTROL_TOOLS = new Set(["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile", "agent.retire_superseded_scout"])
@@ -32,17 +33,25 @@ export function createCanonicalRootToolGuards(input: {
   readonly objectiveTaskGraphMode?: boolean
   readonly objectiveRootTools?: readonly unknown[]
   readonly routeTool: TurnEngineToolExecutor
-  readonly validateArguments: (name: string, value: unknown) => boolean | string
+  readonly validateArguments: (name: string, value: unknown, version?: string) => boolean | string
 }): {
   readonly executeTool: TurnEngineToolExecutor
   readonly validateToolArguments: (name: string, value: unknown) => boolean | string
+  readonly toolVersionForCall: (name: string) => string
 } {
   const objectiveTools = new Set((input.objectiveRootTools ?? []).flatMap(value => {
     const name = object(value).name
     return typeof name === "string" ? [name] : []
   }))
+  const tailorVersion = objectiveTailorVersionFromRootTools(input.objectiveRootTools ?? [])
+  const toolVersionForCall = (name: string) => {
+    if (name !== "agent.tailor") return "1"
+    if (tailorVersion === "ambiguous") throw new Error("objective_tailor_tool_version_ambiguous")
+    return tailorVersion ?? "1"
+  }
   const denied = (name: string): string | undefined => input.interactiveDiscoveryMode && !interactiveDiscoveryRootToolAllowed(name)
     ? "interactive_discovery_root_tool_disabled"
+    : name === "agent.tailor" && tailorVersion === "ambiguous" ? "objective_tailor_tool_version_ambiguous"
     : input.objectiveTaskGraphMode && !objectiveTools.has(name) ? "objective_task_graph_root_tool_disabled"
     : input.selectedJobMode && !selectedJobToolAllowed(name) ? "selected_job_root_tool_disabled" : undefined
   return {
@@ -52,7 +61,8 @@ export function createCanonicalRootToolGuards(input: {
         ? Promise.resolve<TurnEngineToolResult>({ id: request.call.id, toolName: request.call.toolName, toolVersion: request.call.toolVersion, status: "failed", errorCode })
         : input.routeTool(request)
     },
-    validateToolArguments: (name, value) => denied(name) ?? input.validateArguments(name, value),
+    validateToolArguments: (name, value) => denied(name) ?? input.validateArguments(name, value, toolVersionForCall(name)),
+    toolVersionForCall,
   }
 }
 

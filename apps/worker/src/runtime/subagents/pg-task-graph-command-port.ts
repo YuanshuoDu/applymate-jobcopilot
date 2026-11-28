@@ -13,6 +13,8 @@ import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contra
 import type { TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discovery-recovery-page-contract.js"
 import { appendObjectiveTailor as appendTailor, readObjectiveTailorCatalog as readTailor } from "./pg-task-graph-objective-tailor.js"
+import { appendObjectiveTailorWave as appendTailorWave, readObjectiveTailorWaveCatalog as readTailorWave } from "./pg-task-graph-objective-tailor-wave.js"
+import { appendObjectiveTailorCorrection as appendTailorCorrection } from "./pg-task-graph-objective-tailor-correction.js"
 import { projectTaskGraphDiscoveryRecoveryPage } from "./task-graph-discovery-recovery-page.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { createPgRootTaskHistoryResultPageStore } from "../context/root-task-history-result-page-store.js"
@@ -40,6 +42,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     },
     readObjectiveTailorCatalog(scope) { return readTailor(pool, scope) },
     appendObjectiveTailor(input) { return appendTailor(pool, input) },
+    readObjectiveTailorWaveCatalog(scope) { return readTailorWave(pool, scope) },
+    appendObjectiveTailorWave(input) { return appendTailorWave(pool, input) },
+    appendObjectiveTailorCorrection(input) { return appendTailorCorrection(pool, input) },
     async appendScheduledPrepare(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt> {
       return transaction(pool, client => appendScheduledPrepareCommand(client, input))
     },

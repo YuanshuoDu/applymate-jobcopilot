@@ -265,6 +265,31 @@ describe('TaskGraph repair display projection', () => {
     expect(JSON.stringify(result)).not.toMatch(/verification|repairOf|repairReceipt|finding-count/)
   })
 
+  it('projects only a bounded hint for a valid marked wave snapshot', () => {
+    const scout = { key: 'scout', taskId: 'scout-task', templateId: 'scout', goal: 'Private source goal', successCriteria: ['Private criterion'],
+      dependsOn: [], depth: 1, verification: { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'scout',
+        criteria: [{ id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 1 } }] }, verificationDisposition: 'typed' }
+    const analyst = { key: 'analyst', taskId: 'analyst-task', templateId: 'analyst', goal: 'Private analysis goal', successCriteria: ['Private criterion'],
+      dependsOn: ['scout'], depth: 2, verification: { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'analyst',
+        criteria: [{ id: 'finding-count', check: { kind: 'finding_count_gte', minimum: 1 } }] }, verificationDisposition: 'typed' }
+    const writer = { key: 'writer', taskId: 'writer-task', templateId: 'cover_letter_writer', goal: 'Private draft goal', successCriteria: ['Private criterion'],
+      dependsOn: ['analyst'], depth: 3, verificationDisposition: 'specialized' }
+    const reviewer = { key: 'reviewer', taskId: 'reviewer-task', templateId: 'cover_letter_reviewer', goal: 'Private review goal', successCriteria: ['Private criterion'],
+      dependsOn: ['writer'], depth: 4, verificationDisposition: 'specialized' }
+    const marked = { schemaVersion: 'agent-harness.v2.task-graph', nodes: [scout, analyst, writer, reviewer], objectiveTailor: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-graph.v1', sourceNodeCount: 2, slots: [
+        { slotId: 'tailor-1', sourceAnalystNodeKey: 'analyst', writerNodeKey: 'writer', reviewerNodeKey: 'reviewer' },
+      ],
+    } }
+    const redact = vi.fn((value: unknown) => value)
+    const projected = redactTaskGraphTimelineContent('task_graph', marked, redact)
+    expect(projected).toEqual({ objectiveTailorProgressHint: {
+      schemaVersion: 'agent-harness.v2.objective-tailor-progress-hint.v1', sourceNodeCount: 2, slotCount: 1,
+    } })
+    expect(redact).not.toHaveBeenCalled()
+    expect(JSON.stringify(projected)).not.toMatch(/Private|taskId|graphItemId|sourceAnalystNodeKey|writer-task/)
+  })
+
   it('returns null for malformed task graphs and delegates other item types unchanged', () => {
     const redact = vi.fn((value: unknown) => ({ wrapped: value }))
     expect(redactTaskGraphTimelineContent('task_graph', { ...graph(), nodes: [{ ...graph().nodes[0], taskGraphRepairReceipt: { secret: true } }] }, redact)).toBeNull()

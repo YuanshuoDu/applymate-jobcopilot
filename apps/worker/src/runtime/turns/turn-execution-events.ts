@@ -117,12 +117,13 @@ export async function executeToolWithItems(
   onResultItemPersisted?: (receipt: PersistedToolExecutionReceipt) => void,
 ): Promise<TurnEngineToolResult> {
   const input = toRepositoryJson(call.arguments)
+  const toolVersion = options.toolVersionForCall?.(call.name) ?? "1"
   const rejectionMarker = options.dependencyWaitBatchRejected === true
     ? { [DEPENDENCY_WAIT_BATCH_REJECTION_ITEM_KEY]: DEPENDENCY_WAIT_BATCH_REJECTION_MARKER }
     : {}
   const callItem = await writer.startItem({
     id: itemId(options, `item:tool-call:${call.id}`), stepId: step.id, type: "tool_call", phase: null,
-    content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input, ...rejectionMarker }, now: now(),
+    content: { toolCallId: call.id, toolName: call.name, toolVersion, input, ...rejectionMarker }, now: now(),
   })
   onCallItemPersisted?.()
   const startKey = options.childWaitCallStartKey?.(step.id, call) ?? `tool-started:${call.id}`
@@ -132,7 +133,7 @@ export async function executeToolWithItems(
     if (!isSessionPauseRequestedError(error)) throw error
     const interruptedCall = { toolCallId: call.id, toolName: call.name, status: "interrupted", errorCode: "session_pause_requested" }
     const interruptedPrivateCall = options.dependencyWaitBatchRejected === true
-      ? { ...interruptedCall, toolVersion: "1", input, ...rejectionMarker }
+      ? { ...interruptedCall, toolVersion, input, ...rejectionMarker }
       : interruptedCall
     await writer.updateItem(callItem, "interrupted", interruptedPrivateCall, now(), "tool-start-denied", interruptedCall)
     throw error
@@ -145,14 +146,17 @@ export async function executeToolWithItems(
       scope: options.scope, sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
       taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId, actorRole: options.actorRole,
       signal: options.signal ?? new AbortController().signal, capabilities: options.capabilities,
-      call: { id: call.id, toolName: call.name, toolVersion: "1", input: call.arguments },
+      call: { id: call.id, toolName: call.name, toolVersion, input: call.arguments },
     })
   } catch (error: unknown) {
     if (signalWasInterrupted(options.signal ?? new AbortController().signal)) throw error
     if (isSessionPauseRequestedError(error)) {
       pauseError = error
-      result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "session_pause_requested" }
-    } else result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "tool_execution_failed" }
+      result = { id: call.id, toolName: call.name, toolVersion, status: "failed", errorCode: "session_pause_requested" }
+    } else result = { id: call.id, toolName: call.name, toolVersion, status: "failed", errorCode: "tool_execution_failed" }
+  }
+  if (toolVersion === "2" && (result.id !== call.id || result.toolName !== call.name || result.toolVersion !== toolVersion)) {
+    result = { id: call.id, toolName: call.name, toolVersion, status: "failed", errorCode: "tool_result_identity_mismatch" }
   }
   const completedCall = {
     toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion,

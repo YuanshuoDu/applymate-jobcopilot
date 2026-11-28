@@ -4,10 +4,11 @@ import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { validateRoleResult } from "./role-results.js"
 import type { SubagentTaskStatus } from "./types.js"
-import { normalizeResolvedRepairTaskIds } from "./task-graph-final-summary-repair-binding.js"
-export { readResolvedRepairTaskIds } from "./task-graph-final-summary-repair-binding.js"
-import { hasSelectedJobBatchMembers, readBoundSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import { normalizeResolvedRepairTaskIds, readResolvedRepairTaskIds as readOrdinaryResolvedRepairTaskIds } from "./task-graph-final-summary-repair-binding.js"
+import { hasSelectedJobBatchMembers, readBoundSelectedJobBatchFinalOutcome, renderSelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
 import type { SelectedJobBatchFinalOutcome } from "./selected-job-batch-final-outcome.js"
+import { hasObjectiveTailorFinalOutcome, readBoundObjectiveTailorFinalOutcome, renderObjectiveTailorFinalOutcome, type ObjectiveTailorFinalOutcomeProjection } from "./objective-tailor-final-summary-binding.js"
+export { hasObjectiveTailorFinalOutcome, readBoundObjectiveTailorFinalOutcome, renderObjectiveTailorFinalOutcome, renderSelectedJobBatchFinalOutcome }
 
 export const TASK_GRAPH_FINAL_SUMMARY_BINDING: unique symbol = Symbol("task_graph_final_summary_binding")
 
@@ -42,6 +43,7 @@ export type TaskGraphFinalSummaryBinding = Readonly<{
   members?: readonly TaskGraphFinalSummaryMember[]
   resolvedRepairTaskIds?: readonly string[]
   selectedJobBatchFinalOutcome?: SelectedJobBatchFinalOutcome
+  objectiveTailorFinalOutcome?: ObjectiveTailorFinalOutcomeProjection
   summary: TaskGraphFinalSummary
 }>
 
@@ -126,6 +128,19 @@ export function buildTaskGraphFinalSummaryBinding(
     ...(resolved ? { resolvedRepairTaskIds: resolved } : {}), summary }
 }
 
+/** Reads only bounded failed business members confirmed by this private binding. */
+export function readResolvedRepairTaskIds(value: unknown): ReadonlySet<string> {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return new Set()
+    const binding = jsonRecord(value)
+    if (!binding) return new Set()
+    if (hasObjectiveTailorFinalOutcome(binding) && !readBoundObjectiveTailorFinalOutcome(binding)) return new Set()
+    const legacyBinding = { ...binding }
+    Reflect.deleteProperty(legacyBinding, "objectiveTailorFinalOutcome")
+    return readOrdinaryResolvedRepairTaskIds(legacyBinding)
+  } catch { return new Set() }
+}
+
 /** Compares the exact current graph revision and all deterministic reducer facts. */
 export function sameTaskGraphFinalSummaryBinding(
   left: TaskGraphFinalSummaryBinding | null | undefined,
@@ -134,7 +149,10 @@ export function sameTaskGraphFinalSummaryBinding(
   try {
     if (!left || !right) return false
     const leftHasBatch = hasSelectedJobBatchMembers(left), rightHasBatch = hasSelectedJobBatchMembers(right)
-    if (leftHasBatch !== rightHasBatch) return false
+    const leftHasTailor = hasObjectiveTailorFinalOutcome(left), rightHasTailor = hasObjectiveTailorFinalOutcome(right)
+    if (leftHasBatch !== rightHasBatch || leftHasTailor !== rightHasTailor) return false
+    const leftTailor = readBoundObjectiveTailorFinalOutcome(left), rightTailor = readBoundObjectiveTailorFinalOutcome(right)
+    if (leftHasTailor && (!leftTailor || !rightTailor)) return false
     const leftBatch = left.selectedJobBatchFinalOutcome, rightBatch = right.selectedJobBatchFinalOutcome
     if (leftHasBatch) {
       if (!readBoundSelectedJobBatchFinalOutcome(left) || !readBoundSelectedJobBatchFinalOutcome(right)) return false
@@ -142,7 +160,7 @@ export function sameTaskGraphFinalSummaryBinding(
     if (left.rootTaskId !== right.rootTaskId || left.graphItemId !== right.graphItemId
       || JSON.stringify(left.members) !== JSON.stringify(right.members) || left.graphRevision !== right.graphRevision
       || JSON.stringify(left.resolvedRepairTaskIds) !== JSON.stringify(right.resolvedRepairTaskIds)
-      || JSON.stringify(leftBatch) !== JSON.stringify(rightBatch)
+      || JSON.stringify(leftBatch) !== JSON.stringify(rightBatch) || JSON.stringify(leftTailor) !== JSON.stringify(rightTailor)
       || left.summary.graphRevision !== left.graphRevision || right.summary.graphRevision !== right.graphRevision) return false
     return JSON.stringify(left.summary) === JSON.stringify(right.summary)
   }

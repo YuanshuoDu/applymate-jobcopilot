@@ -7,6 +7,7 @@ import type { TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
 import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { parseObjectiveTailorCandidateWitness, type ObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { isRegisteredObjectiveTailorWaveChild, objectiveTailorWaveChildExecutionAllowed } from "./task-graph-pg-create-objective-tailor-wave.js"
 import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT } from "./task-graph-dependency-context.js"
@@ -179,19 +180,15 @@ function validTailorDependencyContext(value: unknown, witness: ObjectiveTailorCa
 }
 
 function exactObjectiveIntent(value: unknown): boolean {
-  const envelope = record(value)
+  const envelope = plainRecord(value)
   if (!envelope || Object.hasOwn(envelope, "input")) return false
-  const intent = record(envelope.intent)
+  const intent = plainRecord(envelope.intent)
   return Boolean(intent && Object.keys(intent).sort().join(",") === "kind,version"
     && validate(TurnIntentSchema, intent)
     && canonicalTaskGraphJson(intent) === canonicalTaskGraphJson(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT))
 }
 
 export function isExactObjectiveTaskGraphIntent(value: unknown): boolean { return exactObjectiveIntent(value) }
-
-function record(value: unknown): Record<string, unknown> | null {
-  return plainRecord(value)
-}
 
 function matchingScope(scope: GraphScope, input: SubagentTaskSpec): boolean {
   return typeof scope.stepId === "string" && scope.stepId.trim().length > 0
@@ -205,7 +202,7 @@ function matchingScope(scope: GraphScope, input: SubagentTaskSpec): boolean {
 
 /** Reuses Session/Turn/Root/Step locks already held by the TaskGraph schedule transaction. */
 export async function admitOwnedObjectiveTaskGraphChild(
-  client: Queryable, input: SubagentTaskSpec, authority: GraphScope | undefined,
+  client: Queryable, input: SubagentTaskSpec, authority: (GraphScope & Readonly<{ objectiveTailorWaveNodeKey?: string }>) | undefined,
 ): Promise<boolean> {
   if (!authority || !matchingScope(authority, input)) return false
   let candidate: unknown
@@ -214,9 +211,11 @@ export async function admitOwnedObjectiveTaskGraphChild(
       constraints: input.constraints, context: input.context, expectedOutputSchema: input.expectedOutputSchema })
   } catch { return false }
   if (!candidate) return false
-  if (!registeredObjectiveChildSpec(candidate as Record<string, unknown>)) return false
+  const waveChild = Boolean(authority?.objectiveTailorWaveNodeKey
+    && isRegisteredObjectiveTailorWaveChild(candidate as Record<string, unknown>, authority.objectiveTailorWaveNodeKey))
+  if (!registeredObjectiveChildSpec(candidate as Record<string, unknown>) && !waveChild) return false
   const result = await client.query(`WITH live AS MATERIALIZED (SELECT clock_timestamp() AS "at")
-    SELECT turn."input", turn."executionMode" FROM live
+    SELECT turn."input", turn."executionMode", root."budgetSnapshot" AS "rootBudgetSnapshot", root."allowedActions" AS "rootAllowedActions" FROM live
     JOIN "agent_sessions" AS session ON session."id" = $1 AND session."userId" = $2
       AND session."status" NOT IN ('aborted', 'archived')
     JOIN "agent_turns" AS turn ON turn."id" = $3 AND turn."sessionId" = session."id" AND turn."userId" = session."userId"
@@ -235,9 +234,9 @@ export async function admitOwnedObjectiveTaskGraphChild(
     authority.turnLeaseVersion, authority.parentLeaseOwner, authority.parentAttemptCount, authority.stepId])
   if (result.rows.length !== 1) return false
   const turn = result.rows[0] as Record<string, unknown>
-  if (!exactObjectiveIntent(turn.input)) return false
+  if (!exactObjectiveIntent(turn.input) || waveChild && !objectiveTailorWaveChildExecutionAllowed(turn)) return false
   if (turn.executionMode === "canonical_task_graph") return true
-  if (turn.executionMode !== null) return false
+  if (turn.executionMode !== null || waveChild) return false
   const promoted = await client.query(`UPDATE "agent_turns" AS turn SET "executionMode" = 'canonical_task_graph'
     WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
       AND turn."source" = 'user' AND turn."status" = 'in_progress' AND turn."rootTaskId" = $4

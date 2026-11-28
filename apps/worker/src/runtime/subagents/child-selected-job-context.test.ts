@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { bindObjectiveTailorWaveCandidateWitness, makeObjectiveTailorWaveCandidateSelection } from "./objective-tailor-wave-witness.js"
+import { OBJECTIVE_TAILOR_CANDIDATE_WITNESS_SCHEMA } from "./objective-tailor-witness.js"
 import type pg from "pg"
 import { loadChildSelectedJobSource, projectChildTaskContext } from "./child-selected-job-context.js"
 import { bindObjectiveTailorCandidateWitness, makeObjectiveTailorCandidateSelection } from "./objective-tailor-witness.js"
+import { bindObjectiveTailorCorrectionProof } from "./objective-tailor-correction-proof.js"
 import { objectiveTailorNodeKeysForCandidate } from "./objective-task-graph-child-authority.js"
 import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
@@ -19,6 +22,18 @@ const selection = makeObjectiveTailorCandidateSelection({ scope, sourceGraphRevi
 const witness = bindObjectiveTailorCandidateWitness(selection, {
   ...objectiveTailorNodeKeysForCandidate(selection.candidateRef)!, admittedRevision: 2,
 })!
+const waveSelection = makeObjectiveTailorWaveCandidateSelection({ scope, sourceGraphRevision: 1, sourceGraphDigest: "e".repeat(64),
+  sourceStatusDigest: "f".repeat(64), analystProofDigest: "1".repeat(64),
+  candidate: { jobId, score: 8.5, materialDigest: `sha256:${"d".repeat(64)}` }, sourceAnalystKey: "analyst-1" })!
+const waveWitness = bindObjectiveTailorWaveCandidateWitness(waveSelection, { slotId: "tailor-1", admittedRevision: 2 })!
+const correctionProof = bindObjectiveTailorCorrectionProof({ graphRevision: 3, slotId: waveWitness.slotId,
+  candidateWitness: waveWitness, writerTaskId: "writer-initial", reviewerTaskId: "reviewer-initial",
+  artifactRef: { artifactId: "artifact-1", version: 1, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}` },
+  artifactVersion: { artifactId: "artifact-1", artifactType: "cover_letter", taskId: "writer-initial", version: 1,
+    contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`, previousHash: null },
+  reviewReceipt: { jobId, artifactId: "artifact-1", version: 1, contentHash: `sha256:${"a".repeat(64)}`,
+    sourceDigest: `sha256:${"d".repeat(64)}`, currentSourceDigest: `sha256:${"d".repeat(64)}`, status: "needs_revision",
+    taskId: "reviewer-initial", toolCallId: "review-call", reviewHash: `sha256:${"e".repeat(64)}` } })!
 
 function objectiveTask(role: "writer" | "reviewer" = "writer"): SubagentTaskRecord {
   return {
@@ -72,6 +87,41 @@ describe("child selected-job context", () => {
       { result: { findings: [{ jobId, note: "keep" }], findingCount: 1 } },
       { result: { candidates: [{ jobId, score: 8 }], candidateCount: 1 } },
     ] } })
+  })
+
+  it("projects the closed V2 witness through the same private-field and selected-Job boundary", () => {
+    const task = { ...objectiveTask(), context: { ...objectiveTask().context as object,
+      objectiveTailorCandidateWitness: waveWitness } }
+    const projection = projectChildTaskContext(task)
+    const serialized = JSON.stringify(projection.context)
+    expect(projection).toMatchObject({ selectedJobId: jobId, scheduledDraft: false })
+    expect(serialized).not.toContain("objectiveTailorCandidateMode")
+    expect(serialized).not.toContain("objectiveTailorCandidateWitness")
+    expect(serialized).not.toContain(waveWitness.candidateRef)
+  })
+
+  it("strips a valid correction proof before model context and rejects malformed proof", () => {
+    const context = { ...objectiveTask().context as object, objectiveTailorCandidateWitness: waveWitness,
+      objectiveTailorCorrectionProof: correctionProof }
+    const projected = projectChildTaskContext({ ...objectiveTask(), context })
+    const serialized = JSON.stringify(projected.context)
+    expect(projected.selectedJobId).toBe(jobId)
+    expect(serialized).not.toContain("objectiveTailorCorrectionProof")
+    expect(serialized).not.toContain("review-call")
+    expect(serialized).not.toContain("writer-initial")
+    expect(() => projectChildTaskContext({ ...objectiveTask(), context: {
+      ...context, objectiveTailorCorrectionProof: { ...correctionProof, prior: {} },
+    } })).toThrow("objective_tailor_child_context_invalid")
+  })
+
+  it.each([
+    ["unknown schema", { ...waveWitness, schemaVersion: "agent-harness.v2.objective-tailor-wave-witness.v9" }],
+    ["mixed schema", { ...waveWitness, schemaVersion: OBJECTIVE_TAILOR_CANDIDATE_WITNESS_SCHEMA }],
+    ["malformed V2", { ...waveWitness, candidateRef: [] }],
+  ])("rejects %s without falling back to another witness version", (_name, badWitness) => {
+    const task = { ...objectiveTask(), context: { ...objectiveTask().context as object,
+      objectiveTailorCandidateWitness: badWitness } }
+    expect(() => projectChildTaskContext(task)).toThrow("objective_tailor_child_context_invalid")
   })
 
   it.each([

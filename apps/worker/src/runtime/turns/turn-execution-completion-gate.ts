@@ -14,6 +14,7 @@ import type { SessionTerminalAdmission } from "../session-gate.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { buildCurrentTaskGraphFinalSummaryBinding, hasObjectiveTailorWaveMarker } from "../subagents/objective-tailor-final-summary-binding.js"
 import { readTaskGraphConfirmedLocationSteer } from "../subagents/task-graph-confirmed-location-steer.js"
 import { resolveTaskGraphConfirmedLocationCompletion } from "./task-graph-confirmed-location-completion.js"
 import { taskGraphCompletionApplicability } from "./task-graph-completion-applicability.js"
@@ -210,8 +211,10 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
       if (applicability.kind === "replan") return deny("result_applicability")
       historicalNodeIndices = applicability.historicalNodeIndices
     }
-    const binding = buildTaskGraphFinalSummaryBinding(loaded, historicalNodeIndices, resolvedRepairTaskIds, retiredScouts)
+    const binding = await buildCurrentTaskGraphFinalSummaryBinding({ client, lease, rootTaskId, loaded, historicalNodeIndices, resolvedRepairTaskIds,
+      buildOrdinary: (graph, historical, resolved) => buildTaskGraphFinalSummaryBinding(graph, historical, resolved, retiredScouts) })
     if (!binding && retiredScouts.size > 0) return deny("result_applicability")
+    if (hasObjectiveTailorWaveMarker(loaded) && !binding) return deny()
     return binding ? { ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } : { ok: true }
   } catch { graphRevision = null; denialCheckpoint = null; return deny() }
 }

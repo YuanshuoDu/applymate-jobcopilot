@@ -1,6 +1,9 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
-import { parseObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { OBJECTIVE_TAILOR_CANDIDATE_WITNESS_SCHEMA, parseObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { OBJECTIVE_TAILOR_WAVE_WITNESS_SCHEMA, parseObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
+import { parseObjectiveTailorCorrectionProof } from "./objective-tailor-correction-witness.js"
+import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { loadObjectiveTailorChildSource } from "./objective-tailor-writer-source.js"
 import { loadSelectedJobArtifactContextForChild, type SelectedJobArtifactContextForChild } from "./scheduled-draft-writer-source.js"
@@ -9,7 +12,7 @@ import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 
 const PRIVATE_FIELDS = new Set([
   "scheduledDraftCandidateWitness", "scheduledDraftCandidateMode",
-  "objectiveTailorCandidateMode", "objectiveTailorCandidateWitness",
+  "objectiveTailorCandidateMode", "objectiveTailorCandidateWitness", "objectiveTailorCorrectionProof",
 ])
 
 export type ChildTaskContextProjection = Readonly<{
@@ -44,11 +47,15 @@ export function projectChildTaskContext(task: SubagentTaskRecord): ChildTaskCont
   const scheduledJobId = scheduledDraftJobId(source)
   const hasObjectiveMode = source !== undefined && Object.hasOwn(source, "objectiveTailorCandidateMode")
   const hasObjectiveWitness = source !== undefined && Object.hasOwn(source, "objectiveTailorCandidateWitness")
+  const hasCorrectionProof = source !== undefined && Object.hasOwn(source, "objectiveTailorCorrectionProof")
   let selectedJobId = scheduledJobId
-  if (hasObjectiveMode || hasObjectiveWitness) {
+  if (hasObjectiveMode || hasObjectiveWitness || hasCorrectionProof) {
     const selection = source && plainRecord(source.selectedJobPreparation)
-    const witness = parseObjectiveTailorCandidateWitness(source?.objectiveTailorCandidateWitness)
+    const witness = parseObjectiveTailorChildWitness(source?.objectiveTailorCandidateWitness)
+    const correction = hasCorrectionProof ? parseObjectiveTailorCorrectionProof(source?.objectiveTailorCorrectionProof) : undefined
     if (scheduledJobId || !source || source.objectiveTailorCandidateMode !== true || !hasObjectiveWitness
+      || hasCorrectionProof && (!correction || !witness || canonicalTaskGraphJson(correction.candidateWitness) !== canonicalTaskGraphJson(witness)
+        || !parseObjectiveTailorWaveCandidateWitness(source.objectiveTailorCandidateWitness))
       || (task.role !== "writer" && task.role !== "reviewer")
       || task.taskType !== (task.role === "writer" ? "cover_letter_draft" : "cover_letter_review")
       || !selection || Object.keys(selection).join(",") !== "jobId"
@@ -123,10 +130,17 @@ function scheduledDraftJobId(source: Record<string, unknown> | undefined): strin
   return selection.jobId
 }
 
+function parseObjectiveTailorChildWitness(value: unknown): { candidate: { jobId: string } } | undefined {
+  const witness = plainRecord(value)
+  if (witness?.schemaVersion === OBJECTIVE_TAILOR_CANDIDATE_WITNESS_SCHEMA) return parseObjectiveTailorCandidateWitness(value)
+  if (witness?.schemaVersion === OBJECTIVE_TAILOR_WAVE_WITNESS_SCHEMA) return parseObjectiveTailorWaveCandidateWitness(value)
+  return undefined
+}
+
 export function hasObjectiveTailorPrivateFields(value: unknown): boolean {
   const source = plainRecord(value)
   return source !== undefined && (Object.hasOwn(source, "objectiveTailorCandidateMode")
-    || Object.hasOwn(source, "objectiveTailorCandidateWitness"))
+    || Object.hasOwn(source, "objectiveTailorCandidateWitness") || Object.hasOwn(source, "objectiveTailorCorrectionProof"))
 }
 
 function objectiveSourceUnavailable(): TaskGraphWriterReviewFeedbackError {

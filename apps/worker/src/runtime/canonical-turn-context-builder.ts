@@ -12,6 +12,9 @@ import { createPgDirectSelectedJobHistoryStore } from "./context/selected-job-hi
 import { createPgDirectRootTaskHistoryStore } from "./context/root-task-history-direct-store.js"
 import { appendObjectiveTailorCandidateCatalog, selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
 import type { ObjectiveTailorCandidateCatalog } from "./subagents/objective-tailor-candidate.js"
+import type { ObjectiveTailorToolVersion } from "./canonical-turn-objective-tailor-mode.js"
+import { appendObjectiveTailorWaveCandidateCatalog } from "./canonical-turn-objective-tailor-wave-context.js"
+import type { ObjectiveTailorWaveCandidateCatalog } from "./subagents/objective-tailor-candidate-v2.js"
 import type { TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
@@ -53,7 +56,9 @@ type Input = Readonly<{
   planningEnabled: boolean
   selectedJobMode: boolean
   objectiveTaskGraphMode?: boolean
+  objectiveTailorToolVersion?: ObjectiveTailorToolVersion
   readObjectiveTailorCatalog?: (scope: TaskGraphReadScope) => Promise<ObjectiveTailorCandidateCatalog | undefined>
+  readObjectiveTailorWaveCatalog?: (scope: TaskGraphReadScope) => Promise<ObjectiveTailorWaveCandidateCatalog | undefined>
   discoveryPersonaMemoryEnabled?: boolean
   selectedJobMemories?: readonly SelectedJobMemoryRecord[]
   selectedJobId?: string
@@ -85,8 +90,10 @@ export function canonicalSteeringHydrationScope(input: Pick<Input, "planningEnab
 }
 
 export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder {
-  const objectiveTailorCatalogReader = input.objectiveTaskGraphMode === true && input.planningEnabled && !input.selectedJobMode
+  const objectiveTailorCatalogReader = input.objectiveTailorToolVersion === "1" && input.objectiveTaskGraphMode === true && input.planningEnabled && !input.selectedJobMode
     && hasObjectiveTaskGraphIntent(input.turnInput) ? input.readObjectiveTailorCatalog : undefined
+  const objectiveTailorWaveCatalogReader = input.objectiveTailorToolVersion === "2" && input.objectiveTaskGraphMode === true && input.planningEnabled && !input.selectedJobMode
+    && hasObjectiveTaskGraphIntent(input.turnInput) ? input.readObjectiveTailorWaveCatalog : undefined
   const reconciliationScope = canonicalSteeringHydrationScope(input)
   const discoveryMemoryEnabled = input.discoveryPersonaMemoryEnabled === true && input.planningEnabled && !input.selectedJobMode
   const loadDiscoveryPersonaMemory = async (stepId: string) => {
@@ -118,7 +125,8 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
     objectiveProgressGoalRevision: () => input.rootTaskObjective
       ? rootTaskHistoryObjectiveDigest(input.turnInput, { goal: input.rootTaskObjective.goal, successCriteria: input.rootTaskObjective.successCriteria }) : undefined,
     build: async request => {
-      let snapshot: StepContextSnapshot = appendObjectiveTailorCandidateCatalog(withoutCallerSearchFootprints(request.snapshot), undefined, undefined)
+      let snapshot: StepContextSnapshot = appendObjectiveTailorWaveCandidateCatalog(
+        appendObjectiveTailorCandidateCatalog(withoutCallerSearchFootprints(request.snapshot), undefined, undefined), undefined, undefined)
       if (input.selectedJobMode) {
         snapshot = injectSelectedJobMemory({ snapshot: selectedJobSnapshot(snapshot), records: input.selectedJobMemories ?? [], jobId: input.selectedJobId, turnId: input.lease.turnId, rootTaskId: input.rootTaskId })
         if (directHistoryReader) snapshot = await appendCanonicalSelectedJobHistoryOutcomes({
@@ -167,13 +175,18 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       })
       if (objectiveProgress) toolObservations.push(objectiveProgress)
       snapshot = { ...snapshot, rootTaskGoalCriteria, toolObservations }
-      if (objectiveTailorCatalogReader && snapshot.taskGraphRevision !== undefined) {
+      if ((objectiveTailorCatalogReader || objectiveTailorWaveCatalogReader) && snapshot.taskGraphRevision !== undefined) {
         const readScope: TaskGraphReadScope = { userId: input.scope.userId, sessionId: input.lease.sessionId, turnId: input.lease.turnId,
           rootTaskId: input.rootTaskId, parentTaskId: input.rootTaskId, turnLeaseOwner: input.lease.ownerId,
           turnLeaseVersion: input.lease.leaseVersion, parentLeaseOwner: input.lease.ownerId, parentAttemptCount: input.rootAttemptCount }
         try {
-          const catalog = await objectiveTailorCatalogReader(readScope)
-          snapshot = appendObjectiveTailorCandidateCatalog(snapshot, catalog, snapshot.taskGraphRevision)
+          if (objectiveTailorCatalogReader) {
+            const catalog = await objectiveTailorCatalogReader(readScope)
+            snapshot = appendObjectiveTailorCandidateCatalog(snapshot, catalog, snapshot.taskGraphRevision)
+          } else if (objectiveTailorWaveCatalogReader) {
+            const catalog = await objectiveTailorWaveCatalogReader(readScope)
+            snapshot = appendObjectiveTailorWaveCandidateCatalog(snapshot, catalog, snapshot.taskGraphRevision)
+          }
         } catch (error: unknown) {
           if (error instanceof TurnLeaseError || error instanceof TurnEngineError) throw error
         }

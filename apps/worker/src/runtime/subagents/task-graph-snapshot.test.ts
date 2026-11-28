@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 
 import { TASK_GRAPH_LIMITS, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2 } from "../planning/task-graph-verification.js"
+import { OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphLifecycleKey, taskGraphSnapshot,
   taskGraphState, taskGraphWaitLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
@@ -139,6 +140,36 @@ const registeredScoutEnvelope = {
   allowedActions: ["jobs.search"],
 } as const
 
+function objectiveTailorFixture() {
+  const scouts = Array.from({ length: 3 }, (_, index) => ({ ...storedNode(`source-scout-${index + 1}`),
+    verification: scoutVerification, verificationDisposition: "typed" as const }))
+  const analysts = Array.from({ length: 4 }, (_, index) => ({ ...storedNode(`source-analyst-${index + 1}`, scouts.map(node => node.key)),
+    templateId: "analyst", depth: 2, verification: analystVerification, verificationDisposition: "typed" as const }))
+  const slots = Array.from({ length: 8 }, (_, index) => {
+    const slotId = `tailor-${index + 1}`
+    const sourceAnalystNodeKey = `source-analyst-${index % analysts.length + 1}`
+    const writerNodeKey = `${slotId}-writer`, reviewerNodeKey = `${slotId}-reviewer`
+    const correction = index < 2 ? { writerNodeKey: `${slotId}-correction-writer`, reviewerNodeKey: `${slotId}-correction-reviewer` } : undefined
+    return { slotId, sourceAnalystNodeKey, writerNodeKey, reviewerNodeKey, ...(correction ? { correction } : {}) }
+  })
+  const tailoringNodes = slots.flatMap(slot => {
+    const writer = { ...storedNode(slot.writerNodeKey, [slot.sourceAnalystNodeKey]), templateId: "cover_letter_writer",
+      depth: 3, verificationDisposition: "specialized" }
+    const reviewer = { ...storedNode(slot.reviewerNodeKey, [slot.writerNodeKey]), templateId: "cover_letter_reviewer",
+      depth: 4, verificationDisposition: "specialized" }
+    if (!slot.correction) return [writer, reviewer]
+    const correctionWriter = { ...storedNode(slot.correction.writerNodeKey, [slot.reviewerNodeKey]), templateId: "cover_letter_writer",
+      depth: 5, verificationDisposition: "specialized" }
+    const correctionReviewer = { ...storedNode(slot.correction.reviewerNodeKey, [slot.correction.writerNodeKey]), templateId: "cover_letter_reviewer",
+      depth: 6, verificationDisposition: "specialized" }
+    return [writer, reviewer, correctionWriter, correctionReviewer]
+  })
+  return {
+    nodes: [...scouts, ...analysts, ...tailoringNodes],
+    marker: { schemaVersion: OBJECTIVE_TAILOR_GRAPH_SCHEMA_VERSION, sourceNodeCount: scouts.length + analysts.length, slots },
+  }
+}
+
 function boundedEightNodeSnapshot(useUnicode: boolean) {
   const keys = Array.from({ length: 8 }, (_, index) => `${"k".repeat(127)}${index}`)
   return snapshotWithNodes(keys.map((key, index) => ({
@@ -268,6 +299,37 @@ describe("parseTaskGraphSnapshot", () => {
     expect(() => parseTaskGraphSnapshot(snapshotWithNodes([...nodes, storedNode("scheduled-overflow")]))).toThrow("task_graph_snapshot_invalid")
     expect(() => parseTaskGraphSnapshot(snapshotWithNodes(Array.from({ length: TASK_GRAPH_LIMITS.maxNodes + 1 }, (_, index) => storedNode(`generic-${index}`)))))
       .toThrow("task_graph_snapshot_capacity_invalid")
+  })
+
+  it("round-trips only the closed Objective Tailor graph above ordinary capacity", () => {
+    const fixture = objectiveTailorFixture()
+    const input = { ...snapshotWithNodes(fixture.nodes), rootSuccessCriteria: ["Eight independent job slots"], objectiveTailor: fixture.marker }
+    const parsed = parseTaskGraphSnapshot(input)
+    expect(parsed.nodes).toHaveLength(27)
+    expect(parsed.objectiveTailor).toEqual(fixture.marker)
+    expect(parseTaskGraphSnapshot(canonicalTaskGraphJson(parsed))).toEqual(parsed)
+
+    const statuses = new Map(parsed.nodes.map(node => [node.taskId, { status: "queued" as const, failureReason: null }]))
+    const taskIds = new Map(parsed.nodes.map(node => [node.key, node.taskId]))
+    const restored = taskGraphState(parsed, 1, statuses, [])
+    expect(taskGraphSnapshot(restored, taskIds)).toEqual(parsed)
+    expect(restored.objectiveTailor).toEqual(parsed.objectiveTailor)
+    const malformedState = Object.assign({}, restored, { objectiveTailor: undefined }) as typeof restored
+    expect(() => taskGraphSnapshot(malformedState, taskIds)).toThrow("task_graph_snapshot_objective_tailor_invalid")
+
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes(fixture.nodes))).toThrow("task_graph_snapshot_invalid")
+    const incompatibleNodes = fixture.nodes.map((node, index) => index === 7
+      ? { ...node, dependsOn: ["source-analyst-2"] }
+      : node)
+    expect(() => parseTaskGraphSnapshot({ ...snapshotWithNodes(incompatibleNodes), objectiveTailor: fixture.marker }))
+      .toThrow("task_graph_snapshot_objective_tailor_invalid")
+    expect(() => parseTaskGraphSnapshot({ ...snapshotWithNodes([storedNode("small")]), objectiveTailor: null }))
+      .toThrow("task_graph_snapshot_objective_tailor_invalid")
+    let markerReads = 0
+    const accessorMarker = snapshotWithNodes([storedNode("accessor")]) as Record<string, unknown>
+    Object.defineProperty(accessorMarker, "objectiveTailor", { enumerable: true, get: () => { markerReads++; return null } })
+    expect(() => parseTaskGraphSnapshot(accessorMarker)).toThrow("task_graph_snapshot_invalid")
+    expect(markerReads).toBe(0)
   })
 
   it("preserves typed packageRefs only on specialized scheduled Execute nodes", () => {

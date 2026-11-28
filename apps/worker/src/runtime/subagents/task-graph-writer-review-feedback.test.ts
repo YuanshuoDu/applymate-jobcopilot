@@ -1,12 +1,16 @@
 import { describe, expect, it, vi } from "vitest"
 import { SELECTED_JOB_BATCH_TEMPLATE_CATALOG } from "@jobcopilot/agent-protocol"
+import { makeObjectiveTailorWaveCandidateSelection, bindObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
+import { bindObjectiveTailorCorrectionProof, objectiveTailorCorrectionNodeKeys } from "./objective-tailor-correction-proof.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 
 const graphMocks = vi.hoisted(() => ({
   hasPersistedTaskGraphMembership: vi.fn(),
   loadTaskGraph: vi.fn(),
 }))
+const inventoryMock = vi.hoisted(() => ({ read: vi.fn() }))
 vi.mock("./task-graph-pg-state.js", () => graphMocks)
+vi.mock("./objective-tailor-wave-inventory.js", () => ({ readObjectiveTailorWaveInventory: inventoryMock.read }))
 
 import {
   assertPersistedWriterReviewDependency, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext,
@@ -149,7 +153,85 @@ function batchWriterFixture(templateId: string, dependsOn: string[], context: un
   }
   return { task, lease, pool: { connect: vi.fn(async () => client) }, queries, client, graph, dbRows, jobId }
 }
+
+function objectiveCorrectionFixture(contextOverride?: unknown) {
+  const jobId = "f47ac10b-58cc-4372-a567-0e02b2c3d479", sourceDigest = artifactRef.sourceDigest
+  const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+  const selection = makeObjectiveTailorWaveCandidateSelection({ scope, sourceGraphRevision: 1, sourceGraphDigest: "d".repeat(64),
+    sourceStatusDigest: "e".repeat(64), analystProofDigest: "f".repeat(64), candidate: { jobId, score: 8, materialDigest: sourceDigest },
+    sourceAnalystKey: "analyst-node" })!
+  const witness = bindObjectiveTailorWaveCandidateWitness(selection, { slotId: "tailor-1", admittedRevision: 2 })!
+  const correctionKeys = objectiveTailorCorrectionNodeKeys(witness.slotId)!
+  const proof = bindObjectiveTailorCorrectionProof({ graphRevision: 2, slotId: witness.slotId, candidateWitness: witness,
+    writerTaskId: "writer-initial", reviewerTaskId: "reviewer-1", artifactRef,
+    artifactVersion: { artifactId: artifactRef.artifactId, artifactType: "cover_letter", taskId: "writer-initial", version: artifactRef.version,
+      contentHash: artifactRef.contentHash, sourceDigest, previousHash: null },
+    reviewReceipt: { jobId, artifactId: artifactRef.artifactId, version: artifactRef.version, contentHash: artifactRef.contentHash,
+      sourceDigest, currentSourceDigest: sourceDigest, status: "needs_revision", taskId: "reviewer-1", toolCallId: "review-call", reviewHash } })!
+  const context = contextOverride ?? { ...dependencyContext(), selectedJobPreparation: { jobId }, objectiveTailorCandidateMode: true,
+    objectiveTailorCandidateWitness: witness, objectiveTailorCorrectionProof: proof,
+    taskGraphDependencyResults: { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{
+      dependencyKey: witness.reviewerNodeKey, dependencyTaskId: "reviewer-1", role: "reviewer", taskStatus: "completed",
+      result: { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+        role: "reviewer", status: "completed", artifactRef, reviewStatus: "needs_revision", reviewHash },
+    }] } }
+  const task = { id: "writer-1", userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+    parentTaskId: scope.parentTaskId, role: "writer", taskType: "cover_letter_draft", status: "running", leaseOwner: "worker-1",
+    attemptCount: 1, interruptRequestedAt: null, context } as unknown as SubagentTaskRecord
+  const lease = { ...task, ownerId: "worker-1", leaseExpiresAt: new Date("2099-01-01T00:00:00Z"), signal: new AbortController().signal } as SubagentLease
+  const markerSlot = { slotId: witness.slotId, sourceAnalystNodeKey: "analyst-node", writerNodeKey: witness.writerNodeKey,
+    reviewerNodeKey: witness.reviewerNodeKey, correction: correctionKeys }
+  const nodes = [
+    { key: "analyst-node", taskId: "analyst-1", templateId: "analyst", dependsOn: [] },
+    { key: witness.writerNodeKey, taskId: "writer-initial", templateId: "cover_letter_writer", dependsOn: [] },
+    { key: witness.reviewerNodeKey, taskId: "reviewer-1", templateId: "cover_letter_reviewer", dependsOn: [witness.writerNodeKey] },
+    { key: correctionKeys.writerNodeKey, taskId: task.id, templateId: "cover_letter_writer", dependsOn: [witness.reviewerNodeKey] },
+    { key: correctionKeys.reviewerNodeKey, taskId: "reviewer-correction", templateId: "cover_letter_reviewer", dependsOn: [correctionKeys.writerNodeKey] },
+  ]
+  const statuses = new Map(nodes.map(node => [node.taskId, node.taskId === task.id ? "running" : node.taskId === correctionKeys.reviewerNodeKey ? "queued" : "completed"]))
+  const taskRows = new Map(nodes.map(node => [node.taskId, { id: node.taskId,
+    role: node.templateId === "cover_letter_writer" ? "writer" : node.templateId === "cover_letter_reviewer" ? "reviewer" : "analyst",
+    taskType: node.templateId === "cover_letter_writer" ? "cover_letter_draft" : node.templateId === "cover_letter_reviewer" ? "cover_letter_review" : "job_analysis",
+    status: statuses.get(node.taskId), failureReason: null }]))
+  const graph = { rootTaskId: scope.rootTaskId, discoveryTurnEligibility: "ordinary" as const,
+    item: { revision: 3 }, snapshot: { nodes, objectiveTailor: { schemaVersion: "agent-harness.v2.objective-tailor-graph.v1", sourceNodeCount: 2, slots: [markerSlot] } },
+    state: { revision: 3, nodes: nodes.map(node => ({ key: node.key, taskId: node.taskId, status: statuses.get(node.taskId) })),
+      objectiveTailor: { schemaVersion: "agent-harness.v2.objective-tailor-graph.v1", sourceNodeCount: 2, slots: [markerSlot] } }, tasks: taskRows }
+  graphMocks.loadTaskGraph.mockResolvedValue(graph)
+  inventoryMock.read.mockResolvedValue({ marker: graph.snapshot.objectiveTailor, occupiedSlots: [{ slotId: witness.slotId, witness,
+    jobId, sourceAnalystNodeKey: "analyst-node", writerTaskId: "writer-initial", reviewerTaskId: "reviewer-1",
+    correction: { proof, writerTaskId: task.id, reviewerTaskId: "reviewer-correction" } }] })
+  const queries: string[] = []
+  const client = { query: vi.fn(async (sql: string) => { queries.push(sql); return { rows: sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session')
+    ? [{ id: task.id, userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, rootTaskId: task.rootTaskId,
+      parentTaskId: task.parentTaskId, status: task.status, role: task.role, leaseOwner: task.leaseOwner,
+      attemptCount: task.attemptCount, interruptRequestedAt: null, context }] : [], rowCount: 1 } }), release: vi.fn() }
+  return { task, lease, graph, client, queries, pool: { connect: vi.fn(async () => client) }, context, proof }
+}
 describe("private Writer review feedback handoff", () => {
+  it("admits a correction Writer only from its exact persisted slot and original needs-revision Reviewer", async () => {
+    const fixture = objectiveCorrectionFixture(), dependency = writerReviewDependencyFromTaskContext(fixture.context, "f47ac10b-58cc-4372-a567-0e02b2c3d479")
+    await expect(assertPersistedWriterReviewDependency(fixture.pool as never, fixture.task, fixture.lease, dependency)).resolves.toBeUndefined()
+    expect(inventoryMock.read).toHaveBeenCalledWith(fixture.client, expect.objectContaining({ userId: scope.userId }), fixture.graph)
+    expect(fixture.queries).toContain("COMMIT")
+  })
+
+  it("rejects a correction Writer when its persisted dependency context changed after lease read", async () => {
+    const fixture = objectiveCorrectionFixture(), dependency = writerReviewDependencyFromTaskContext(fixture.context, "f47ac10b-58cc-4372-a567-0e02b2c3d479")
+    fixture.lease.context = { ...fixture.context as object, taskGraphDependencyResults: { schemaVersion: "bad", items: [] } }
+    await expect(assertPersistedWriterReviewDependency(fixture.pool as never, fixture.task, fixture.lease, dependency))
+      .rejects.toMatchObject({ code: "writer_review_receipt_unavailable" })
+    expect(fixture.queries).toContain("ROLLBACK")
+  })
+
+  it("rejects a correction dependency that changes the prior immutable artifact identity", async () => {
+    const fixture = objectiveCorrectionFixture(), dependency = writerReviewDependencyFromTaskContext(fixture.context, "f47ac10b-58cc-4372-a567-0e02b2c3d479")!
+    await expect(assertPersistedWriterReviewDependency(fixture.pool as never, fixture.task, fixture.lease,
+      { ...dependency, artifactRef: { ...dependency.artifactRef, version: dependency.artifactRef.version + 1 } }))
+      .rejects.toMatchObject({ code: "writer_review_dependency_invalid" })
+    expect(fixture.queries).toContain("ROLLBACK")
+  })
+
   it("allows a native selected-job Writer first draft with no Reviewer feedback dependency", async () => {
     const context = {
       selectedJobPreparation: { jobId: scope.jobId },

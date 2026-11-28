@@ -128,7 +128,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     }
     const setup = await prepareCanonicalTurnSetup({ pool, lease, signal, now, options, manager, rootTasks, executionProjection, sessionProjection, coordinationEnabled, childExecutionEnabled, consumeWaitOutcomes, batchCompletionGate: createCanonicalSelectedJobBatchRuntime })
     if ("earlyResult" in setup) return setup.earlyResult
-    const { interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled, selectedJobMode, selectedJobBatch, scheduledDraftMode, selectedJobPreparation,
+    const { interactiveDiscoveryMode, objectiveTaskGraphMode, taskGraphPlanningEnabled, selectedJobMode, objectiveTailorToolVersion, selectedJobBatch, scheduledDraftMode, selectedJobPreparation,
       turnCoordination, nativeQuestionWaitEnabled, toolCapabilities, lifecycle, toolRuntime, rootTools, root, durableWaitPort } = setup
     let { state, runtime: batchRuntime } = prepareCanonicalSelectedJobBatchRuntime({ pool, lease, root, state: setup.state, selectedJobBatch, commandPort: options.taskGraphCommandPort, rootTasks, now })
     const selectedJobRootMode = selectedJobMode || Boolean(selectedJobBatch)
@@ -199,15 +199,15 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ? undefined : recoveredScheduledCandidate?.candidateText ?? nativeRecovery.candidateText
     const modelSnapshot = preparedContext.modelSnapshot
     const routeTool = createToolRouterExecutor(toolRuntime.router)
-    const rootToolGuards = createCanonicalRootToolGuards({ interactiveDiscoveryMode, selectedJobMode: selectedJobRootMode, objectiveTaskGraphMode: objectiveTaskGraphMode || Boolean(selectedJobBatch), objectiveRootTools: rootTools, routeTool, validateArguments: (name, args) => toolRuntime.registry.validateArguments(name, args, "1") })
+    const rootToolGuards = createCanonicalRootToolGuards({ interactiveDiscoveryMode, selectedJobMode: selectedJobRootMode, objectiveTaskGraphMode: objectiveTaskGraphMode || Boolean(selectedJobBatch), objectiveRootTools: rootTools, routeTool, validateArguments: (name, args, version) => toolRuntime.registry.validateArguments(name, args, version) })
     const inputStore = createPgInputClaimStore(pool, state.scope)
     const contextBuilder = createCanonicalTurnContextBuilder({
       pool, store: inputStore, baseBuilder: options.contextBuilderFactory?.({ pool, scope: state.scope }), scope: state.scope, lease,
       rootTaskId: root.id, rootAttemptCount: root.attemptCount, rootInputId: state.rootInputId,
       turnInput: state.turnInput, rootTaskObjective: { goal: root.goal, successCriteria: root.successCriteria },
       taskGraphTemplateRoles: setup.taskGraphTemplateRoles,
-      planningEnabled: taskGraphPlanningEnabled, selectedJobMode: selectedJobRootMode, objectiveTaskGraphMode, discoveryPersonaMemoryEnabled,
-      readObjectiveTailorCatalog: productionFlags?.objectiveTailorEnabled === true ? options.taskGraphCommandPort?.readObjectiveTailorCatalog?.bind(options.taskGraphCommandPort) : undefined,
+      planningEnabled: taskGraphPlanningEnabled, selectedJobMode: selectedJobRootMode, objectiveTaskGraphMode, discoveryPersonaMemoryEnabled, objectiveTailorToolVersion,
+      readObjectiveTailorCatalog: options.taskGraphCommandPort?.readObjectiveTailorCatalog?.bind(options.taskGraphCommandPort), readObjectiveTailorWaveCatalog: options.taskGraphCommandPort?.readObjectiveTailorWaveCatalog?.bind(options.taskGraphCommandPort),
       crossSessionRootTaskHistoryEnabled: productionFlags?.crossSessionRootTaskHistoryEnabled === true && taskGraphPlanningEnabled && !selectedJobRootMode,
       objectiveHistoryIndexEnabled: productionFlags?.objectiveHistoryIndexEnabled === true && taskGraphPlanningEnabled && !selectedJobRootMode,
       selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,

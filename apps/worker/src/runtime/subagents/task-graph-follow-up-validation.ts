@@ -48,6 +48,12 @@ export function validateTaskGraphFollowUpBinding(value: unknown): TaskGraphFollo
   } catch { return null }
 }
 
+/** Revalidates the ordinary source portion of an Objective final binding. */
+export function validateObjectiveSourceBinding(value: Record<string, unknown>): boolean {
+  return validateTaskGraphFollowUpBinding({ rootTaskId: value.rootTaskId, graphItemId: value.graphItemId,
+    graphRevision: value.graphRevision, members: value.members, summary: value.summary }) !== null
+}
+
 function readOutcomes(value: unknown, members: ReadonlyMap<string, TaskGraphFinalSummaryMember>): Map<string, Outcome> | null {
   const rows = dense(value, MAX_NODES), expected = [...members.values()].filter(member => member.kind === "business")
   if (!rows || rows.length !== expected.length) return null

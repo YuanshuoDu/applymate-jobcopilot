@@ -19,6 +19,8 @@ import {
   type TaskGraphSourceRoleResultStatus,
   type TaskGraphSourceTaskStatus,
 } from './final-task-graph-source-manifest'
+import { projectFinalAnswerContent } from './final-answer-evidence-projection'
+import { parseObjectiveTailorFinalOutcomesFromContent } from './objective-tailor-final-content'
 
 const MAX_TASK_GRAPH_NODES = 11
 
@@ -49,8 +51,10 @@ export function projectFinalAnswerTaskGraphSourceContent(finalItemId: string, ph
   const manifest = phase === 'final_answer' && status === 'completed'
     ? parseFinalTaskGraphSourceManifest(record(rawContent)?.taskGraphSources) : null
   const taskGraphSources = manifest && isCanonicalTaskGraphSourceManifest(finalItemId, manifest) ? manifest : undefined
+  const objectiveTailorFinalOutcomes = phase === 'final_answer' && status === 'completed' && hasCanonicalFinalAnswerContent(rawContent)
+    ? parseObjectiveTailorFinalOutcomesFromContent(rawContent) : undefined
   return { text: answerText, ...(summary ? { summary } : {}), ...(answerEvidence ? { answerEvidence } : {}),
-    ...(taskGraphSources ? { taskGraphSources } : {}) }
+    ...(taskGraphSources ? { taskGraphSources } : {}), ...(objectiveTailorFinalOutcomes ? { objectiveTailorFinalOutcomes } : {}) }
 }
 
 export function projectFinalTaskGraphSourceDetail(input: {
@@ -175,6 +179,19 @@ function sourceRoleMatches(task: Record<string, unknown>, source: FinalTaskGraph
   if (source.role !== 'unsupported') return task.role === source.role
   return typeof task.role === 'string' && !oneOf(task.role, TASK_GRAPH_SOURCE_ROLES.slice(0, -1))
     && !(task.role === 'auditor' && task.taskType === 'native_verification')
+}
+
+function hasCanonicalFinalAnswerContent(value: unknown): boolean {
+  const content = record(value)
+  if (!content) return false
+  return projectFinalAnswerContent({ text: ownDataValue(content, 'text'), final: ownDataValue(content, 'final') }) !== null
+}
+
+function ownDataValue(value: Record<string, unknown>, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined
+  } catch { return undefined }
 }
 
 function roleResultMatches(value: unknown, source: FinalTaskGraphSource): boolean {

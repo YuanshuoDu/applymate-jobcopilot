@@ -7,6 +7,7 @@ import {
   type TaskGraphVerificationSummary,
 } from '@jobcopilot/agent-protocol'
 import { projectRepairTargetCheckIndexes } from './task-graph-repair-criteria'
+import { objectiveTailorProgressHint, parseObjectiveTailorProgressSnapshot } from './agent/session/objective-tailor-progress-snapshot'
 
 type PlanLedgerNode = PlanLedger['nodes'][number]
 export type PlanLedgerWithRepairTargetGoals = Omit<PlanLedger, 'nodes'> & {
@@ -181,6 +182,8 @@ export function redactTaskGraphTimelineContent(
   existingRedactor: (value: unknown) => unknown,
 ): unknown {
   if (itemType !== 'task_graph') return existingRedactor(content)
+  const objectiveProgress = parseObjectiveTailorProgressSnapshot(content)
+  if (objectiveProgress) return { objectiveTailorProgressHint: objectiveTailorProgressHint(objectiveProgress) }
   const snapshot = parseTaskGraphSnapshot(content)
   if (!snapshot) return null
   const normalized = {

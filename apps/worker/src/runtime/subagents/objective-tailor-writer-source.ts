@@ -4,6 +4,10 @@ import { RUNNABLE_SESSION } from "../session-gate.js"
 import { loadSelectedJobArtifactContext, type SelectedJobArtifactContextBundle } from "./selected-job-artifact-context.js"
 import { readCurrentObjectiveTailorBinding } from "./objective-tailor-current-binding.js"
 import { parseObjectiveTailorCandidateWitness, type ObjectiveTailorCandidateWitness } from "./objective-tailor-witness.js"
+import { parseObjectiveTailorWaveCandidateWitness, type ObjectiveTailorWaveCandidateWitness } from "./objective-tailor-wave-witness.js"
+import { readObjectiveTailorWaveInventory } from "./objective-tailor-wave-inventory.js"
+import { parseObjectiveTailorCorrectionProof } from "./objective-tailor-correction-witness.js"
+import { readObjectiveTailorCorrectionChildBinding } from "./objective-tailor-correction-child-source.js"
 import { readCurrentScheduledDraftJobMaterialDigest, scheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.js"
 import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
 import type { SubagentLease } from "./types.js"
@@ -20,6 +24,13 @@ export async function loadObjectiveTailorChildSource(
   const taskType = lease.role === "writer" ? "cover_letter_draft" : "cover_letter_review"
   const row = await readLiveChild(client, scope, lease, taskType)
   if (!row || !rowMatchesLease(row, scope, lease, taskType)) return undefined
+  const contextVersion = objectiveTailorContextVersion(lease.context)
+  if (!contextVersion || !sameLeaseContext(row.context, lease.context)) return undefined
+  if (hasObjectiveTailorGraphMarker(loaded)) {
+    if (contextVersion !== "wave") return undefined
+    return loadWaveChildSource(client, scope, loaded, lease, row)
+  }
+  if (contextVersion !== "single") return undefined
   const binding = await readCurrentObjectiveTailorBinding(client, scope, loaded)
   const taskId = lease.role === "writer" ? binding.status === "bound" && binding.writerTaskId
     : binding.status === "bound" && binding.reviewerTaskId
@@ -39,6 +50,32 @@ export async function loadObjectiveTailorChildSource(
     return await readCurrentScheduledDraftJobMaterialDigest(current, scope.userId, jobId) === binding.witness.candidate.materialDigest
   }
   return { context: source, assertCurrentDraftMaterial }
+}
+
+async function loadWaveChildSource(client: Queryable, scope: GraphIdentityScope, loaded: LoadedGraph,
+  lease: SubagentLease, row: Row): Promise<SelectedJobArtifactContextForChild | undefined> {
+  const inventory = await readObjectiveTailorWaveInventory(client, scope, loaded)
+  const leaseContext = record(lease.context), witness = parseObjectiveTailorWaveCandidateWitness(leaseContext?.objectiveTailorCandidateWitness)
+  const correction = leaseContext && Object.hasOwn(leaseContext, "objectiveTailorCorrectionProof")
+    ? parseObjectiveTailorCorrectionProof(leaseContext.objectiveTailorCorrectionProof) : undefined
+  if (!inventory?.marker || !witness || !matchesWaveContext(row.context, lease.context, witness)) return undefined
+  if (leaseContext && Object.hasOwn(leaseContext, "objectiveTailorCorrectionProof") && !correction) return undefined
+  const slots = inventory.occupiedSlots.filter(slot => {
+    return correction
+      ? (lease.role === "writer" ? slot.correction?.writerTaskId : slot.correction?.reviewerTaskId) === lease.id
+      : (lease.role === "writer" ? slot.writerTaskId : slot.reviewerTaskId) === lease.id
+  })
+  const slot = slots[0]
+  if (slots.length !== 1 || !slot || canonicalTaskGraphJson(slot.witness) !== canonicalTaskGraphJson(witness)
+    || correction && (!slot.correction || canonicalTaskGraphJson(slot.correction.proof) !== canonicalTaskGraphJson(correction)
+      || canonicalTaskGraphJson(correction.candidateWitness) !== canonicalTaskGraphJson(witness))) return undefined
+  if (correction && !await readObjectiveTailorCorrectionChildBinding({ client, scope, loaded, taskId: lease.id,
+    role: lease.role as "writer" | "reviewer", context: lease.context, inventory })) return undefined
+  const jobId = witness.candidate.jobId
+  const source = await loadVerifiedJobSource(client, scope.userId, jobId, witness.candidate.materialDigest)
+  if (!source) return undefined
+  if (lease.role === "reviewer") return { context: source }
+  return { context: source, assertCurrentDraftMaterial: materialRechecker(scope.userId, jobId, witness.candidate.materialDigest) }
 }
 
 async function readLiveChild(client: Queryable, scope: GraphIdentityScope, lease: SubagentLease, taskType: string): Promise<Row | undefined> {
@@ -82,12 +119,59 @@ function rowMatchesLease(row: Row, scope: GraphIdentityScope, lease: SubagentLea
 
 function matchesContext(rowValue: unknown, leaseValue: unknown, witness: ObjectiveTailorCandidateWitness, jobId: string): boolean {
   const row = record(rowValue), lease = record(leaseValue)
-  if (!row || !lease || canonicalTaskGraphJson(row) !== canonicalTaskGraphJson(lease)) return false
+  if (!row || !lease || !sameLeaseContext(row, lease)) return false
   const rowWitness = parseObjectiveTailorCandidateWitness(row.objectiveTailorCandidateWitness)
-  const selection = record(row.selectedJobPreparation)
   return row.objectiveTailorCandidateMode === true && rowWitness !== undefined
-    && canonicalTaskGraphJson(rowWitness) === canonicalTaskGraphJson(witness)
-    && selection !== undefined && Object.keys(selection).length === 1 && selection.jobId === jobId
+    && canonicalTaskGraphJson(rowWitness) === canonicalTaskGraphJson(witness) && selectedJobMatches(row, jobId)
+}
+
+function matchesWaveContext(rowValue: unknown, leaseValue: unknown, witness: ObjectiveTailorWaveCandidateWitness): boolean {
+  const row = record(rowValue), lease = record(leaseValue)
+  if (!row || !lease || !sameLeaseContext(row, lease)) return false
+  const rowWitness = parseObjectiveTailorWaveCandidateWitness(row.objectiveTailorCandidateWitness)
+  return row.objectiveTailorCandidateMode === true && rowWitness !== undefined
+    && canonicalTaskGraphJson(rowWitness) === canonicalTaskGraphJson(witness) && selectedJobMatches(row, witness.candidate.jobId)
+}
+
+function selectedJobMatches(context: Row, jobId: string): boolean {
+  const selection = record(context.selectedJobPreparation)
+  return selection !== undefined && Reflect.ownKeys(selection).length === 1 && selection.jobId === jobId
+}
+
+function sameLeaseContext(rowValue: unknown, leaseValue: unknown): boolean {
+  const row = record(rowValue), lease = record(leaseValue)
+  return Boolean(row && lease && canonicalTaskGraphJson(row) === canonicalTaskGraphJson(lease))
+}
+
+function objectiveTailorContextVersion(value: unknown): "single" | "wave" | undefined {
+  const context = record(value), witness = record(context?.objectiveTailorCandidateWitness)
+  if (!context || !witness || context.objectiveTailorCandidateMode !== true) return undefined
+  if (parseObjectiveTailorCandidateWitness(witness)) return "single"
+  if (parseObjectiveTailorWaveCandidateWitness(witness)) return "wave"
+  return undefined
+}
+
+function hasObjectiveTailorGraphMarker(loaded: LoadedGraph): boolean {
+  try {
+    return Boolean(loaded.snapshot && Object.hasOwn(loaded.snapshot, "objectiveTailor")
+      || loaded.state && Object.hasOwn(loaded.state, "objectiveTailor"))
+  } catch { return true }
+}
+
+async function loadVerifiedJobSource(client: Queryable, userId: string, jobId: string, materialDigest: string): Promise<SelectedJobArtifactContextBundle | undefined> {
+  let source: SelectedJobArtifactContextBundle
+  try { source = await loadSelectedJobArtifactContext(client, userId, jobId) }
+  catch { return undefined }
+  const jobs = source.transientSources.filter(item => item.sourceRef === `job:${jobId}`)
+  return source.preparation.jobId === jobId && jobs.length === 1 && record(jobs[0]?.content)?.id === jobId
+    && scheduledDraftJobMaterialDigest(jobs[0]?.content) === materialDigest ? source : undefined
+}
+
+function materialRechecker(userId: string, jobId: string, materialDigest: string) {
+  return async (current: Queryable, currentUserId: string, currentJobId: string): Promise<boolean> => {
+    if (currentUserId !== userId || currentJobId !== jobId) return false
+    return await readCurrentScheduledDraftJobMaterialDigest(current, userId, jobId) === materialDigest
+  }
 }
 
 function record(value: unknown): Row | undefined {

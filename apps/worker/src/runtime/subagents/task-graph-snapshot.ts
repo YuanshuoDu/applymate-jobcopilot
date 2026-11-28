@@ -2,15 +2,18 @@ import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import { taskGraphLifecycleKey } from "./task-graph-receipt-keys.js"
 export { taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-receipt-keys.js"
-import { isValidTaskGraphRepairRelation, TASK_GRAPH_LIMITS, type TaskGraphEvent, type TaskGraphNodeProposal, type TaskGraphRepairOf, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
+import { isValidTaskGraphRepairRelation, TASK_GRAPH_LIMITS, type TaskGraphEvent, type TaskGraphNodeProposal, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
 import { taskGraphVerificationRole, validateTaskGraphVerificationContract, validateTaskGraphVerificationDependencySelectors, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { parseTaskGraphNativeDelegation, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { parseRegisteredScoutEnvelope, taskGraphNodeKeysMatch, type RegisteredScoutEnvelope } from "./task-graph-command-port.js"
 import { APPLICATION_FILLER_TEMPLATE_ID } from "./role-policy.js"
-import { SELECTED_JOB_BATCH_TEMPLATE_CATALOG } from "@jobcopilot/agent-protocol"
+import { OBJECTIVE_TAILOR_GRAPH_MAX_NODES, parseObjectiveTailorGraph, SELECTED_JOB_BATCH_TEMPLATE_CATALOG,
+  type ObjectiveTailorGraph } from "@jobcopilot/agent-protocol"
 import { readPinnedRootCriteria } from "./root-plan-criteria.js"
-import { parseTaskGraphSnapshotPackageRefs, taskGraphSnapshotCapacityValid, taskGraphSnapshotStringList as stringList } from "./task-graph-snapshot-capacity.js"
+import { parseTaskGraphSnapshotPackageRefs, taskGraphSnapshotCapacityValid, taskGraphSnapshotExactKeys as exactKeys,
+  taskGraphSnapshotObject as object, taskGraphSnapshotOwnData, taskGraphSnapshotRepairOf as parsedRepairOf,
+  taskGraphSnapshotStringList as stringList, taskGraphSnapshotText as text } from "./task-graph-snapshot-capacity.js"
 
 export const TASK_GRAPH_ITEM_TYPE = "task_graph"
 export const TASK_GRAPH_SNAPSHOT_VERSION = "agent-harness.v2.task-graph"
@@ -27,9 +30,11 @@ export type TaskGraphSnapshot = Readonly<{
   schemaVersion: typeof TASK_GRAPH_SNAPSHOT_VERSION
   nodes: readonly StoredTaskGraphNode[]
   rootSuccessCriteria?: readonly string[]
+  objectiveTailor?: ObjectiveTailorGraph
 }>
 
-const MAX_NODES = TASK_GRAPH_LIMITS.maxPersistedNodes, MAX_SNAPSHOT_BYTES = TASK_GRAPH_LIMITS.maxSnapshotBytes
+const MAX_OBJECTIVE_TAILOR_NODES = OBJECTIVE_TAILOR_GRAPH_MAX_NODES, MAX_SNAPSHOT_BYTES = TASK_GRAPH_LIMITS.maxSnapshotBytes
+const MAX_LEGACY_NODES = TASK_GRAPH_LIMITS.maxPersistedNodes
 const MAX_DEPTH = TASK_GRAPH_LIMITS.maxDepth, MAX_KEY_LENGTH = TASK_GRAPH_LIMITS.maxKeyLength
 const MAX_TEMPLATE_ID_LENGTH = TASK_GRAPH_LIMITS.maxTemplateIdLength, MAX_GOAL_LENGTH = TASK_GRAPH_LIMITS.maxGoalLength
 const MAX_CRITERIA = TASK_GRAPH_LIMITS.maxSuccessCriteria, MAX_CRITERION_LENGTH = TASK_GRAPH_LIMITS.maxCriterionLength
@@ -47,35 +52,21 @@ const TASK_STATUSES = new Set<SubagentTaskStatus>([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
 ])
 
-function object(value: unknown): Record<string, unknown> | null {
-  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
-  const prototype = Object.getPrototypeOf(parsed)
-  return (prototype === Object.prototype || prototype === null) && Object.getOwnPropertySymbols(parsed).length === 0
-    ? parsed as Record<string, unknown>
-    : null
-}
-function exactKeys(value: Record<string, unknown>, expected: string): boolean {
-  const keys = Reflect.ownKeys(value)
-  return keys.every((key): key is string => typeof key === "string") && keys.sort().join(",") === expected
-}
-function text(value: unknown, maxLength = Number.MAX_SAFE_INTEGER): value is string {
-  return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength
-}
-function parsedRepairOf(value: unknown): TaskGraphRepairOf | undefined {
-  const row = object(value)
-  if (!row || !exactKeys(row, "criterionIds,graphRootTaskId,nodeKey,taskId")
-    || !text(row.graphRootTaskId, MAX_KEY_LENGTH) || !text(row.nodeKey, MAX_KEY_LENGTH) || !text(row.taskId, MAX_TASK_ID_LENGTH)
-    || !stringList(row.criterionIds, MAX_CRITERIA, 64, false) || new Set(row.criterionIds).size !== row.criterionIds.length) return undefined
-  return { graphRootTaskId: row.graphRootTaskId, nodeKey: row.nodeKey, taskId: row.taskId, criterionIds: [...row.criterionIds] }
-}
 export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
   const row = object(value)
+  const objectiveField = row ? taskGraphSnapshotOwnData(row, "objectiveTailor") : { present: false, valid: true }
   const pinnedShape = row !== null && exactKeys(row, "nodes,rootSuccessCriteria,schemaVersion")
-  if (!row || (!pinnedShape && !exactKeys(row, "nodes,schemaVersion")) || row.schemaVersion !== TASK_GRAPH_SNAPSHOT_VERSION
-    || !Array.isArray(row.nodes) || row.nodes.length > MAX_NODES) throw new Error("task_graph_snapshot_invalid")
-  const rootSuccessCriteria = pinnedShape && row ? readPinnedRootCriteria(row) : undefined
-  if (pinnedShape && (!rootSuccessCriteria?.length)) throw new Error("task_graph_snapshot_root_criteria_invalid")
+  const objectiveShape = row !== null && exactKeys(row, "nodes,objectiveTailor,schemaVersion")
+  const pinnedObjectiveShape = row !== null && exactKeys(row, "nodes,objectiveTailor,rootSuccessCriteria,schemaVersion")
+  const maxNodes = objectiveField.present ? MAX_OBJECTIVE_TAILOR_NODES : MAX_LEGACY_NODES
+  if (!row || !objectiveField.valid || !(pinnedShape || objectiveShape || pinnedObjectiveShape || exactKeys(row, "nodes,schemaVersion"))
+    || row.schemaVersion !== TASK_GRAPH_SNAPSHOT_VERSION
+    || !Array.isArray(row.nodes) || row.nodes.length > maxNodes) throw new Error("task_graph_snapshot_invalid")
+  const rawObjectiveTailor = objectiveField.present ? parseObjectiveTailorGraph(objectiveField.value, row.nodes) ?? undefined : undefined
+  if (objectiveField.present && !rawObjectiveTailor) throw new Error("task_graph_snapshot_objective_tailor_invalid")
+  const hasPinnedCriteria = pinnedShape || pinnedObjectiveShape
+  const rootSuccessCriteria = hasPinnedCriteria ? readPinnedRootCriteria(row) : undefined
+  if (hasPinnedCriteria && (!rootSuccessCriteria?.length)) throw new Error("task_graph_snapshot_root_criteria_invalid")
   const keys = new Set<string>()
   const ids = new Set<string>()
   const nodes: StoredTaskGraphNode[] = []
@@ -114,7 +105,7 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
     } else if (hasVerification) {
       throw new Error("task_graph_snapshot_verification_disposition_invalid")
     }
-    const repairOf = hasRepair ? parsedRepairOf(node.repairOf) : undefined
+    const repairOf = hasRepair ? parsedRepairOf(node.repairOf, MAX_KEY_LENGTH, MAX_CRITERIA) : undefined
     if (hasRepair && !repairOf) throw new Error("task_graph_snapshot_repair_invalid")
     const nativeDelegation = nativeShape ? parseTaskGraphNativeDelegation(node.nativeDelegation) : undefined
     if (nativeShape && (!nativeDelegation || node.templateId !== TASK_GRAPH_NATIVE_TEMPLATE_ID || verificationDisposition !== "legacy_unverified")) throw new Error("task_graph_snapshot_native_delegation_invalid")
@@ -161,13 +152,16 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
     }
   }
   if (visited !== nodes.length) throw new Error("task_graph_snapshot_cycle_invalid")
-  if (!taskGraphSnapshotCapacityValid(nodes)) throw new Error("task_graph_snapshot_capacity_invalid")
-  const snapshot: TaskGraphSnapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes, ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}) }
+  const objectiveTailor = rawObjectiveTailor ? parseObjectiveTailorGraph(rawObjectiveTailor, nodes) ?? undefined : undefined
+  if (rawObjectiveTailor && !objectiveTailor) throw new Error("task_graph_snapshot_objective_tailor_invalid")
+  if (!objectiveTailor && !taskGraphSnapshotCapacityValid(nodes)) throw new Error("task_graph_snapshot_capacity_invalid")
+  const snapshot: TaskGraphSnapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes,
+    ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}), ...(objectiveTailor ? { objectiveTailor } : {}) }
   assertTaskGraphSnapshotSize(snapshot)
   return snapshot
 }
 
-export function taskGraphSnapshot(state: TaskGraphState & Readonly<{ rootSuccessCriteria?: readonly string[] }>, taskIds: ReadonlyMap<string, string>, rootSuccessCriteria = state.rootSuccessCriteria): TaskGraphSnapshot {
+export function taskGraphSnapshot(state: TaskGraphState & Readonly<{ rootSuccessCriteria?: readonly string[]; objectiveTailor?: ObjectiveTailorGraph }>, taskIds: ReadonlyMap<string, string>, rootSuccessCriteria = state.rootSuccessCriteria): TaskGraphSnapshot {
   const snapshot = {
     schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
     nodes: state.nodes.map(node => {
@@ -182,6 +176,7 @@ export function taskGraphSnapshot(state: TaskGraphState & Readonly<{ rootSuccess
       const verificationDisposition = existingDisposition ?? (node.verification ? "typed" : role ? "legacy_unverified" : "specialized")
       return { ...stored, taskId, verificationDisposition }
     }), ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}),
+    ...(Object.hasOwn(state, "objectiveTailor") ? { objectiveTailor: state.objectiveTailor } : {}),
   }
   return parseTaskGraphSnapshot(snapshot)
 }
@@ -202,7 +197,7 @@ export function taskGraphState(
   revision: number,
   statuses: ReadonlyMap<string, { status: SubagentTaskStatus; failureReason: string | null }>,
   events: readonly TaskGraphEvent[],
-): TaskGraphState & Readonly<{ rootSuccessCriteria?: readonly string[] }> {
+): TaskGraphState & Readonly<{ rootSuccessCriteria?: readonly string[]; objectiveTailor?: ObjectiveTailorGraph }> {
   if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("task_graph_revision_invalid")
   return {
     revision,
@@ -212,6 +207,7 @@ export function taskGraphState(
       return { ...node, status: current.status, ...(current.failureReason ? { failureReason: current.failureReason } : {}) }
     }),
     appliedEvents: events, ...(snapshot.rootSuccessCriteria ? { rootSuccessCriteria: snapshot.rootSuccessCriteria } : {}),
+    ...(snapshot.objectiveTailor ? { objectiveTailor: snapshot.objectiveTailor } : {}),
   }
 }
 

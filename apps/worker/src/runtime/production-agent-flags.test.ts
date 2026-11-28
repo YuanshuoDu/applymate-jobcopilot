@@ -7,6 +7,7 @@ describe("production agent flags", () => {
     expect(resolveProductionAgentFlags({})).toEqual({
       taskGraphPlanningEnabled: false,
       objectiveTailorEnabled: false,
+      objectiveTailorWavesEnabled: false,
       childExecutionEnabled: false,
       coordinationEnabled: false,
       consumeWaitOutcomes: false,
@@ -85,6 +86,22 @@ describe("production agent flags", () => {
     }
   })
 
+  it("enables Objective Tailor waves only behind their exact flag and TaskGraph prerequisites", () => {
+    const prerequisites = {
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1",
+      ENABLE_AGENT_CHILD_EXECUTION: "1",
+      ENABLE_AGENT_WAIT_RESOLVER: "1",
+    } as const
+    expect(resolveProductionAgentFlags({ ...prerequisites, ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1" }).objectiveTailorWavesEnabled).toBe(true)
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1" }).objectiveTailorWavesEnabled).toBe(false)
+    for (const key of Object.keys(prerequisites) as Array<keyof typeof prerequisites>) {
+      expect(resolveProductionAgentFlags({ ...prerequisites, ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: "1", [key]: "0" }).objectiveTailorWavesEnabled).toBe(false)
+    }
+    for (const value of [undefined, "", "0", "true", "01", " 1", "1 "]) {
+      expect(resolveProductionAgentFlags({ ...prerequisites, ENABLE_AGENT_OBJECTIVE_TAILOR_WAVES: value }).objectiveTailorWavesEnabled).toBe(false)
+    }
+  })
+
   it("enables canonical automation only with its exact server flag", () => {
     expect(resolveProductionAgentFlags({ ENABLE_AGENT_CANONICAL_AUTOMATION: "1" }).canonicalAutomationEnabled).toBe(true)
     for (const value of [undefined, "", "0", "true", "01", " 1", "1 "]) {
@@ -114,6 +131,7 @@ describe("production agent flags", () => {
     })).toEqual({
       taskGraphPlanningEnabled: true,
       objectiveTailorEnabled: false,
+      objectiveTailorWavesEnabled: false,
       childExecutionEnabled: true,
       coordinationEnabled: true,
       consumeWaitOutcomes: true,

@@ -5,6 +5,8 @@ import { TaskGraphWriterReviewFeedbackError } from "./task-graph-writer-review-f
 import { hasPersistedTaskGraphMembership, loadTaskGraph, type LoadedGraph } from "./task-graph-pg-state.js"
 import { TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { parseArtifactReference, type ArtifactVersionReference } from "./role-results.js"
+import { readObjectiveTailorCorrectionChildBinding } from "./objective-tailor-correction-child-source.js"
+import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 
@@ -49,7 +51,7 @@ export async function assertPersistedWriterReviewDependency(
       rootTaskId: lease.rootTaskId, parentTaskId,
     }
     const graph = await loadTaskGraph(client, scope, false)
-    const context = plainRecord(lease.context), hasTaskGraphDependencyContext = context !== null && Object.hasOwn(context, DEPENDENCY_CONTEXT_KEY)
+    const context = plainRecord(lease.context), hasTaskGraphDependencyContext = context !== null && Object.hasOwn(context, DEPENDENCY_CONTEXT_KEY), hasCorrection = context !== null && Object.hasOwn(context, "objectiveTailorCorrectionProof")
     if (!graph.snapshot) {
       if (hasTaskGraphDependencyContext || await hasPersistedTaskGraphMembership(client, scope, lease.id)
         || dependency || task.status !== "running" || lease.status !== "running") {
@@ -69,6 +71,8 @@ export async function assertPersistedWriterReviewDependency(
       || !writer || writer.role !== "writer") {
       throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
     }
+    if (hasCorrection && !await readObjectiveTailorCorrectionChildBinding({ client, scope, loaded: graph,
+      taskId: lease.id, role: "writer", context: lease.context, dependency })) throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
     const batchSlot = selectedBatchWriter ? selectedBatchWriterSlot(graph, writerNode, task, lease) : null
     if (selectedBatchWriter && !batchSlot) throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
     if (selectedBatchWriter && !dependency && (hasTaskGraphDependencyContext || batchSlot?.correction
@@ -127,6 +131,7 @@ export async function assertPersistedWriterReviewDependency(
       || row.attemptCount !== lease.attemptCount || row.interruptRequestedAt !== null) {
       throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
     }
+    if (hasCorrection && canonicalTaskGraphJson(row.context) !== canonicalTaskGraphJson(lease.context)) throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
     if (selectedBatchWriter) {
       const jobId = selectedJobFromContext(row.context)
       if (row.taskType !== "cover_letter_draft" || !jobId || jobId !== selectedJobFromContext(lease.context) || !batchReviewerOnly(row.context)
@@ -201,10 +206,8 @@ export function writerReviewDependencyFromTaskContext(value: unknown, expectedJo
     throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
   }
 }
-
 type BatchNode = TaskGraphSnapshot["nodes"][number]
 type BatchSlot = SelectedJobBatchGraphSlot<BatchNode>
-
 function selectedBatchWriterSlot(
   graph: LoadedGraph, writerNode: BatchNode, task: SubagentTaskRecord, lease: SubagentLease,
 ): BatchSlot | null {
@@ -219,25 +222,21 @@ function selectedBatchWriterSlot(
   const slot = slots?.find(candidate => candidate.effective.writer.taskId === lease.id)
   return slot && slot.effective.writer.key === writerNode.key && slot.effective.writer.templateId === writerNode.templateId ? slot : null
 }
-
 function selectedJobFromContext(value: unknown): string | null {
   const selected = plainRecord(plainRecord(value)?.selectedJobPreparation)
   return selected && Object.keys(selected).sort().join(",") === "jobId"
     && typeof selected.jobId === "string" && SAFE_JOB_ID.test(selected.jobId) ? selected.jobId : null
 }
-
 function batchReviewerOnly(value: unknown): boolean {
   const evidence = plainRecord(plainRecord(value)?.[DEPENDENCY_CONTEXT_KEY]), items = evidence?.items
   return Array.isArray(items) && items.length === 1 && plainRecord(items[0])?.role === "reviewer"
 }
-
 function sameDependency(left: TaskGraphWriterReviewDependency | null, right: TaskGraphWriterReviewDependency | null): boolean {
   return Boolean(left && right && left.dependencyKey === right.dependencyKey && left.dependencyTaskId === right.dependencyTaskId
     && left.reviewHash === right.reviewHash && left.artifactRef.artifactId === right.artifactRef.artifactId
     && left.artifactRef.version === right.artifactRef.version && left.artifactRef.contentHash === right.artifactRef.contentHash
     && left.artifactRef.sourceDigest === right.artifactRef.sourceDigest)
 }
-
 function plainRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   try {
