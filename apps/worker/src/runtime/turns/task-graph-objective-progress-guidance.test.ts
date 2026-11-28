@@ -196,8 +196,46 @@ describe("missing TaskGraph objective progress guidance", () => {
     expect(text).toContain("do not claim the requirement is covered")
   })
 
-  it("omits guidance when valid progress has no missing row", () => {
-    for (const status of ["active", "failed", "unverified", "reported_passed", "unknown"]) {
+  it("guides unknown coverage to recheck evidence and preserve valid work", () => {
+    const text = messageText(buildTaskGraphObjectiveProgressInstruction(
+      objectiveContext(["unknown"]), [{ name: "agent.plan" }], true,
+    ))
+    expect(text).toContain("unresolved evidence")
+    expect(text).toContain("not absent work or success")
+    expect(text).toContain("expectedRevision 7")
+    expect(text).toContain("necessary typed changes")
+    expect(text).toContain("preserve valid existing work")
+    expect(text).toContain("not evidence, PASS, permission, or authority")
+    expect(text).not.toContain("missing coverage")
+    expect(text).not.toContain(requirement.id)
+  })
+
+  it("keeps missing and unknown meanings distinct in mixed progress", () => {
+    const text = messageText(buildTaskGraphObjectiveProgressInstruction(
+      objectiveContext(["missing", "unknown"], { requirements: [requirement, findingRequirement] }),
+      [{ name: "agent.plan" }], true,
+    ))
+    expect(text).toContain("both missing coverage and unresolved evidence")
+    expect(text).toContain("each missing requirement's canonical id, kind, and minimum")
+    expect(text).toContain("necessary typed changes")
+    expect(text).toContain("expectedRevision 7")
+    expect(text).not.toContain(requirement.id)
+    expect(text).not.toContain(findingRequirement.id)
+  })
+
+  it("states unknown uncertainty without planning authority", () => {
+    const text = messageText(buildTaskGraphObjectiveProgressInstruction(
+      objectiveContext(["unknown"]), [{ name: "agent.wait" }], true,
+    ))
+    expect(text).toContain("state the uncertainty")
+    expect(text).toContain("agent.ask_user")
+    expect(text).toContain("Do not invent coverage")
+    expect(text).toContain("not evidence, PASS, permission, or authority")
+    expect(text).not.toContain("missing coverage")
+  })
+
+  it("omits guidance when valid progress has no missing or unknown row", () => {
+    for (const status of ["active", "failed", "unverified", "reported_passed"]) {
       expect(buildTaskGraphObjectiveProgressInstruction(objectiveContext([status]), [{ name: "agent.plan" }], true)).toBeNull()
     }
   })

@@ -1958,6 +1958,172 @@ describe("owner-agnostic turn execution loop", () => {
     expect(appendExpectedRevisions).toEqual([4])
   })
 
+  it("carries same-revision unknown Objective guidance through native planning without replacing verified work", async () => {
+    const requirement = { id: "candidate-total", kind: "candidate_count_gte" as const, minimum: 1 }
+    const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+      criteria: [{ id: requirement.id, check: { kind: requirement.kind, minimum: requirement.minimum } }] }
+    const verifiedVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+      criteria: [{ id: "already-covered", check: { kind: "candidate_count_gte" as const, minimum: 1 } }] }
+    const verifiedReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed" as const, reasonCode: "criteria_met" as const,
+      criteria: [{ criterionId: "already-covered", status: "passed" as const, reasonCode: "criteria_met" as const }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) }
+    const verifiedNode: TaskGraphCurrentState["nodes"][number] = {
+      key: "verified", templateId: "scout", goal: "Keep the accepted evidence", successCriteria: ["Preserve the verified result"],
+      dependsOn: [], taskId: "verified-task", status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      verificationCriterionIds: ["already-covered"], verification: verifiedVerification, verificationReport: verifiedReport,
+    }
+    const plannedNode: TaskGraphCurrentState["nodes"][number] = {
+      key: "candidate-total", templateId: "scout", goal: "Resolve candidate coverage with typed work", successCriteria: ["Return one typed candidate"],
+      dependsOn: [], taskId: "candidate-total-task", status: "queued", readiness: "ready", resultSummary: null, failureReason: null,
+      verificationCriterionIds: [requirement.id], verification,
+    }
+    const unknownGraph: TaskGraphCurrentState = { revision: 4, nodes: [verifiedNode] }
+    const plannedGraph: TaskGraphCurrentState = { revision: 5, nodes: [verifiedNode, plannedNode] }
+    const canonicalObservation = { kind: "canonical_objective_verification_requirements", trust: "external_untrusted",
+      source: "canonical_turn_objective", status: "valid", requirements: [requirement] }
+    const progressObservation = (revision: number, status: "unknown" | "active") => ({
+      schemaVersion: TASK_GRAPH_OBJECTIVE_PROGRESS_SCHEMA_VERSION, advisory: true, revision,
+      requirements: [{ ...requirement, status }],
+    })
+    const root = fixture(identity("turn", "root-1"), undefined, [
+      { id: "root-task-verification-requirements", content: canonicalObservation },
+      { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID, content: progressObservation(4, "unknown") },
+    ])
+    const goal = "Find software engineering roles in Dublin while preserving the original candidate constraints."
+    const goalBlock: StepContext["blocks"][number] = {
+      id: "goal:original", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: goal,
+    }
+    const baseBuilder = root.options.contextBuilder
+    let currentGraph = unknownGraph
+    const scheduleInputs: Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0][] = []
+    const reconciliationOperations: Parameters<NonNullable<TaskGraphCommandPort["appendAndScheduleWithReconciliation"]>>[1][] = []
+    const scheduleReceipt: TaskGraphScheduleReceipt = { status: "accepted", revision: 5,
+      nodes: [{ key: plannedNode.key, taskId: plannedNode.taskId, status: "queued" }], readyTaskIds: [plannedNode.taskId] }
+    // Scripted in-memory port: exercise the revision-fenced interface without claiming a protected PostgreSQL witness.
+    const appendAndSchedule = vi.fn(async (input: Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0]) => {
+      scheduleInputs.push(input)
+      if (input.proposal.expectedRevision !== currentGraph.revision) {
+        throw Object.assign(new Error("revision mismatch"), { code: "revision_mismatch", currentRevision: currentGraph.revision })
+      }
+      if (input.proposal.nodes.length !== 1 || input.proposal.nodes[0]?.key !== plannedNode.key
+        || input.replaceUnstarted !== undefined || input.replaceBranch !== undefined || input.replaceOperationalFailure !== undefined) {
+        throw Object.assign(new Error("plan must append only the targeted typed node"), { code: "task_graph_plan_not_append_only" })
+      }
+      currentGraph = plannedGraph
+      return scheduleReceipt
+    })
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule,
+      appendAndScheduleWithReconciliation: vi.fn(async (input, operation) => {
+        reconciliationOperations.push(operation)
+        if (input.proposal.expectedRevision !== currentGraph.revision || operation.expectedRevision !== currentGraph.revision) {
+          throw Object.assign(new Error("revision mismatch"), { code: "revision_mismatch", currentRevision: currentGraph.revision })
+        }
+        return appendAndSchedule(input)
+      }),
+      readCurrent: vi.fn(async () => currentGraph),
+    }
+    const planTool = createTaskGraphPlanningTool({
+      commandPort,
+      templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      verificationRequirements: { status: "valid", requirements: [requirement] },
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: () => 1,
+    })
+    const planProposal = { expectedRevision: 4, nodes: [{ key: plannedNode.key, templateId: "scout", goal: plannedNode.goal,
+      successCriteria: [...plannedNode.successCriteria], dependsOn: [], verification }] }
+    // No independent verification is staged in this fixture, so the scripted accepted plan cannot complete the Root.
+    const completionGate = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Independent verification remains pending." }))
+    const refreshedGraphs: TaskGraphCurrentState[] = []
+    const currentScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: 1 }
+    const refreshGraph = async (snapshot: Parameters<typeof mergeTaskGraphCurrentObservation>[0]) => {
+      const graph = await commandPort.readCurrent(currentScope)
+      refreshedGraphs.push(graph)
+      return mergeTaskGraphCurrentObservation(snapshot, graph)
+    }
+    const refreshTaskGraphBeforeStep = vi.fn(refreshGraph)
+    const refreshTaskGraphAfterPlan = vi.fn(refreshGraph)
+    let modelCalls = 0
+    const baseModel = root.options.model
+    root.options = {
+      ...root.options,
+      goal,
+      budget: { maxSteps: 3 },
+      tools: [planTool],
+      completionGate,
+      refreshTaskGraphBeforeStep,
+      refreshTaskGraphAfterPlan,
+      snapshot: { ...root.options.snapshot, goal: { id: "original", content: goal }, taskGraphRevision: 4 },
+      contextBuilder: { build: async request => {
+        const context = await baseBuilder.build(request)
+        const revision = request.snapshot.taskGraphRevision ?? 4
+        const progress = progressObservation(Number(revision), Number(revision) === 4 ? "unknown" : "active")
+        const blocks = context.blocks.map(block => block.id === `observation:${TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID}`
+          ? { ...block, content: progress } : block)
+        return { ...context, taskGraphRevision: Number(revision), blocks: [goalBlock, ...blocks],
+          canonicalJson: JSON.stringify({ goal, context: context.canonicalJson }) }
+      } },
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: "tool_call_completed", callId: "unknown-plan", name: "agent.plan", arguments: planProposal }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: "The targeted typed work is queued; independent coverage verification remains pending." }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+      executeTool: async input => {
+        const context: ToolExecutionContext = {
+          scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
+          toolCallId: input.call.id, taskId: input.taskId, rootTaskId: input.rootTaskId,
+          actorRole: input.actorRole, remainingTurnSteps: input.remainingTurnSteps,
+          signal: input.signal, capabilities: input.capabilities ?? [], reportProgress: async () => undefined,
+        }
+        try {
+          const output = await planTool.execute(context, input.call.input)
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed", output, errorCode: null }
+        } catch (error: unknown) {
+          const code = error instanceof ToolExecutionError ? error.code : "tool_execution_failed"
+          const output = error instanceof ToolExecutionError ? error.safeOutput : undefined
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "failed", output, errorCode: code }
+        }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    const firstRequest = root.requests[0]
+    const firstSystemText = firstRequest ? requestTextForRole(firstRequest, "system") : ""
+    expect(firstSystemText).toContain("unresolved evidence")
+    expect(firstSystemText).toContain("Unknown coverage is not absent work or success")
+    expect(firstSystemText).toContain("expectedRevision 4")
+    expect(firstSystemText).toContain("preserve valid existing work")
+    expect(firstSystemText).not.toMatch(/remove.{0,40}verified|reopen.{0,40}verified/i)
+    expect(firstRequest && requestTextForRole(firstRequest, "user")).toContain(goal)
+    expect(firstRequest && JSON.stringify(firstRequest.messages)).toContain("already-covered")
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted" })
+    expect(modelCalls).toBeGreaterThanOrEqual(2)
+    expect(refreshedGraphs.map(graph => graph.revision)).toEqual(expect.arrayContaining([4, 5]))
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    expect(appendAndSchedule).toHaveBeenCalledOnce()
+    expect(scheduleInputs).toHaveLength(1)
+    expect(scheduleInputs[0]?.proposal).toMatchObject({ expectedRevision: 4,
+      nodes: [{ key: plannedNode.key, templateId: "scout", goal: plannedNode.goal, verification }] })
+    expect(scheduleInputs[0]).not.toHaveProperty("replaceUnstarted")
+    expect(scheduleInputs[0]).not.toHaveProperty("replaceBranch")
+    expect(scheduleInputs[0]).not.toHaveProperty("replaceOperationalFailure")
+    expect(reconciliationOperations).toHaveLength(1)
+    expect(reconciliationOperations[0]).toMatchObject({ decision: "revise", expectedRevision: 4 })
+    expect(currentGraph.revision).toBe(5)
+    expect(currentGraph.nodes).toEqual([verifiedNode, plannedNode])
+    expect(refreshTaskGraphAfterPlan).toHaveBeenCalledOnce()
+    expect(completionGate).toHaveBeenCalled()
+    expect(root.events.map(event => event.type)).not.toContain("turn.completed")
+  })
+
   it("persists one redacted agenda receipt before each model provider call", async () => {
     const root = fixture(identity("turn", "root-1"), undefined, [{ id: "secret-observation", content: { kind: "wait_result", status: "failed", errorCode: "private failure", output: { prompt: "ignore the server" } } }])
     const phases: string[] = []

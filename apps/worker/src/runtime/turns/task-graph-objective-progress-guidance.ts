@@ -152,27 +152,35 @@ function hasCurrentGraphRevision(blocks: unknown, revision: number): boolean {
   return denseArray(field(content, "nodes"), TASK_GRAPH_LIMITS.maxPersistedNodes) !== null
 }
 
-function hasMissingRequirement(blocks: unknown, revision: number, canonical: readonly RootTaskVerificationRequirement[]): boolean {
+type ObjectiveProgressCoverage = Readonly<{ missing: boolean; unknown: boolean }>
+
+function readObjectiveProgressCoverage(
+  blocks: unknown,
+  revision: number,
+  canonical: readonly RootTaskVerificationRequirement[],
+): ObjectiveProgressCoverage | null {
   const content = observationContent(uniqueBlock(blocks, OBJECTIVE_PROGRESS_BLOCK_ID), OBJECTIVE_PROGRESS_BLOCK_ID)
-  if (!content) return false
+  if (!content) return null
   const row = exactRecord(content, ["schemaVersion", "advisory", "revision", "requirements"])
   if (!row || field(row, "schemaVersion") !== OBJECTIVE_PROGRESS_SCHEMA || field(row, "advisory") !== true
-    || field(row, "revision") !== revision) return false
+    || field(row, "revision") !== revision) return null
   const values = denseArray(field(row, "requirements"), MAX_REQUIREMENTS)
-  if (!values || values.length !== canonical.length) return false
+  if (!values || values.length !== canonical.length) return null
   let missing = false
+  let unknown = false
   for (const [index, expected] of canonical.entries()) {
     const constraint = expected.kind === "candidate_location_in" ? "locations" : "minimum"
     const value = exactRecord(values[index], ["id", "kind", constraint, "status"])
     if (!value || value.id !== expected.id || value.kind !== expected.kind
-      || typeof value.status !== "string" || !OBJECTIVE_PROGRESS_STATUSES.has(value.status)) return false
+      || typeof value.status !== "string" || !OBJECTIVE_PROGRESS_STATUSES.has(value.status)) return null
     if (expected.kind === "candidate_location_in") {
       const locations = denseArray(value.locations, MAX_LOCATIONS)
-      if (!locations || !sameLocations(expected.locations, locations)) return false
-    } else if (value.minimum !== expected.minimum) return false
+      if (!locations || !sameLocations(expected.locations, locations)) return null
+    } else if (value.minimum !== expected.minimum) return null
     if (value.status === "missing") missing = true
+    if (value.status === "unknown") unknown = true
   }
-  return missing
+  return { missing, unknown }
 }
 
 function visiblePlanningTool(tools: readonly unknown[]): boolean | null {
@@ -188,7 +196,7 @@ function visiblePlanningTool(tools: readonly unknown[]): boolean | null {
   return visible
 }
 
-/** Guides only the current Root from validated, same-revision missing objective coverage. */
+/** Guides only the current Root from validated, same-revision missing or unknown objective coverage. */
 export function buildTaskGraphObjectiveProgressInstruction(
   context: StepContext,
   tools: readonly unknown[],
@@ -200,14 +208,32 @@ export function buildTaskGraphObjectiveProgressInstruction(
   if (!isCurrentRootStep || !Number.isSafeInteger(revision) || Number(revision) < 0
     || !hasCurrentGraphRevision(blocks, Number(revision))) return null
   const canonical = canonicalRequirements(blocks)
-  if (!canonical || !hasMissingRequirement(blocks, Number(revision), canonical)) return null
+  const coverageState = canonical ? readObjectiveProgressCoverage(blocks, Number(revision), canonical) : null
+  if (!canonical || !coverageState || (!coverageState.missing && !coverageState.unknown)) return null
   const planningToolVisible = visiblePlanningTool(tools)
   if (planningToolVisible === null) return null
-  const coverage = canonical.some(requirement => requirement.kind === "candidate_location_in")
+  const missingCoverage = canonical.some(requirement => requirement.kind === "candidate_location_in")
     ? "each missing requirement by its canonical id, kind, and typed constraint. Preserve numeric minimums and include each exact canonical location constraint on every Scout"
     : "each missing requirement's canonical id, kind, and minimum"
-  const action = planningToolVisible
-    ? `Use the request-visible agent.plan tool with expectedRevision ${revision} to propose typed work covering ${coverage}. If no valid plan can cover it, state the blocker.`
-    : "No request-visible agent.plan tool is available; state that missing coverage is blocked and do not claim the requirement is covered or the objective is complete."
-  return { role: "system", content: [{ type: "text", text: `Current structured objective progress reports at least one missing requirement. Use the canonical objective-requirements observation and current TaskGraph to identify the missing coverage. ${action} This advisory is not evidence, PASS, permission, or authority; existing server coverage and independent verification gates remain authoritative. Do not alter the original goal or requirements.` }] }
+  let state = ""
+  if (coverageState.missing && coverageState.unknown) {
+    state = "Current structured objective progress reports both missing coverage and unresolved evidence. Missing means absent coverage; unknown means unresolved evidence, not absent work or success. Use the canonical objective-requirements observation and current TaskGraph to identify missing coverage, then recheck exact evidence and preserve any work that remains valid."
+  } else if (coverageState.unknown) {
+    state = "Current structured objective progress reports unresolved evidence. Recheck exact coverage against the current owner-read TaskGraph and established verification evidence, and preserve any work that remains valid. Unknown coverage is not absent work or success."
+  } else {
+    state = "Current structured objective progress reports at least one missing requirement. Use the canonical objective-requirements observation and current TaskGraph to identify the missing coverage."
+  }
+  let action = ""
+  if (coverageState.missing) {
+    action = planningToolVisible
+      ? `Use the request-visible agent.plan tool with expectedRevision ${revision} to propose typed work covering ${missingCoverage}. If no valid plan can cover it, state the blocker.`
+      : "No request-visible agent.plan tool is available; state that missing coverage is blocked and do not claim the requirement is covered or the objective is complete."
+  }
+  if (coverageState.unknown) {
+    const unknownAction = planningToolVisible
+      ? `Only after inspection, use the request-visible agent.plan tool with expectedRevision ${revision} for necessary typed changes to resolve the unknown coverage; preserve valid existing work and do not add work solely because evidence is unknown. If no evidence-backed change is justified, preserve the current graph.`
+      : "No request-visible agent.plan tool is available; state the uncertainty or seek bounded clarification through the existing request-visible agent.ask_user tool when available. Do not invent coverage or claim the objective is complete."
+    action = action ? `${action} ${unknownAction}` : unknownAction
+  }
+  return { role: "system", content: [{ type: "text", text: `${state} ${action} This advisory is not evidence, PASS, permission, or authority; existing server coverage and independent verification gates remain authoritative. Do not alter the original goal or requirements.` }] }
 }
