@@ -4,6 +4,7 @@ import { appendTaskGraphReceipt } from "../subagents/task-graph-pg-events.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { questionId, questionItemId, type TurnQuestionQueryClient } from "./turn-question-store-guards.js"
 import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
+import { TurnQuestionSteeringRefreshRequiredError } from "./turn-question-contract.js"
 
 vi.mock("../subagents/steering-reconciliation-read.js", () => ({ readSteeringReconciliationState: vi.fn() }))
 vi.mock("../subagents/task-graph-pg-events.js", () => ({ appendTaskGraphReceipt: vi.fn() }))
@@ -76,6 +77,21 @@ describe("turn question planning observation store", () => {
         { id: "steer-consumed", acceptedSequence: "8", status: "consumed", consumedByStepId: "step-1", consumingOrdinal: 1 },
         { id: "steer-new", acceptedSequence: "12", status: "accepted", consumedByStepId: null, consumingOrdinal: null },
       ], inputCheckpoint: { throughSequence: "12", consumedInputIds: ["original", "steer-consumed"] } })
+  })
+
+  it("requires a fresh model context only for accepted steering beyond the locked Step cursor", async () => {
+    const db = client()
+    vi.mocked(readSteeringReconciliationState).mockImplementation(async actualClient => {
+      expect(actualClient).toBe(db)
+      db.order.push("ledger")
+      return { ...state, unresolvedInputs: [
+      ...state.unresolvedInputs,
+      { id: "steer-after-context", acceptedSequence: 13n, status: "accepted", consumedByStepId: null, consumingOrdinal: null },
+      ] }
+    })
+    await expect(prepareTurnQuestionPlanningObservation(db, { owner, stepId, toolCallId, waitId, questionItemId: questionItemId(waitId) }))
+      .rejects.toBeInstanceOf(TurnQuestionSteeringRefreshRequiredError)
+    expect(db.order).toEqual(["root-policy", "ledger", "confirmed-policy", "step"])
   })
 
   it("fails closed when the locked Step checkpoint differs from the reader's checkpoint", async () => {

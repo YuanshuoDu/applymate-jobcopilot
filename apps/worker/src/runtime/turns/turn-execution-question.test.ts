@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { SessionPauseRequestedError } from "../session-gate.js"
-import { TurnQuestionStoreError, type TurnQuestionStore } from "./turn-question-contract.js"
+import { TurnQuestionStoreError, TurnQuestionSteeringRefreshCommittedError, type TurnQuestionStore } from "./turn-question-contract.js"
 import { executeNativeQuestionTool, isTurnStateRefreshRetryError, nativeQuestionCallId, nativeQuestionResultCall, nativeQuestionResultMatches, questionWaitResult, readPendingNativeQuestion, recoverableNativeQuestionCalls, recoverPendingNativeQuestion } from "./turn-execution-question.js"
 import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
@@ -185,6 +185,8 @@ describe("native question runtime decisions", () => {
   it("retries uncertain wait commits without converting pause or owner fences", async () => {
     const failed = options({ waitForQuestion: async () => { throw new Error("temporary database failure") } })
     await expect(questionWaitResult(failed, "step-1", "call-1", () => new Date(), 1, 1)).rejects.toMatchObject({ code: "prepared_question_wait_retry_required" })
+    await expect(questionWaitResult(options({ waitForQuestion: async () => { throw new TurnQuestionSteeringRefreshCommittedError() } }),
+    "step-1", "call-1", () => new Date(), 1, 1)).rejects.toMatchObject({ code: "turn_state_refresh_retry_required" })
     const pause = new SessionPauseRequestedError()
     await expect(questionWaitResult(options({ waitForQuestion: async () => { throw pause } }), "step-1", "call-1", () => new Date(), 1, 1)).rejects.toBe(pause)
     const lost = new Error("lost lease")

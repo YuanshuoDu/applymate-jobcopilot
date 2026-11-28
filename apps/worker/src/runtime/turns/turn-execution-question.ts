@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { signalWasInterrupted } from "../interrupt/registry.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
-import { TurnQuestionStoreError, parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, type TurnQuestionRecovery } from "./turn-question-contract.js"
+import { TurnQuestionStoreError, TurnQuestionSteeringRefreshCommittedError, parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, type TurnQuestionRecovery } from "./turn-question-contract.js"
 import { toRepositoryJson, TurnEngineError, type ToolCallRecovery, type TurnEngineResult, type TurnEngineStep, type TurnEngineToolCall, type TurnEngineToolResult } from "./turn-engine-types.js"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import { executionId, type TurnExecutionIdentity, type TurnExecutionOptions } from "./turn-execution-types.js"
@@ -136,7 +136,8 @@ async function commitQuestion(
     if (receipt.status === "answered") throw new PreparedQuestionRetryError()
     return { status: "waiting_for_user", waitId: receipt.waitId, stepCount: 0, toolCallCount: 0 }
   } catch (error: unknown) {
-    if (isPreparedQuestionRetryError(error) || !retryableStoreFailure(options, error)) throw error
+    if (error instanceof TurnQuestionSteeringRefreshCommittedError) throw new TurnStateRefreshRetryError()
+    if (isPreparedQuestionRetryError(error) || error instanceof TurnStateRefreshRetryError || !retryableStoreFailure(options, error)) throw error
     throw new PreparedQuestionRetryError()
   }
 }

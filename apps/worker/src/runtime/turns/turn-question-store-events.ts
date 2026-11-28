@@ -18,7 +18,7 @@ export type TurnQuestionStartedEventInput = {
   readonly toolCallId: string
   readonly toolCallCount: number
 }
-type EventInput = { readonly owner: TurnExecutionOwnerFence; readonly id: string; readonly type: string; readonly itemId: string | null
+export type TurnQuestionEventInput = { readonly owner: TurnExecutionOwnerFence; readonly id: string; readonly type: string; readonly itemId: string | null
   readonly correlationId: string; readonly causationId: string | null; readonly idempotencyKey: string; readonly payload: RepositoryJsonValue }
 type OrphanStep = Record<string, unknown>
 export class OrphanPauseUsageRecoveredError extends Error {
@@ -51,7 +51,7 @@ function modelReceipt(row: Record<string, unknown> | undefined, owner: TurnExecu
 function eventId(input: TurnQuestionStartedEventInput, phase: "step" | "question"): string {
   return phase === "step" ? `agent-question-step-event-${input.stepId}` : `agent-question-item-event-${input.questionId}`
 }
-function outbox(input: EventInput, sequence: string): AgentOutboxIdentity {
+function outbox(input: TurnQuestionEventInput, sequence: string): AgentOutboxIdentity {
   const payload: AgentOutboxPayload = {
     eventId: input.id, sessionId: input.owner.sessionId, turnId: input.owner.turnId, taskId: input.owner.taskId,
     itemId: input.itemId, sequence, type: input.type, actor: "orchestrator", correlationId: input.correlationId,
@@ -60,7 +60,7 @@ function outbox(input: EventInput, sequence: string): AgentOutboxIdentity {
   return { id: `agent-outbox-${input.id}`, topic: "agent.events", aggregateId: input.owner.sessionId, idempotencyKey: `agent-event:${input.id}`, payload }
 }
 
-async function appendOne(client: TurnQuestionQueryClient, input: EventInput): Promise<void> {
+async function appendOne(client: TurnQuestionQueryClient, input: TurnQuestionEventInput): Promise<void> {
   const existing = await client.query<Row>(`SELECT "id", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload"
     FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2 FOR UPDATE`, [input.owner.sessionId, input.idempotencyKey])
   let sequence: string
@@ -85,6 +85,10 @@ async function appendOne(client: TurnQuestionQueryClient, input: EventInput): Pr
   if ((inserted.rowCount ?? 0) === 1) return
   const stored = await client.query<Row>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox" WHERE "idempotencyKey" = $1 FOR UPDATE`, [expected.idempotencyKey])
   if (!matchesAgentOutboxIdentity(stored.rows[0], expected)) throw questionConflict(`outbox ${expected.idempotencyKey}`)
+}
+
+export async function appendQuestionEvent(client: TurnQuestionQueryClient, input: TurnQuestionEventInput): Promise<void> {
+  return appendOne(client, input)
 }
 
 export async function appendQuestionStartedEvents(client: TurnQuestionQueryClient, input: TurnQuestionStartedEventInput): Promise<void> {
