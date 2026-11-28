@@ -4,9 +4,10 @@ import React from 'react'
 
 import { useI18n } from '@/lib/i18n'
 
-import type { CognitiveAgendaAction, CognitiveAgendaBlocker, CognitiveAgendaSignal, CognitiveAgendaView } from './cognitive-agenda-view'
+import type { CognitiveAgendaAction, CognitiveAgendaBlocker, CognitiveAgendaObjectiveProgressRow, CognitiveAgendaSignal, CognitiveAgendaView } from './cognitive-agenda-view'
 import type { TimelineCognitiveAgendaEntry } from './timeline-cognitive-agenda'
 import type { TimelineSteeringMarkerState } from './timeline-steering-markers'
+import { cognitiveAgendaObjectiveProgressLabels } from './cognitive-agenda-progress-labels'
 
 export interface CognitiveAgendaTaskLabel {
   readonly label: string
@@ -27,7 +28,7 @@ const BLOCKER_KEYS: Record<CognitiveAgendaBlocker, string> = {
 }
 
 export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: CognitiveAgendaCardProps) {
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
   const signals: Array<[string, CognitiveAgendaSignal]> = [
     [t('agent.cognitiveAgenda.signal.pendingInputs'), agenda.signals.pendingInputs],
     [t('agent.cognitiveAgenda.signal.approvals'), agenda.signals.approvals],
@@ -39,6 +40,7 @@ export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: Cognit
   const blocker = agenda.blockedBy.kind ? t(BLOCKER_KEYS[agenda.blockedBy.kind]) : t('agent.cognitiveAgenda.none')
   const revisions = revisionLabels(t, agenda)
   const scopedRows = scopedAgendaRows(agendas, agenda, taskLabels).slice(0, 6)
+  const objectiveProgress = agenda.objectiveProgress?.slice(0, 8) ?? []
   return (
     <section data-agent-cognitive-agenda="true" aria-label={t('agent.cognitiveAgenda.title')} style={cardStyle}>
       <div style={headingStyle}><strong>{t('agent.cognitiveAgenda.brain')}</strong><span style={metaStyle}>{t('agent.cognitiveAgenda.serverOwned')}</span></div>
@@ -46,6 +48,12 @@ export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: Cognit
       <div style={rowStyle}><span>{t('agent.cognitiveAgenda.blockedBy')}</span><span>{blocker}</span></div>
       {revisions.length > 0 && <div data-agent-cognitive-agenda-revisions="true" style={revisionStyle}>
         {revisions.map(label => <span key={label}>{label}</span>)}
+      </div>}
+      {objectiveProgress.length > 0 && <div role="group" aria-label={cognitiveAgendaObjectiveProgressLabels.title(lang)} data-agent-objective-progress="true" style={progressStyle}>
+        <strong>{cognitiveAgendaObjectiveProgressLabels.title(lang)}</strong>
+        <div role="list" style={progressRowsStyle}>
+          {objectiveProgress.map((row, index) => <ObjectiveProgressRow key={`${row.kind}:${index}`} row={row} lang={lang} />)}
+        </div>
       </div>}
       <div style={signalsStyle}>{signals.map(([label, signal]) => <span key={label}>{label}: {signal.count}</span>)}</div>
       {agenda.steeringMarkers && <div data-agent-steering-lifecycle="true" style={signalsStyle}>
@@ -65,6 +73,17 @@ export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: Cognit
       </div>}
     </section>
   )
+}
+
+function ObjectiveProgressRow({ row, lang }: { row: CognitiveAgendaObjectiveProgressRow; lang: ReturnType<typeof useI18n>['lang'] }) {
+  const labels = cognitiveAgendaObjectiveProgressLabels.row(row, lang)
+  return <div role="listitem" style={progressRowStyle}>
+    <span>{labels.requirement}</span>
+    <span style={progressStatusStyle}>
+      {labels.beforeStatus && <><span>{labels.beforeStatus}</span><span aria-hidden="true">→</span></>}
+      <strong>{labels.status}</strong>
+    </span>
+  </div>
 }
 
 function revisionLabels(
@@ -105,3 +124,7 @@ const signalsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns
 const scopedStyle: React.CSSProperties = { display: 'grid', gap: 4, paddingTop: 5, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 9 }
 const revisionStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8, color: 'var(--text-muted)', fontSize: 9 }
 const scopedActionStyle: React.CSSProperties = { display: 'grid', justifyItems: 'end', textAlign: 'right' }
+const progressStyle: React.CSSProperties = { display: 'grid', gap: 4, paddingTop: 5, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 10 }
+const progressRowsStyle: React.CSSProperties = { display: 'grid', gap: 4 }
+const progressRowStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, auto)', alignItems: 'start', gap: 6 }
+const progressStatusStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 4, textAlign: 'right' }

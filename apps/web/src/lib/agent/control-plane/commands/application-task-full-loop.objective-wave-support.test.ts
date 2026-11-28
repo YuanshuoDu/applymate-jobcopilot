@@ -113,6 +113,27 @@ describe("Objective wave test rate-limit window", () => {
     expect(redis.pexpire).toHaveBeenCalledWith(domainKey, 1_000)
   })
 
+  it("accepts a retried fill attempt when submission evidence remains unique", async () => {
+    const phaseProof = proof(1)
+    phaseProof.applications[0].fillAttemptCount = 2
+    const redis = redisClient({ domainCount: "2", expireAfterReads: 1 })
+    await expect(expireObjectiveWaveRateLimitWindow(input(redis, { phaseProof })))
+      .resolves.toMatchObject({ completedApplications: 1, expectedCounter: 2, expired: true })
+    expect(redis.pexpire).toHaveBeenCalledExactlyOnceWith(domainKey, 1_000)
+  })
+
+  it.each([0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects an invalid fill attempt count (%s) before Redis access",
+    async count => {
+      const phaseProof = proof(1)
+      phaseProof.applications[0].fillAttemptCount = count
+      const redis = redisClient()
+      await expect(expireObjectiveWaveRateLimitWindow(input(redis, { phaseProof })))
+        .rejects.toThrow("objective_wave_rate_limit_phase_invalid")
+      expect(redis.get).not.toHaveBeenCalled()
+    },
+  )
+
   it.each([
     ["wrong Redis service", { ...environment, REDIS_URL: "redis://127.0.0.1:6379/0" }, {}],
     ["non-run owner", environment, { userId: "ordinary-user" }],

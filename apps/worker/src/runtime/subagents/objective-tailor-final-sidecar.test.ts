@@ -14,7 +14,10 @@ const privateOutcome = {
 
 const sourceSummary = {
   graphRevision: 7,
-  counts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" } },
+  counts: { discoveredJobs: { knownCount: 1, coverage: "complete" }, analyzedJobs: { knownCount: 1, coverage: "complete" },
+    prepareJobs: { coverage: "not_requested", knownCount: null }, artifactReferences: { coverage: "not_requested", knownCount: null },
+    reviewOutcomes: { coverage: "not_requested", knownCount: null } },
+  prepareResults: [], artifactReferences: [], reviewOutcomes: [],
   discoveredJobs: [{ jobId: "job-private", taskIds: ["task-private-0"] }],
   analyzedJobs: [{ jobId: "job-private", findings: [{ taskId: "task-private-1", score: 8 }] }],
   taskOutcomes: ["scout", "analyst"].map((role, index) => ({ taskId: `task-private-${index}`, role,
@@ -47,6 +50,25 @@ describe("objective-tailor-final-sidecar", () => {
   it("distinguishes ordinary absence from a malformed marked proof", () => {
     expect(readObjectiveTailorFinalOutcomeSidecar(undefined)).toEqual({ status: "absent" })
     expect(readObjectiveTailorFinalOutcomeSidecar(binding({ ...privateOutcome, unknown: true }))).toEqual({ status: "invalid" })
+  })
+
+  it("rejects incomplete summaries and forged retired Scout proof", () => {
+    const source = binding()
+    expect(readObjectiveTailorFinalOutcomeSidecar({ ...source, summary: { graphRevision: 7 } } as TaskGraphFinalSummaryBinding)).toEqual({ status: "invalid" })
+    const retired = {
+      ...source,
+      members: source.members!.map((member, index) => index === 0 ? { ...member, taskType: "job_discovery",
+        taskStatus: "interrupted", kind: "retired", retirement: { attempt: 1, interruptRequestedAt: "2026-11-19T10:00:00.000Z",
+          receiptEventId: "receipt", lifecycleEventId: "lifecycle" } } : member),
+      summary: { ...source.summary, taskOutcomes: source.summary.taskOutcomes.slice(1), discoveredJobs: [], analyzedJobs: [],
+        counts: { ...source.summary.counts, discoveredJobs: { coverage: "not_requested", knownCount: null },
+          analyzedJobs: { coverage: "complete", knownCount: 0 } } },
+    }
+    expect(readObjectiveTailorFinalOutcomeSidecar(retired).status).toBe("ready")
+    const forged = { ...retired, members: retired.members.map((member, index) => index === 0
+      ? { ...member, retirement: { attempt: 0, interruptRequestedAt: "2026-11-19T10:00:00.000Z", receiptEventId: "receipt", lifecycleEventId: "lifecycle" } }
+      : member) }
+    expect(readObjectiveTailorFinalOutcomeSidecar(forged)).toEqual({ status: "invalid" })
   })
 
   it("matches only the exact public projection and fails closed on an injected sidecar", () => {

@@ -6,14 +6,18 @@ import {
   type ObjectiveRestartWorker,
 } from "./application-task-full-loop.objective-restart-support"
 
-function barrier(events: string[], failCleanup = false): ObjectiveJobProjectionBarrier {
+function barrier(events: string[], options: { failCleanup?: boolean; failWait?: boolean } = {}): ObjectiveJobProjectionBarrier {
   return {
-    waitUntilBlocked: async () => { events.push("blocked") },
+    readWaiterCount: async () => { events.push("read-waiters"); return 0 },
+    waitUntilBlocked: async () => {
+      events.push("blocked")
+      if (options.failWait) throw new Error("objective_wave_projection_barrier_wait_timeout")
+    },
     waitUntilUnblocked: async () => { events.push("unblocked") },
     release: async () => { events.push("release") },
     cleanup: async () => {
       events.push("cleanup")
-      if (failCleanup) throw new Error("trigger cleanup failed")
+      if (options.failCleanup) throw new Error("trigger cleanup failed")
     },
   }
 }
@@ -30,10 +34,11 @@ function worker(events: string[], name: string): FakeWorker {
   }
 }
 
-function input(events: string[], options: { failBlocked?: boolean; failReady?: boolean; failCleanup?: boolean } = {}) {
+function input(events: string[], options: { failBlocked?: boolean; failWait?: boolean; failReady?: boolean;
+  failCleanup?: boolean; failReceiver?: boolean; failPublish?: boolean } = {}) {
   const original = worker(events, "first")
   const successor = worker(events, "second")
-  const projectionBarrier = barrier(events, options.failCleanup)
+  const projectionBarrier = barrier(events, { failCleanup: options.failCleanup, failWait: options.failWait })
   const waitForExit = vi.fn(async (child: FakeWorker) => {
     events.push(child === original ? "first-exit" : "second-exit")
     child.markExited()
@@ -45,13 +50,27 @@ function input(events: string[], options: { failBlocked?: boolean; failReady?: b
     waitForExit,
     args: {
       installBarrier: async () => { events.push("install"); return projectionBarrier },
-      publishFinalApproval: async () => { events.push("approve") },
+      publishFinalApproval: async () => {
+        events.push("approve")
+        if (options.failPublish) throw new Error("private database detail")
+      },
+      waitForReceiver: async () => {
+        events.push("receiver")
+        if (options.failReceiver) throw new Error("objective_wave_receiver_wait_timeout")
+      },
       worker: original,
       waitForExit,
       assertCommittedResult: async (phase: "blocked" | "crashed") => {
         events.push(`result-${phase}`)
         if (phase === "blocked" && options.failBlocked) throw new Error("receipt check failed")
       },
+      ...(options.failWait || options.failReceiver ? { captureWaitTimeout: async ({ waiterCount, workerAlive }: { waiterCount: number; workerAlive: boolean }) => {
+        events.push("diagnostic")
+        return { available: true, waiterCount, workerAlive, attemptState: "submitted", privateDetail: "do not expose",
+          resultAttemptMatch: false, exactResultReceipt: false, exactStartMarker: false,
+          receiverAttempts: 1, receiverValid: 1, receiverMalformed: 0, receiverLineCount: 1,
+          executionStartCount: 0, resultReceiptCount: 0 }
+      } } : {}),
       startExactlyOneWorker: () => { events.push("spawn"); return successor },
       waitUntilReady: async (_worker: FakeWorker, timeoutMs: number) => {
         events.push("ready")
@@ -69,7 +88,7 @@ describe("Objective projection restart support", () => {
     const result = await restartObjectiveWorkerAtProjectionBarrier(scenario.args)
     expect(result).toBe(scenario.successor)
     expect(events).toEqual([
-      "install", "approve", "blocked", "result-blocked", "first:SIGKILL", "first-exit",
+      "install", "approve", "receiver", "blocked", "result-blocked", "first:SIGKILL", "first-exit",
       "unblocked", "result-crashed", "cleanup", "spawn", "ready",
     ])
     expect(scenario.waitForExit).toHaveBeenCalledOnce()
@@ -80,7 +99,7 @@ describe("Objective projection restart support", () => {
     const scenario = input(events, { failBlocked: true })
     await expect(restartObjectiveWorkerAtProjectionBarrier(scenario.args)).rejects.toThrow("receipt check failed")
     expect(events).toEqual([
-      "install", "approve", "blocked", "result-blocked", "first:SIGKILL", "first-exit", "unblocked", "cleanup",
+      "install", "approve", "receiver", "blocked", "result-blocked", "first:SIGKILL", "first-exit", "unblocked", "cleanup",
     ])
   })
 
@@ -97,9 +116,65 @@ describe("Objective projection restart support", () => {
     let failure: unknown
     try { await restartObjectiveWorkerAtProjectionBarrier(scenario.args) } catch (error) { failure = error }
     expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).message).toBe(
+      "objective_projection_restart_cleanup_failed:assert_precrash_result:other:cleanup_barrier:other",
+    )
     expect((failure as AggregateError).errors).toEqual([
       new Error("receipt check failed"), new Error("trigger cleanup failed"),
     ])
+    expect(events).not.toContain("spawn")
+  })
+
+  it("distinguishes publish and receiver cleanup failures without exposing arbitrary error text", async () => {
+    const publishEvents: string[] = []
+    const publish = input(publishEvents, { failPublish: true, failCleanup: true })
+    let publishFailure: unknown
+    try { await restartObjectiveWorkerAtProjectionBarrier(publish.args) } catch (error) { publishFailure = error }
+    expect(publishFailure).toBeInstanceOf(AggregateError)
+    expect((publishFailure as AggregateError).message).toBe(
+      "objective_projection_restart_cleanup_failed:publish_final_approval:other:cleanup_barrier:other",
+    )
+    expect((publishFailure as AggregateError).message).not.toContain("private database detail")
+    expect((publishFailure as AggregateError).errors).toEqual([
+      new Error("private database detail"), new Error("trigger cleanup failed"),
+    ])
+    expect(publishEvents).not.toContain("receiver")
+
+    const receiverEvents: string[] = []
+    const receiver = input(receiverEvents, { failReceiver: true, failCleanup: true })
+    let receiverFailure: unknown
+    try { await restartObjectiveWorkerAtProjectionBarrier(receiver.args) } catch (error) { receiverFailure = error }
+    expect(receiverFailure).toBeInstanceOf(AggregateError)
+    expect((receiverFailure as AggregateError).message).toBe(
+      'objective_projection_restart_cleanup_failed:wait_for_receiver:objective_wave_receiver_wait_timeout:cleanup_barrier:other:{"available":true,"waiterCount":0,"workerAlive":true,"resultAttemptMatch":false,"exactResultReceipt":false,"exactStartMarker":false,"receiverAttempts":1,"receiverValid":1,"receiverMalformed":0,"receiverLineCount":1,"executionStartCount":0,"resultReceiptCount":0}',
+    )
+    expect((receiverFailure as AggregateError).errors).toHaveLength(2)
+    expect(((receiverFailure as AggregateError).errors[0] as Error).message)
+      .toMatch(/^objective_wave_receiver_wait_timeout:/)
+    expect((receiverFailure as AggregateError).message).not.toContain("privateDetail")
+    expect(receiverEvents).not.toContain("blocked")
+    expect(receiverEvents).not.toContain("spawn")
+  })
+
+  it("captures the bounded boundary before killing the Worker on a waiter timeout", async () => {
+    const events: string[] = []
+    const scenario = input(events, { failWait: true })
+    await expect(restartObjectiveWorkerAtProjectionBarrier(scenario.args)).rejects.toThrow(
+      'objective_wave_projection_barrier_wait_timeout:{"available":true,"waiterCount":0,"workerAlive":true,"resultAttemptMatch":false,"exactResultReceipt":false,"exactStartMarker":false,"receiverAttempts":1,"receiverValid":1,"receiverMalformed":0,"receiverLineCount":1,"executionStartCount":0,"resultReceiptCount":0}',
+    )
+    expect(events).toEqual(["install", "approve", "receiver", "blocked", "read-waiters", "diagnostic", "first:SIGKILL", "first-exit", "unblocked", "cleanup"])
+  })
+
+  it("reports a distinct receiver timeout and cleans the barrier without starting a successor", async () => {
+    const events: string[] = []
+    const scenario = input(events, { failReceiver: true })
+    await expect(restartObjectiveWorkerAtProjectionBarrier(scenario.args)).rejects.toThrow(
+      'objective_wave_receiver_wait_timeout:{"available":true,"waiterCount":0,"workerAlive":true,"resultAttemptMatch":false,"exactResultReceipt":false,"exactStartMarker":false,"receiverAttempts":1,"receiverValid":1,"receiverMalformed":0,"receiverLineCount":1,"executionStartCount":0,"resultReceiptCount":0}',
+    )
+    expect(events).toEqual([
+      "install", "approve", "receiver", "read-waiters", "diagnostic", "first:SIGKILL", "first-exit", "unblocked", "cleanup",
+    ])
+    expect(events).not.toContain("blocked")
     expect(events).not.toContain("spawn")
   })
 

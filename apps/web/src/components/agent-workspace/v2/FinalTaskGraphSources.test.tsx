@@ -1,17 +1,39 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/lib/i18n'
-import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from '@/lib/agent/session/final-task-graph-source-manifest'
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4, parseFinalTaskGraphSourceManifest } from '@/lib/agent/session/final-task-graph-source-manifest'
 import { FinalTaskGraphSources, finalTaskGraphSourceDetailUrl, loadFinalTaskGraphSourceDetail,
-  parseFinalTaskGraphSourceDetailResponse, requestMatchesIdentity } from './FinalTaskGraphSources'
+  artifactViewerKey, coverLetterVersionLabel, parseFinalTaskGraphSourceDetailResponse,
+  requestMatchesIdentity, viewableSourceArtifactRef } from './FinalTaskGraphSources'
 
 const sourceKey = `src_${'A'.repeat(43)}`
 const manifest = {
   schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION,
   graphRevision: 4,
   sources: [{ sourceKey, nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'missing' }],
+}
+const artifactRef = {
+  artifactId: 'private-artifact-id', version: 3, contentHash: 'sha256:' + 'a'.repeat(64), sourceDigest: 'sha256:' + 'b'.repeat(64),
+}
+const artifactVersionProof = 'avp_' + 'c'.repeat(64)
+const coveredSource = {
+  sourceKey, nodeIndex: 0, role: 'writer', taskStatus: 'completed', resultState: 'valid',
+  roleResultStatus: 'completed', artifactVersionProof,
+}
+const unprovenWriter = {
+  sourceKey: `src_${'B'.repeat(43)}`, nodeIndex: 1, role: 'writer', taskStatus: 'completed', resultState: 'valid',
+  roleResultStatus: 'completed',
+}
+const coveredReviewer = {
+  sourceKey: `src_${'C'.repeat(43)}`, nodeIndex: 2, role: 'reviewer', taskStatus: 'completed', resultState: 'valid',
+  roleResultStatus: 'completed', artifactVersionProof,
+}
+const v3Manifest = {
+  schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4, graphRevision: 4, historicalNodeIndices: [], retiredNodeIndices: [],
+  sources: [coveredSource, unprovenWriter, coveredReviewer],
 }
 
 function deferred<T>() {
@@ -65,6 +87,102 @@ describe('FinalTaskGraphSources', () => {
     expect(parseFinalTaskGraphSourceDetailResponse({ task: { ...task, role: 'writer', roleResultStatus: 'partial' } })).toBeNull()
     expect(parseFinalTaskGraphSourceDetailResponse({ task: { ...task, goal: 'x'.repeat(241) } })).toBeNull()
     expect(parseFinalTaskGraphSourceDetailResponse({ task: { ...task, verification: { status: 'passed', taskId: 'PRIVATE' } } })).toBeNull()
+  })
+
+  it('accepts a closed owner-verified artifact ref and rejects malformed or widened refs', () => {
+    const task = {
+      goal: 'Write a cover letter', role: 'writer', taskStatus: 'completed', resultState: 'valid',
+      roleResultStatus: 'completed', verification: { status: 'unavailable' }, artifactRef,
+    }
+    expect(parseFinalTaskGraphSourceDetailResponse({ task })).toMatchObject({ artifactRef, role: 'writer' })
+    for (const invalid of [
+      { ...artifactRef, version: 0 },
+      { ...artifactRef, contentHash: 'sha256:' + 'A'.repeat(64) },
+      { ...artifactRef, extra: 'private' },
+      null,
+    ]) {
+      expect(parseFinalTaskGraphSourceDetailResponse({ task: { ...task, artifactRef: invalid } })).toBeNull()
+    }
+    const noOwnerArtifact = { ...task }
+    delete (noOwnerArtifact as { artifactRef?: typeof artifactRef }).artifactRef
+    expect(parseFinalTaskGraphSourceDetailResponse({ task: noOwnerArtifact })).not.toHaveProperty('artifactRef')
+    expect(parseFinalTaskGraphSourceDetailResponse({ task: { ...task, role: 'scout' } })).toBeNull()
+    expect(parseFinalTaskGraphSourceDetailResponse({ task: {
+      goal: task.goal, role: 'writer', taskStatus: 'failed', resultState: 'invalid', verification: task.verification, artifactRef,
+    } })).toBeNull()
+  })
+
+  it('exposes only an exact verified artifact ref for a proof-backed V3 Writer or Reviewer source', () => {
+    const parsedV3 = parseFinalTaskGraphSourceManifest(v3Manifest)
+    expect(parsedV3).not.toBeNull()
+    const verifiedDetail = parseFinalTaskGraphSourceDetailResponse({ task: {
+      goal: 'Write a cover letter', role: 'writer', taskStatus: 'completed', resultState: 'valid',
+      roleResultStatus: 'completed', verification: { status: 'unavailable' }, artifactRef,
+    } })
+    expect(viewableSourceArtifactRef(parsedV3, parsedV3?.sources[0], verifiedDetail)).toEqual(artifactRef)
+    expect(viewableSourceArtifactRef(parsedV3, parsedV3?.sources[1], verifiedDetail)).toBeNull()
+    expect(viewableSourceArtifactRef(parsedV3, { ...coveredSource, role: 'scout' }, verifiedDetail)).toBeNull()
+    const reviewerDetail = parseFinalTaskGraphSourceDetailResponse({ task: {
+      goal: 'Review the cover letter', role: 'reviewer', taskStatus: 'completed', resultState: 'valid',
+      roleResultStatus: 'completed', verification: { status: 'unavailable' }, artifactRef,
+    } })
+    expect(viewableSourceArtifactRef(parsedV3, parsedV3?.sources[2], reviewerDetail)).toEqual(artifactRef)
+    expect(viewableSourceArtifactRef(parsedV3, parsedV3?.sources[0], reviewerDetail)).toBeNull()
+    expect(viewableSourceArtifactRef(parsedV3, parsedV3?.sources[0], parseFinalTaskGraphSourceDetailResponse({ task: {
+      goal: 'Write a cover letter', role: 'writer', taskStatus: 'completed', resultState: 'valid',
+      roleResultStatus: 'completed', verification: { status: 'unavailable' },
+    } }))).toBeNull()
+
+    const v1 = parseFinalTaskGraphSourceManifest(manifest)
+    const v2 = parseFinalTaskGraphSourceManifest({ ...manifest, schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, historicalNodeIndices: [1] })
+    expect(viewableSourceArtifactRef(v1, coveredSource, verifiedDetail)).toBeNull()
+    expect(viewableSourceArtifactRef(v2, coveredSource, verifiedDetail)).toBeNull()
+    expect(coverLetterVersionLabel(3, 'en')).toBe('View cover letter version 3')
+    expect(coverLetterVersionLabel(3, 'zh')).toBe('查看求职信第 3 版')
+  })
+
+  it('keeps the viewer unmounted until a proof-backed source has explicit selection', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    try {
+      const html = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources
+        content={{ taskGraphSources: v3Manifest }} sessionId="session-1" finalItemId="item-1" lang="en"
+      /></I18nProvider>)
+      expect(html).toContain('data-agent-related-task-sources="true"')
+      expect(html).not.toContain('data-cover-letter-version-access')
+      expect(html).not.toContain('data-selected-job-draft')
+      expect(html).not.toContain(artifactVersionProof)
+      expect(fetchSpy).not.toHaveBeenCalled()
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('keeps Objective navigation available with a v4 proof and a retired Scout', () => {
+    const combined = { ...v3Manifest, retiredNodeIndices: [3] }
+    const parsed = parseFinalTaskGraphSourceManifest(combined)
+    const detail = parseFinalTaskGraphSourceDetailResponse({ task: {
+      goal: 'Write a cover letter', role: 'writer', taskStatus: 'completed', resultState: 'valid',
+      roleResultStatus: 'completed', verification: { status: 'unavailable' }, artifactRef,
+    } })
+    expect(viewableSourceArtifactRef(parsed, parsed?.sources[0], detail)).toEqual(artifactRef)
+    const html = renderToStaticMarkup(<I18nProvider><FinalTaskGraphSources
+      content={{ taskGraphSources: combined }} sessionId="session" finalItemId="item" lang="en"
+      navigationTargetId="related-tasks" /></I18nProvider>)
+    expect(html).toContain('id="related-tasks" tabindex="-1"')
+    expect(html).not.toContain('data-cover-letter-version-access')
+  })
+
+  it('keys the disclosure to the exact session, final item, source, and artifact identity', () => {
+    const identity = { sessionId: 'session-1', finalItemId: 'item-1', sourceKey, artifactRef }
+    const originalKey = artifactViewerKey(identity)
+    expect(artifactViewerKey(identity)).toBe(originalKey)
+    for (const next of [
+      { ...identity, sessionId: 'session-2' },
+      { ...identity, finalItemId: 'item-2' },
+      { ...identity, sourceKey: `src_${'B'.repeat(43)}` },
+      { ...identity, artifactRef: { ...artifactRef, version: 4 } },
+      { ...identity, artifactRef: { ...artifactRef, contentHash: 'sha256:' + 'd'.repeat(64) } },
+    ]) expect(artifactViewerKey(next)).not.toBe(originalKey)
   })
 
   it('encodes route identifiers and selector as path segments', () => {

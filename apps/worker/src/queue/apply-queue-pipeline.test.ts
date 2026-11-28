@@ -60,7 +60,7 @@ const mocks = vi.hoisted(() => {
     checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
     withCloakContext: vi.fn(),
     insertApplyResult: vi.fn().mockResolvedValue(1),
-    recordObjectiveSubmitResult: vi.fn().mockResolvedValue(73),
+    recordObjectiveSubmitResult: vi.fn().mockResolvedValue({ kind: "recorded", resultId: 73 }),
     recordExecutionSettled: vi.fn().mockResolvedValue(true),
     query: vi.fn().mockResolvedValue({ rowCount: 1 }),
     outcomeQuery,
@@ -70,10 +70,16 @@ const mocks = vi.hoisted(() => {
     readApplyQueueMaterialMode: vi.fn().mockResolvedValue("ordinary"),
     hasExactObjectiveSubmitResult: vi.fn().mockResolvedValue(false),
     objectiveSubmit: vi.fn().mockResolvedValue({ status: "submitted", durationMs: 7 }),
+    objectiveObservation: {
+      arm: vi.fn().mockReturnValue(true), accept: vi.fn().mockReturnValue(true), reject: vi.fn(),
+      forward: vi.fn().mockReturnValue(true), waitForConfirmation: vi.fn().mockResolvedValue("confirmed"),
+      outcome: vi.fn().mockReturnValue("confirmed"), dispose: vi.fn(),
+    },
     objectiveTargetSupported: vi.fn((url: unknown) => url === "https://boards.greenhouse.io/acme/jobs/123"),
     objectiveMaterial: undefined as unknown,
     acquireStartFence: vi.fn(),
     routeHandler: undefined as unknown,
+    submissionEvents: [] as string[],
     gotoCountAtToolExecution: null as number | null,
     detectCaptcha: vi.fn().mockResolvedValue(false),
     detectFlow: vi.fn().mockReturnValue(null),
@@ -154,6 +160,12 @@ vi.mock("../cloak/captcha.js", () => ({
 vi.mock("../db/apply-results.js", () => ({
   insertApplyResult: mocks.insertApplyResult,
   getPool: vi.fn(() => ({ query: mocks.query, connect: vi.fn().mockResolvedValue(mocks.outcomeClient) })),
+}));
+vi.mock("../db/objective-submission-uncertain.js", () => ({
+  markExactStartedObjectiveSubmissionUncertain: async (pool: unknown, scope: { applicationTaskId: string }, message: string) => {
+    const result = await mocks.finishApplicationTask(pool, scope.applicationTaskId, "waiting_for_user", "submission_uncertain", message, "submit", scope);
+    return result === "superseded" ? "superseded" : "written";
+  },
 }));
 vi.mock("../db/objective-application-submit-result.js", async importOriginal => ({
   ...await importOriginal<typeof import("../db/objective-application-submit-result.js")>(),
@@ -236,6 +248,7 @@ vi.mock("../runtime/tools/application-submit-tool.js", () => ({
           ...(mocks.objectiveMaterial ? { objectiveMaterial: mocks.objectiveMaterial } : {}) });
         return { status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: null, errorCode: null, output: null };
       } catch (error) {
+        mocks.submissionEvents.push("tool-settled");
         const errorCode = error && typeof error === "object" && "code" in error && typeof error.code === "string"
           ? error.code
           : "browser_failed";
@@ -247,6 +260,10 @@ vi.mock("../runtime/tools/application-submit-tool.js", () => ({
 vi.mock("./objective-application-submit-material.js", () => ({
   objectiveApplicationSubmitTargetSupported: mocks.objectiveTargetSupported,
   runObjectiveGreenhouseApplicationSubmit: mocks.objectiveSubmit,
+}));
+vi.mock("../flows/objective-greenhouse-submission-observation.js", () => ({
+  OBJECTIVE_SUBMISSION_START_TIMEOUT_MS: 8_000,
+  createObjectiveGreenhouseSubmissionObservation: vi.fn(() => mocks.objectiveObservation),
 }));
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }));
 
@@ -299,10 +316,11 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.objectiveMaterial = undefined;
     mocks.acquireStartFence.mockReset().mockResolvedValue({ state: "ready", release: vi.fn().mockResolvedValue(undefined) });
     mocks.routeHandler = undefined;
+    mocks.submissionEvents.length = 0;
     mocks.gotoCountAtToolExecution = null;
     mocks.outcomeQuery.mockClear();
     mocks.outcomeClient.release.mockClear();
-    mocks.recordObjectiveSubmitResult.mockReset().mockResolvedValue(73);
+    mocks.recordObjectiveSubmitResult.mockReset().mockResolvedValue({ kind: "recorded", resultId: 73 });
     mocks.recordExecutionSettled.mockReset().mockResolvedValue(true);
     mocks.workerHandler = undefined;
     mocks.workerEvents = {};
@@ -425,12 +443,14 @@ describe("apply-queue Phase 5 pipeline", () => {
       task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
       material: unknown;
       page: unknown;
+      observation: { arm: (intent: { url: string; method: string }) => boolean };
     }) => {
       expect(input.material).toEqual(material);
       expect(input.page).toBe(mocks.fakePage);
       expect(input.task.beforeSubmit).toEqual(expect.any(Function));
       const intent = { url: `${approvedUrl}/application`, method: "POST" };
       await expect(input.task.beforeSubmit?.(intent)).resolves.toBe(true);
+      expect(input.observation.arm(intent)).toBe(true);
       const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
       expect(handler).toEqual(expect.any(Function));
       await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
@@ -465,12 +485,14 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.fakePage.url.mockReturnValue(approvedUrl);
     mocks.objectiveMaterial = { approvedApplyUrl: approvedUrl, reviewedResumeContent: {}, reviewedCoverLetter: "Reviewed letter", confirmedAnswers: {} };
     mocks.acquireStartFence.mockResolvedValueOnce({ state: "uncertain", release: vi.fn().mockResolvedValue(undefined) });
-    mocks.recordObjectiveSubmitResult.mockResolvedValueOnce(null);
+    mocks.recordObjectiveSubmitResult.mockResolvedValueOnce({ kind: "superseded" });
     const frame = mocks.fakePage.mainFrame();
     mocks.fakePage.mainFrame.mockReturnValue(frame);
-    mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> } }) => {
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      observation: { arm: (intent: { url: string; method: string }) => boolean } }) => {
       const intent = { url: `${approvedUrl}/application`, method: "POST" };
       await input.task.beforeSubmit?.(intent);
+      expect(input.observation.arm(intent)).toBe(true);
       const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
       await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
         frame: () => frame, isNavigationRequest: () => true }), continue: vi.fn(),
@@ -480,9 +502,127 @@ describe("apply-queue Phase 5 pipeline", () => {
 
     await expect(runApplyJob()).resolves.toBeUndefined();
 
-    expect(mocks.recordObjectiveSubmitResult).toHaveBeenCalledWith(expect.objectContaining({ requestStarted: true,
-      requestContinued: false, fenceUnavailable: true }));
-    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+    expect(mocks.recordObjectiveSubmitResult).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+      status: "manual", error: expect.stringContaining("previous background attempt was interrupted"),
+    }));
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(expect.anything(), "application-task-1", "waiting_for_user",
+      "submission_uncertain", expect.any(String), "submit", expect.anything());
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalledWith(expect.anything(), expect.anything(),
+      expect.objectContaining({ workflowState: "submitted" }), expect.anything());
+  }, 15_000);
+
+  it("aborts a hung Objective boundary commit before waiting for uncertain persistence", async () => {
+    const approvedUrl = "https://boards.greenhouse.io/acme/jobs/123";
+    const events: string[] = [];
+    let releaseCommit!: () => void;
+    let unlock!: () => void;
+    let releaseEntered!: () => void;
+    const releaseStarted = new Promise<void>(resolve => { releaseEntered = resolve; });
+    const commit = new Promise<void>(resolve => { releaseCommit = resolve; });
+    const lockReleased = new Promise<void>(resolve => { unlock = resolve; });
+    const release = vi.fn(() => { events.push("release"); releaseEntered(); return commit; });
+    const abort = vi.fn(() => { events.push("abort"); unlock(); });
+    const routeContinue = vi.fn().mockResolvedValue(undefined);
+    mocks.acquireStartFence.mockResolvedValueOnce({ state: "ready", release, abort });
+    mocks.fakeContext.close.mockImplementation(async () => { events.push("close"); });
+    mocks.finishApplicationTask.mockImplementation(async (_pool, _task, status, checkpoint) => {
+      if (status === "waiting_for_user" && checkpoint === "submission_uncertain") {
+        events.push("uncertain-wait");
+        await lockReleased;
+        events.push("uncertain-written");
+      }
+      return undefined;
+    });
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.loadTaskContext.mockResolvedValueOnce({ applyUrl: approvedUrl, persona: { fullName: "Ada Lovelace" },
+      coverLetterText: null, jobTitle: "Engineer", jobCompany: "Example", jobKeywords: "typescript",
+      confirmedAnswers: {}, resumeTempPath: undefined });
+    mocks.detectFlow.mockReturnValue("greenhouse");
+    mocks.fakePage.url.mockReturnValue(approvedUrl);
+    mocks.objectiveMaterial = { approvedApplyUrl: approvedUrl, reviewedResumeContent: {}, reviewedCoverLetter: "Reviewed letter", confirmedAnswers: {} };
+    const frame = mocks.fakePage.mainFrame();
+    mocks.fakePage.mainFrame.mockReturnValue(frame);
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: {
+      task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      observation: { arm: (intent: { url: string; method: string }) => boolean };
+    }) => {
+      const intent = { url: `${approvedUrl}/application`, method: "POST" };
+      await input.task.beforeSubmit?.(intent);
+      expect(input.observation.arm(intent)).toBe(true);
+      const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
+      vi.useFakeTimers();
+      await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
+        frame: () => frame, isNavigationRequest: () => true }), continue: routeContinue,
+        abort: vi.fn().mockResolvedValue(undefined), fallback: vi.fn().mockResolvedValue(undefined) });
+      return { status: "submitted", durationMs: 7 };
+    });
+    try {
+      let completed = false;
+      const job = runApplyJob().then(() => { completed = true; });
+      await releaseStarted;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(completed).toBe(true);
+      await job;
+      expect(routeContinue).toHaveBeenCalledOnce();
+      expect(release).toHaveBeenCalledOnce();
+      expect(abort).toHaveBeenCalledOnce();
+      expect(events.indexOf("close")).toBeGreaterThanOrEqual(0);
+      expect(events.indexOf("close")).toBeLessThan(events.indexOf("abort"));
+      expect(events.indexOf("abort")).toBeLessThan(events.indexOf("uncertain-written"));
+      expect(mocks.finishApplicationTask.mock.calls.filter(([, , status, checkpoint]) => status === "waiting_for_user" && checkpoint === "submission_uncertain")).toHaveLength(1);
+      expect(mocks.recordObjectiveSubmitResult).not.toHaveBeenCalled();
+      expect(mocks.recordExecutionSettled).not.toHaveBeenCalled();
+      expect(mocks.updateJobForSubmission).not.toHaveBeenCalledWith(expect.anything(), expect.anything(),
+        expect.objectContaining({ status: "applied", workflowState: "submitted" }), expect.anything());
+      releaseCommit();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mocks.recordObjectiveSubmitResult).not.toHaveBeenCalled();
+      expect(mocks.recordExecutionSettled).not.toHaveBeenCalled();
+      expect(routeContinue).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  }, 15_000);
+
+  it("keeps a stopped Objective request uncertain when its marker already committed", async () => {
+    const approvedUrl = "https://boards.greenhouse.io/acme/jobs/123";
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.loadTaskContext.mockResolvedValueOnce({ applyUrl: approvedUrl, persona: { fullName: "Ada Lovelace" },
+      coverLetterText: null, jobTitle: "Engineer", jobCompany: "Example", jobKeywords: "typescript",
+      confirmedAnswers: {}, resumeTempPath: undefined });
+    mocks.detectFlow.mockReturnValue("greenhouse");
+    mocks.fakePage.url.mockReturnValue(approvedUrl);
+    mocks.objectiveMaterial = { approvedApplyUrl: approvedUrl, reviewedResumeContent: {},
+      reviewedCoverLetter: "Reviewed letter", confirmedAnswers: {} };
+    mocks.acquireStartFence.mockResolvedValueOnce({ state: "stopped", markerCommitted: true,
+      release: vi.fn().mockResolvedValue(undefined) });
+    const frame = mocks.fakePage.mainFrame();
+    mocks.fakePage.mainFrame.mockReturnValue(frame);
+    const routeAbort = vi.fn().mockResolvedValue(undefined);
+    const routeContinue = vi.fn();
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: {
+      task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      observation: { arm: (intent: { url: string; method: string }) => boolean };
+    }) => {
+      const intent = { url: `${approvedUrl}/application`, method: "POST" };
+      await input.task.beforeSubmit?.(intent);
+      expect(input.observation.arm(intent)).toBe(true);
+      const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
+      await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
+        frame: () => frame, isNavigationRequest: () => true }), continue: routeContinue,
+        abort: routeAbort, fallback: vi.fn().mockResolvedValue(undefined) });
+      return { status: "manual", error: "Stopped after start marker", durationMs: 7 };
+    });
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(routeAbort).toHaveBeenCalledWith("failed");
+    expect(routeContinue).not.toHaveBeenCalled();
+    expect(mocks.recordObjectiveSubmitResult).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+      status: "manual", error: expect.stringContaining("previous background attempt was interrupted"),
+    }));
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(expect.anything(), "application-task-1", "waiting_for_user",
+      "submission_uncertain", expect.any(String), "submit", expect.anything());
     expect(mocks.updateJobForSubmission).not.toHaveBeenCalledWith(expect.anything(), expect.anything(),
       expect.objectContaining({ workflowState: "submitted" }), expect.anything());
   }, 15_000);
@@ -516,6 +656,50 @@ describe("apply-queue Phase 5 pipeline", () => {
     }
   }, 15_000);
 
+  it.each(["manual", "throw"] as const)("quiesces the paused Objective request before a %s provider outcome settles", async outcome => {
+    const approvedUrl = "https://boards.greenhouse.io/acme/jobs/123";
+    mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
+    mocks.loadTaskContext.mockResolvedValueOnce({ applyUrl: approvedUrl, persona: { fullName: "Ada Lovelace" },
+      coverLetterText: null, jobTitle: "Engineer", jobCompany: "Example", jobKeywords: "typescript",
+      confirmedAnswers: {}, resumeTempPath: undefined });
+    mocks.detectFlow.mockReturnValue("greenhouse");
+    mocks.fakePage.url.mockReturnValue(approvedUrl);
+    mocks.objectiveMaterial = { approvedApplyUrl: approvedUrl, reviewedResumeContent: {},
+      reviewedCoverLetter: "Reviewed letter", confirmedAnswers: {} };
+    const frame = mocks.fakePage.mainFrame();
+    mocks.fakePage.mainFrame.mockReturnValue(frame);
+    const routeAbort = vi.fn(async () => { mocks.submissionEvents.push("route-aborted"); });
+    const routeContinue = vi.fn();
+    mocks.acquireStartFence.mockImplementationOnce((_pool: unknown, _scope: unknown, options: { signal: AbortSignal }) =>
+      new Promise(resolve => {
+        const cancelled = (): void => resolve({ state: "cancelled", release: vi.fn().mockResolvedValue(undefined) });
+        if (options.signal.aborted) cancelled();
+        else options.signal.addEventListener("abort", cancelled, { once: true });
+      }));
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: {
+      task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+    }) => {
+      const intent = { url: `${approvedUrl}/application`, method: "POST" };
+      await input.task.beforeSubmit?.(intent);
+      const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
+      const routeWork = handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
+        frame: () => frame, isNavigationRequest: () => true }), continue: routeContinue,
+        abort: routeAbort, fallback: vi.fn().mockResolvedValue(undefined) });
+      void routeWork?.catch(() => undefined);
+      if (outcome === "throw") throw new Error("provider failed");
+      return { status: "manual", error: "No submit button found", durationMs: 7 };
+    });
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.acquireStartFence).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({
+      signal: expect.objectContaining({ aborted: true }), timeoutMs: expect.any(Number),
+    }));
+    expect(routeAbort).toHaveBeenCalledOnce();
+    expect(routeContinue).not.toHaveBeenCalled();
+    expect(mocks.submissionEvents).toEqual(["route-aborted", "tool-settled"]);
+  }, 15_000);
+
   it("keeps a forwarded Objective success unknown if its durable result link fails", async () => {
     const approvedUrl = "https://boards.greenhouse.io/acme/jobs/123";
     mocks.readApplyQueueMaterialMode.mockResolvedValueOnce("objective");
@@ -528,9 +712,11 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.recordObjectiveSubmitResult.mockRejectedValueOnce(new Error("result link unavailable"));
     const frame = mocks.fakePage.mainFrame();
     mocks.fakePage.mainFrame.mockReturnValue(frame);
-    mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> } }) => {
+    mocks.objectiveSubmit.mockImplementationOnce(async (input: { task: { beforeSubmit?: (intent: { url: string; method: string }) => Promise<boolean> };
+      observation: { arm: (intent: { url: string; method: string }) => boolean } }) => {
       const intent = { url: `${approvedUrl}/application`, method: "POST" };
       await expect(input.task.beforeSubmit?.(intent)).resolves.toBe(true);
+      expect(input.observation.arm(intent)).toBe(true);
       const handler = mocks.routeHandler as ((route: unknown) => Promise<void>) | undefined;
       await handler?.({ request: () => ({ url: () => intent.url, method: () => intent.method,
         frame: () => frame, isNavigationRequest: () => true }), continue: vi.fn().mockResolvedValue(undefined),

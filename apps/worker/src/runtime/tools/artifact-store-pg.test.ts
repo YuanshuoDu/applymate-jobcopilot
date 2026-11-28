@@ -90,17 +90,39 @@ describe("PgArtifactToolStore immutable persistence", () => {
     })
 
     const statements = pool.transactions.at(-1)!
+    const sourceLock = statements.findIndex(sql => sql.includes("hashtextextended($1::text, 0)"))
+    const sourceVerify = statements.findIndex((sql, index) => index > sourceLock && sql === "SELECT pg_current_xact_id()::text AS transaction_id")
+    const artifactLock = statements.findIndex(sql => sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))"))
     const staged = statements.findIndex(sql => sql.startsWith('INSERT INTO "agent_artifact_version"'))
     const jobLock = statements.findIndex(sql => sql.includes('FROM "Job"') && sql.endsWith("FOR SHARE"))
     const guarded = statements.indexOf("SELECT fake material guard")
     const leaseChecks = statements.flatMap((sql, index) => sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()') ? [index] : [])
     expect(version.version).toBe(1)
     expect(guardClient).toBe(pool.lastConnectedClient)
-    expect(staged).toBeGreaterThanOrEqual(0)
+    expect(sourceLock).toBeGreaterThanOrEqual(0)
+    expect(pool.sourceLockKeys.at(-1)).toEqual(["applymate:gate-source-fence:v1:user-a"])
+    expect(sourceVerify).toBeGreaterThan(sourceLock)
+    expect(artifactLock).toBeGreaterThan(sourceVerify)
+    expect(staged).toBeGreaterThan(artifactLock)
     expect(jobLock).toBeGreaterThan(staged)
     expect(guarded).toBeGreaterThan(jobLock)
     expect(leaseChecks.at(-1)).toBeGreaterThan(guarded)
     expect(statements.at(-1)).toBe("COMMIT")
+  })
+
+  it("rolls back a scheduled draft before writing when the source fence fails", async () => {
+    const pool = new FakeArtifactPool()
+    const guard = vi.fn(async () => true)
+    const store = new PgArtifactToolStore(pool as unknown as Pool, undefined, guard)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    pool.failSourceFence = true
+
+    await expect(store.writeDraft(scope, {
+      baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("request"),
+    })).rejects.toThrow("source material fence transaction verification failed")
+    expect(guard).not.toHaveBeenCalled()
+    expect(pool.transactions.at(-1)?.at(-1)).toBe("ROLLBACK")
+    expect(pool.transactions.at(-1)?.some(sql => sql.startsWith('INSERT INTO "agent_artifact_version"'))).toBe(false)
   })
 
   it("rolls back a staged scheduled draft when current material is unavailable or stale", async () => {
@@ -204,13 +226,11 @@ describe("PgArtifactToolStore immutable persistence", () => {
       content: "corrected draft", constraints: {}, requestHash: hashArtifactContent("corrected draft"),
       expectedPreviousVersion: version.version, expectedPreviousHash: version.contentHash })
     expect(corrected).toMatchObject({ artifactId: version.artifactId, version: version.version + 1, previousHash: version.contentHash })
-    const recoveryStore = new PgArtifactToolStore(pool as unknown as Pool, readCurrentSourceDigest, undefined, true)
-    await expect(recoveryStore.readRevisionReview(correctionScope, revision)).resolves.toMatchObject({ id: review.id, status: "needs_revision" })
     await expect(store.readRevisionReview(correctionScope, revision)).resolves.toBeNull()
-    await expect(recoveryStore.readRevisionReview(scopeFor("other-correction-writer", "other-write-call"), revision)).resolves.toBeNull()
+    await expect(store.readRevisionReview(scopeFor("other-correction-writer", "other-write-call"), revision)).resolves.toBeNull()
 
     pool.fence.interruptRequestedAt = new Date()
-    await expect(recoveryStore.readRevisionReview(correctionScope, revision)).resolves.toBeNull()
+    await expect(store.readRevisionReview(correctionScope, revision)).resolves.toBeNull()
   })
 
   it("rejects ambiguous review receipts and a review whose artifact head has advanced", async () => {
@@ -387,6 +407,8 @@ class FakeArtifactPool {
   conflictWinnerReads = 0
   private resolvingVersionConflict = false
   private advisoryLockTail: Promise<void> = Promise.resolve()
+  readonly sourceLockKeys: unknown[][] = []
+  failSourceFence = false
   readonly transactions: string[][] = []
   lastConnectedClient: object | undefined
   readonly fence = {
@@ -402,7 +424,12 @@ class FakeArtifactPool {
     let transactionSnapshot: ReturnType<FakeArtifactPool["snapshot"]> | undefined
     const client = {
       query: async (sql: string, values?: unknown[]) => {
-        if (sql.includes("hashtextextended($1::text, 0)")) return this.query(sql, values)
+        if (sql.includes("hashtextextended($1::text, 0)")) {
+          transactionStatements.push(sql)
+          this.sourceLockKeys.push(values ?? [])
+          if (this.failSourceFence) throw new Error("fence failure")
+          return this.query(sql, values)
+        }
         if (sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))")) {
           if (jobLockHeld) return this.empty()
           const predecessor = this.advisoryLockTail

@@ -1,7 +1,10 @@
 import { projectFinalAnswerDisplayContent, type FinalAnswerDisplayContent } from './final-answer-evidence-projection'
+import { isFinalTaskGraphArtifactVersionProof, TASK_GRAPH_FINAL_ARTIFACT_MANIFEST_SCHEMA } from '@jobcopilot/agent-protocol'
 
 export const TASK_GRAPH_SOURCES_SCHEMA_VERSION = 'agent-harness.v2.task-graph-sources.v1' as const
 export const TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 = 'agent-harness.v2.task-graph-sources.v2' as const
+export const TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 = 'agent-harness.v2.task-graph-sources.v3' as const
+export const TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4 = TASK_GRAPH_FINAL_ARTIFACT_MANIFEST_SCHEMA
 
 export const TASK_GRAPH_SOURCE_ROLES = ['scout', 'analyst', 'writer', 'reviewer', 'prepare', 'unsupported'] as const
 export const TASK_GRAPH_SOURCE_TASK_STATUSES = ['queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed'] as const
@@ -19,6 +22,7 @@ export type FinalTaskGraphSource = Readonly<{
   taskStatus: TaskGraphSourceTaskStatus
   resultState: TaskGraphSourceResultState
   roleResultStatus?: TaskGraphSourceRoleResultStatus
+  artifactVersionProof?: string
 }>
 export type FinalTaskGraphSourceManifestV1 = Readonly<{
   schemaVersion: typeof TASK_GRAPH_SOURCES_SCHEMA_VERSION
@@ -31,7 +35,17 @@ export type FinalTaskGraphSourceManifestV2 = Readonly<{
   sources: readonly FinalTaskGraphSource[]
   historicalNodeIndices: readonly number[]
 }>
-export type FinalTaskGraphSourceManifest = FinalTaskGraphSourceManifestV1 | FinalTaskGraphSourceManifestV2
+export type FinalTaskGraphSourceManifestV3 = Readonly<{
+  schemaVersion: typeof TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3
+  graphRevision: number
+  sources: readonly FinalTaskGraphSource[]
+  historicalNodeIndices: readonly number[]
+  retiredNodeIndices: readonly number[]
+}>
+export type FinalTaskGraphSourceManifestV4 = Omit<FinalTaskGraphSourceManifestV3, 'schemaVersion'> & Readonly<{
+  schemaVersion: typeof TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4
+}>
+export type FinalTaskGraphSourceManifest = FinalTaskGraphSourceManifestV1 | FinalTaskGraphSourceManifestV2 | FinalTaskGraphSourceManifestV3 | FinalTaskGraphSourceManifestV4
 
 export type FinalAnswerWithTaskGraphSources = FinalAnswerDisplayContent & Readonly<{ taskGraphSources?: FinalTaskGraphSourceManifest }>
 
@@ -63,50 +77,78 @@ export function parseFinalTaskGraphSourceManifest(value: unknown): FinalTaskGrap
   if (!row) return null
   const v1Shape = exactKeys(row, ['graphRevision', 'schemaVersion', 'sources'])
   const v2Shape = !v1Shape && exactKeys(row, ['graphRevision', 'historicalNodeIndices', 'schemaVersion', 'sources'])
-  if (!v1Shape && !v2Shape) return null
+  const extendedShape = !v1Shape && !v2Shape && exactKeys(row, ['graphRevision', 'historicalNodeIndices', 'retiredNodeIndices', 'schemaVersion', 'sources'])
+  if (!v1Shape && !v2Shape && !extendedShape) return null
   const schemaVersion = row.schemaVersion
-  if (v1Shape ? schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION : schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2) return null
+  const v3Shape = extendedShape && schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3
+  const v4Shape = extendedShape && schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4
+  if (v1Shape ? schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION
+    : v2Shape ? schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2 : !v3Shape && !v4Shape) return null
 
   const graphRevision = row.graphRevision
-  const sourceRows = row.sources
-  if (!integer(graphRevision, 1, Number.MAX_SAFE_INTEGER) || !dense(sourceRows, 1, 8)) return null
+  const sourceRows = extendedShape ? denseData(row.sources, 1, 8) : dense(row.sources, 1, 8) ? row.sources : null
+  if (!integer(graphRevision, 1, Number.MAX_SAFE_INTEGER) || !sourceRows) return null
 
   const sources: FinalTaskGraphSource[] = []
   const keys = new Set<string>(), indexes = new Set<number>()
+  let hasArtifactProof = false
   let previousIndex = -1
   for (const value of sourceRows) {
     const source = record(value)
     if (!source) return null
     const hasResultStatus = Object.hasOwn(source, 'roleResultStatus')
+    const hasArtifactVersionProof = Object.hasOwn(source, 'artifactVersionProof')
     const expected = hasResultStatus
       ? ['nodeIndex', 'resultState', 'role', 'roleResultStatus', 'sourceKey', 'taskStatus']
       : ['nodeIndex', 'resultState', 'role', 'sourceKey', 'taskStatus']
-    if (!exactKeys(source, expected) || typeof source.sourceKey !== 'string' || !SOURCE_KEY.test(source.sourceKey)
+    if (hasArtifactVersionProof) expected.push('artifactVersionProof')
+    if (!exactKeys(source, expected) || v1Shape && hasArtifactVersionProof || v2Shape && hasArtifactVersionProof
+      || hasArtifactVersionProof && (!v4Shape || !isFinalTaskGraphArtifactVersionProof(source.artifactVersionProof)
+        || source.role !== 'writer' && source.role !== 'reviewer' || source.taskStatus !== 'completed'
+        || source.resultState !== 'valid' || source.roleResultStatus !== 'completed')
+      || typeof source.sourceKey !== 'string' || !SOURCE_KEY.test(source.sourceKey)
       || !integer(source.nodeIndex, 0, 7) || source.nodeIndex <= previousIndex || indexes.has(source.nodeIndex)
       || keys.has(source.sourceKey) || !oneOf(source.role, TASK_GRAPH_SOURCE_ROLES)
       || !oneOf(source.taskStatus, TASK_GRAPH_SOURCE_TASK_STATUSES) || !oneOf(source.resultState, TASK_GRAPH_SOURCE_RESULT_STATES)
       || hasResultStatus && !oneOf(source.roleResultStatus, TASK_GRAPH_SOURCE_ROLE_RESULT_STATUSES)
       || !coherentOutcome(source as unknown as FinalTaskGraphSource)) return null
+    hasArtifactProof ||= hasArtifactVersionProof
     previousIndex = source.nodeIndex
     indexes.add(source.nodeIndex)
     keys.add(source.sourceKey)
     sources.push({ sourceKey: source.sourceKey, nodeIndex: source.nodeIndex, role: source.role as TaskGraphSourceRole,
       taskStatus: source.taskStatus as TaskGraphSourceTaskStatus, resultState: source.resultState as TaskGraphSourceResultState,
-      ...(hasResultStatus ? { roleResultStatus: source.roleResultStatus as TaskGraphSourceRoleResultStatus } : {}) })
+      ...(hasResultStatus ? { roleResultStatus: source.roleResultStatus as TaskGraphSourceRoleResultStatus } : {}),
+      ...(hasArtifactVersionProof ? { artifactVersionProof: source.artifactVersionProof as string } : {}) })
   }
 
   if (v1Shape) return { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision, sources }
 
-  const historicalRows = denseData(row.historicalNodeIndices, 1, 8)
+  const historicalRows = denseData(row.historicalNodeIndices, extendedShape ? 0 : 1, 8)
   if (!historicalRows || sourceRows.length + historicalRows.length > 8) return null
   const historicalNodeIndices: number[] = []
   previousIndex = -1
   for (const nodeIndex of historicalRows) {
     if (!integer(nodeIndex, 0, 7) || nodeIndex <= previousIndex || indexes.has(nodeIndex)) return null
     previousIndex = nodeIndex
+    indexes.add(nodeIndex)
     historicalNodeIndices.push(nodeIndex)
   }
-  return { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, graphRevision, sources, historicalNodeIndices }
+  if (v2Shape) return { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2, graphRevision, sources, historicalNodeIndices }
+
+  const retiredRows = denseData(row.retiredNodeIndices, v4Shape ? 0 : 1, 8)
+  if (!retiredRows || sourceRows.length + historicalRows.length + retiredRows.length > 8) return null
+  const retiredNodeIndices: number[] = []
+  previousIndex = -1
+  for (const nodeIndex of retiredRows) {
+    if (!integer(nodeIndex, 0, 7) || nodeIndex <= previousIndex || indexes.has(nodeIndex)) return null
+    previousIndex = nodeIndex
+    indexes.add(nodeIndex)
+    retiredNodeIndices.push(nodeIndex)
+  }
+  if (v4Shape) return hasArtifactProof
+    ? { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4, graphRevision, sources, historicalNodeIndices, retiredNodeIndices } : null
+  return { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, graphRevision, sources, historicalNodeIndices, retiredNodeIndices }
 }
 
 /** Keeps the strict final-answer DTO and adds only the bounded public sidecar. */
@@ -149,9 +191,16 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
 }
 
 function dense(value: unknown, min: number, max: number): value is unknown[] {
-  if (!Array.isArray(value) || value.length < min || value.length > max) return false
-  try { return Reflect.ownKeys(value).length === value.length + 1 && value.every((_, index) => Object.hasOwn(value, index)) }
-  catch { return false }
+  try {
+    if (!Array.isArray(value)) return false
+    const length = Object.getOwnPropertyDescriptor(value, 'length')?.value
+    if (!integer(length, min, max) || Reflect.ownKeys(value).length !== length + 1) return false
+    for (let index = 0; index < length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+      if (!descriptor || !Object.hasOwn(descriptor, 'value')) return false
+    }
+    return true
+  } catch { return false }
 }
 
 function denseData(value: unknown, min: number, max: number): unknown[] | null {

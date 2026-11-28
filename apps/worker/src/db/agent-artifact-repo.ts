@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from "pg"
 import { randomUUID } from "node:crypto"
-import { hasOwnCorrectionSuccessorHeadWithClient } from "./agent-artifact-correction-head.js"
 import { withFencedArtifactWriteTransaction } from "./agent-artifact-write-transaction.js"
+import { hasExactCorrectionDraftResumeReceiptWithClient } from "./agent-artifact-revision-resume.js"
 import {
   AgentArtifactRepositoryError, artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive, findCurrentDraftHeadWithClient, findReviewReceiptWithClient,
   saveAgentArtifactDraftWithClient, toAgentArtifactReviewRow, toAgentArtifactRow, toAgentArtifactVersionRow, withArtifactTransaction,
@@ -19,7 +19,6 @@ export type AgentArtifactRevisionReviewRead = Readonly<{
   userId: string; sessionId: string; jobId: string; artifactId: string; version: number; contentHash: string
   sourceDigest: string; currentSourceDigest: string; dependencyTaskId: string; reviewHash: string; taskFence: AgentArtifactTaskFence
   readCurrentSourceDigest: AgentArtifactSourceDigestReader
-  allowOwnCorrectionSuccessor?: true
 }>
 
 export type AgentArtifactDraftHead = Readonly<{
@@ -168,12 +167,13 @@ export function createAgentArtifactRepository(pool: Pool) {
           || review.sourceDigest !== input.sourceDigest || review.currentSourceDigest !== input.currentSourceDigest) return null
         const head = await selectOne(client, input.userId, input.artifactId, true)
         if (!head || head.lifecycle !== "draft" || head.jobId !== input.jobId) return null
-        const currentPrior = head.version === input.version && head.hash === input.contentHash
-        const ownSuccessor = !currentPrior && input.allowOwnCorrectionSuccessor === true
-          && await hasOwnCorrectionSuccessorHeadWithClient(client, { userId: input.userId, sessionId: input.sessionId,
-            jobId: input.jobId, artifactId: input.artifactId, priorVersion: input.version,
-            priorContentHash: input.contentHash, sourceDigest: input.sourceDigest, correctionWriterTaskId: input.taskFence.taskId })
-        if (!currentPrior && !ownSuccessor) return null
+        const predecessorIsHead = head.version === input.version && head.hash === input.contentHash
+        const exactResume = !predecessorIsHead && await hasExactCorrectionDraftResumeReceiptWithClient(client, {
+          taskFence: input.taskFence, jobId: input.jobId, artifactId: input.artifactId,
+          predecessorVersion: input.version, predecessorContentHash: input.contentHash, sourceDigest: input.sourceDigest,
+          liveHeadVersion: head.version, liveHeadHash: head.hash,
+        })
+        if (!predecessorIsHead && !exactResume) return null
         return await artifactTaskLeaseIsLive(client, input.taskFence) ? review : null
       })
     },

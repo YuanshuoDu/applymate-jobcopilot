@@ -13,7 +13,7 @@ import type { ChildExecutorOptions, ChildToolRuntime } from "./child-executor.js
 import type { ChildAttemptResume } from "./child-resume.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import { createJobDiscoveryClient, type JobDiscoveryRequest } from "../tools/job-discovery-client.js"
-import { InMemoryArtifactToolStore } from "../tools/artifact-tools.js"
+import { InMemoryArtifactToolStore, type ArtifactToolDraftInput } from "../tools/artifact-tools.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient } from "./selected-job-artifact-context.js"
@@ -22,6 +22,7 @@ import { scheduledDraftJobMaterialDigest } from "./scheduled-draft-job-material.
 import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { buildInteractiveDiscoveryShortlist, requireCurrentOwnerJobs } from "../interactive-discovery-persistence.js"
 import { restoreToolCallState } from "../turns/persisted-tool-call-state.js"
+import { buildChildResumeObservations } from "./child-resume-observations.js"
 import type { ChildMailboxReader } from "./child-context.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
@@ -184,6 +185,8 @@ type PersistedWriterReviewGraphFixture = Readonly<{
   readonly reviewerResult: unknown
   readonly writerTemplateId?: string
   readonly writerExpectedOutputSchema?: unknown
+  readonly writerAttemptCount?: number
+  readonly writerLeaseOwner?: string
 }>
 
 function persistedWriterReviewGraph(fixture: PersistedWriterReviewGraphFixture) {
@@ -226,7 +229,8 @@ function persistedWriterReviewGraph(fixture: PersistedWriterReviewGraphFixture) 
     ],
     writerLease: {
       id: fixture.writerTaskId, sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
-      userId: "user-1", status: "running", role: "writer", leaseOwner: "worker-1", attemptCount: 1,
+      userId: "user-1", status: "running", role: "writer", leaseOwner: fixture.writerLeaseOwner ?? "worker-1",
+      attemptCount: fixture.writerAttemptCount ?? 1,
       interruptRequestedAt: null,
     },
   }
@@ -391,6 +395,7 @@ function selectedJobExecutor(input: {
   readonly model: ModelAdapter
   readonly pool?: ReturnType<typeof selectedJobPool>
   readonly mailboxReader?: ChildMailboxReader
+  readonly resumeLoader?: (lease: SubagentLease) => Promise<ChildAttemptResume | undefined>
   readonly modelRuntimeFactory?: ChildExecutorOptions["modelRuntimeFactory"]
 }) {
   artifactStoreMock.current = input.artifactStore
@@ -400,7 +405,7 @@ function selectedJobExecutor(input: {
     enabled: true, pool: pool as never, turnStore: input.persistence.engineStore, treeBudget: budget(),
     authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
     modelRuntimeFactory: input.modelRuntimeFactory ?? (() => input.model),
-    resumeLoader: async () => undefined,
+    resumeLoader: input.resumeLoader ?? (async () => undefined),
     ...(input.mailboxReader ? { mailboxReader: input.mailboxReader } : {}),
   })
   if (!executor) throw new Error("production selected-job child executor was not created")
@@ -2167,6 +2172,138 @@ describe("production child runtime", () => {
     expect(forgedRequests).toHaveLength(0)
     expect(revisionReviewReadSpy).not.toHaveBeenCalled()
     expect(draftSpy).not.toHaveBeenCalled()
+  })
+
+  it("resumes a correction Writer from its exact earlier draft receipt and immediate artifact successor", async () => {
+    const selected = await selectedJobSourceDigest()
+    const preparation = selected.preparation
+    const artifacts = new InMemoryArtifactToolStore()
+    const base = artifacts.registerBase({
+      id: `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`,
+      type: "cover_letter", jobId: "job-1", userId: "user-1", content: { text: "Base cover-letter material" },
+    })
+    const initialFence = {
+      taskId: "writer-initial", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      parentTaskId: "root-1", leaseOwner: "worker-1", attemptCount: 1,
+    }
+    const initialScope = { ...preparation, userId: "user-1", sessionId: "session-1", taskId: initialFence.taskId,
+      toolCallId: "initial-draft-call", taskFence: initialFence }
+    const initialInput: ArtifactToolDraftInput = { baseArtifactId: base.id, baseHash: base.hash,
+      content: "Initial draft with an unclear opening.", constraints: { maxWords: 160 } }
+    const initialVersion = await artifacts.writeDraft(initialScope, { ...initialInput,
+      requestHash: hashArtifactContent({ callId: initialScope.toolCallId, input: initialInput }) })
+    const predecessorRef = { artifactId: initialVersion.artifactId, version: initialVersion.version,
+      contentHash: initialVersion.contentHash, sourceDigest: initialVersion.sourceDigest }
+    const finding = {
+      id: "opening_clarity", code: "content_clarity", severity: "warning" as const,
+      message: "Clarify the opening without adding unsupported claims.", artifactHash: predecessorRef.contentHash,
+      evidence: [{ artifactHash: predecessorRef.contentHash, path: "$.text", summary: "The opening does not identify the strongest experience." }],
+    }
+    const reviewHash = hashArtifactContent({ artifactRef: predecessorRef, currentSourceDigest: preparation.sourceDigest,
+      status: "needs_revision", findings: [finding], evidenceRefs: preparation.evidenceRefs })
+    const reviewerFence = { ...initialFence, taskId: "reviewer-task" }
+    const storedReview = await artifacts.saveReview({
+      userId: "user-1", sessionId: "session-1", jobId: "job-1", artifactId: predecessorRef.artifactId,
+      version: predecessorRef.version, contentHash: predecessorRef.contentHash, sourceDigest: preparation.sourceDigest,
+      currentSourceDigest: preparation.sourceDigest, status: "needs_revision", findings: [finding], evidenceRefs: [...preparation.evidenceRefs],
+      taskId: reviewerFence.taskId, toolCallId: "review-call", requestHash: hashArtifactContent({ predecessorRef, finding }), reviewHash,
+      taskFence: reviewerFence,
+    })
+    const reviewerStructuredResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed",
+      artifactRef: predecessorRef, reviewStatus: "needs_revision", reviewHash }
+    const reviewerResult = { status: "completed", stepCount: 3, toolCallCount: 2, finalItemId: null,
+      finalText: JSON.stringify(reviewerStructuredResult), structuredResult: reviewerStructuredResult }
+    const scope = taskScope()
+    const revisionContext = materializeTaskGraphDependencyContext({ selectedJobPreparation: { jobId: "job-1" } }, scope, ["reviewer"], [{
+      ...scope, key: "reviewer", taskId: reviewerFence.taskId, status: "completed", role: "reviewer",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" }, result: reviewerResult,
+    }])
+    const correctionWriterId = "writer-correction"
+    const correctionLease = {
+      ...jobTask("writer", revisionContext), id: correctionWriterId, ownerId: "worker-2", leaseOwner: "worker-2", attemptCount: 2,
+      leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
+    }
+    const correctionCallId = "correction-draft-call"
+    const correctionInput: ArtifactToolDraftInput = {
+      baseArtifactId: base.id, baseHash: base.hash, content: "Corrected opening with the strongest relevant experience.",
+      constraints: { maxWords: 160 }, expectedPreviousVersion: predecessorRef.version, expectedPreviousHash: predecessorRef.contentHash,
+    }
+    const correctionScope = { ...preparation, userId: "user-1", sessionId: "session-1", taskId: correctionWriterId,
+      toolCallId: correctionCallId, taskFence: { ...initialFence, taskId: correctionWriterId } }
+    const successor = await artifacts.writeDraft(correctionScope, { ...correctionInput,
+      requestHash: hashArtifactContent({ callId: correctionCallId, input: correctionInput }) })
+    const successorRef = { artifactId: successor.artifactId, version: successor.version,
+      contentHash: successor.contentHash, sourceDigest: successor.sourceDigest }
+    const persistedInput = {
+      baseArtifactId: correctionInput.baseArtifactId, baseHash: correctionInput.baseHash,
+    }
+    const stepId = `task:${correctionWriterId}:step:0:attempt:1`
+    const resumeRows = [
+      { id: "correction-call-item", revision: 1, stepId, attempt: 1, ordinal: 0, sessionId: "session-1", turnId: "turn-1",
+        rootTaskId: "root-1", taskId: correctionWriterId, type: "tool_call", status: "completed",
+        content: { toolCallId: correctionCallId, toolName: "cover_letter.draft", input: persistedInput } },
+      { id: "correction-result-item", revision: 1, stepId, attempt: 1, ordinal: 0, sessionId: "session-1", turnId: "turn-1",
+        rootTaskId: "root-1", taskId: correctionWriterId, type: "tool_result", status: "completed",
+        content: { toolCallId: correctionCallId, output: { artifactRef: successorRef }, errorCode: null } },
+    ]
+    const restored = buildChildResumeObservations(resumeRows, correctionLease)
+    const ordinaryReviewRead = artifacts.readRevisionReview.bind(artifacts)
+    const reviewRead = vi.spyOn(artifacts, "readRevisionReview").mockImplementation(async (readScope, revision) => {
+      const prior = await ordinaryReviewRead(readScope, revision)
+      if (prior) return prior
+      const currentHead = await artifacts.read(readScope.userId, predecessorRef.artifactId)
+      const persistedSuccessor = await artifacts.readVersion(readScope, successorRef)
+      const receipt = restored.childToolReplayReceipts.find(candidate => candidate.toolCallId === correctionCallId)
+      const boundReceipt = receipt?.userId === correctionLease.userId && receipt.sessionId === correctionLease.sessionId
+        && receipt.turnId === correctionLease.turnId && receipt.rootTaskId === correctionLease.rootTaskId
+        && receipt.taskId === correctionWriterId && receipt.attempt === 1 && receipt.toolName === "cover_letter.draft"
+        && receipt.result.status === "completed" && receipt.result.errorCode === null
+        && JSON.stringify(receipt.input) === JSON.stringify(persistedInput)
+        && JSON.stringify(receipt.result.output) === JSON.stringify({ artifactRef: successorRef })
+      if (!boundReceipt || !persistedSuccessor || !currentHead || revision.dependencyTaskId !== reviewerFence.taskId
+        || revision.reviewHash !== reviewHash || revision.currentSourceDigest !== preparation.sourceDigest
+        || persistedSuccessor.version !== predecessorRef.version + 1 || persistedSuccessor.previousHash !== predecessorRef.contentHash
+        || persistedSuccessor.taskId !== correctionWriterId || persistedSuccessor.toolCallId !== correctionCallId
+        || persistedSuccessor.sourceDigest !== preparation.sourceDigest || currentHead.version !== successorRef.version
+        || currentHead.hash !== successorRef.contentHash) return null
+      return artifacts.findReview(readScope, revision.artifactRef)
+    })
+    const draftWrite = vi.spyOn(artifacts, "writeDraft")
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: successorRef }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const pool = selectedJobPool({ writerTaskId: correctionWriterId, reviewerTaskId: reviewerFence.taskId,
+      writerDependsOnReviewer: true, reviewerResult, writerAttemptCount: 2, writerLeaseOwner: "worker-2" })
+    const persistence = recordingStore()
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence, model, pool, mailboxReader: emptyMailboxReader,
+      resumeLoader: async lease => lease.attemptCount === 2 ? {
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 2n, consumedInputIds: [],
+          usage: { inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0 } },
+        observations: restored.observations, childToolReplayReceipts: restored.childToolReplayReceipts,
+      } : undefined })
+
+    const result = await executor({ lease: correctionLease })
+
+    expect(reviewRead).toHaveBeenCalledOnce()
+    await expect(reviewRead.mock.results[0]?.value).resolves.toMatchObject({ id: storedReview.id, status: "needs_revision" })
+    expect(result).toMatchObject({ status: "completed", result: { structuredResult: { artifactRef: successorRef } } })
+    expect(requests).toHaveLength(1)
+    const restoredContext = stringsDeep(requests[0]!).join("\n")
+    expect(restoredContext).toContain(successorRef.artifactId)
+    expect(restoredContext).toContain(successorRef.contentHash)
+    expect(restoredContext).toContain('"version":2')
+    expect(restoredContext).not.toContain(correctionInput.content)
+    expect(restoredContext).toContain(finding.message)
+    expect(JSON.stringify(persistence.writes)).not.toContain(finding.message)
+    expect(draftWrite).not.toHaveBeenCalled()
+    expect(await artifacts.readVersion(correctionScope, successorRef)).toMatchObject({ id: successor.id, version: 2,
+      previousHash: predecessorRef.contentHash, taskId: correctionWriterId, toolCallId: correctionCallId })
   })
 
   it("fails closed when an omitted dependency hides a persisted direct Reviewer edge", async () => {

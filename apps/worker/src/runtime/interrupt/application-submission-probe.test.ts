@@ -25,6 +25,12 @@ const objectiveSource = {
   reviewTurnId: "review-turn-1", materialProofHash: "f".repeat(64),
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
+}
+
 function fakePool(turnStatus = "in_progress", interrupted = false, markerRowCount = 1, markerCommitFails = false) {
   readTurnState.mockResolvedValue({ sessionStatus: "running", turnStatus, interrupted });
   const clients: Array<{ role: "marker" | "boundary"; query: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }> = [];
@@ -100,6 +106,41 @@ describe("application submission Stop probe", () => {
     expect(clients[3]?.query).toHaveBeenLastCalledWith("ROLLBACK");
   });
 
+  it("retains the ready lease across acquisition abort and timeout until the route owner releases it", async () => {
+    vi.useFakeTimers()
+    const { pool, clients, connect } = fakePool()
+    const controller = new AbortController()
+    const ready = await acquireApplicationSubmissionStartFence(pool, scope, { signal: controller.signal, timeoutMs: 1_000 })
+    expect(ready.state).toBe("ready")
+
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(1_001)
+    expect(clients[1]?.release).not.toHaveBeenCalled()
+    const nextAttempt = acquireApplicationSubmissionStartFence(pool, scope)
+    await Promise.resolve()
+    expect(connect).toHaveBeenCalledTimes(2)
+    await ready.release(true)
+    const next = await nextAttempt
+    expect(clients[1]?.query).toHaveBeenLastCalledWith("COMMIT")
+    expect(clients[1]?.release).toHaveBeenCalledOnce()
+    expect(connect).toHaveBeenCalledTimes(4)
+    await next.release(false)
+  })
+
+  it("destroys a ready lease once when its route owner forcibly aborts release", async () => {
+    const { pool, clients, connect } = fakePool()
+    const ready = await acquireApplicationSubmissionStartFence(pool, scope)
+    expect(ready.state).toBe("ready")
+    ready.abort?.()
+    ready.abort?.()
+    expect(clients[1]?.release).toHaveBeenCalledOnce()
+    expect(clients[1]?.release).toHaveBeenCalledWith(expect.any(Error))
+    await expect(ready.release(true)).rejects.toThrow("Submission fence was forcibly released.")
+    const next = await acquireApplicationSubmissionStartFence(pool, scope)
+    expect(connect).toHaveBeenCalledTimes(4)
+    await next.release(false)
+  })
+
   it("releases its permit after a checkout error or a stopped turn", async () => {
     const fallback = fakePool("interrupted");
     const connect = vi.fn()
@@ -146,6 +187,34 @@ describe("application submission Stop probe", () => {
     expect(clients[0]?.release).toHaveBeenCalledOnce();
     await fence.release(false);
   });
+
+  it("keeps an in-flight marker COMMIT uncertain when cancellation wins and never opens the boundary", async () => {
+    const commitStarted = deferred<void>()
+    const lateCommit = deferred<{ rows: unknown[]; rowCount: number }>()
+    const query = vi.fn(async (sql: string) => {
+      if (sql === "COMMIT") { commitStarted.resolve(); return lateCommit.promise }
+      if (["BEGIN", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes("UPDATE application_tasks")) return { rows: [{ id: "task_1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ status: "running" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns"')) return { rows: [{ status: "in_progress" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"')) return { rows: [{ stopped: false }], rowCount: 1 }
+      throw new Error(`Unexpected query: ${sql}`)
+    })
+    const release = vi.fn()
+    const connect = vi.fn().mockResolvedValue({ query, release })
+    const controller = new AbortController()
+    const pending = acquireApplicationSubmissionStartFence({ connect } as unknown as Pool, scope, {
+      signal: controller.signal, timeoutMs: 1_000,
+    })
+
+    await commitStarted.promise
+    controller.abort()
+    await expect(pending).resolves.toMatchObject({ state: "uncertain" })
+    expect(connect).toHaveBeenCalledOnce()
+    expect(release).toHaveBeenCalledWith(expect.any(Error))
+
+    lateCommit.resolve({ rows: [], rowCount: 1 })
+  })
 
   it("declines an invalid reviewed receipt before writing the durable request marker", async () => {
     const { pool, clients, connect } = fakePool();
@@ -204,6 +273,74 @@ describe("application submission Stop probe", () => {
     expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT");
     expect(clients[1]?.query).toHaveBeenCalledWith("ROLLBACK");
     expect(clients[1]?.release).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an Objective boundary Stop uncertain after the marker", async () => {
+    const { pool, clients } = fakePool();
+    readTurnState
+      .mockResolvedValueOnce({ sessionStatus: "running", turnStatus: "in_progress", interrupted: false })
+      .mockResolvedValueOnce({ sessionStatus: "running", turnStatus: "interrupted", interrupted: true });
+    requestFence
+      .mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+        kind: "current", value: await work(), sourceTurnId: null, objectiveSource,
+      }))
+      .mockImplementationOnce(async (_client, _scope, _phase, expected, work) => ({
+        kind: "current", value: await work(), sourceTurnId: null, objectiveSource: expected && typeof expected === "object" ? expected.source : undefined,
+      }));
+
+    const fence = await acquireApplicationSubmissionStartFence(pool, scope);
+
+    expect(fence).toMatchObject({ state: "uncertain", markerCommitted: true });
+    expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT");
+    expect(clients[1]?.query).toHaveBeenLastCalledWith("ROLLBACK");
+    expect(clients.every(client => client.release.mock.calls.length === 1)).toBe(true);
+  });
+
+  it.each([null, "source-turn-1"] as const)("keeps a %s boundary superseded after marker commit uncertain", async sourceTurnId => {
+    const { pool, clients } = fakePool();
+    requestFence
+      .mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+        kind: "current", value: await work(), sourceTurnId,
+      }))
+      .mockResolvedValueOnce({ kind: "superseded" });
+    const fence = await acquireApplicationSubmissionStartFence(pool, scope);
+    expect(fence).toMatchObject({ state: "uncertain", markerCommitted: true });
+    expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT");
+    expect(clients[1]?.release).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an Objective boundary superseded after marker commit uncertain", async () => {
+    const { pool, clients } = fakePool();
+    requestFence
+      .mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+        kind: "current", value: await work(), sourceTurnId: null, objectiveSource,
+      }))
+      .mockResolvedValueOnce({ kind: "superseded" });
+
+    const fence = await acquireApplicationSubmissionStartFence(pool, scope);
+
+    expect(fence.state).toBe("uncertain");
+    expect(clients[0]?.query).toHaveBeenCalledWith("COMMIT");
+    expect(clients[1]?.query).toHaveBeenCalledWith("COMMIT");
+    expect(clients.every(client => client.release.mock.calls.length === 1)).toBe(true);
+  });
+
+  it("keeps a reviewed boundary Stop uncertain after the marker", async () => {
+    const { pool } = fakePool();
+    readTurnState
+      .mockResolvedValueOnce({ sessionStatus: "running", turnStatus: "in_progress", interrupted: false })
+      .mockResolvedValueOnce({ sessionStatus: "running", turnStatus: "interrupted", interrupted: true });
+    requestFence
+      .mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+        kind: "current", value: await work(), sourceTurnId: "selected-source-turn",
+      }))
+      .mockImplementationOnce(async (_client, _scope, _phase, _expected, work) => ({
+        kind: "current", value: await work(), sourceTurnId: "selected-source-turn",
+      }));
+
+    const fence = await acquireApplicationSubmissionStartFence(pool, scope);
+
+    expect(fence).toMatchObject({ state: "uncertain", markerCommitted: true });
   });
 
   it("checks scoped session, Turn, and interruption state", async () => {

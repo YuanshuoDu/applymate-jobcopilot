@@ -1,5 +1,6 @@
 import type { Page } from "playwright-core";
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js";
+import { clickObjectiveSubmitOnce, type ObjectiveGreenhouseSubmissionObservation } from "./objective-greenhouse-submission-observation.js";
 import { clickSubmit, fillCustomQuestions, getPersonaValue, tryFill, uploadResume } from "./helpers.js";
 
 /** Field map: try each selector in order, fill from persona if found */
@@ -27,7 +28,7 @@ const COVER_LETTER_SELECTORS = [
 export async function runGreenhouseFlow(
   page: Page,
   task: ApplyTask,
-  options?: { reviewedCoverLetter: string; objectiveReviewedSubmission?: true },
+  options?: { reviewedCoverLetter: string; objectiveReviewedSubmission?: true; submissionObservation?: ObjectiveGreenhouseSubmissionObservation },
 ): Promise<HarnessResult> {
   const startedAt = Date.now();
   const objectiveSubmission = options?.objectiveReviewedSubmission === true;
@@ -106,6 +107,20 @@ export async function runGreenhouseFlow(
     ".submit-button",
     "#submit-app",
   ];
+  if (objectiveSubmission) {
+    const observation = options?.submissionObservation;
+    if (!observation) return { status: "submission_blocked", error: "Objective submit observation was unavailable.", durationMs: Date.now() - startedAt, log };
+    try {
+      const clicked = await clickObjectiveSubmitOnce(page, submitSelectors, task.beforeSubmit, observation);
+      if (clicked === "blocked") return { status: "submission_blocked", error: "Objective submit authorization was denied.", durationMs: Date.now() - startedAt, log };
+      if (clicked === "observer_unavailable") return { status: "submission_blocked", error: "Objective submit observation could not be armed.", durationMs: Date.now() - startedAt, log };
+      if (clicked === "click_error") return { status: "manual", error: "objective_submit_observation_click_error", durationMs: Date.now() - startedAt, log };
+      if (clicked === "missing") return { status: "manual", error: "No submit button found", durationMs: Date.now() - startedAt, log };
+      const outcome = await observation.waitForConfirmation();
+      if (outcome !== "confirmed") return { status: "manual", error: `objective_submit_observation_${outcome}`, durationMs: Date.now() - startedAt, log };
+      return { status: "submitted", turns: 1, durationMs: Date.now() - startedAt, log };
+    } finally { observation.dispose() }
+  }
   const submission = await clickSubmit(page, submitSelectors, task.beforeSubmit);
   if (submission.outcome === "blocked") {
     log.push({ field: submission.reason, selector: "submit", action: "submission_blocked" });

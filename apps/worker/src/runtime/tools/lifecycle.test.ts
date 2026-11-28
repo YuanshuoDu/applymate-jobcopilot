@@ -28,6 +28,7 @@ const planCall: LifecycleCall = { ...call, toolName: "agent.plan" }
 const tailorCall: LifecycleCall = { ...call, toolName: "agent.tailor" }
 const numericDelegateTaskId = "subagent-00000000-0000-4000-8000-000000000002"
 const scoutDelegateCall: LifecycleCall = { ...call, id: "delegate-call", toolName: "scout.delegate", taskId: "parent-1", rootTaskId: "root-1" }
+const retirementCall: LifecycleCall = { ...call, toolName: "agent.retire_superseded_scout", taskId: "root-1", rootTaskId: "root-1" }
 const prepareTaskId = "subagent-abcdefab-cdef-4abc-8def-abcdefabcdef"
 const scheduledPrepareSummary = {
   schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: prepareTaskId, attemptCount: 2,
@@ -267,6 +268,16 @@ describe("ToolLifecycle", () => {
     expect(returned).toEqual(prepareLifecycleValue(raw).safe)
     expect(returned).not.toEqual(raw)
   })
+  it("keeps unmarked retirement IDs on generic redaction", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const raw = { taskId: numericDelegateTaskId, status: "interrupt_requested", attempt: 2 }
+    const returned = await lifecycle.completed(retirementCall, raw)
+    expect(returned).toEqual(prepareLifecycleValue(raw).safe)
+    expect(returned).toMatchObject({ taskId: "subagent-[REDACTED_PHONE]", status: "interrupt_requested", attempt: 2 })
+    expect(sink.events[0]?.payload.output).toEqual(returned)
+  })
+
   it("emits replayable started, progress, and result Items without raw sensitive data", async () => {
     const sink = new InMemoryToolLifecycleSink()
     const lifecycle = new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" })

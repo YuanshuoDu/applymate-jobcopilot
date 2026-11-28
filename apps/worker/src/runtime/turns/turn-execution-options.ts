@@ -43,6 +43,8 @@ export type PrepareFinalDependencyWait = (input: PrepareFinalDependencyWaitInput
   | Promise<null | Readonly<{ taskIds: readonly string[] }>>
 
 export type TurnExecutionOptions = {
+  /** Private recovery marker for a Root batch rejected before any tool dispatch. */
+  readonly dependencyWaitBatchRejected?: true
   readonly identity: TurnExecutionIdentity
   readonly scope: TenantScope
   readonly goal: string

@@ -1,3 +1,4 @@
+import type { TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import type pg from "pg"
 import type { RuntimePolicyDecision } from "@jobcopilot/agent-policy"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
@@ -16,13 +17,15 @@ import { failSelectedJobPreparationUnavailable } from "./selected-job-preparatio
 import { canonicalSelectedJobBatchRuntimeAvailable, failCanonicalSelectedJobBatchUnavailable, prepareCanonicalSelectedJobBatchForTurn, type CanonicalSelectedJobBatchReady } from "./canonical-selected-job-batch-setup.js"
 import { loadSelectedJobPreparation } from "./selected-job-preparation.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
-import type { TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgCoordinationStore } from "./mailbox/store.js"
 import { createPgDurableWaitPort } from "./subagents/durable-wait-store.js"
 import type { RootTaskStore } from "./subagents/root-task-store.js"
+import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-terminal-assessment.js"
+import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
 import { registerCanonicalObjectiveTailorTool, type ObjectiveTailorToolVersion } from "./canonical-turn-objective-tailor-mode.js"
+import { registerTaskGraphSupersededScoutRetirementTool } from "./tools/task-graph-retire-superseded-scout.js"
 import { assertCanonicalCoordinationSurface, assertCanonicalQuestionSurface, isNativeQuestionWaitEnabled } from "./turns/canonical-runtime-tool-recovery.js"
 import { failInteractiveDiscoveryUnavailable, failObjectiveTaskGraphUnavailable, objectiveTaskGraphRootToolAllowed, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
 import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurface } from "./interactive-discovery-contract.js"
@@ -31,8 +34,6 @@ import { toolSafeDurableWaitPort } from "./tools/coordination-executor-support.j
 import type { CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import type { CanonicalSessionProjection } from "./canonical-session-projection.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
-import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-terminal-assessment.js"
-import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
 import type { DiscoveryShortlistResult } from "./subagents/discovery-shortlist.js"
 
 type TaskGraphRuntimeResult = Awaited<ReturnType<typeof taskGraphRuntimeForTurn>>
@@ -84,6 +85,7 @@ export function taskGraphTemplateRoleView(
     return Object.freeze(roles)
   } catch { return undefined }
 }
+
 
 export async function prepareCanonicalTurnSetup(input: {
   readonly pool: pg.Pool
@@ -154,7 +156,10 @@ export async function prepareCanonicalTurnSetup(input: {
     coordination: input.coordinationEnabled, nativeRoot: turnCoordination.nativeOptions.enabled,
     requested: options.nativeQuestionWaitEnabled, customAdapters: !!options.turnEngineStoreFactory || !!options.toolRuntimeFactory,
   })
-  const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, input.coordinationEnabled, graph.enabled)
+  const scoutRetirementPolicyEnabled = objectiveTaskGraphMode && graph.enabled && input.coordinationEnabled
+    && input.childExecutionEnabled && input.consumeWaitOutcomes
+    && typeof options.taskGraphCommandPort?.requestSupersededScoutRetirement === "function"
+  const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, input.coordinationEnabled, graph.enabled, scoutRetirementPolicyEnabled)
   const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
   const toolCapabilities = [...new Set([...configuredCapabilities, ...(input.coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
   const lifecycle = { sink: null as ToolLifecycleSink | null, owner: null as ExecutionOwner | null, taskGraphParentAttemptCount: null as number | null, policyDecisionRecorder: null as ((decision: RuntimePolicyDecision) => Promise<void>) | null }
@@ -189,6 +194,10 @@ export async function prepareCanonicalTurnSetup(input: {
       && input.coordinationEnabled && input.childExecutionEnabled && input.consumeWaitOutcomes && !selectedJobBatch && !graph.selectedJobMode && !graph.scheduledDraftMode,
     flags: options.productionFlags, options: { turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
       parentLeaseOwner: lease.ownerId, parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null } })
+  registerTaskGraphSupersededScoutRetirementTool(toolRuntime.registry, objectiveTaskGraphMode, {
+    commandPort: options.taskGraphCommandPort, manager, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+    parentLeaseOwner: lease.ownerId, parentAttemptCount: () => lifecycle.taskGraphParentAttemptCount,
+  })
   if (input.coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
   if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)
   const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), graph.selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool)

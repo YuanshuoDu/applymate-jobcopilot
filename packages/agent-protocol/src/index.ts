@@ -70,6 +70,13 @@ export {
   selectedJobBatchTemplatesForSlot,
 } from './selected-job-batch-templates.js'
 export type { SelectedJobBatchSlotId, SelectedJobBatchTemplateEntry, SelectedJobBatchTemplateId } from './selected-job-batch-templates.js'
+export {
+  finalTaskGraphArtifactProofInput,
+  isFinalTaskGraphArtifactVersionProof,
+  parseFinalTaskGraphArtifactRef,
+  TASK_GRAPH_FINAL_ARTIFACT_MANIFEST_SCHEMA,
+} from './task-graph-final-artifact-proof.js'
+export type { FinalTaskGraphArtifactRef } from './task-graph-final-artifact-proof.js'
 export { AgentStepSchema, AgentStepUsageSchema, StepStatusSchema } from './step.js'
 export type { AgentStep, AgentStepUsage, StepStatus } from './step.js'
 export {

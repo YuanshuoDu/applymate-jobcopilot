@@ -7,6 +7,7 @@ import { tmpdir } from "node:os"
 import { generateResumePdf, type ResumeContent } from "../db/resume-pdf.js"
 import type { ApplyTask, HarnessResult } from "../harness/agent-harness.js"
 import { runGreenhouseFlow } from "../flows/greenhouse-flow.js"
+import type { ObjectiveGreenhouseSubmissionObservation } from "../flows/objective-greenhouse-submission-observation.js"
 
 export type ObjectiveApplicationSubmitMaterial = Readonly<{
   reviewedResumeContent: unknown
@@ -15,7 +16,7 @@ export type ObjectiveApplicationSubmitMaterial = Readonly<{
   approvedApplyUrl: string
 }>
 
-type SubmitInput = Readonly<{ userId: string; task: ApplyTask; material: unknown; page: Page }>
+type SubmitInput = Readonly<{ userId: string; task: ApplyTask; material: unknown; page: Page; observation?: ObjectiveGreenhouseSubmissionObservation }>
 const MATERIAL_KEYS = ["approvedApplyUrl", "confirmedAnswers", "reviewedCoverLetter", "reviewedResumeContent"]
 const MAX_JSON_NODES = 10_000
 
@@ -32,6 +33,7 @@ export async function runObjectiveGreenhouseApplicationSubmit(input: SubmitInput
     || greenhouseJobIdentity(input.task.applyUrl) !== greenhouseJobIdentity(material.approvedApplyUrl)
     || liveGreenhouseTarget(input.page) !== greenhouseJobIdentity(material.approvedApplyUrl)) return unavailable(startedAt)
   if (input.task.dryRun) return { status: "dry-run", durationMs: Date.now() - startedAt, turns: 1, log: [] }
+  if (!input.observation) return unavailable(startedAt)
 
   const pdfOwnerId = `objective-${randomUUID()}`
   let resumePath: string
@@ -54,6 +56,7 @@ export async function runObjectiveGreenhouseApplicationSubmit(input: SubmitInput
     return await runGreenhouseFlow(input.page, task, {
       reviewedCoverLetter: material.reviewedCoverLetter,
       objectiveReviewedSubmission: true,
+      submissionObservation: input.observation,
     })
   } finally {
     cleanupGeneratedResume(pdfOwnerId)

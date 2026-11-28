@@ -21,6 +21,7 @@ import {
 } from "./objective-reported-score-floor.js"
 export { parseObjectiveTailorFinalOutcome, OBJECTIVE_TAILOR_FINAL_OUTCOME_SCHEMA }
 export type { ObjectiveTailorFinalOutcomeProjection }
+import { validateObjectiveSourceBinding } from "./task-graph-follow-up-validation.js"
 
 type OrdinarySummaryBuilder = (loaded: LoadedGraph, historical?: ReadonlySet<number>, resolved?: ReadonlySet<string>) => TaskGraphFinalSummaryBinding | null
 
@@ -90,7 +91,7 @@ export function readBoundObjectiveTailorFinalOutcome(value: unknown): ObjectiveT
     const descriptor = Object.getOwnPropertyDescriptor(row, "objectiveTailorFinalOutcome")
     const outcome = descriptor?.enumerable && "value" in descriptor ? parseObjectiveTailorFinalOutcome(descriptor.value) : null
     const members = row.members
-    if (!outcome || row.graphRevision !== outcome.graphRevision || row.summary && record(row.summary)?.graphRevision !== outcome.graphRevision
+    if (!outcome || !validateObjectiveSourceBinding(row) || row.graphRevision !== outcome.graphRevision || row.summary && record(row.summary)?.graphRevision !== outcome.graphRevision
       || typeof row.rootTaskId !== "string" || !row.rootTaskId.trim()
       || typeof row.graphItemId !== "string" || row.graphItemId !== taskGraphItemId(row.rootTaskId) || !dense(members, 8) || members.length !== outcome.sourceNodeCount) return null
     const taskIds = new Set<string>()
@@ -100,7 +101,7 @@ export function readBoundObjectiveTailorFinalOutcome(value: unknown): ObjectiveT
         || member.role !== member.templateId || typeof member.nodeKey !== "string" || !member.nodeKey.trim()
         || typeof member.taskType !== "string" || !member.taskType.trim() || typeof member.taskId !== "string" || !member.taskId.trim()
         || taskIds.has(member.taskId) || typeof member.taskStatus !== "string" || !["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"].includes(member.taskStatus)
-        || typeof member.kind !== "string" || !["business", "historical"].includes(member.kind)) return null
+        || typeof member.kind !== "string" || !["business", "historical", "retired"].includes(member.kind)) return null
       taskIds.add(member.taskId)
     }
     return outcome
