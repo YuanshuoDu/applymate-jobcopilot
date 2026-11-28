@@ -1,10 +1,11 @@
-import { CoordinationError, type CoordinationRuntimeOptions, type CoordinationTaskView, type DurableWaitPort } from "./coordination-types.js"
+import { CoordinationError, type CoordinationRuntimeOptions, type CoordinationTaskView, type DurableWaitPort, type SponsorshipWaitObservation } from "./coordination-types.js"
 import { TERMINAL_TASK_STATUSES } from "./coordination-followup.js"
 import { validatedStructuredResult } from "./coordination-result-aggregate.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import { projectNativeVerificationResult } from "./native-verification-feedback-projection.js"
 import { parseTaskGraphVerificationCriterionIds, parseTaskGraphVerificationReport } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
+import { parseSponsorshipObservationPublicFrame } from "../subagents/sponsorship-observation-contract.js"
 import { sanitizeLifecyclePreview } from "./redaction.js"
 import type { ToolExecutionContext } from "./types.js"
 
@@ -12,7 +13,7 @@ export type CoordinationExecutorOptions = CoordinationRuntimeOptions
 
 const WAIT_RESULT_MAX_BYTES = 2 * 1024
 const WAIT_FAILURE_MAX_BYTES = 500
-const OMITTED_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget", "discoveryRecovery"])
+const OMITTED_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget", "discoveryRecovery", "sponsorshipObservations"])
 
 export function currentTurnTask(context: ToolExecutionContext, task: CoordinationTaskView): CoordinationTaskView {
   if (task.turnId !== context.turnId) throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
@@ -69,14 +70,16 @@ export function taskOutput(task: CoordinationTaskView) {
   return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, role: task.role, taskType: task.taskType, status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts, leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null, interruptRequestedAt: task.interruptRequestedAt?.toISOString() ?? null, result: terminal ? waitResult(task.result) : null, failureReason: terminal ? boundedFailureReason(task.failureReason) : null }
 }
 
-export function waitTaskOutput(task: CoordinationTaskView) {
+export function waitTaskOutput(task: CoordinationTaskView, sponsorshipObservations?: readonly SponsorshipWaitObservation[]) {
   const checked = validatedStructuredResult(task)
+  const baseResult = checked.invalid ? null : waitResult(task.result)
+  const result = addSponsorshipWaitObservations(baseResult, sponsorshipObservations, checked.result)
   return {
     taskId: task.id, status: task.status, role: task.role,
     attemptCount: task.attemptCount, maxAttempts: task.maxAttempts,
     leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null,
     interruptRequestedAt: task.interruptRequestedAt?.toISOString() ?? null,
-    result: checked.invalid ? null : waitResult(task.result),
+    result,
     failureReason: boundedFailureReason(checked.invalid ? "invalid_structured_result" : task.failureReason),
   }
 }
@@ -85,6 +88,26 @@ export function waitResult(value: unknown): ReturnType<typeof sanitizeLifecycleP
   if (value === undefined || value === null) return null
   try { return stripForeignResultKeys(sanitizeLifecyclePreview(projectNativeVerificationResult(projectTaskGraphVerificationResult(value)), WAIT_RESULT_MAX_BYTES)) }
   catch { return { $truncated: true, summary: "Task result was omitted because it could not be safely encoded" } }
+}
+
+function addSponsorshipWaitObservations(result: ReturnType<typeof sanitizeLifecyclePreview> | null,
+  observations: readonly SponsorshipWaitObservation[] | undefined,
+  structured: ReturnType<typeof validatedStructuredResult>["result"]): ReturnType<typeof sanitizeLifecyclePreview> | null {
+  if (!result || !observations?.length || !structured || structured.role !== "scout"
+    || observations.length !== structured.candidates.length) return result
+  const row = safeResultRecord(result)
+  if (!row) return result
+  const expectedIds = structured.candidates.map(candidate => candidate.jobId)
+  if (observations.some((item, index) => item.jobId !== expectedIds[index] || item.sourceRef !== "saved_job_listing"
+    || item.guidance !== "Use owner-scoped jobs.get for this Job. Sponsorship interpretation remains unverified without an independent same-role, same-country review bound to the exact source."
+    || !parseSponsorshipObservationPublicFrame(item.observation) || item.observation.status === "explicit")) return result
+  const { sponsorshipObservations: _untrusted, ...safe } = row
+  return { ...safe, sponsorshipObservations: observations } as unknown as ReturnType<typeof sanitizeLifecyclePreview>
+}
+
+function safeResultRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  try { const prototype = Object.getPrototypeOf(value); return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : undefined } catch { return undefined }
 }
 
 function projectTaskGraphVerificationResult(value: unknown): unknown {

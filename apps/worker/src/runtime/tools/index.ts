@@ -9,6 +9,7 @@ import { createToolResultsReadTool } from "./tool-results-read-tool.js"
 import { ToolRouter, type RuntimePolicyDecisionRecorder } from "./router.js"
 import type { PolicyEngine } from "../policy/index.js"
 import { createCoordinationTools } from "./coordination-tools.js"
+import { readSponsorshipWaitObservations } from "../subagents/sponsorship-observation-binder.js"
 import { createArtifactTools, type ArtifactToolStore } from "./artifact-tools.js"
 import type { CoordinationRuntimeOptions, DurableWaitPort, CoordinationStore, NativeCoordinationRuntimeOptions } from "./coordination-types.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -86,6 +87,7 @@ export function createWorkerToolRuntime(
       wait: coordination.wait,
       nativeCoordination: coordination.nativeCoordination,
       verificationRequirements: coordination.verificationRequirements,
+      sponsorshipObservationReader: task => readSponsorshipWaitObservations(pool, task),
     }
     definitions.push(...createCoordinationTools(options))
     if (coordination.askUserEnabled) definitions.push(createAskUserTool() as RuntimeToolDefinition)

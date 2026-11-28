@@ -2,6 +2,7 @@ import type { AgentTreeManager } from "../subagents/manager.js"
 import type { SubagentTaskRecord } from "../subagents/types.js"
 import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
+import type { SponsorshipObservationPublicFrame } from "../subagents/sponsorship-observation-contract.js"
 import { ToolExecutionError, type ToolExecutionContext } from "./types.js"
 
 export type CoordinationTaskView = Pick<SubagentTaskRecord,
@@ -14,6 +15,13 @@ export type CoordinationTaskView = Pick<SubagentTaskRecord,
   readonly result?: unknown | null
   readonly failureReason?: string | null
 }
+
+export type SponsorshipWaitObservation = Readonly<{
+  readonly jobId: string
+  readonly sourceRef: "saved_job_listing"
+  readonly observation: SponsorshipObservationPublicFrame
+  readonly guidance: "Use owner-scoped jobs.get for this Job. Sponsorship interpretation remains unverified without an independent same-role, same-country review bound to the exact source."
+}>
 
 export type CoordinationMessage = {
   readonly id: string
@@ -164,6 +172,8 @@ export type CoordinationRuntimeOptions = {
   readonly nativeCoordination?: NativeCoordinationRuntimeOptions
   /** Server-resolved canonical objective requirements; never supplied by a model tool call. */
   readonly verificationRequirements?: RootTaskVerificationRequirementsResolution
+  /** Server-only revalidation for the model-facing, status-only Scout wait projection. */
+  readonly sponsorshipObservationReader?: (task: CoordinationTaskView) => Promise<readonly SponsorshipWaitObservation[] | undefined>
 }
 
 export class CoordinationError extends ToolExecutionError {

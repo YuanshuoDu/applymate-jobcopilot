@@ -1,12 +1,14 @@
-import { assertRootChildCreationUsesCoveragePlan, CoordinationError, type CoordinationTaskView } from "./coordination-types.js"
+import { assertRootChildCreationUsesCoveragePlan, CoordinationError, type CoordinationTaskView, type SponsorshipWaitObservation } from "./coordination-types.js"
 import { executeFollowup as runFollowup } from "./coordination-pending-replacement.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import type { ToolExecutionContext } from "./types.js"
 import { APPLICATION_FILLER_ROLE, getSubagentRolePolicy, isHarnessSubagentRole } from "../subagents/role-policy.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { SPONSORSHIP_OBSERVATION_PUBLIC_SCHEMA } from "../subagents/sponsorship-observation-contract.js"
 import { hasNestedScoutPrivateContext, hasNestedScoutProtectedActions } from "../subagents/nested-scout-creation-authority.js"
 import { appendNativeCoordination, nativeCoordinationKey, nativeCoordinationOutput, plannerEnabledRoot } from "./task-graph-coordination-bridge.js"
-import { buildScoutAnalystAggregate } from "./coordination-result-aggregate.js"
+import { buildScoutAnalystAggregate, validatedStructuredResult } from "./coordination-result-aggregate.js"
+import { isCanonicalJobId } from "./job-read-output-redaction.js"
 import {
   activity,
   assertSpawnReplay,
@@ -49,6 +51,31 @@ async function assertPostGateChildCreationAllowed(context: ToolExecutionContext,
     throw new CoordinationError("coordination_scheduled_post_gate_plan_required",
       "Use the verified scheduled post-Gate agent.plan continuation; direct spawn and follow-up are unavailable")
   }
+}
+
+const SPONSORSHIP_WAIT_GUIDANCE = "Use owner-scoped jobs.get for this Job. Sponsorship interpretation remains unverified without an independent same-role, same-country review bound to the exact source." as const
+const MAX_CONCURRENT_SPONSORSHIP_READS = 4
+
+function unavailableSponsorshipObservations(task: CoordinationTaskView): readonly SponsorshipWaitObservation[] | undefined {
+  const result = validatedStructuredResult(task).result
+  if (result?.role !== "scout" || result.candidates.length > 50
+    || result.candidates.some(candidate => !isCanonicalJobId(candidate.jobId))) return undefined
+  return result.candidates.map(candidate => ({ jobId: candidate.jobId, sourceRef: "saved_job_listing",
+    observation: { schemaVersion: SPONSORSHIP_OBSERVATION_PUBLIC_SCHEMA, status: "unavailable", reason: "read_failed" },
+    guidance: SPONSORSHIP_WAIT_GUIDANCE }))
+}
+
+async function mapConcurrent<T, U>(values: readonly T[], limit: number, visit: (value: T) => Promise<U>): Promise<U[]> {
+  const results = new Array<U>(values.length)
+  let nextIndex = 0
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, async () => {
+    while (true) {
+      const index = nextIndex++
+      if (index >= values.length) return
+      results[index] = await visit(values[index]!)
+    }
+  }))
+  return results
 }
 function expectedOutputSchema(value: unknown, role: string): { readonly schemaVersion: typeof ROLE_RESULT_SCHEMA; readonly role: "scout" | "analyst" } | undefined {
   if (value === undefined) return undefined
@@ -172,7 +199,14 @@ export async function executeWaitSubagents(context: ToolExecutionContext, input:
   })
   const hydratedTargets = result.status === "waiting" ? targets : await Promise.all(targets.map(async task => currentTurnTask(context, await visibleTask(context, task.id, options))))
   await activity(context, options, "wait_subagents", current?.id ?? null, { status: result.status, targetCount: targets.length }, input.idempotencyKey)
-  const tasks = hydratedTargets.map(waitTaskOutput)
+  const tasks = await mapConcurrent(hydratedTargets, MAX_CONCURRENT_SPONSORSHIP_READS, async task => {
+    let observations: readonly SponsorshipWaitObservation[] | undefined
+    if (options.sponsorshipObservationReader && task.status === "completed" && task.role === "scout" && task.taskType === "job_discovery") {
+      try { observations = await options.sponsorshipObservationReader(task) }
+      catch { observations = unavailableSponsorshipObservations(task) }
+    }
+    return waitTaskOutput(task, observations)
+  })
   const aggregate = buildScoutAnalystAggregate(hydratedTargets)
   return { waitId: result.waitId, status: result.status, taskIds: targets.map(task => task.id), deadlineAt: result.deadlineAt, matchedTaskIds: [...result.matchedTaskIds], tasks, ...(aggregate ? { aggregate } : {}) }
 }

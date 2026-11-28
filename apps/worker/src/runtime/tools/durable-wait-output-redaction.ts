@@ -2,6 +2,8 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { redactSensitiveValue } from "@jobcopilot/shared"
 import { isCanonicalRawSubagentWaitId } from "../subagents/subagent-wait-structural-ids.js"
 import { projectNativeVerificationResult } from "./native-verification-feedback-projection.js"
+import { parseSponsorshipObservationPublicFrame } from "../subagents/sponsorship-observation-contract.js"
+import { isCanonicalJobId } from "./job-read-output-redaction.js"
 
 const ROOT_WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -11,6 +13,7 @@ const TASK_STATE_FIELDS = ["attemptCount", "maxAttempts", "leaseExpiresAt", "int
 const WAIT_STATUSES = new Set(["waiting", "ready", "timed_out", "interrupted", "closed"])
 const TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const MAX_WAIT_TARGETS = 50
+const SPONSORSHIP_WAIT_GUIDANCE = "Use owner-scoped jobs.get for this Job. Sponsorship interpretation remains unverified without an independent same-role, same-country review bound to the exact source."
 export type DurableWaitToolName = "agent.wait" | "wait_subagents"
 export type DurableWaitOwnerKind = "turn" | "task"
 
@@ -32,6 +35,14 @@ export function redactDurableWaitOutput(value: unknown, toolName: DurableWaitToo
 
     const taskRows = readArray(receipt.tasks, 1, MAX_WAIT_TARGETS)
     if (taskRows.length !== taskIds.length) throw invalidReceipt()
+    const sponsorshipIds = taskRows.map(value => {
+      const row = exactObject(value, LEGACY_TASK_FIELDS, TASK_STATE_FIELDS)
+      const resultRecord = row.result !== null && typeof row.result === "object" && !Array.isArray(row.result)
+        ? row.result as Record<string, RepositoryJsonValue> : null
+      const ids = sponsorshipObservationIds(resultRecord)
+      if (ids && row.role !== "scout") throw invalidReceipt()
+      return ids
+    })
     taskRows.forEach((value, index) => {
       const task = exactObject(value, LEGACY_TASK_FIELDS, TASK_STATE_FIELDS)
       const hasTaskState = TASK_STATE_FIELDS.some(field => Object.hasOwn(task, field))
@@ -57,7 +68,17 @@ export function redactDurableWaitOutput(value: unknown, toolName: DurableWaitToo
       const safeTask = asRecord(row)
       const taskId = taskIds[index]
       if (taskId === undefined) throw invalidReceipt()
-      return { ...safeTask, taskId }
+      const ids = sponsorshipIds[index]
+      if (!ids) return { ...safeTask, taskId }
+      const result = asRecord(safeTask.result), frames = readArray(result.sponsorshipObservations, 1, 50)
+      if (frames.length !== ids.length) throw invalidReceipt()
+      const sponsorshipObservations = frames.map((frame, frameIndex) => {
+        const frameRow = asRecord(frame), jobId = ids[frameIndex]
+        const parsed = frameRow ? parseSponsorshipObservationPublicFrame(frameRow.observation) : null
+        if (!jobId || !frameRow || !parsed || parsed.status === "explicit") throw invalidReceipt()
+        return { ...frameRow, jobId }
+      })
+      return { ...safeTask, taskId, result: { ...result, sponsorshipObservations } }
     })
     return {
       ...safe,
@@ -69,6 +90,20 @@ export function redactDurableWaitOutput(value: unknown, toolName: DurableWaitToo
   } catch {
     throw invalidReceipt()
   }
+}
+
+function sponsorshipObservationIds(value: Record<string, RepositoryJsonValue> | null): string[] | undefined {
+  if (!value || !Object.hasOwn(value, "sponsorshipObservations")) return undefined
+  const rows = readArray(value.sponsorshipObservations, 1, 50), ids: string[] = []
+  for (const raw of rows) {
+    const frame = exactObject(raw, ["jobId", "sourceRef", "observation", "guidance"])
+    const observation = parseSponsorshipObservationPublicFrame(frame.observation)
+    if (typeof frame.jobId !== "string" || !isCanonicalJobId(frame.jobId) || ids.includes(frame.jobId)
+      || frame.sourceRef !== "saved_job_listing" || frame.guidance !== SPONSORSHIP_WAIT_GUIDANCE
+      || !observation || observation.status === "explicit") throw invalidReceipt()
+    ids.push(frame.jobId)
+  }
+  return ids
 }
 
 function validWaitId(value: RepositoryJsonValue | undefined, toolName: DurableWaitToolName, ownerKind: DurableWaitOwnerKind): value is string {

@@ -27,11 +27,14 @@ import type {
   CoordinationStore,
   CoordinationTaskView,
   DurableWaitPort,
+  SponsorshipWaitObservation,
 } from "./coordination-types.js"
 import { ToolSchemaValidator } from "./schema-validator.js"
 import type { ToolExecutionContext } from "./types.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { SPONSORSHIP_OBSERVATION_PUBLIC_SCHEMA } from "../subagents/sponsorship-observation-contract.js"
 import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
+import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import type { TaskGraphCommandPort, TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
 import { resolveRootTaskVerificationRequirements, type RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
@@ -895,6 +898,124 @@ describe("coordination executors", () => {
     expect(result.tasks[0]).not.toHaveProperty("userId")
     expect(Buffer.byteLength(result.tasks[1]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
     expect(runtime.store.activities).toContain("wait_subagents")
+  })
+
+  it("projects only a closed sponsorship status frame for a completed Scout wait", async () => {
+    const runtime = makeRuntime(), jobId = "c123456789012345678901234"
+    const structuredResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId, source: "greenhouse", url: "https://jobs.example/role/1", evidenceIds: ["source-ref"] }],
+      evidence: [{ id: "source-ref", kind: "job", ref: jobId, source: "greenhouse" }], summary: "One saved listing.",
+    }
+    const child = makeTask({ id: "scout-evidence", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/scout-evidence", depth: 1,
+      role: "scout", taskType: "job_discovery", status: "completed",
+      result: { status: "completed", finalText: "scout result", structuredResult } })
+    runtime.store.tasks.set(child.id, child)
+    const sponsorshipObservationReader = vi.fn(async (): Promise<readonly SponsorshipWaitObservation[]> => [{ jobId, sourceRef: "saved_job_listing",
+      observation: { schemaVersion: SPONSORSHIP_OBSERVATION_PUBLIC_SCHEMA, status: "inconclusive", reason: "interpretation_unverified" },
+      guidance: "Use owner-scoped jobs.get for this Job. Sponsorship interpretation remains unverified without an independent same-role, same-country review bound to the exact source." }])
+    const output = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "wait-sponsorship", taskIds: [child.id], mode: "all", timeoutMs: 5000,
+    }, { ...runtime.options, sponsorshipObservationReader })
+
+    expect(sponsorshipObservationReader).toHaveBeenCalledWith(expect.objectContaining({ id: child.id, attemptCount: child.attemptCount }))
+    expect(output.tasks[0]).toMatchObject({ result: { sponsorshipObservations: [{ jobId,
+      observation: { status: "inconclusive", reason: "interpretation_unverified" }, sourceRef: "saved_job_listing" }] } })
+    expect(JSON.stringify(output)).not.toContain("descriptionExcerpt")
+    expect(JSON.stringify(output)).not.toContain("bindingDigest")
+    expect(JSON.stringify(output)).toContain("interpretation remains unverified")
+  })
+
+  it("keeps the durable wait usable and reports bounded unavailable status if enrichment unexpectedly throws", async () => {
+    const runtime = makeRuntime(), jobId = "c123456789012345678901234"
+    const structuredResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId, source: "greenhouse", url: "https://jobs.example/role/1", evidenceIds: ["source-ref"] }],
+      evidence: [{ id: "source-ref", kind: "job", ref: jobId, source: "greenhouse" }], summary: "One saved listing.",
+    }
+    const child = makeTask({ id: "scout-enrichment-failure", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/scout-enrichment-failure", depth: 1,
+      role: "scout", taskType: "job_discovery", status: "completed", result: { status: "completed", structuredResult } })
+    runtime.store.tasks.set(child.id, child)
+    const sponsorshipObservationReader = vi.fn().mockRejectedValue(new Error("private database detail"))
+
+    const output = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "wait-sponsorship-failure", taskIds: [child.id], mode: "all", timeoutMs: 5000,
+    }, { ...runtime.options, sponsorshipObservationReader })
+
+    expect(output.status).toBe("ready")
+    expect(output.tasks[0]).toMatchObject({ result: { sponsorshipObservations: [{ jobId,
+      observation: { status: "unavailable", reason: "read_failed" } }] } })
+    expect(JSON.stringify(output)).not.toContain("private database detail")
+  })
+
+  it("omits the whole fallback sidecar above the redactor limit without failing the Scout wait", async () => {
+    const runtime = makeRuntime()
+    runtime.wait.wait = vi.fn(async input => ({ waitId: "wait-12345678-1234-4234-9234-123456789012", status: "ready" as const,
+      deadlineAt: "2026-11-27T00:00:00.000Z", matchedTaskIds: [...input.targetTaskIds] }))
+    const candidates = Array.from({ length: 51 }, (_value, index) => {
+      const jobId = `c${String(index).padStart(24, "0")}`, evidenceId = `source-${index}`
+      return { jobId, source: "greenhouse", url: `https://jobs.example/role/${index}`, evidenceIds: [evidenceId] }
+    })
+    const structuredResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates,
+      evidence: candidates.map(candidate => ({ id: candidate.evidenceIds[0]!, kind: "job", ref: candidate.jobId, source: candidate.source })),
+      summary: "Fifty-one saved listings." }
+    const child = makeTask({ id: "subagent-12345678-1234-4234-9234-123456789012", rootTaskId: "root-1", parentTaskId: "root-1",
+      path: "/root-1/many-scout-results", depth: 1, role: "scout", taskType: "job_discovery", status: "completed",
+      result: { status: "completed", structuredResult } })
+    runtime.store.tasks.set(child.id, child)
+    const sponsorshipObservationReader = vi.fn().mockRejectedValue(new Error("private database detail"))
+
+    const output = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "wait-sponsorship-over-limit", taskIds: [child.id], mode: "all", timeoutMs: 5000,
+    }, { ...runtime.options, sponsorshipObservationReader })
+    const safe = redactDurableWaitOutput(output, "agent.wait", "turn") as Record<string, unknown>
+    const safeTask = (safe.tasks as Array<Record<string, unknown>>)[0]!
+    const safeResult = safeTask.result as Record<string, unknown>
+
+    expect(output.status).toBe("ready")
+    expect(sponsorshipObservationReader).toHaveBeenCalledOnce()
+    expect(safeResult).toMatchObject({ $truncated: true })
+    expect(safeResult).not.toHaveProperty("sponsorshipObservations")
+  })
+
+  it("bounds sponsorship readers to four concurrent tasks while preserving wait order", async () => {
+    const runtime = makeRuntime()
+    const children = Array.from({ length: 9 }, (_value, index) => makeTask({ id: `scout-${index}`,
+      rootTaskId: "root-1", parentTaskId: "root-1", path: `/root-1/scout-${index}`, depth: 1,
+      role: "scout", taskType: "job_discovery", status: "completed", result: { status: "completed", finalText: `Scout ${index}` } }))
+    for (const child of children) runtime.store.tasks.set(child.id, child)
+    let active = 0, maximumActive = 0
+    const sponsorshipObservationReader = vi.fn(async (_task: CoordinationTaskView) => {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      await new Promise(resolve => setTimeout(resolve, 5))
+      active -= 1
+      return undefined
+    })
+
+    const output = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "wait-sponsorship-concurrency", taskIds: children.map(child => child.id), mode: "all", timeoutMs: 5000,
+    }, { ...runtime.options, sponsorshipObservationReader })
+
+    expect(maximumActive).toBe(4)
+    expect(sponsorshipObservationReader).toHaveBeenCalledTimes(children.length)
+    expect(output.tasks.map(task => task.taskId)).toEqual(children.map(child => child.id))
+  })
+
+  it("preserves ordinary legacy Scout wait output without invoking sponsorship enrichment", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "legacy-scout", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/legacy-scout", depth: 1,
+      role: "scout", taskType: "research", status: "completed", result: { status: "completed", summary: "Legacy Scout result" } })
+    runtime.store.tasks.set(child.id, child)
+    const sponsorshipObservationReader = vi.fn()
+
+    const output = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "wait-legacy-scout", taskIds: [child.id], mode: "all", timeoutMs: 5000,
+    }, { ...runtime.options, sponsorshipObservationReader })
+
+    expect(sponsorshipObservationReader).not.toHaveBeenCalled()
+    expect(output.tasks[0]).toMatchObject({ status: "completed", role: "scout", result: { status: "completed", summary: "Legacy Scout result" } })
+    expect(JSON.stringify(output)).not.toContain("sponsorshipObservations")
   })
 
   it("refreshes timed-out targets and returns their current safe execution state", async () => {

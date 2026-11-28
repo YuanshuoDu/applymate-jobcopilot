@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { redactSensitiveValue } from "@jobcopilot/shared"
 
 import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
+import { SPONSORSHIP_OBSERVATION_PUBLIC_SCHEMA } from "../subagents/sponsorship-observation-contract.js"
 import { redactDurableWaitOutput as redactWaitOutput } from "./durable-wait-output-redaction.js"
 
 const waitId = "wait-12345678-1234-4234-9234-123456789012"
@@ -76,6 +77,23 @@ describe("durable wait output redaction", () => {
     const safeAggregate = safe.aggregate as Record<string, unknown>
     expect(safeAggregate.jobIds).not.toEqual([taskId])
     expect(output.waitId).toBe(waitId)
+  })
+
+  it.each([49, 50])("redacts and replays a complete sponsorship status sidecar at %i entries", count => {
+    const ids = Array.from({ length: count }, (_value, index) => `c${String(index).padStart(24, "0")}`)
+    const output = validOutput()
+    const originalTask = output.tasks[0]!
+    const outputWithObservations = { ...output, tasks: [{ ...originalTask, result: { sponsorshipObservations: ids.map(jobId => ({ jobId, sourceRef: "saved_job_listing",
+      observation: { schemaVersion: SPONSORSHIP_OBSERVATION_PUBLIC_SCHEMA, status: "unavailable", reason: "read_failed" },
+      guidance: "Use owner-scoped jobs.get for this Job. Sponsorship interpretation remains unverified without an independent same-role, same-country review bound to the exact source." })) } }] }
+
+    const safe = redactDurableWaitOutput(outputWithObservations, "agent.wait", "turn") as Record<string, unknown>
+    const safeResult = ((safe.tasks as Array<Record<string, unknown>>)[0]!.result) as Record<string, unknown>
+    const frames = safeResult.sponsorshipObservations as Array<Record<string, unknown>>
+    expect(frames).toHaveLength(count)
+    expect(frames.map(frame => frame.jobId)).toEqual(ids)
+    expect(redactDurableWaitOutput(JSON.parse(JSON.stringify(safe)), "agent.wait", "turn")).toEqual(safe)
+    expect(JSON.stringify(safe)).not.toContain("bindingDigest")
   })
 
   it("preserves complete execution state, accepts legacy task rows, and rejects partial or invalid state", () => {
