@@ -1153,4 +1153,190 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       vi.unstubAllEnvs()
     }
   }, 60_000)
+
+  it("reserves the strict Root output budget for a depth-two Worker lease through the real usage route", async () => {
+    // Seed depth two directly to isolate usage admission. This exercises a real claimed Worker lease and its exact owner/step
+    // through Web, but bypasses `scout.delegate`, its nested-spawn guard/outbox handoff, and real discovery: the child runtime
+    // below supplies an empty tool set and a synthetic model.
+    const sessionId = `p1-subagent-depth-two-session-${suffix}`
+    const turnId = `p1-subagent-depth-two-turn-${suffix}`
+    const rootTaskId = `p1-subagent-depth-two-root-${suffix}`
+    const parentTaskId = `p1-subagent-depth-two-parent-${suffix}`
+    const taskIds = [`p1-subagent-grandchild-a-${suffix}`, `p1-subagent-grandchild-b-${suffix}`]
+    const rootBudget = { limits: { maxSteps: 32, maxToolCalls: 40, maxOutputTokens: 64 } }
+    await adminPool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Depth-two usage budget fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userA.userId])
+    await adminPool!.query(`INSERT INTO "agent_turns"
+      ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+      VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, $4::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+    [turnId, sessionId, userA.userId, JSON.stringify({ provider: "anthropic", model: "fixture-root-budget-model" })])
+    await adminPool!.query(`INSERT INTO "sub_agent_tasks"
+      ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+       "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+      VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'Depth-two usage budget fixture',
+        '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $4::jsonb, 0, 1, CURRENT_TIMESTAMP)`,
+    [rootTaskId, sessionId, turnId, JSON.stringify(rootBudget)])
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1, "outputTokenReservationVersion" = 1
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [rootTaskId, sessionId, turnId])
+    await adminPool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2 AND "sessionId" = $3 AND "userId" = $4`,
+      [rootTaskId, turnId, sessionId, userA.userId])
+    await adminPool!.query(`INSERT INTO "sub_agent_tasks"
+      ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+       "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+      VALUES ($1, $2, $3, $4, $4, $5, 1, 'scout', 'job_discovery', 'waiting', 'Depth-two usage budget parent',
+        '{}'::jsonb, '[]'::jsonb, '["jobs.search", "scout.delegate"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        '{}'::jsonb, '{}'::jsonb, 1, 3, CURRENT_TIMESTAMP)`, [parentTaskId, sessionId, turnId, rootTaskId, `/root/${parentTaskId}`])
+    for (const [index, taskId] of taskIds.entries()) {
+      await adminPool!.query(`INSERT INTO "sub_agent_tasks"
+        ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status",
+         "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot",
+         "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, $6, 2, 'scout', 'job_discovery', 'queued', 'Depth-two usage budget fixture',
+          '{}'::jsonb, '[]'::jsonb, '["jobs.discover", "tool_results.read"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+          '{}'::jsonb, '{}'::jsonb, 0, 3, CURRENT_TIMESTAMP)`,
+      [taskId, sessionId, turnId, rootTaskId, parentTaskId, `/root/${parentTaskId}/grandchild-${index + 1}`])
+    }
+    const hierarchy = await adminPool!.query<{ depth: number; parentTaskId: string; parentDepth: number; rootTaskId: string }>(
+      `SELECT child."depth", child."parentTaskId", parent."depth" AS "parentDepth", child."rootTaskId"
+       FROM "sub_agent_tasks" child JOIN "sub_agent_tasks" parent
+         ON parent."id" = child."parentTaskId" AND parent."sessionId" = child."sessionId" AND parent."turnId" = child."turnId"
+       WHERE child."id" = ANY($1::text[]) AND child."sessionId" = $2 AND child."turnId" = $3
+         AND child."rootTaskId" = $4 ORDER BY child."id"`,
+      [taskIds, sessionId, turnId, rootTaskId])
+    expect(hierarchy.rows).toHaveLength(taskIds.length)
+    expect(hierarchy.rows.every(row => row.depth === 2 && row.parentTaskId === parentTaskId
+      && row.parentDepth === 1 && row.rootTaskId === rootTaskId)).toBe(true)
+
+    const executionPool = runtimePool(ownerAPool!, userA.userId)
+    usageRouteMocks.database = createPgUsageDatabase(executionPool)
+    usageRouteMocks.resolveAiAccess.mockResolvedValue("allowed")
+    usageRouteMocks.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 10 } })
+    usageRouteMocks.loadWorkerAiConfig.mockResolvedValue({
+      provider: "anthropic", model: "fixture-root-budget-model", apiKey: "server-only-root-budget-key",
+    })
+    const secret = "fixture-root-budget-worker-secret"
+    vi.stubEnv("AGENT_WORKER_SECRET", secret)
+    // @ts-expect-error The Worker Vitest alias resolves this allowlisted Web route at runtime.
+    const { POST } = await import("@/app/api/internal/agent-runtime/usage/route")
+
+    type BridgeBody = { operation?: string; input?: Record<string, unknown> }
+    const requests: { body: BridgeBody; status: number; response: unknown }[] = []
+    const bridge = createWorkerUsageAuthorizer({
+      endpointUrl: "http://agent-fixture/api/internal/agent-runtime/usage",
+      secret,
+      fetch: async (input, init) => {
+        const body = JSON.parse(String(init?.body)) as BridgeBody
+        const response = await POST(new Request(String(input), init) as never)
+        const payload: unknown = await response.clone().json().catch(() => null)
+        requests.push({ body, status: response.status, response: payload })
+        return response
+      },
+    })
+    const modelProfile: ModelAdapter["profile"] = {
+      provider: "anthropic", model: "fixture-root-budget-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null,
+      defaultMaxOutputTokens: 128, costClass: "low",
+    }
+    const providerRequests: Array<{ taskId: string; stepId: string; maxOutputTokens: number | undefined }> = []
+    const executor = createProductionChildExecutor({
+      pool: executionPool as unknown as PgPool,
+      turnStore: createPgTurnEngineStore(executionPool as never),
+      treeBudget: createPgTreeBudgetReservationStore(executionPool as never),
+      authorizeUsage: bridge,
+      modelRuntimeFactory: ({ task }) => ({
+        id: `root-budget-fixture-${task.id}`, profile: modelProfile,
+        async *stream(request: HarnessModelRequest) {
+          providerRequests.push({ taskId: task.id, stepId: request.metadata.stepId, maxOutputTokens: request.maxOutputTokens })
+          yield { type: "text_delta", text: "Synthetic local model result." }
+          yield { type: "usage", inputTokens: 20, outputTokens: 64, estimatedCostUsd: 0.01 }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }),
+      toolRuntimeFactory: () => ({
+        definitions: [],
+        router: { async execute(_context, request) { return { ...request, status: "completed", output: {}, errorCode: null } } },
+        validateArguments: () => true,
+      }),
+      resumeLoader: async () => undefined,
+    })
+    const manager = new (await import("./manager.js")).AgentTreeManager(ownerAStore)
+    const usageMonth = utcMonth()
+    const before = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+
+    try {
+      const first = await manager.run({ taskId: taskIds[0]!, sessionId, rootTaskId, ownerId: `depth-two-budget-worker-${suffix}-1` }, executor)
+      expect(first).toMatchObject({ taskId: taskIds[0], status: "completed" })
+      const exhausted = await manager.run({ taskId: taskIds[1]!, sessionId, rootTaskId, ownerId: `depth-two-budget-worker-${suffix}-2` }, executor)
+      expect(exhausted).toMatchObject({ taskId: taskIds[1], status: "failed" })
+
+      expect(providerRequests).toHaveLength(1)
+      expect(providerRequests[0]).toMatchObject({ taskId: taskIds[0], maxOutputTokens: 64 })
+      expect(providerRequests[0]?.stepId).toEqual(expect.any(String))
+      const authorizeRequests = requests.filter(request => request.body.operation === "authorize")
+      const startRequests = requests.filter(request => request.body.operation === "start")
+      const settleRequests = requests.filter(request => request.body.operation === "settle")
+      expect(authorizeRequests.map(request => request.status)).toEqual([200, 429])
+      expect(authorizeRequests[0]?.body.input?.executionOwner).toMatchObject({
+        kind: "task", taskId: taskIds[0], rootTaskId, attemptCount: 1,
+      })
+      expect(authorizeRequests[0]?.body.input).toMatchObject({
+        userId: userA.userId, sessionId, turnId, stepId: providerRequests[0]?.stepId,
+        provider: "anthropic", model: "fixture-root-budget-model", requestedOutputTokens: 128, startProtocolVersion: 1,
+      })
+      expect(authorizeRequests[1]?.body.input?.executionOwner).toMatchObject({
+        kind: "task", taskId: taskIds[1], rootTaskId, attemptCount: 1,
+      })
+      expect(authorizeRequests[1]?.response).toMatchObject({ code: "output_budget_exhausted" })
+      expect(startRequests).toHaveLength(1)
+      expect(startRequests[0]?.status).toBe(200)
+      expect(settleRequests).toHaveLength(1)
+      expect(settleRequests[0]?.status).toBe(200)
+
+      const reservation = await adminPool!.query<{
+        id: string; userId: string; sessionId: string; turnId: string; rootTaskId: string; taskId: string; stepId: string
+        executionOwnerKind: string; executionOwnerId: string; executionOwnerVersion: number; attempt: number; attemptId: string
+        provider: string; model: string; outputReservationRequired: boolean; reservedOutputTokens: number; actualOutputTokens: number
+        status: string; outcomeStatus: string; errorCode: string | null
+      }>(`SELECT "id", "userId", "sessionId", "turnId", "rootTaskId", "taskId", "stepId", "executionOwnerKind",
+          "executionOwnerId", "executionOwnerVersion", "attempt", "attemptId", "provider", "model",
+          "outputReservationRequired", "reservedOutputTokens", "actualOutputTokens", "status", "outcomeStatus", "errorCode"
+        FROM "agent_root_usage_reservations" WHERE "sessionId" = $1 AND "rootTaskId" = $2 ORDER BY "id"`,
+      [sessionId, rootTaskId])
+      expect(reservation.rows).toHaveLength(1)
+      expect(reservation.rows[0]).toMatchObject({
+        userId: userA.userId, sessionId, turnId, rootTaskId,
+        taskId: taskIds[0], stepId: providerRequests[0]?.stepId, executionOwnerKind: "task",
+        executionOwnerId: `depth-two-budget-worker-${suffix}-1`, executionOwnerVersion: 1,
+        attempt: 1, attemptId: "route-1", provider: "anthropic", model: "fixture-root-budget-model",
+        outputReservationRequired: true, reservedOutputTokens: 64, actualOutputTokens: 64,
+        status: "settled", outcomeStatus: "success", errorCode: null,
+      })
+      const usage = await adminPool!.query<{
+        id: string; status: string; providerStartedAt: Date | null; outputReservationRequired: boolean
+        startProtocolVersion: number; outputTokens: number; credentialSource: string
+      }>(`SELECT id, status, provider_started_at AS "providerStartedAt", output_reservation_required AS "outputReservationRequired",
+          usage_start_protocol_version AS "startProtocolVersion", output_tokens AS "outputTokens", credential_source AS "credentialSource"
+        FROM ai_usage_events WHERE id = $1`, [reservation.rows[0]?.id])
+      expect(usage.rows).toHaveLength(1)
+      expect(usage.rows[0]).toMatchObject({
+        id: reservation.rows[0]?.id, status: "success", outputReservationRequired: true,
+        startProtocolVersion: 1, outputTokens: 64, credentialSource: "user",
+      })
+      expect(usage.rows[0]?.providerStartedAt).toEqual(expect.any(Date))
+      const deniedReservation = await adminPool!.query(`SELECT "id" FROM "agent_root_usage_reservations"
+        WHERE "sessionId" = $1 AND "rootTaskId" = $2 AND "taskId" = $3`, [sessionId, rootTaskId, taskIds[1]])
+      expect(deniedReservation.rows).toHaveLength(0)
+      const after = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+      expect(after.ledger).toHaveLength(before.ledger.length + 1)
+      expect(after.budgets.find(row => row.month === usageMonth)?.used)
+        .toBe((before.budgets.find(row => row.month === usageMonth)?.used ?? 0) + 1)
+    } finally {
+      await manager.shutdown()
+      vi.unstubAllEnvs()
+    }
+  }, 60_000)
 })
