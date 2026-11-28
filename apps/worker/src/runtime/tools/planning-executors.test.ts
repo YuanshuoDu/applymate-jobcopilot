@@ -336,6 +336,8 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("findings_from_scout_union is Analyst-only and selects 2 to 8 unique direct typed Scout keys")
     expect(tool.description).toContain("it requires nonempty findings and a nonempty deduplicated candidate union, and every finding must belong to that selected group")
     expect(tool.description).toContain("findings_cover_scout_candidate_union_gte uses its own selected group")
+    expect(tool.description).toContain("divide work across independent read-only Analyst nodes")
+    expect(tool.description).toContain("append a read-only Analyst using that same criterion ID")
     expect(tool.description).toContain("coverage is aggregate across unique candidates")
     expect(tool.description).toContain("findings_cover_each_scout_candidates_gte is Analyst-only and optional; it selects 2 to 8 unique direct typed Scouts")
     expect(tool.description).toContain("Use it only when the goal explicitly requires per-source coverage; do not infer or impose source quotas for a general goal")

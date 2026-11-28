@@ -599,15 +599,37 @@ function report(status: "passed" | "failed" | "unverified") {
 function storedResult(status: "passed" | "failed" | "unverified") {
   return { taskGraphVerificationReport: report(status), ...(status === "unverified" ? {} : { structuredResult: structuredResult(status) }) }
 }
-function graphClient(nodes: unknown[], tasks: Array<Record<string, unknown>>, revision = 1, onQuery?: (sql: string, params?: unknown[]) => void) {
+function graphClient(nodes: unknown[], tasks: Array<Record<string, unknown>>, revision = 1,
+  onQuery?: (sql: string, params?: unknown[]) => void, turnInput?: unknown) {
   const content = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes }
   return { query: vi.fn(async (sql: string, params?: unknown[]) => {
     onQuery?.(sql, params)
-    if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: "graph-item", revision, content }], rowCount: 1 }
+    if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: "graph-item", revision, content,
+      ...(turnInput === undefined ? {} : { turnSource: "user", turnExecutionMode: "canonical_task_graph" }) }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: tasks.map(task => ({ taskType: "scout", ...task })), rowCount: tasks.length }
     if (sql.includes('FROM "agent_events" AS event')) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_turns" AS turn')) return { rows: turnInput === undefined ? [] : [{ input: turnInput }], rowCount: turnInput === undefined ? 0 : 1 }
     throw new Error(`Unexpected graph query: ${sql}`)
   }) } as never
+}
+
+function findingAnalystNode(key: string, taskId: string, minimum = 1) {
+  return { key, taskId, templateId: "analyst", goal: "Analyze verified job evidence", successCriteria: ["Return findings"],
+    dependsOn: [], depth: 2, verificationDisposition: "typed", verification: {
+      schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "analyst",
+      criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum } }],
+    } }
+}
+
+function findingAnalystTask(taskId: string, jobId: string) {
+  const structured = { schemaVersion: "agent-harness.v2.subagent.result", role: "analyst", status: "completed",
+    findings: [{ jobId, score: 8, evidenceIds: [`read:job:${jobId}`] }],
+    evidence: [{ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "fixture" }], summary: "Verified" }
+  return { id: taskId, status: "completed", role: "analyst", failureReason: null, result: {
+    structuredResult: structured, taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+      status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: digest, resultDigest: taskGraphResultDigest(structured) },
+  } }
 }
 
 describe("TaskGraph terminal verification gate", () => {
@@ -1217,5 +1239,24 @@ describe("TaskGraph terminal verification gate", () => {
     expect(recovered.system[0]?.content).toContain("nodeOrdinal=1 criterionOrdinal=1")
     expect(decision.feedback.match(/\(\d+ feedback items omitted; inspect TaskGraph before retrying\.\)/g)).toHaveLength(1)
     expect(decision.feedback).toMatch(/\(\d+ feedback items omitted; inspect TaskGraph before retrying\.\)$/)
+  })
+
+  it("denies a split typed user finding minimum when verified Analyst lineages overlap", async () => {
+    const first = findingAnalystNode("analyst-a", "task-a"), second = findingAnalystNode("analyst-b", "task-b")
+    const input = { verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 2 } }] } }
+    const reads: Array<{ sql: string; params?: unknown[] }> = []
+    const client = graphClient([first, second], [findingAnalystTask("task-a", "job-overlap"), findingAnalystTask("task-b", "job-overlap")], 4,
+      (sql, params) => reads.push({ sql, params }), input)
+    const decision = await checkTaskGraphTerminalVerification(client, graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+    if (decision.ok) return
+    expect(decision.feedback).toContain("issue=finding_count_shortfall required=2 observed=1 criterionId=finding-count")
+    expect(decision.feedback.length).toBeLessThanOrEqual(512)
+    expect(decision.feedback).not.toContain("job-overlap")
+    const turnRead = reads.find(read => read.sql.includes('turn."input"'))
+    expect(turnRead?.sql).toContain('turn."rootTaskId" = $4')
+    expect(turnRead?.sql).toContain('turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6')
+    expect(turnRead?.params).toEqual(["turn-1", "session-1", "user-1", "root-1", "worker-1", 1])
   })
 })

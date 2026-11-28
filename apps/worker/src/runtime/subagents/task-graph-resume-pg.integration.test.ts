@@ -9362,6 +9362,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const scoutUnionOwner = fixture()
   const objectiveScoutAuthorityOwner = fixture()
   const objectiveAnalystAuthorityOwner = fixture()
+  const objectiveFindingPartitionOwner = fixture()
   const objectiveEmptySearchOwner = fixture()
   const emptyAnalystOwner = fixture()
   const emptyAnalystOrphanOwner = fixture()
@@ -9468,7 +9469,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       locationRepairOwner, locationMismatchOwner, locationConflictOwner, locationForeignOwner, replanApplicabilityOwner, supersededReadOnlyScoutOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
       emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner, objectiveScoutAuthorityOwner,
-      objectiveAnalystAuthorityOwner, objectiveEmptySearchOwner]
+      objectiveAnalystAuthorityOwner, objectiveFindingPartitionOwner, objectiveEmptySearchOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
     if (!allFixtureWorkersExited) cleanupFailures.push("fixture process Workers are not proven exited; queue cleanup was refused")
     let ownerRowsMayBeDeleted = false
@@ -21991,6 +21992,472 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     } finally {
       releaseScoutResult.resolve()
     }
+  }, 120_000)
+
+  it("aggregates distinct findings across Analysts and recovers an actual duplicate shortfall", async () => {
+    const value = objectiveFindingPartitionOwner
+    const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
+      import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"), import("../../queue/subagent-queue.js"),
+    ])
+    const { createProductionChildExecutor } = await import("./production-child-runtime.js")
+    const { createTurnQueue, TURN_QUEUE_NAME } = await import("../turns/turn-queue.js")
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+      [value.userId, `${value.userId}@example.invalid`])
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Objective finding partition fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId])
+    const objective = "Find and analyze two distinct software engineering jobs in Dublin"
+    const requirements = {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 2 } }],
+    } as const satisfies ObjectiveStartFixtureCommand["verificationRequirements"]
+    const startService = await createDisposableWebObjectiveStartService(databaseUrl!)
+    let started: ObjectiveStartFixtureResult | undefined
+    try {
+      started = await startService.commands.start({ sessionId: value.sessionId, userId: value.userId,
+        clientMessageId: `p3-1238-objective-start:${value.suffix}`, source: "user", objective,
+        content: [{ type: "text", text: objective }], verificationRequirements: requirements })
+    } finally { await startService.prisma.$disconnect() }
+    if (!started) throw new Error("ObjectiveStart did not return a Turn")
+    expect(started.disposition).toBe("started")
+    value.turnId = started.turnId
+    const persistedTurn = await pool!.query<{ input: unknown; executionMode: string | null }>(
+      `SELECT "input", "executionMode" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId])
+    expect(persistedTurn.rows).toHaveLength(1)
+    expect(persistedTurn.rows[0]?.executionMode).toBe("canonical_task_graph")
+    expect(record(persistedTurn.rows[0]?.input)).toMatchObject({ intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      verificationRequirements: requirements })
+    const firstJobId = fixtureJobId(value.suffix, 0), secondJobId = fixtureJobId(value.suffix, 1)
+    for (const [index, jobId] of [firstJobId, secondJobId].entries()) {
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+        VALUES ($1, $2, $3, 'Software Engineer', 'Dublin', 'saved', $4, $5, 'greenhouse', CURRENT_TIMESTAMP)
+        ON CONFLICT ("id") DO NOTHING`, [jobId, value.userId, `Objective Partition Fixture ${index + 1}`,
+        `https://jobs.example.invalid/objective-partition-${index + 1}`, `Partition fixture job ${index + 1}`])
+    }
+
+    const flags: ProductionAgentFlags = { taskGraphPlanningEnabled: true, childExecutionEnabled: true,
+      coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
+    const profile = { provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true,
+      streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const }
+    const planCallId = `p3-1238-partition-plan:${value.turnId}`
+    const initialWaitCallId = `p3-1238-partition-initial-wait:${value.turnId}`
+    const appendCallId = `p3-1238-partition-append:${value.turnId}`
+    const finalWaitCallId = `p3-1238-partition-final-wait:${value.turnId}`
+    const rootToolNames = deferredSignal<string[]>()
+    const initialPlanReceipt = deferredSignal<RecordValue>()
+    const scoutReadObserved = deferredSignal<void>()
+    const releaseScoutResult = deferredSignal<void>()
+    const initialAnalystsRead = deferredSignal<void>()
+    const duplicateShortfallObserved = deferredSignal<void>()
+    const appendPlanReceipt = deferredSignal<RecordValue>()
+    const additionalAnalystRead = deferredSignal<void>()
+    const analystTaskIds: string[] = []
+    const analystJobByTaskId = new Map<string, string>()
+    const analystReads = new Set<string>()
+    let extraAnalystTaskId: string | null = null
+    let rootTaskId: string | null = null
+    let expectedAppendRevision: number | null = null
+    let rootStage: "plan" | "initial_wait" | "first_final" | "shortfall" | "append_wait" | "final" | "done" = "plan"
+    let lastRootAssertion = "not_started"
+    let childStage = "not_started"
+    const searchInput = { target: "Software Engineer", location: "Dublin", limit: 10 }
+    const partitionFailureSnapshot = async (): Promise<string> => {
+      const base = { rootStage, lastRootAssertion, childStage }
+      try {
+        if (!rootTaskId) return JSON.stringify({ ...base, available: true, rootMissing: true })
+        const [turnResult, graphResult, taskResult, stepResult, rejectionResult, waitResult] = await Promise.all([
+          pool!.query<{ status: string; error: string | null; rootTaskId: string | null }>(
+            `SELECT turn."status", turn."error", turn."rootTaskId" FROM "agent_turns" AS turn
+             JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+             WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3`,
+            [value.turnId, value.sessionId, value.userId]),
+          pool!.query<{ content: unknown; revision: number }>(
+            `SELECT item."content", item."revision" FROM "agent_items" AS item JOIN "agent_turns" AS turn
+               ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+             JOIN "agent_sessions" AS session ON session."id" = item."sessionId" AND session."userId" = turn."userId"
+             WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+               AND item."type" = 'task_graph' AND turn."userId" = $5`,
+            [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId]),
+          pool!.query<{ role: string; status: string }>(
+            `SELECT task."role", task."status" FROM "sub_agent_tasks" AS task
+             JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+             JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = turn."userId"
+             WHERE task."sessionId" = $1 AND task."turnId" = $2 AND task."rootTaskId" = $3
+               AND task."parentTaskId" = $3 AND turn."userId" = $4`,
+            [value.sessionId, value.turnId, rootTaskId, value.userId]),
+          pool!.query<{ status: string; errorCode: string | null }>(
+            `SELECT "status", "errorCode" FROM "agent_steps"
+             WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+             ORDER BY "ordinal" DESC, "attempt" DESC LIMIT 1`, [value.sessionId, value.turnId, rootTaskId]),
+          pool!.query<{ rejection: boolean; aggregateShortfall: boolean }>(
+            `SELECT COALESCE(bool_or(event."payload"->>'blocker' = 'task_graph_verification_unverified'), false) AS "rejection",
+                    COALESCE(bool_or(event."payload"::text LIKE '%finding_count_shortfall%'), false) AS "aggregateShortfall"
+             FROM "agent_events" AS event JOIN "agent_turns" AS turn
+               ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+             WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+               AND event."type" = 'final.rejected' AND turn."rootTaskId" = event."taskId" AND turn."userId" = $4`,
+            [value.sessionId, value.turnId, rootTaskId, value.userId]),
+          pool!.query<{ key: string; status: string; consumedAt: Date | null; matchedTaskIds: unknown }>(
+            `SELECT wait."idempotencyKey" AS "key", wait."status", wait."consumedAt", wait."matchedTaskIds"
+             FROM "agent_wait_conditions" AS wait JOIN "agent_turns" AS turn
+               ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId"
+             JOIN "agent_sessions" AS session ON session."id" = wait."sessionId" AND session."userId" = turn."userId"
+             WHERE wait."sessionId" = $1 AND wait."turnId" = $2 AND wait."parentTaskId" = $3
+               AND turn."rootTaskId" = wait."parentTaskId" AND turn."userId" = $4
+               AND wait."idempotencyKey" = ANY($5::text[])`,
+            [value.sessionId, value.turnId, rootTaskId, value.userId, [initialWaitCallId, finalWaitCallId]]),
+        ])
+        const turn = turnResult.rows[0]
+        const graph = record(graphResult.rows[0]?.content)
+        const taskCounts = { scout: {} as Record<string, number>, analyst: {} as Record<string, number>, other: {} as Record<string, number> }
+        const graphCounts = { scout: {} as Record<string, number>, analyst: {} as Record<string, number>, other: {} as Record<string, number> }
+        for (const row of taskResult.rows) {
+          const role = row.role === "scout" || row.role === "analyst" ? row.role : "other"
+          const status = diagnosticEnum(row.status, TASK_DIAGNOSTIC_STATUSES) ?? "other"
+          taskCounts[role][status] = (taskCounts[role][status] ?? 0) + 1
+        }
+        const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+        for (const node of graphNodes) {
+          const role = node?.templateId === "scout" || node?.templateId === "analyst" ? node.templateId : "other"
+          const status = diagnosticEnum(node?.status, TASK_DIAGNOSTIC_STATUSES) ?? "other"
+          graphCounts[role][status] = (graphCounts[role][status] ?? 0) + 1
+        }
+        const waits = (key: string) => {
+          const row = waitResult.rows.find(wait => wait.key === key)
+          const matched = Array.isArray(row?.matchedTaskIds) ? row.matchedTaskIds.length : 0
+          return { found: Boolean(row), status: row ? diagnosticEnum(row.status, WAIT_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+            consumed: row?.consumedAt instanceof Date, matchedCount: diagnosticBoundedCount(matched) }
+        }
+        const rejection = rejectionResult.rows[0]
+        const step = stepResult.rows[0]
+        return JSON.stringify({ ...base, available: true,
+          turnStatus: turn ? diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+          turnErrorCode: turn?.error ? diagnosticErrorCode(turn.error) ?? "other" : "none",
+          rootStepStatus: step ? diagnosticEnum(step.status, STEP_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+          rootStepErrorCode: step?.errorCode ? diagnosticErrorCode(step.errorCode) ?? "other" : "none",
+          graphRevision: Number.isSafeInteger(graphResult.rows[0]?.revision) ? graphResult.rows[0]!.revision : null,
+          graphNodeCount: diagnosticBoundedCount(graphNodes.length),
+          graphRoleStatusCounts: graphCounts,
+          taskRoleStatusCounts: taskCounts,
+          aggregateDenialPresent: rejection?.rejection === true,
+          aggregateShortfallPresent: rejection?.aggregateShortfall === true,
+          waits: { initial: waits(initialWaitCallId), final: waits(finalWaitCallId) },
+        })
+      } catch {
+        return JSON.stringify({ ...base, available: false })
+      }
+    }
+    const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags, authorizeUsage: authorizeUnreservedUsage,
+      taskGraphTemplates: TASK_GRAPH_TEMPLATES, taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      modelRuntimeFactory: async ({ userId: factoryUserId, state }) => {
+        const targetCandidate = factoryUserId === value.userId && state.scope.userId === value.userId
+          && state.goal === objective
+          && state.snapshot.goal?.id === `turn-goal:${value.turnId}`
+        const targetTurn = targetCandidate ? await pool!.query<{
+          id: string; sessionId: string; userId: string; rootTaskId: string; rootLeaseOwner: string
+        }>(
+          `SELECT turn."id", turn."sessionId", turn."userId", root."id" AS "rootTaskId", root."leaseOwner" AS "rootLeaseOwner"
+           FROM "agent_turns" AS turn JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+           JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+             AND root."turnId" = turn."id" AND root."rootTaskId" = root."id"
+           WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+             AND turn."executionMode" = 'canonical_task_graph' AND turn."status" = 'in_progress'
+             AND turn."leaseOwnerId" IS NOT NULL AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP
+             AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."status" = 'running'
+             AND root."leaseOwner" = turn."leaseOwnerId" AND root."leaseExpiresAt" > CURRENT_TIMESTAMP`,
+          [value.turnId, value.sessionId, value.userId]) : undefined
+        const row = targetTurn?.rows[0]
+        const ownedTarget = targetTurn?.rows.length === 1 && row?.id === value.turnId && row.sessionId === value.sessionId
+          && row.userId === value.userId && typeof row.rootTaskId === "string" && typeof row.rootLeaseOwner === "string"
+        if (!ownedTarget) return { adapter: { id: "p3-1238-non-target-guard", profile,
+          async *stream() { throw new Error("p3_1238_non_target_turn_blocked") } } as ModelAdapter, registry: {} as never, candidates: [] }
+        rootTaskId = row!.rootTaskId
+        const adapter: ModelAdapter = { id: "p3-1238-finding-partition-root", profile, async *stream(request) {
+          if (request.metadata.userId !== value.userId || request.metadata.sessionId !== value.sessionId
+            || request.metadata.turnId !== value.turnId || request.metadata.taskId !== rootTaskId) throw new Error("p3_1238_root_scope_mismatch")
+          if (rootStage === "plan") {
+            lastRootAssertion = "initial_plan_request"
+            rootToolNames.resolve(request.tools.map(tool => record(tool)?.name).filter((name): name is string => typeof name === "string").sort())
+            rootStage = "initial_wait"
+            yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
+              expectedRevision: 0,
+              nodes: [
+                { key: "scout", templateId: "scout", goal: "Find the two saved Dublin fixture jobs", successCriteria: ["Return owner-scoped source candidates"], dependsOn: [], verification: SCOUT_VERIFICATION },
+                { key: "analysis-a", templateId: "analyst", goal: "Analyze the first saved fixture job, partition A", successCriteria: ["Return one evidence-bound finding"], dependsOn: ["scout"], verification: DISCOVERY_ANALYST_VERIFICATION },
+                { key: "analysis-b", templateId: "analyst", goal: "Analyze the first saved fixture job, partition B", successCriteria: ["Return one evidence-bound finding"], dependsOn: ["scout"], verification: DISCOVERY_ANALYST_VERIFICATION },
+              ],
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (rootStage === "initial_wait") {
+            lastRootAssertion = "initial_plan_receipt"
+            const plan = record(latestToolResult(request, planCallId))
+            const ids = planTaskIds(request, planCallId, 3)
+            if (!plan || plan.status !== "accepted" || ids.length !== 3) throw new Error("p3_1238_initial_plan_invalid")
+            analystTaskIds.push(ids[1]!, ids[2]!)
+            analystJobByTaskId.set(ids[1]!, firstJobId); analystJobByTaskId.set(ids[2]!, firstJobId)
+            initialPlanReceipt.resolve(plan); rootStage = "first_final"
+            yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
+              idempotencyKey: initialWaitCallId, taskIds: analystTaskIds, mode: "all", timeoutMs: 30_000,
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (rootStage === "first_final") {
+            lastRootAssertion = "initial_wait_children_completed"
+            const wait = repairWaitOutcomeFromRequest(request, initialWaitCallId, analystTaskIds)
+            const waitTasks = Array.isArray(wait.tasks) ? wait.tasks : []
+            const graph = record(currentGraphFromRequest(request)), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+            if (wait.status !== "ready" || waitTasks.length !== 2 || waitTasks.some(task => record(task)?.status !== "completed")
+              || nodes.length !== 3 || nodes.some(node => node?.status !== "completed")) throw new Error("p3_1238_duplicate_analysts_not_complete")
+            for (const key of ["analysis-a", "analysis-b"]) expectPassedVerificationReport(nodes.find(node => node?.key === key)?.verificationReport,
+              "finding-count", "findings-from-scout")
+            rootStage = "shortfall"
+            yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "The current findings satisfy the requested target." }) }
+            yield { type: "completed", finishReason: "stop" }; return
+          }
+          if (rootStage === "shortfall") {
+            lastRootAssertion = "aggregate_shortfall_feedback"
+            const expected = "finding_count_shortfall required=2 observed=1 criterionId=finding-count"
+            if (!JSON.stringify(request.messages).includes(expected)) throw new Error("p3_1238_root_did_not_receive_aggregate_shortfall")
+            lastRootAssertion = "aggregate_denial_receipt"
+            const denials = await pool!.query<{ payload: unknown }>(
+              `SELECT event."payload" FROM "agent_events" AS event JOIN "agent_turns" AS turn
+                 ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+               WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+                 AND event."type" = 'final.rejected' AND event."payload"->>'blocker' = 'task_graph_verification_unverified'
+                 AND turn."rootTaskId" = event."taskId" AND turn."userId" = $4 ORDER BY event."sequence"`,
+              [value.sessionId, value.turnId, rootTaskId, value.userId])
+            const shortfall = record(denials.rows[0]?.payload)
+            if (!shortfall || typeof shortfall.feedback !== "string" || !shortfall.feedback.includes(`issue=${expected}`)) {
+              throw new Error("p3_1238_terminal_gate_did_not_persist_exact_shortfall")
+            }
+            if (denials.rows.length !== 1 || shortfall.feedback.includes(firstJobId) || shortfall.feedback.includes(secondJobId)) {
+              throw new Error("p3_1238_shortfall_feedback_was_not_bounded")
+            }
+            lastRootAssertion = "append_revision_available"
+            const graph = record(currentGraphFromRequest(request))
+            if (!graph || typeof graph.revision !== "number" || !Number.isSafeInteger(graph.revision)) {
+              throw new Error("p3_1238_shortfall_graph_revision_missing")
+            }
+            expectedAppendRevision = graph.revision
+            duplicateShortfallObserved.resolve()
+            rootStage = "append_wait"
+            yield { type: "tool_call_completed", callId: appendCallId, name: "agent.plan", arguments: {
+              expectedRevision: graph.revision,
+              nodes: [{ key: "analysis-extra", templateId: "analyst", goal: "Analyze the second saved fixture job after the distinct-finding shortfall",
+                successCriteria: ["Return one evidence-bound distinct finding"], dependsOn: ["scout"], verification: DISCOVERY_ANALYST_VERIFICATION }],
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (rootStage === "append_wait") {
+            lastRootAssertion = "distinct_analyst_append_receipt"
+            const plan = record(latestToolResult(request, appendCallId)), ids = planTaskIds(request, appendCallId, 1)
+            if (!plan || plan.status !== "accepted" || ids.length !== 1 || expectedAppendRevision === null
+              || plan.revision !== expectedAppendRevision + 1) throw new Error("p3_1238_distinct_analyst_append_rejected")
+            extraAnalystTaskId = ids[0]!
+            if (analystTaskIds.includes(extraAnalystTaskId)) throw new Error("p3_1238_extra_analyst_reused_a_task")
+            analystJobByTaskId.set(extraAnalystTaskId, secondJobId); appendPlanReceipt.resolve(plan)
+            rootStage = "final"
+            yield { type: "tool_call_completed", callId: finalWaitCallId, name: "agent.wait", arguments: {
+              idempotencyKey: finalWaitCallId, taskIds: [extraAnalystTaskId], mode: "all", timeoutMs: 30_000,
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (rootStage === "final") {
+            lastRootAssertion = "final_wait_children_completed"
+            const wait = repairWaitOutcomeFromRequest(request, finalWaitCallId, [extraAnalystTaskId!])
+            const waitTasks = Array.isArray(wait.tasks) ? wait.tasks : []
+            const graph = record(currentGraphFromRequest(request)), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+            if (wait.status !== "ready" || waitTasks.length !== 1 || record(waitTasks[0])?.status !== "completed"
+              || nodes.length !== 4 || nodes.some(node => node?.status !== "completed")) throw new Error("p3_1238_additional_analyst_not_complete")
+            for (const key of ["analysis-a", "analysis-b", "analysis-extra"]) expectPassedVerificationReport(
+              nodes.find(node => node?.key === key)?.verificationReport, "finding-count", "findings-from-scout")
+            rootStage = "done"
+            yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Two distinct jobs have verified findings." }) }
+            yield { type: "completed", finishReason: "stop" }; return
+          }
+          throw new Error("p3_1238_root_received_an_unexpected_request")
+        } }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    const childExecutor = createProductionChildExecutor({ pool: pool!, authorizeUsage: authorizeUnreservedUsage,
+      modelRuntimeFactory: ({ task }) => {
+        if (task.userId !== value.userId || task.sessionId !== value.sessionId || task.turnId !== value.turnId
+          || task.rootTaskId !== rootTaskId || task.parentTaskId !== rootTaskId) throw new Error("p3_1238_child_scope_mismatch")
+        let round = 0
+        const callId = `p3-1238-read:${task.role}:${task.id}:${task.attemptCount}`
+        const adapter: ModelAdapter = { id: `p3-1238-${task.role}-fixture`, profile, async *stream(request) {
+          if (request.metadata.userId !== value.userId || request.metadata.sessionId !== value.sessionId
+            || request.metadata.turnId !== value.turnId || request.metadata.taskId !== task.id) throw new Error("p3_1238_child_model_scope_mismatch")
+          round += 1
+          if (task.role === "scout") {
+            if (round === 1) {
+              childStage = "scout_search_requested"
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
+              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: searchInput }
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            if (round !== 2) throw new Error("p3_1238_scout_unexpected_round")
+            childStage = "scout_search_result_received"
+            const paired = latestToolResultForExactToolInput(request, "jobs.search", searchInput)
+            const jobs = Array.isArray(record(paired?.result)?.jobs) ? (record(paired?.result)!.jobs as unknown[]).map(record) : []
+            for (const jobId of [firstJobId, secondJobId]) if (!jobs.some(job => job?.id === jobId && job.source === "greenhouse")) {
+              throw new Error("p3_1238_scout_did_not_read_both_owned_jobs")
+            }
+            childStage = "scout_result_held_before_completion"
+            scoutReadObserved.resolve(); await releaseScoutResult.promise
+            const evidence = [firstJobId, secondJobId].map(jobId => ({ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }))
+            yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+              candidates: evidence.map(item => ({ jobId: item.ref, source: item.source, url: null, evidenceIds: [item.id] })), evidence,
+              summary: "Found two owner-scoped Dublin roles" }) }
+            yield { type: "completed", finishReason: "stop" }; return
+          }
+          if (task.role !== "analyst") throw new Error("p3_1238_unsupported_child_role")
+          const jobId = analystJobByTaskId.get(task.id)
+          if (!jobId) throw new Error("p3_1238_analyst_target_not_bound")
+          if (round === 1) {
+            childStage = "analyst_jobs_get_requested"
+            const context = taskGraphDependencyContextFromModelRequest(request)
+            const items = Array.isArray(context.items) ? context.items.map(record) : []
+            const source = items.find(item => item?.dependencyKey === "scout")
+            const candidates = record(source?.result)?.candidates
+            if (!source || !Array.isArray(candidates) || !candidates.some(candidate => record(candidate)?.jobId === jobId)) {
+              throw new Error("p3_1238_analyst_dependency_did_not_include_target")
+            }
+            expectPassedVerificationReport(source?.verification, "candidate-count")
+            expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.get")
+            yield { type: "tool_call_completed", callId, name: "jobs.get", arguments: { jobId } }
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (round !== 2) throw new Error("p3_1238_analyst_unexpected_round")
+          childStage = "analyst_jobs_get_result_received"
+          const paired = inspectToolResultForExactToolInput(request, "jobs.get", { jobId })
+          const readJob = paired.status === "paired" ? record(record(paired.pair.result)?.job) : null
+          if (!readJob || readJob.id !== jobId || readJob.source !== "greenhouse") throw new Error("p3_1238_analyst_did_not_read_bound_job")
+          childStage = "analyst_bound_job_verified"
+          const evidence = { id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }
+          if (analystTaskIds.includes(task.id)) {
+            analystReads.add(task.id)
+            if (analystReads.size === 2) initialAnalystsRead.resolve()
+          } else additionalAnalystRead.resolve()
+          childStage = "analyst_result_emitted"
+          yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+            findings: [{ jobId, score: 8.5, evidenceIds: [evidence.id] }], evidence: [evidence],
+            summary: "Assessed the owner-scoped job record" }) }
+          yield { type: "completed", finishReason: "stop" }
+        } }
+        return adapter
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({ pool: pool!, runtime, ownerId: value.ownerId,
+      turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
+      waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-1238-partition-wait-resolver-${value.suffix}` },
+      subagents: { execute: childExecutor, intervalMs: 10 } })
+    try {
+      expect(await withinIntegrationDeadline(rootToolNames.promise, "Objective Root did not request plan tools", 30_000)).toEqual(
+        ["agent.ask_user", "agent.list", "agent.plan", "agent.reconcile", "agent.retire_superseded_scout", "agent.wait"])
+      const plan = await withinIntegrationDeadline(initialPlanReceipt.promise, "Objective Root did not return the partition plan", 30_000)
+      expect(plan).toMatchObject({ status: "accepted", revision: 1 })
+      const planNodes = Array.isArray(plan.nodes) ? plan.nodes.map(record) : []
+      expect(planNodes).toHaveLength(3)
+      expect(planNodes.map(node => node?.key)).toEqual(["scout", "analysis-a", "analysis-b"])
+      expect(planNodes.slice(1).every(node => node?.status === "waiting")).toBe(true)
+      expect(new Set(analystTaskIds).size).toBe(2)
+      const persistedRootTaskId = rootTaskId
+      if (!persistedRootTaskId) throw new Error("Objective partition Root identity was not persisted")
+      const persistedGraph = await pool!.query<{ content: unknown }>(
+        `SELECT item."content" FROM "agent_items" AS item JOIN "agent_turns" AS turn
+           ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+           AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5`,
+        [taskGraphItemId(persistedRootTaskId), value.sessionId, value.turnId, persistedRootTaskId, value.userId])
+      const storedNodes = Array.isArray(record(persistedGraph.rows[0]?.content)?.nodes)
+        ? (record(persistedGraph.rows[0]?.content)!.nodes as unknown[]).map(record) : []
+      expect(storedNodes).toHaveLength(3)
+      expect(storedNodes.slice(1)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ key: "analysis-a", verificationDisposition: "typed", verification: DISCOVERY_ANALYST_VERIFICATION }),
+        expect.objectContaining({ key: "analysis-b", verificationDisposition: "typed", verification: DISCOVERY_ANALYST_VERIFICATION }),
+      ]))
+      await withinIntegrationDeadline(scoutReadObserved.promise, "Objective Scout did not read both fixture jobs", 30_000)
+      const scoutRead = await pool!.query<{ content: unknown }>(
+        `SELECT resultItem."content" FROM "agent_items" AS callItem JOIN "agent_items" AS resultItem
+           ON resultItem."sessionId" = callItem."sessionId" AND resultItem."turnId" = callItem."turnId"
+             AND resultItem."taskId" = callItem."taskId" AND resultItem."type" = 'tool_result'
+             AND resultItem."content"->>'toolCallId' = callItem."content"->>'toolCallId'
+         JOIN "agent_sessions" AS session ON session."id" = callItem."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = callItem."turnId" AND turn."sessionId" = callItem."sessionId"
+         WHERE callItem."sessionId" = $1 AND callItem."turnId" = $2 AND callItem."taskId" = $3
+           AND callItem."type" = 'tool_call' AND callItem."content"->>'toolName' = 'jobs.search'
+           AND callItem."content"->>'toolCallId' = $4 AND session."userId" = $5 AND turn."userId" = $5`,
+        [value.sessionId, value.turnId, planNodes[0]?.taskId, `p3-1238-read:scout:${planNodes[0]?.taskId}:1`, value.userId])
+      const searchedJobs = record(record(scoutRead.rows[0]?.content)?.output)?.jobs
+      expect(Array.isArray(searchedJobs) && [firstJobId, secondJobId].every(id => searchedJobs.some((job: unknown) => record(job)?.id === id))).toBe(true)
+      releaseScoutResult.resolve()
+      await withinIntegrationDeadline(initialAnalystsRead.promise, "Both duplicate Analysts did not read the same fixture Job", 30_000)
+      try {
+        await withinIntegrationDeadline(duplicateShortfallObserved.promise, "Root did not receive duplicate finding shortfall", 45_000)
+      } catch {
+        throw new Error(`p3_1238_shortfall_snapshot=${await partitionFailureSnapshot()}`)
+      }
+      const appended = await withinIntegrationDeadline(appendPlanReceipt.promise, "Root did not append a new distinct Analyst", 30_000)
+      if (expectedAppendRevision === null) throw new Error("Objective partition append revision was not recorded")
+      expect(appended).toMatchObject({ status: "accepted", revision: expectedAppendRevision + 1 })
+      expect(extraAnalystTaskId).toBeTruthy()
+      expect(extraAnalystTaskId).not.toBe(analystTaskIds[0])
+      await withinIntegrationDeadline(additionalAnalystRead.promise, "Additional Analyst did not read the second fixture Job", 30_000)
+      await waitForTurnStatus(pool!, value.turnId, "completed", 75_000, finalWaitCallId)
+
+      const children = await pool!.query<{ id: string; role: string; status: string; result: unknown }>(
+        `SELECT child."id", child."role", child."status", child."result" FROM "sub_agent_tasks" AS child
+         JOIN "agent_sessions" AS session ON session."id" = child."sessionId"
+         JOIN "agent_turns" AS turn ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId"
+         WHERE child."sessionId" = $1 AND child."turnId" = $2 AND child."rootTaskId" = $3 AND child."parentTaskId" = $3
+           AND child."id" = ANY($4::text[]) AND session."userId" = $5 AND turn."userId" = $5 ORDER BY child."id"`,
+        [value.sessionId, value.turnId, persistedRootTaskId, [planNodes[0]?.taskId, ...analystTaskIds, extraAnalystTaskId], value.userId])
+      expect(children.rows).toHaveLength(4)
+      expect(children.rows.map(row => `${row.role}:${row.status}`).sort()).toEqual([
+        "analyst:completed", "analyst:completed", "analyst:completed", "scout:completed",
+      ])
+      const analystResults = children.rows.filter(row => row.role === "analyst").map(row => {
+        const envelope = record(row.result)
+        expectPassedVerificationReport(envelope?.taskGraphVerificationReport, "finding-count", "findings-from-scout")
+        return record(envelope?.structuredResult)
+      })
+      const reportedIds = analystResults.map(result => {
+        const findings = Array.isArray(result?.findings) ? result.findings.map(record) : []
+        expect(findings).toHaveLength(1)
+        return findings[0]?.jobId
+      })
+      expect(reportedIds.filter(id => id === firstJobId)).toHaveLength(2)
+      expect(reportedIds.filter(id => id === secondJobId)).toHaveLength(1)
+      expect(new Set(reportedIds).size).toBe(2)
+      const rejections = await pool!.query<{ payload: unknown }>(
+        `SELECT event."payload" FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2
+           AND event."taskId" = $3 AND event."type" = 'final.rejected' ORDER BY event."sequence"`,
+        [value.sessionId, value.turnId, persistedRootTaskId])
+      expect(rejections.rows).toHaveLength(1)
+      expect(record(rejections.rows[0]?.payload)).toMatchObject({ blocker: "task_graph_verification_unverified" })
+      const completedTurn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
+        `SELECT turn."status", turn."rootTaskId", turn."finalResponse" FROM "agent_turns" AS turn
+         JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3`,
+        [value.turnId, value.sessionId, value.userId])
+      expect(completedTurn.rows).toHaveLength(1)
+      expect(completedTurn.rows[0]).toMatchObject({ status: "completed", rootTaskId: persistedRootTaskId })
+      const finalResponse = record(JSON.parse(completedTurn.rows[0]?.finalResponse ?? "null"))
+      if (!finalResponse) throw new Error("Objective partition final response was not persisted")
+      expect(finalResponse).toMatchObject({ schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied" })
+      await expectGroundedTaskGraphFinalCopies(pool!, value, persistedRootTaskId, finalResponse, "Two distinct jobs have verified findings.")
+      expect(finalResponse.response).toContain("Analysis results: 2 unique jobs with findings reported (complete coverage).")
+    } finally { releaseScoutResult.resolve() }
   }, 120_000)
 
   it("routes a typed empty jobs.search shortfall into an ordinary Scout repair", async () => {

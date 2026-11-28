@@ -1,7 +1,8 @@
 import { Buffer } from "node:buffer"
 import type { RootTaskVerificationRequirementsResolution } from "./root-task-objective.js"
 import { validateTaskGraphCurrentVerificationGraph, parseTaskGraphCurrentVerificationMetadata } from "../canonical-turn-task-graph-verification-context.js"
-import { selectTaskGraphObjectiveRequirementLineage } from "../planning/task-graph-objective-lineage.js"
+import { selectTaskGraphObjectiveRequirementLineage, selectTaskGraphObjectiveRequirementLineages,
+  type TaskGraphObjectiveLineageCriterion } from "../planning/task-graph-objective-lineage.js"
 import type { TaskGraphCurrentNode, TaskGraphCurrentState } from "../subagents/task-graph-command-port.js"
 import type { ContextSeedBlock } from "./step-context-builder.js"
 
@@ -137,20 +138,16 @@ function currentGraph(input: Input): Readonly<{ revision: number; nodes: readonl
   return { revision: Number(revision.value), nodes: currentNodes }
 }
 
-function statusFor(requirement: Requirement, nodes: readonly ProjectionNode[], rootTaskId: string,
-  templateRoles: Readonly<Record<string, string>> | undefined): TaskGraphObjectiveProgressStatus {
-  const selected = selectTaskGraphObjectiveRequirementLineage(requirement, nodes, rootTaskId)
-  if (selected.status === "missing") return nodes.some(node => node.verificationCriterionIds?.includes(requirement.id)) ? "unknown" : "missing"
-  if (selected.status !== "selected") return "unknown"
-  const node = selected.node
+function lineageStatus(requirement: Requirement, node: ProjectionNode, selectedCriterion: TaskGraphObjectiveLineageCriterion,
+  templateRoles: Readonly<Record<string, string>> | undefined, minimum = requirement.kind === "candidate_location_in" ? 0 : requirement.minimum): TaskGraphObjectiveProgressStatus {
   const role = requirement.kind === "finding_count_gte" ? "analyst" : "scout"
-  const check = selected.criterion.check
+  const check = selectedCriterion.check
   if (node.verification?.role !== role || activeTemplateRole(templateRoles, node.templateId) !== role) return "unknown"
   if (requirement.kind === "candidate_location_in") {
     if (check.kind !== requirement.kind || check.locations.length !== requirement.locations.length
       || !check.locations.every((location, index) => location === requirement.locations[index])) return "unknown"
   } else if ((check.kind !== "candidate_count_gte" && check.kind !== "finding_count_gte")
-    || check.kind !== requirement.kind || check.minimum < requirement.minimum) return "unknown"
+    || check.kind !== requirement.kind || check.minimum < minimum) return "unknown"
   if (["queued", "running", "retrying", "waiting", "waiting_for_user"].includes(node.status)) return "active"
   const report = node.verificationReport
   const criterion = report?.criteria.find(item => item.criterionId === requirement.id)
@@ -158,6 +155,41 @@ function statusFor(requirement: Requirement, nodes: readonly ProjectionNode[], r
   if (["failed", "completed"].includes(node.status) && report?.status === "unverified" && criterion?.status === "unverified") return "unverified"
   if (node.status === "completed" && report?.status === "passed" && report.reasonCode === "criteria_met"
     && criterion?.status === "passed" && criterion.reasonCode === "criteria_met") return "reported_passed"
+  return "unknown"
+}
+
+function statusFor(requirement: Requirement, nodes: readonly ProjectionNode[], rootTaskId: string,
+  templateRoles: Readonly<Record<string, string>> | undefined): TaskGraphObjectiveProgressStatus {
+  if (requirement.kind !== "finding_count_gte") {
+    const selected = selectTaskGraphObjectiveRequirementLineage(requirement, nodes, rootTaskId)
+    if (selected.status === "missing") return nodes.some(node => node.verificationCriterionIds?.includes(requirement.id)) ? "unknown" : "missing"
+    return selected.status === "selected" ? lineageStatus(requirement, selected.node, selected.criterion, templateRoles) : "unknown"
+  }
+  const selected = selectTaskGraphObjectiveRequirementLineages(requirement, nodes, rootTaskId)
+  if (selected.status === "missing") return nodes.some(node => node.verificationCriterionIds?.includes(requirement.id)) ? "unknown" : "missing"
+  if (selected.status !== "selected") return "unknown"
+  if (selected.lineages.length === 1) {
+    const only = selected.lineages[0]!
+    return lineageStatus(requirement, only.node, only.criterion, templateRoles)
+  }
+  let declaredMinimum = 0
+  for (const { node, criterion } of selected.lineages) {
+    const check = criterion.check
+    if (node.templateId !== "analyst" || node.verification?.role !== "analyst"
+      || activeTemplateRole(templateRoles, node.templateId) !== "analyst" || check.kind !== "finding_count_gte"
+      || !Number.isSafeInteger(check.minimum) || check.minimum < 1) return "unknown"
+    declaredMinimum += check.minimum
+  }
+  if (declaredMinimum < requirement.minimum) return "unknown"
+  const statuses = selected.lineages.map(({ node, criterion }) => {
+    const value = lineageStatus(requirement, node, criterion, templateRoles, 1)
+    return criterion.check.kind === "finding_count_gte" ? value : "unknown"
+  })
+  if (statuses.length === 1) return statuses[0] ?? "unknown"
+  if (statuses.includes("failed")) return "failed"
+  if (statuses.includes("unverified")) return "unverified"
+  if (statuses.includes("active")) return "active"
+  // Component reports do not prove a distinct cross-Analyst job union.
   return "unknown"
 }
 
