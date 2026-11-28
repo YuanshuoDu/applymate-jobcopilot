@@ -39,6 +39,12 @@ export interface WorkerUsageAuthorization {
   settleUnknown?(input: WorkerUsageSettlementInput): Promise<void> | void
 }
 
+const OUTPUT_BUDGET_CLASSIFICATION_VERSION = 1 as const
+export type WorkerOutputBudgetDisposition =
+  | "configured_zero_limit"
+  | "settled_exhausted"
+  | "active_reservation_hold"
+
 type UsageBridgeFetch = typeof fetch
 
 export type WorkerUsageBridgeOptions = {
@@ -46,10 +52,17 @@ export type WorkerUsageBridgeOptions = {
   secret?: string
   fetch?: UsageBridgeFetch
   timeoutMs?: number
+  /** Opt in to the authorize-only, versioned output-budget denial metadata. */
+  outputBudgetClassificationVersion?: typeof OUTPUT_BUDGET_CLASSIFICATION_VERSION
 }
 
 export class UsageBridgeError extends Error {
-  constructor(readonly code: string, message = code, readonly retryable = false) {
+  constructor(
+    readonly code: string,
+    message = code,
+    readonly retryable = false,
+    readonly outputBudgetDisposition?: WorkerOutputBudgetDisposition,
+  ) {
     super(message)
     this.name = "UsageBridgeError"
   }
@@ -101,6 +114,12 @@ function safeCode(value: unknown, fallback: string): string {
   return typeof value === "string" && /^[a-z0-9_.-]{1,64}$/i.test(value) ? value : fallback
 }
 
+function protocolInput(input: WorkerUsageAuthorizationInput): WorkerUsageAuthorizationInput & { startProtocolVersion: 1 } {
+  const { outputBudgetClassificationVersion: ignored, ...identity } = input as WorkerUsageAuthorizationInput & { outputBudgetClassificationVersion?: unknown }
+  void ignored
+  return { ...identity, startProtocolVersion: 1 }
+}
+
 function requiredContext(input: WorkerUsageAuthorizationInput): void {
   if (!input.sessionId.trim()) throw new UsageBridgeError("usage_context_unavailable")
   const row = input as unknown as Record<string, unknown>
@@ -129,6 +148,7 @@ async function post(
   body: unknown,
   fetcher: UsageBridgeFetch,
   timeoutMs: number,
+  outputBudgetClassificationVersion?: typeof OUTPUT_BUDGET_CLASSIFICATION_VERSION,
 ): Promise<Record<string, unknown>> {
   let response: Response
   try {
@@ -145,7 +165,17 @@ async function post(
   if (!response.ok) {
     const row = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {}
     const transient = response.status >= 500
-    throw new UsageBridgeError(transient ? "usage_broker_unavailable" : safeCode(row.code, "usage_denied"), undefined, transient)
+    const code = transient ? "usage_broker_unavailable" : safeCode(row.code, "usage_denied")
+    const disposition = !transient && response.status === 429 &&
+      outputBudgetClassificationVersion === OUTPUT_BUDGET_CLASSIFICATION_VERSION &&
+      code === "output_budget_exhausted" &&
+      row.outputBudgetClassificationVersion === OUTPUT_BUDGET_CLASSIFICATION_VERSION &&
+      (row.outputBudgetDisposition === "configured_zero_limit" ||
+        row.outputBudgetDisposition === "settled_exhausted" ||
+        row.outputBudgetDisposition === "active_reservation_hold")
+      ? row.outputBudgetDisposition
+      : undefined
+    throw new UsageBridgeError(code, undefined, transient, disposition)
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new UsageBridgeError("usage_broker_unavailable")
   return payload as Record<string, unknown>
@@ -157,15 +187,20 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
   const secret = options.secret?.trim() || process.env.AGENT_WORKER_SECRET?.trim()
   const fetcher = options.fetch ?? globalThis.fetch
   const timeoutMs = options.timeoutMs ?? 15_000
+  const outputBudgetClassificationVersion = options.outputBudgetClassificationVersion
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new RangeError("Usage bridge timeout must be positive")
+  if (outputBudgetClassificationVersion !== undefined &&
+      outputBudgetClassificationVersion !== OUTPUT_BUDGET_CLASSIFICATION_VERSION) {
+    throw new RangeError("Unsupported output budget classification version")
+  }
 
   const release = async (input: WorkerUsageAuthorizationInput): Promise<void> => {
     requiredContext(input)
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
-    const protocolInput = { ...input, startProtocolVersion: 1 as const }
+    const identity = protocolInput(input)
     for (let attempt = 0; ; attempt++) {
       try {
-        const response = await post(endpoint, secret, { operation: "release", input: protocolInput }, fetcher, timeoutMs)
+        const response = await post(endpoint, secret, { operation: "release", input: identity }, fetcher, timeoutMs)
         if (response.status !== "released") throw new UsageBridgeError("usage_broker_unavailable")
         return
       } catch (error: unknown) {
@@ -178,10 +213,14 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
   return async (input: WorkerUsageAuthorizationInput) => {
     requiredContext(input)
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
-    const protocolInput = { ...input, startProtocolVersion: 1 as const }
+    const baseProtocolInput = protocolInput(input)
+    const authorizationInput = outputBudgetClassificationVersion === OUTPUT_BUDGET_CLASSIFICATION_VERSION
+      ? { ...baseProtocolInput, outputBudgetClassificationVersion }
+      : baseProtocolInput
     let response: Record<string, unknown>
     try {
-      response = await post(endpoint, secret, { operation: "authorize", input: protocolInput }, fetcher, timeoutMs)
+      response = await post(endpoint, secret, { operation: "authorize", input: authorizationInput }, fetcher, timeoutMs,
+        outputBudgetClassificationVersion)
     } catch (error: unknown) {
       if (error instanceof UsageBridgeError && error.code === "usage_broker_unavailable") await release(input).catch(() => undefined)
       throw error
@@ -217,7 +256,7 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
         if (startCalled) throw new UsageBridgeError("usage_start_replayed")
         startCalled = true
         const started = await post(endpoint, secret, {
-          operation: "start", input: { ...protocolInput, operationId },
+          operation: "start", input: { ...baseProtocolInput, operationId },
         }, fetcher, timeoutMs)
         if (started.status !== "started" || started.startProtocolVersion !== 1 || started.outputReservationRequired !== outputReservationRequired ||
             started.maxOutputTokens !== maxOutputTokens) throw new UsageBridgeError("usage_start_conflict")
