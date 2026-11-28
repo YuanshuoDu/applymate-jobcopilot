@@ -29,7 +29,7 @@ export function projectTaskGraphDiscoveryRecoveryPage(
   const node = loaded.snapshot.nodes.find(candidate => candidate.key === request.nodeKey)
   const current = loaded.state.nodes.find(candidate => candidate.key === request.nodeKey)
   const task = node ? loaded.tasks.get(node.taskId) : undefined
-  if (!node || !current || !task || !matchesCurrentNode(node, current, task) || !ordinaryGenericScout(node, task)) {
+  if (!node || !current || !task || !matchesCurrentNode(node, current, task) || !isOrdinaryGenericScout(node, task)) {
     return unavailable(revision, "node_unavailable")
   }
   if (task.status !== "failed") return unavailable(revision, "node_unavailable")
@@ -53,7 +53,7 @@ export function projectTaskGraphDiscoveryRecoveryPage(
   }
 }
 
-function ordinaryGenericScout(node: StoredTaskGraphNode, task: GraphTaskRow): boolean {
+export function isOrdinaryGenericScout(node: StoredTaskGraphNode, task: GraphTaskRow): boolean {
   if (node.templateId !== "scout" || node.verificationDisposition !== "typed" || node.repairOf || "nativeDelegation" in node
     || task.role !== "scout" || task.taskType !== "job_discovery") return false
   const registered = parseRegisteredScoutEnvelope(node.registeredScoutEnvelope)
