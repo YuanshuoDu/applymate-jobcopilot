@@ -14,6 +14,7 @@ describe("production agent flags", () => {
       nativeSemanticProgressMemoryEnabled: false,
       crossSessionRootTaskHistoryEnabled: false,
       objectiveHistoryIndexEnabled: false,
+      outputBudgetClassificationEnabled: false,
     })
   })
 
@@ -101,6 +102,7 @@ describe("production agent flags", () => {
       nativeSemanticProgressMemoryEnabled: false,
       crossSessionRootTaskHistoryEnabled: false,
       objectiveHistoryIndexEnabled: false,
+      outputBudgetClassificationEnabled: false,
     })
   })
 
@@ -130,6 +132,13 @@ describe("production agent flags", () => {
     })
     for (const value of [undefined, "", "0", "false", "true", "01", " 1", "1 "]) {
       expect(resolveProductionAgentFlags({ ENABLE_AGENT_OBJECTIVE_HISTORY_INDEX: value }).objectiveHistoryIndexEnabled).toBe(false)
+    }
+  })
+
+  it("enables Root output-budget classification only with the exact explicit gate", () => {
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_OUTPUT_BUDGET_CLASSIFICATION_V1: "1" }).outputBudgetClassificationEnabled).toBe(true)
+    for (const value of [undefined, "", "0", "true", "01", " 1", "1 "]) {
+      expect(resolveProductionAgentFlags({ ENABLE_AGENT_OUTPUT_BUDGET_CLASSIFICATION_V1: value }).outputBudgetClassificationEnabled).toBe(false)
     }
   })
 })

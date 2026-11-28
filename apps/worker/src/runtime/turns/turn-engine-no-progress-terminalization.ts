@@ -18,6 +18,7 @@ import { READ_TASK_GRAPH_DENIAL_CHECKPOINT } from "./turn-execution-types.js"
 import { parseTaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { isTaskGraphTerminalDenial, matchedTaskGraphDenialCheckpoint, sameCheckpoint, terminalEntries, validDenial, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminal-contract.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness } from "../context/root-task-history-chronology-witness.js"
+import { negotiatedRootOutputBudgetDisposition } from "../../queue/ai-usage-bridge.js"
 
 export { isTaskGraphTerminalDenial, matchedTaskGraphDenialCheckpoint, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminal-contract.js"
 
@@ -200,7 +201,8 @@ export async function terminalizeTurnExecutionError(input: Readonly<{
     return { status: "interrupted", stepCount: input.stepCount, toolCallCount: input.toolCallCount, errorCode: code }
   }
   if (isSessionPauseRequestedError(error) || signal.aborted) throw error
-  const code = turnErrorCode(error)
+  const rootBudgetFailure = options.identity.kind === "turn" ? rootOutputBudgetFailure(error) : undefined
+  const code = rootBudgetFailure?.code ?? turnErrorCode(error)
   if (error instanceof NoProgressError) {
     const result = await terminalizeNoProgressFailure({ error, options, writer, step: input.lastStep, stepOpen: input.stepOpen,
       stepCount: input.stepCount, toolCallCount: input.toolCallCount, usage: input.usage, now,
@@ -217,10 +219,14 @@ export async function terminalizeTurnExecutionError(input: Readonly<{
     ? "Confirmed Persona facts exceed the discovery memory limit. Narrow the facts shared for discovery in Persona settings, then start a new Turn." : null
   const terminalReason = error instanceof BudgetExceededError ? "budget_exhausted" : error instanceof NoProgressError ? "no_progress"
     : code === "final_unverified" || code.startsWith("evidence_") || code === "business_precondition_failed" ? "final_unverified" : "unrecoverable_error"
-  const finalResponse = finalizeTurn({ goal: options.goal, terminalReason, blocker: discoveryOverflow ?? (error instanceof Error ? error.message : code),
+  const finalResponse = finalizeTurn({ goal: options.goal, terminalReason,
+    blocker: rootBudgetFailure?.message ?? discoveryOverflow ?? (error instanceof Error ? error.message : code),
     usage: totalTurnUsage(options.resume?.usage, input.usage), stepCount: input.stepCount, toolCallCount: input.toolCallCount,
-    next: discoveryOverflow ? ["Narrow the confirmed facts shared for discovery in Persona settings, then start a new Turn"] : ["Review the blocker and resume the Turn"],
-    ...(discoveryOverflow ? { response: discoveryOverflow, summaryOverride: discoveryOverflow } : {}) })
+    next: rootBudgetFailure ? [rootBudgetFailure.next]
+      : discoveryOverflow ? ["Narrow the confirmed facts shared for discovery in Persona settings, then start a new Turn"]
+        : ["Review the blocker and resume the Turn"],
+    ...(rootBudgetFailure ? { response: rootBudgetFailure.message, summaryOverride: rootBudgetFailure.message }
+      : discoveryOverflow ? { response: discoveryOverflow, summaryOverride: discoveryOverflow } : {}) })
   if (options.isOwnershipLost?.(error, signal)) throw error
   const finalItem = await publishFinalResponse(writer, options, input.lastStep, finalResponse, now).catch(() => null)
   if (finalItem && canPersistFinalResponse(options)) await options.store.recordFinalResponse?.({ identity: options.identity,
@@ -230,6 +236,27 @@ export async function terminalizeTurnExecutionError(input: Readonly<{
     `turn-failed:${code}`).catch(() => undefined)
   return { status: "failed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, errorCode: code,
     ...(finalItem ? { finalItemId: finalItem.id } : {}) }
+}
+
+function rootOutputBudgetFailure(error: unknown): { readonly code: string; readonly message: string; readonly next: string } | undefined {
+  switch (negotiatedRootOutputBudgetDisposition(error)) {
+    case "configured_zero_limit": return {
+      code: "root_output_budget_configured_zero_limit",
+      message: "This Turn stopped before model output because its configured output limit is zero. No automatic retry was made.",
+      next: "Review the output budget before starting another Turn.",
+    }
+    case "settled_exhausted": return {
+      code: "root_output_budget_settled_exhausted",
+      message: "This Turn stopped before model output because settled usage leaves no output allowance for this Root Turn. No automatic retry was made.",
+      next: "Review the usage allowance before starting another Turn.",
+    }
+    case "active_reservation_hold": return {
+      code: "root_output_budget_active_reservation_hold",
+      message: "This Turn stopped before model output because an existing usage reservation holds the remaining allowance. It was not automatically replayed.",
+      next: "Check the reservation status before starting another attempt.",
+    }
+    default: return undefined
+  }
 }
 
 async function lockRootTask(client: TurnEngineQueryClient, owner: Extract<ExecutionOwnerFence, { kind: "turn" }>): Promise<void> {

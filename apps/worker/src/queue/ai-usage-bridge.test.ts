@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { createWorkerUsageAuthorizer, UsageBridgeError } from "./ai-usage-bridge.js"
+import { createWorkerUsageAuthorizer, negotiatedRootOutputBudgetDisposition, UsageBridgeError } from "./ai-usage-bridge.js"
 
 const input = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", leaseOwnerId: "worker-1", leaseVersion: 2,
@@ -126,8 +126,47 @@ describe("Worker AI usage bridge", () => {
     try { await authorizer(input) } catch (error: unknown) { caught = error }
     expect(caught).toBeInstanceOf(UsageBridgeError)
     expect(caught).toMatchObject({ code: "output_budget_exhausted", retryable: false, outputBudgetDisposition: disposition })
+    expect(negotiatedRootOutputBudgetDisposition(caught)).toBe(disposition)
     expect(String(caught)).not.toContain("private server detail")
     expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it("keeps negotiated classification Root-only even if a task caller receives a v1-capable authorizer", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({
+      code: "output_budget_exhausted", outputBudgetClassificationVersion: 1, outputBudgetDisposition: "active_reservation_hold",
+    }, 429))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher, outputBudgetClassificationVersion: 1 })
+    const { leaseOwnerId: _leaseOwnerId, leaseVersion: _leaseVersion, ...common } = input
+
+    let caught: unknown
+    try {
+      await authorizer({ ...common, executionOwner: { kind: "task", taskId: "child-1", rootTaskId: "root-1", ownerId: "worker-1", attemptCount: 2 } })
+    } catch (error: unknown) { caught = error }
+
+    expect(caught).toMatchObject({ code: "output_budget_exhausted", outputBudgetDisposition: undefined })
+    expect(negotiatedRootOutputBudgetDisposition(caught)).toBeUndefined()
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input: {
+      ...common, executionOwner: { kind: "task", taskId: "child-1", rootTaskId: "root-1", ownerId: "worker-1", attemptCount: 2 }, startProtocolVersion: 1,
+    } })
+  })
+
+  it("does not trust manually constructed UsageBridgeErrors with a disposition", () => {
+    const forged = new UsageBridgeError("output_budget_exhausted", "output_budget_exhausted", false, "settled_exhausted")
+    expect(negotiatedRootOutputBudgetDisposition(forged)).toBeUndefined()
+  })
+
+  it("keeps the parsed v1 disposition immutable if the error property is later changed", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({
+      code: "output_budget_exhausted", outputBudgetClassificationVersion: 1, outputBudgetDisposition: "active_reservation_hold",
+    }, 429))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher, outputBudgetClassificationVersion: 1 })
+    let caught: unknown
+    try { await authorizer(input) } catch (error: unknown) { caught = error }
+
+    expect(caught).toBeInstanceOf(UsageBridgeError)
+    Object.defineProperty(caught, "outputBudgetDisposition", { value: "settled_exhausted", configurable: true })
+    expect((caught as UsageBridgeError).outputBudgetDisposition).toBe("settled_exhausted")
+    expect(negotiatedRootOutputBudgetDisposition(caught)).toBe("active_reservation_hold")
   })
 
   it.each([
