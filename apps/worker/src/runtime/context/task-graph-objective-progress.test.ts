@@ -9,6 +9,7 @@ import { taskGraphObjectiveProgressObservation, TASK_GRAPH_OBJECTIVE_PROGRESS_OB
 const rootTaskId = "root-task"
 const requirementId = "candidate-total"
 const requirement = { id: requirementId, kind: "candidate_count_gte" as const, minimum: 2 }
+const findingRequirementId = "finding-total"
 const locationRequirementId = "candidate-location"
 const locationRequirement = { id: locationRequirementId, kind: "candidate_location_in" as const, locations: ["berlin", "dublin"] }
 const resolution = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
@@ -53,6 +54,20 @@ function locationResolution(locations = locationRequirement.locations) {
     schemaVersion: "agent-harness.v2.objective-requirements.v2",
     requirements: [{ id: locationRequirementId, check: { kind: "candidate_location_in", locations } }],
   } } })
+}
+
+function findingResolution(minimum = 2) {
+  return resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
+    schemaVersion: "agent-harness.v2.objective-requirements.v1",
+    requirements: [{ id: findingRequirementId, check: { kind: "finding_count_gte", minimum } }],
+  } } })
+}
+
+function findingNode(input: Parameters<typeof node>[0] = {}) {
+  const base = node({ ...input, role: "analyst" })
+  return { ...base, verificationCriterionIds: [findingRequirementId], verification: {
+    ...base.verification, criteria: [{ id: findingRequirementId, check: { kind: "finding_count_gte" as const, minimum: input.minimum ?? 3 } }],
+  }, ...(input.report ? { verificationReport: report(input.report, findingRequirementId) } : {}) }
 }
 
 function locationNode(input: Readonly<{ status?: "failed" | "completed"; observedLocation?: string | null;
@@ -134,6 +149,28 @@ describe("TaskGraph objective progress observation", () => {
       .toMatchObject({ requirements: [{ id: requirementId, status: "unknown" }] })
     expect(project(current([target, repair, node({ key: "unrelated", taskId: "unrelated-task" })]))?.content)
       .toMatchObject({ requirements: [{ id: requirementId, status: "unknown" }] })
+  })
+
+  it("keeps partition progress active, but never aggregates component passes into objective PASS", () => {
+    const first = findingNode({ key: "analyst-a", taskId: "task-a", status: "completed", minimum: 1, report: "passed" })
+    const second = findingNode({ key: "analyst-b", taskId: "task-b", status: "completed", minimum: 1, report: "passed" })
+    const resolved = findingResolution(2)
+    expect(project(current([first, second]), { resolution: resolved })?.content)
+      .toMatchObject({ requirements: [{ id: findingRequirementId, status: "unknown" }] })
+    const queued = findingNode({ key: "analyst-queued", taskId: "task-queued", status: "queued", minimum: 1 })
+    expect(project(current([first, queued]), { resolution: resolved })?.content)
+      .toMatchObject({ requirements: [{ id: findingRequirementId, status: "active" }] })
+    const failed = findingNode({ key: "analyst-failed", taskId: "task-failed", status: "failed", minimum: 1, report: "failed" })
+    expect(project(current([failed, first]), { resolution: resolved })?.content)
+      .toMatchObject({ requirements: [{ id: findingRequirementId, status: "failed" }] })
+    expect(project(current([first, second]), { resolution: findingResolution(3) })?.content)
+      .toMatchObject({ requirements: [{ id: findingRequirementId, status: "unknown" }] })
+    expect(project(current([first, second]), { resolution: resolved,
+      taskGraphTemplateRoles: { ...activeTemplateRoles, analyst: "scout" } })?.content)
+      .toMatchObject({ requirements: [{ id: findingRequirementId, status: "unknown" }] })
+    const wholeTarget = findingNode({ key: "analyst-whole", taskId: "task-whole", status: "completed", minimum: 2, report: "passed" })
+    expect(project(current([wholeTarget]), { resolution: resolved })?.content)
+      .toMatchObject({ requirements: [{ id: findingRequirementId, status: "reported_passed" }] })
   })
 
   it.each([

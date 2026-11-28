@@ -11,6 +11,12 @@ export type TaskGraphObjectiveRequirementLineageSelection<Node extends TaskGraph
   | Readonly<{ status: "missing" }>
   | Readonly<{ status: "invalid" }>
   | Readonly<{ status: "selected"; node: Node; criterion: TaskGraphObjectiveLineageCriterion }>
+export type TaskGraphObjectiveRequirementLineageMember<Node extends TaskGraphObjectiveLineageNode = TaskGraphObjectiveLineageNode> =
+  Readonly<{ node: Node; criterion: TaskGraphObjectiveLineageCriterion }>
+export type TaskGraphObjectiveRequirementLineagesSelection<Node extends TaskGraphObjectiveLineageNode = TaskGraphObjectiveLineageNode> =
+  | Readonly<{ status: "missing" }>
+  | Readonly<{ status: "invalid" }>
+  | Readonly<{ status: "selected"; lineages: readonly TaskGraphObjectiveRequirementLineageMember<Node>[] }>
 
 function criterionOccurrences(node: TaskGraphObjectiveLineageNode, id: string): TaskGraphObjectiveLineageCriterion[] {
   return (node.verification?.criteria ?? []).filter(criterion => criterion.id === id)
@@ -26,12 +32,12 @@ function repairLinkValid(node: TaskGraphObjectiveLineageNode, target: TaskGraphO
       target as TaskGraphNodeProposal & Readonly<{ taskId?: string; verificationDisposition?: TaskGraphVerificationDisposition }>)
 }
 
-/** Selects the latest unambiguous node and exact criterion for one resolved objective requirement. */
-export function selectTaskGraphObjectiveRequirementLineage<Node extends TaskGraphObjectiveLineageNode>(
+/** Selects the latest valid member of each unambiguous repair lineage for one requirement. */
+export function selectTaskGraphObjectiveRequirementLineages<Node extends TaskGraphObjectiveLineageNode>(
   requirement: RootTaskVerificationRequirement,
   nodes: readonly Node[],
   rootTaskId: string,
-): TaskGraphObjectiveRequirementLineageSelection<Node> {
+): TaskGraphObjectiveRequirementLineagesSelection<Node> {
   const byKey = new Map(nodes.map(node => [node.key, node] as const))
   const positions = new Map(nodes.map((node, index) => [node.key, index] as const))
   const malformedLineages = new Set<string>()
@@ -71,9 +77,25 @@ export function selectTaskGraphObjectiveRequirementLineage<Node extends TaskGrap
   })
 
   if (lineages.size === 0) return malformedLineages.size ? { status: "invalid" } : { status: "missing" }
-  const onlyLineage = lineages.size === 1 ? [...lineages.values()][0] : undefined
-  const latest = onlyLineage?.reduce((last, candidate) => candidate.index > last.index ? candidate : last)
-  const occurrences = latest ? criterionOccurrences(latest.node, requirement.id) : []
-  if (lineages.size !== 1 || malformedLineages.size !== 0 || occurrences.length !== 1) return { status: "invalid" }
-  return { status: "selected", node: latest!.node, criterion: occurrences[0]! }
+  if (malformedLineages.size !== 0) return { status: "invalid" }
+  const selected = [...lineages.values()].map(members => {
+    const latest = members.reduce((last, candidate) => candidate.index > last.index ? candidate : last)
+    const occurrences = criterionOccurrences(latest.node, requirement.id)
+    return occurrences.length === 1 ? { node: latest.node, criterion: occurrences[0]! } : undefined
+  })
+  return selected.some(member => !member) ? { status: "invalid" }
+    : { status: "selected", lineages: selected as TaskGraphObjectiveRequirementLineageMember<Node>[] }
+}
+
+/** Selects one exact criterion on one unambiguous repair lineage. */
+export function selectTaskGraphObjectiveRequirementLineage<Node extends TaskGraphObjectiveLineageNode>(
+  requirement: RootTaskVerificationRequirement,
+  nodes: readonly Node[],
+  rootTaskId: string,
+): TaskGraphObjectiveRequirementLineageSelection<Node> {
+  const selected = selectTaskGraphObjectiveRequirementLineages(requirement, nodes, rootTaskId)
+  if (selected.status !== "selected") return selected
+  return selected.lineages.length === 1
+    ? { status: "selected", ...selected.lineages[0]! }
+    : { status: "invalid" }
 }

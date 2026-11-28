@@ -38,6 +38,10 @@ describe("TaskGraph final-summary repair binding", () => {
       members: members(taskIds), summary: summary(taskIds) }
 
     expect(readResolvedRepairTaskIds({ ...base, resolvedRepairTaskIds: taskIds })).toEqual(new Set(taskIds))
+    expect(readResolvedRepairTaskIds({ ...base, resolvedRepairTaskIds: taskIds,
+      executionFailureOutcomes: [{ taskId: "failed-a", category: "deadline" }] })).toEqual(new Set(taskIds))
+    expect(readResolvedRepairTaskIds({ ...base, resolvedRepairTaskIds: taskIds,
+      executionFailureOutcomes: [], unexpected: true })).toEqual(new Set())
     expect(readResolvedRepairTaskIds({ ...base, resolvedRepairTaskIds: [...taskIds].reverse() })).toEqual(new Set())
     expect(readResolvedRepairTaskIds({ ...base, resolvedRepairTaskIds: ["foreign-task"] })).toEqual(new Set())
     expect(readResolvedRepairTaskIds({ ...base, resolvedRepairTaskIds: ["failed-a", "failed-a"] })).toEqual(new Set())

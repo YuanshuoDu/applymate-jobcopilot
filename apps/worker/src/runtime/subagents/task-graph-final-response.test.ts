@@ -18,8 +18,15 @@ function binding(summary: TaskGraphFinalSummary): TaskGraphFinalSummaryBinding {
 
 function currentBinding(summary: TaskGraphFinalSummary): TaskGraphFinalSummaryBinding {
   return { rootTaskId: "root-task-1", graphItemId: "graph-item-1", graphRevision: summary.graphRevision, summary,
-    members: summary.taskOutcomes.map((outcome, nodeIndex) => ({ nodeIndex, nodeKey: `node-${nodeIndex}`, templateId: outcome.role,
-      taskId: outcome.taskId, role: outcome.role, taskType: `${outcome.role}_task`, taskStatus: outcome.taskStatus, kind: "business" })) }
+    members: summary.taskOutcomes.map((outcome, nodeIndex) => ({ nodeIndex, nodeKey: `node-${nodeIndex}`,
+      templateId: outcome.role === "writer" ? "cover_letter_writer" : outcome.role === "reviewer" ? "cover_letter_reviewer" : outcome.role,
+      taskId: outcome.taskId, role: outcome.role, taskType: taskType(outcome.role), taskStatus: outcome.taskStatus, kind: "business" })) }
+}
+
+function taskType(role: TaskGraphFinalSummary["taskOutcomes"][number]["role"]): string {
+  return role === "scout" ? "job_discovery" : role === "analyst" ? "job_analysis"
+    : role === "writer" ? "cover_letter_draft" : role === "reviewer" ? "cover_letter_review"
+      : role === "prepare" ? "scheduled_application_prepare" : "unsupported"
 }
 
 function batchBinding(): TaskGraphFinalSummaryBinding {
@@ -138,6 +145,43 @@ describe("grounded TaskGraph final response", () => {
     expect(buildGroundedTaskGraphFinalResponse(currentFailure)).toContain("Inspect the reported Analysis task outcome.")
     expect(buildGroundedTaskGraphFinalResponse({ ...currentFailure, resolvedRepairTaskIds: ["failed-analysis"] }))
       .not.toContain("Inspect the reported Analysis task outcome.")
+  })
+
+  it("renders only the exact current closed failure projection and repair direction", () => {
+    const summary = structuredSummary(), current = currentBinding(summary)
+    const unresolved = buildGroundedTaskGraphFinalResponse({ ...current, executionFailureOutcomes: [
+      { taskId: "private-analyst-task", category: "execution_deadline_exceeded" },
+    ] })
+    const resolved = buildGroundedTaskGraphFinalResponse({ ...current, resolvedRepairTaskIds: ["private-analyst-task"], executionFailureOutcomes: [
+      { taskId: "private-analyst-task", category: "execution_deadline_exceeded" },
+    ] })
+    const legacy = buildGroundedTaskGraphFinalResponse(current)
+    const malformed = buildGroundedTaskGraphFinalResponse({ ...current, executionFailureOutcomes: [
+      { taskId: "private-analyst-task", category: "raw_failure_reason" as unknown as "execution_deadline_exceeded" },
+    ] })
+    const foreign = buildGroundedTaskGraphFinalResponse({ ...current, executionFailureOutcomes: [
+      { taskId: "foreign-task", category: "execution_deadline_exceeded" },
+    ] })
+    const stale = buildGroundedTaskGraphFinalResponse({ ...current,
+      members: current.members?.map(member => member.taskId === "private-analyst-task" ? { ...member, taskStatus: "completed" as const } : member),
+      executionFailureOutcomes: [{ taskId: "private-analyst-task", category: "execution_deadline_exceeded" }],
+    })
+    expect(unresolved).toContain("Execution blocker: The task exceeded its execution deadline. Inspect current evidence for the affected task before deciding what to do next.")
+    expect(unresolved).not.toContain("Inspect the reported Analysis task outcome.")
+    for (const privateValue of ["private-analyst-task", "foreign-task", "execution_deadline_exceeded", "child_turn_missing"]) {
+      expect(unresolved).not.toContain(privateValue)
+    }
+    const failureLine = unresolved.split("\n").find(line => line.startsWith("Execution blocker:")) ?? ""
+    expect(failureLine).not.toMatch(/retry|replace|approve|submit/i)
+    expect(resolved).toContain("Earlier execution issue: The task exceeded its execution deadline. See the current verified results.")
+    expect(resolved).toContain("Verified repair evidence covers the affected criteria.")
+    expect(legacy).not.toContain("Execution blocker:")
+    expect(malformed).not.toContain("Execution blocker:")
+    expect(foreign).not.toContain("Execution blocker:")
+    expect(stale).not.toContain("Execution blocker:")
+    for (const response of [unresolved, resolved, legacy, malformed, foreign, stale]) {
+      expect(new TextEncoder().encode(response).byteLength).toBeLessThanOrEqual(4_096)
+    }
   })
 
   it("keeps not-requested, observed zero, and unavailable distinct", () => {
