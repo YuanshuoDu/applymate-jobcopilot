@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { buildScheduledAutomationSnapshot, getAutomationRunMode, type ScheduledAutomationSnapshotInput } from "./scheduled-automation-snapshot"
 import { sessionSnapshotFields, withAgentSearchFootprintSessionSnapshot } from "@/lib/agent-search-footprint-session-snapshot"
+import { readRootOutputTokenBudgetSnapshot } from "./control-plane/root-output-token-budget"
 
 export interface AutomationSessionRow {
   id: string
@@ -84,7 +85,7 @@ export async function ensureAutomationTurn(
     const created = await store.agentTurn.create({
       data: {
         id: randomUUID(), sessionId: input.sessionId, userId: input.userId, source: "automation", status: "queued",
-        input: turnInput, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {},
+        input: turnInput, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: readRootOutputTokenBudgetSnapshot(),
       },
       select: { id: true },
     })

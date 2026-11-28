@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT, SELECTED_JOB_BATCH_PREPARATION_INTENT, type InputContentPart, type TurnSource, type VerifiedShortlistSelectionBinding } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
+import { readRootOutputTokenBudgetSnapshot } from "../root-output-token-budget"
 import { activeTurnChanged, sessionNotFound } from "./errors"
 import type { CommandDisposition, CommandIdentity, InterruptDisposition, ObjectiveVerificationRequirements, SelectedJobPreparationScope, ServerAgentTurnIntent } from "./types"
 
@@ -39,6 +40,11 @@ export interface AcceptedCommandFacts {
   inputId: string
   turnId: string
   sequence: string
+}
+
+export interface RootTurnCreationOptions {
+  /** Retries pass the predecessor's persisted snapshot instead of rereading configuration. */
+  budgetSnapshot?: Prisma.InputJsonValue
 }
 
 function json(value: unknown): Prisma.InputJsonValue {
@@ -91,6 +97,7 @@ export async function createRootTurn(
   selectedJobPreparation?: SelectedJobPreparationScope,
   intent?: ServerAgentTurnIntent,
   verificationRequirements?: ObjectiveVerificationRequirements | null, verifiedShortlistSelection?: VerifiedShortlistSelectionBinding,
+  options: RootTurnCreationOptions = {},
 ): Promise<ActiveTurn> {
   const goal = explicitGoal ?? (content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content")
   const selectedJobBatch = command.source === "user" && intent?.kind === SELECTED_JOB_BATCH_PREPARATION_INTENT.kind && intent.version === SELECTED_JOB_BATCH_PREPARATION_INTENT.version && verifiedShortlistSelection !== undefined && selectedJobPreparation === undefined && verificationRequirements === undefined
@@ -115,7 +122,7 @@ export async function createRootTurn(
       }),
       modelProfileSnapshot: json({}),
       toolPolicySnapshot: json({}),
-      budgetSnapshot: json({}),
+      budgetSnapshot: json(options.budgetSnapshot ?? readRootOutputTokenBudgetSnapshot()),
     },
     select: { id: true },
   })

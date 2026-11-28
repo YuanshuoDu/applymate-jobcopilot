@@ -7,6 +7,7 @@ import { assertContent, dispositionFromEvent } from "./command-content"
 import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
 import { isRetryableTurnStatus, parsePersistedRetryContent } from "./retry-input"
 import { acceptRetriedInput } from "./retry-lineage"
+import { requirePersistedRootBudgetSnapshot } from "../root-output-token-budget"
 import { assertSteeringCapacity } from "./steering-capacity"
 import {
   acceptInputFacts,
@@ -233,7 +234,7 @@ export class AgentCommandService {
 
       const target = await tx.agentTurn.findFirst({
         where: { id: command.targetTurnId, sessionId: command.sessionId, userId: command.userId },
-        select: { id: true, status: true, revision: true, input: true, source: true, executionMode: true },
+        select: { id: true, status: true, revision: true, input: true, source: true, executionMode: true, budgetSnapshot: true },
       })
       if (!target || !isRetryableTurnStatus(target.status)) throw retryTargetInvalid(command.targetTurnId, target?.status ?? null)
       if (command.expectedRevision !== undefined && command.expectedRevision !== null && command.expectedRevision !== target.revision) {
@@ -243,7 +244,9 @@ export class AgentCommandService {
       if (active) throw retryActiveConflict(active.id)
       const persisted = parsePersistedRetryContent(target.id, target.input)
 
-      const created = await createRootTurn(tx, command, persisted.content, persisted.goal, persisted.selectedJobPreparation, persisted.intent, persisted.verificationRequirements)
+      const retryBudgetSnapshot = requirePersistedRootBudgetSnapshot(target.budgetSnapshot)
+      const created = await createRootTurn(tx, command, persisted.content, persisted.goal, persisted.selectedJobPreparation,
+        persisted.intent, persisted.verificationRequirements, undefined, { budgetSnapshot: retryBudgetSnapshot })
       return acceptRetriedInput(tx, command, target, persisted, () => acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true))
     })
   }

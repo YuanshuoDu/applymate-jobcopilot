@@ -115,7 +115,8 @@ function makeDb(options: {
             && turn.userId === where.userId && (where.source === undefined || turn.source === where.source))
           if (created) return { ...created }
           const target = options.retryTarget
-          return target && where.id === target.id && where.sessionId === "session_1" && where.userId === ownerId ? { ...target } : null
+          return target && where.id === target.id && where.sessionId === target.sessionId && where.userId === target.userId
+            && where.sessionId === "session_1" && where.userId === ownerId ? { ...target } : null
         }
         if (!active) return null
         if (where.status === "in_progress" && active.status !== "in_progress") return null
@@ -125,7 +126,7 @@ function makeDb(options: {
       }),
       create: vi.fn(async (args: unknown) => {
         const data = (args as { data: Row }).data
-        active = { id: String(data.id), sessionId: data.sessionId, userId: data.userId, source: data.source, status: "queued", revision: 0, input: data.input }
+        active = { id: String(data.id), sessionId: data.sessionId, userId: data.userId, source: data.source, status: "queued", revision: 0, input: data.input, budgetSnapshot: data.budgetSnapshot }
         turns.push(active)
         return { id: active.id }
       }),
@@ -327,7 +328,7 @@ function acceptedSteeringRows(count: number): Row[] {
 }
 
 function retryTarget(status = "failed", input: unknown = { goal: "Find backend roles", content: [...content] }, source = "user", executionMode: string | null = null) {
-  return { id: "turn_failed", sessionId: "session_1", userId: "user_1", status, source, executionMode, revision: 4, input }
+  return { id: "turn_failed", sessionId: "session_1", userId: "user_1", status, source, executionMode, revision: 4, input, budgetSnapshot: {} }
 }
 
 function retryCommand(clientMessageId: string, expectedRevision: number | null = 4, source: "user" | "automation" = "user", targetTurnId = "turn_failed") {
@@ -1051,6 +1052,29 @@ describe("AgentCommandService", () => {
     expect(sessionLock).toContain('"status" NOT IN (\'aborted\', \'archived\')')
   })
 
+  it("persists the server-owned Root token ceiling and rejects invalid configuration before writes", async () => {
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", "72")
+    const configured = makeDb()
+    await new AgentCommandService(configured.db).start({
+      ...startCommand("root_budget_configured"),
+      content: [...content, { type: "text", text: "client budgetSnapshot maxOutputTokens=999999" }],
+    })
+    expect(configured.state.active).toMatchObject({
+      userId: "user_1", sessionId: "session_1", budgetSnapshot: { limits: { maxOutputTokens: 72 } },
+    })
+    expect(configured.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", "not-a-number")
+    const invalid = makeDb()
+    await expect(new AgentCommandService(invalid.db).start(startCommand("root_budget_invalid")))
+      .rejects.toMatchObject({ code: "root_output_token_budget_configuration_invalid" })
+    expect(invalid.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(invalid.state.active).toBeNull()
+    expect(invalid.state.items).toHaveLength(0)
+    expect(invalid.state.events).toHaveLength(0)
+    expect(invalid.state.outbox).toHaveLength(0)
+  })
+
   it.each([
     ["start", "aborted", { sessionStatus: "aborted" }],
     ["message", "archived", { sessionStatus: "archived" }],
@@ -1162,6 +1186,34 @@ describe("AgentCommandService", () => {
     expect(fake.state.inputs[0]).toMatchObject({ delivery: "follow_up", content })
     expect(fake.state.events.map(event => event.type)).toEqual(["turn.started", "input.accepted"])
     expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it.each(["999", "not-a-number"])("retains the predecessor Root budget snapshot when current server configuration is %s", async (currentSetting) => {
+    vi.stubEnv("AGENT_ROOT_MAX_OUTPUT_TOKENS", currentSetting)
+    const predecessorBudget = { limits: { maxOutputTokens: 32, maxSteps: 7 }, executionPolicy: { source: "server" } }
+    const fake = makeDb({ retryTarget: { ...retryTarget(), budgetSnapshot: predecessorBudget } })
+
+    const result = await new AgentCommandService(fake.db).retry(retryCommand("retry_budget_snapshot"))
+
+    expect(result.disposition).toBe("started")
+    expect(fake.state.active).toMatchObject({
+      userId: "user_1", sessionId: "session_1", budgetSnapshot: predecessorBudget,
+    })
+    expect(fake.tx.agentTurn.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "turn_failed", sessionId: "session_1", userId: "user_1" },
+      select: expect.objectContaining({ budgetSnapshot: true }),
+    }))
+  })
+
+  it("never reuses another owner's persisted Root budget for a retry", async () => {
+    const foreign = makeDb({ retryTarget: {
+      ...retryTarget(), userId: "user_2", budgetSnapshot: { limits: { maxOutputTokens: 1 } },
+    } })
+
+    await expect(new AgentCommandService(foreign.db).retry(retryCommand("retry_foreign_budget")))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(foreign.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(foreign.state.outbox).toHaveLength(0)
   })
 
   it("preserves server-owned discovery intent when retrying a failed Turn", async () => {
