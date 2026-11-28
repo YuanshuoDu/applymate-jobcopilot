@@ -1,9 +1,12 @@
 import { Buffer } from "node:buffer"
 import type pg from "pg"
 import { describe, expect, it, vi } from "vitest"
-import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "../subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, taskGraphFailedBranchRepairFingerprint } from "../subagents/task-graph-pg-failed-branch-relation.js"
+import { STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
+  parseSteeringReconciliationReceipt, steeringReconciliationDurableIdempotencyKey } from "../subagents/steering-reconciliation-contract.js"
 import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { createDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
@@ -20,6 +23,12 @@ const { readWitness } = vi.hoisted(() => ({ readWitness: vi.fn(async (_client: u
 vi.mock("./root-task-history-chronology-witness.js", async importOriginal => ({
   ...(await importOriginal<typeof import("./root-task-history-chronology-witness.js")>()),
   readRootTaskHistoryChronologyWitness: readWitness,
+}))
+const { verifyBranchReplacement } = vi.hoisted(() => ({ verifyBranchReplacement: vi.fn(async () => ({
+  reason: "result_invalid" as const, sourceTemplateIds: ["scout", "analyst"], successorTemplateIds: ["scout", "analyst"],
+})) }))
+vi.mock("../subagents/steering-reconciliation-failed-branch-history.js", () => ({
+  verifyHistoricalFailedBranchReplacementMemory: verifyBranchReplacement,
 }))
 
 type Row = Record<string, unknown>
@@ -38,6 +47,7 @@ type Options = Readonly<{
   sourceSessionLockedAtGraphLoad?: boolean
   tenantScope?: string | null
   omitSameSessionTerminalTime?: boolean
+  branchReplacementEvent?: Row
 }>
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
@@ -78,6 +88,38 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
     terminalPayload: status === "failed" ? { turnId, taskId: rootTaskId, errorCode, finalItemId: null }
       : { turnId, taskId: rootTaskId, errorCode }, terminalEventCount: 1,
   }
+}
+
+function branchReplacementEvent(source: Row): Row {
+  const scope = { userId: "user-1", sessionId: String(source.sessionId), turnId: String(source.turnId),
+    rootTaskId: String(source.rootTaskId), parentTaskId: String(source.rootTaskId) }
+  const root = { nodeKey: "failed-scout", taskId: "failed-scout-task" }, callId = "branch-plan-call", stepId = "branch-plan-step"
+  const replaceBranch = { root, sources: [
+    { ...root, replacementKey: "fresh-scout" },
+    { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task", replacementKey: "fresh-analyst" },
+  ] }
+  const nodes = [{ key: "fresh-scout", templateId: "scout", goal: "Search", successCriteria: ["Find roles"], dependsOn: [] },
+    { key: "fresh-analyst", templateId: "analyst", goal: "Assess", successCriteria: ["Rank roles"], dependsOn: ["fresh-scout"] }]
+  const operationKey = steeringReconciliationDurableIdempotencyKey(scope, stepId, callId)!
+  const failedBranch = {
+    schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, operationKey, graphRootTaskId: scope.rootTaskId,
+    observedRevision: 4, resultingRevision: 6, branchRoot: root,
+    sources: replaceBranch.sources.map(source => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId }, replacementKey: source.replacementKey })),
+    failedSource: { source: root, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64),
+      event: { id: "failed-event", sequence: "10", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, root.nodeKey, 1, "task.failed") } },
+    cancellations: [{ source: { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task" },
+      event: { id: "cancelled-event", sequence: "12", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
+    verifiedExternalDependencies: [],
+    planEvent: { id: "plan-event", sequence: "13", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 5) },
+    requestFingerprint: taskGraphFailedBranchRepairFingerprint({ expectedRevision: 4, replaceBranch, nodes }),
+    agentPlanCall: { callId, stepId, expectedRevision: 4, replaceBranch },
+  }
+  return { id: "reconciliation-event", sessionId: scope.sessionId, turnId: scope.turnId, itemId: null, taskId: scope.rootTaskId,
+    sequence: "14", type: STEERING_RECONCILIATION_EVENT_TYPE, actor: "orchestrator", correlationId: scope.turnId, causationId: stepId,
+    idempotencyKey: operationKey, outboxIdempotencyKey: null,
+    payload: { schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION, sessionId: scope.sessionId,
+      turnId: scope.turnId, rootTaskId: scope.rootTaskId, stepId, decision: "revise", observedRevision: 4,
+      resultingRevision: 6, steerInputIds: [], inputCheckpoint: { throughSequence: "18" }, failedBranch } }
 }
 
 function objectiveIntentInput(goal = "Explore roles") {
@@ -220,6 +262,10 @@ function fixture(options: Options = {}) {
           },
         } : null,
       })) }
+      if (sql.includes('event."payload"->>\'schemaVersion\'')) return { rows: options.branchReplacementEvent ? [{
+        ...options.branchReplacementEvent, sessionUserId: "user-1", turnUserId: "user-1",
+        turnRootTaskId: options.branchReplacementEvent.taskId,
+      }] : [] }
       if (sql.includes('FROM "agent_events" AS event')) return { rows: [] }
       throw new Error(`unexpected query: ${sql}`)
     },
@@ -244,11 +290,53 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-1"])
     expect(outcomes[0]).not.toHaveProperty("sourceSessionDiffers")
     expect(outcomes[0]).not.toHaveProperty("terminalAt")
+    expect(outcomes[0]).not.toHaveProperty("branchReplacementEpisode")
+    const branchRead = test.queries.find(query => query.sql.includes("payload\"->>'schemaVersion'"))
+    expect(branchRead?.sql).toContain('event."sequence" < $7::bigint')
+    expect(branchRead?.values).toEqual(["session-1", "turn-source-1", "root-source-1", "user-1",
+      "agent.plan.reconciliation", "agent-harness.v2.plan-reconciliation.v4", "4"])
     expect(test.connects).toBe(0)
     expect(test.queries.filter(query => query.sql.includes("current_setting('app.user_id'")).length).toBe(1)
     expect(test.queries.some(query => query.sql.includes("set_config"))).toBe(false)
     expect(test.tenantScope).toBe("user-1")
     expect(test.queries.some(query => ["BEGIN", "COMMIT", "ROLLBACK"].includes(query.sql))).toBe(false)
+  })
+
+  it("rehydrates only a parsed same-session replacement receipt before the selected Turn terminal witness", async () => {
+    const source = candidate(1, "20"), event = branchReplacementEvent(source)
+    expect(parseSteeringReconciliationReceipt(event.payload)?.failedBranch).toBeDefined()
+    const test = fixture({ candidates: [source], branchReplacementEvent: event })
+    verifyBranchReplacement.mockClear()
+    const outcomes = await test.store.loadWithClient(test.client, test.input)
+
+    expect(test.queries.find(query => query.sql.includes('event."payload"->>'))).toBeDefined()
+    expect(verifyBranchReplacement).toHaveBeenCalled()
+    expect(outcomes[0]?.branchReplacementEpisode).toMatchObject({
+      reason: "result_invalid", failedRole: "scout",
+      replacedRoles: { scout: 1, analyst: 1 }, successorRoles: { scout: 1, analyst: 1 },
+    })
+    const sourceScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-source-1",
+      rootTaskId: "root-source-1", parentTaskId: "root-source-1" }
+    expect(verifyBranchReplacement).toHaveBeenCalledWith(test.client, sourceScope,
+      expect.objectContaining({ graphRootTaskId: "root-source-1" }), {
+        id: "reconciliation-event", sequence: 14n, stepId: "branch-plan-step", idempotencyKey: expect.any(String),
+      })
+    const receiptRead = test.queries.find(query => query.sql.includes('event."payload"->>\'schemaVersion\''))
+    expect(receiptRead?.sql).toContain('ORDER BY event."sequence" DESC, event."id" DESC LIMIT 2')
+    expect(receiptRead?.values).toEqual(["session-1", "turn-source-1", "root-source-1", "user-1",
+      STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION, "20"])
+  })
+
+  it("keeps other same-session history when the optional replacement receipt is malformed", async () => {
+    const source = candidate(1, "20"), event = branchReplacementEvent(source)
+    event.payload = { ...(event.payload as Row), unrecognized: "private" }
+    const test = fixture({ candidates: [source], branchReplacementEvent: event })
+    verifyBranchReplacement.mockClear()
+    const outcomes = await test.store.loadWithClient(test.client, test.input)
+
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0]).not.toHaveProperty("branchReplacementEpisode")
+    expect(verifyBranchReplacement).not.toHaveBeenCalled()
   })
 
   it.each([

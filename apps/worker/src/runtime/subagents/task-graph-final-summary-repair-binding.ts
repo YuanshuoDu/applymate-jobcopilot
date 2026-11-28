@@ -30,7 +30,7 @@ export function readResolvedRepairTaskIds(value: unknown): ReadonlySet<string> {
   try {
     const binding = record(value)
     if (!binding || !Object.hasOwn(binding, "resolvedRepairTaskIds")) return new Set()
-    const { resolvedRepairTaskIds: ids, ...legacyBinding } = binding
+    const { resolvedRepairTaskIds: ids, executionFailureOutcomes: _failureOutcomes, ...legacyBinding } = binding
     const facts = validateTaskGraphFollowUpBinding(legacyBinding), rows = dense(ids, TASK_GRAPH_LIMITS.maxPersistedNodes)
     if (!facts || !rows?.length) return new Set()
     const result = new Set<string>()

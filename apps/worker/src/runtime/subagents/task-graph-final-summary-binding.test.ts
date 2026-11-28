@@ -7,6 +7,7 @@ import {
   sameTaskGraphFinalSummaryBinding,
   TASK_GRAPH_FINAL_SUMMARY_BINDING,
 } from "./task-graph-final-summary-binding.js"
+import { readFinalExecutionFailureOutcomes } from "./task-graph-final-failure-outcomes.js"
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
 
 const scoutResult = (jobId: string) => ({
@@ -220,6 +221,28 @@ describe("current TaskGraph final-summary binding", () => {
     expect(readResolvedRepairTaskIds(stale)).toEqual(new Set())
     expect(sameTaskGraphFinalSummaryBinding(resolved, unresolved)).toBe(false)
     expect(sameTaskGraphFinalSummaryBinding(resolved, stale)).toBe(false)
+  })
+
+  it("binds closed execution failure outcomes and keeps repair proof readable", () => {
+    const base = buildTaskGraphFinalSummaryBinding(graph(6, ["failed-scout"], [
+      failedRow("failed-scout", "scout", "scout"),
+    ]))!
+    const first = { ...base, executionFailureOutcomes: [
+      { taskId: "failed-scout", category: "execution_setup_unavailable" as const },
+    ] }
+    const same = { ...first, executionFailureOutcomes: [...first.executionFailureOutcomes] }
+    const changed = { ...first, executionFailureOutcomes: [{ taskId: "failed-scout", category: "resume_state_unavailable" as const }] }
+    const malformed = { ...base, executionFailureOutcomes: [{ taskId: "foreign-task", category: "execution_setup_unavailable" as const }] }
+    const malformedDifferent = { ...base, executionFailureOutcomes: [{ taskId: "failed-scout", category: "unknown" as never }] }
+
+    expect([...readFinalExecutionFailureOutcomes(first)]).toEqual([["failed-scout", "execution_setup_unavailable"]])
+    expect(readResolvedRepairTaskIds({ ...first, resolvedRepairTaskIds: ["failed-scout"] })).toEqual(new Set(["failed-scout"]))
+    expect(sameTaskGraphFinalSummaryBinding(first, same)).toBe(true)
+    expect(sameTaskGraphFinalSummaryBinding(first, changed)).toBe(false)
+    expect(sameTaskGraphFinalSummaryBinding(base, first)).toBe(false)
+    expect(sameTaskGraphFinalSummaryBinding(base, malformed)).toBe(true)
+    expect(sameTaskGraphFinalSummaryBinding(malformed, malformedDifferent)).toBe(true)
+    expect(sameTaskGraphFinalSummaryBinding(first, malformed)).toBe(false)
   })
 
   it("binds Prepare results to the persisted task attempt", () => {

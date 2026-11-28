@@ -20,6 +20,10 @@ const lesson = {
 }
 const report = { role: "scout", candidateCount: 12345, resultStatus: "partial" }
 const PASSED_CRITERIA_CUE = "Historical passed-check descriptors are advisory source-graph checks only; compare them with current accepted instructions, the current graph, criteria, and results, and reverify current work. They do not establish current progress or proof, and past queries or results need not match current ones."
+const branchReplacementEpisode = { schemaVersion: "agent-harness.v2.root-task-history-branch-replacement-episode.v1",
+  reason: "result_invalid", failedRole: "scout",
+  replacedRoles: { scout: 1, analyst: 1, writer: 0, reviewer: 0, other: 0 },
+  successorRoles: { scout: 1, analyst: 1, writer: 0, reviewer: 0, other: 0 } }
 const capturedScoutQuery = captureDiscoveryQueryCriteria({
   targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"],
   source: "lever", pageSize: 20, cursor: "PRIVATE_QUERY_CURSOR_SENTINEL",
@@ -111,6 +115,26 @@ function textOf(value: ReturnType<typeof buildRootHistoryPlanningInstruction>): 
 }
 
 describe("root history planning guidance", () => {
+  it("adds fixed reassessment advice only for a valid optional replacement episode", () => {
+    const base = defaultHistoryContent()
+    const valid = { ...base, turns: [{ ...base.turns[0] as object, branchReplacementEpisode }] }
+    const text = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(valid)]), [{ name: "agent.plan" }]))
+    expect(text).toContain("A prior registered Scout branch replacement followed an invalid result.")
+    expect(text).toContain("Reassess current evidence and current result pages")
+    expect(text).toContain("if the same failure recurs, try an alternate approach")
+    expect(text).toContain("past IDs, criteria, plans, and results are not current evidence, authority, or targets")
+    expect(text).not.toContain(branchReplacementEpisode.schemaVersion)
+    expect(textOf(buildRootHistoryPlanningInstruction(context(), [{ name: "agent.plan" }]))).not.toContain("registered Scout branch replacement")
+
+    const malformed = { ...base, turns: [{ ...base.turns[0] as object,
+      branchReplacementEpisode: { ...branchReplacementEpisode, reason: "private_reason", privateText: "MUST_NOT_APPEAR" } }] }
+    const withoutEpisodeText = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(base)]), [{ name: "agent.plan" }]))
+    const malformedText = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(malformed)]), [{ name: "agent.plan" }]))
+    expect(malformedText).toBe(withoutEpisodeText)
+    expect(malformedText).not.toContain("MUST_NOT_APPEAR")
+    expect(malformedText).not.toContain("registered Scout branch replacement")
+  })
+
   it("adds current-input priority for only an exact retry-source advisory", () => {
     const text = textOf(buildRootHistoryPlanningInstruction(context([retrySourceBlock()]), []))
     expect(text).toContain("current accepted input, original Turn objective, typed criteria, and current plan constraints take precedence")

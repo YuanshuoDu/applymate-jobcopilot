@@ -11,8 +11,10 @@ import { taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapsh
 import {
   parseSteeringReconciliationReceipt,
   steeringReconciliationIdempotencyKey,
+  steeringReconciliationDurableIdempotencyKey,
   steeringReconciliationRevision,
   steeringReconciliationSequence,
+  validHistoricalFailedBranchReplacementToolCall,
   validSteeringReconciliationToolCall,
   STEERING_RECONCILIATION_EVENT_TYPE,
   STEERING_RECONCILIATION_SCHEMA_VERSION,
@@ -156,6 +158,27 @@ describe("steering reconciliation receipt contract", () => {
     expect(parseSteeringReconciliationReceipt(value, scope)).toEqual(value)
     expect(parseSteeringReconciliationReceipt({ ...value, stepId: "foreign-step" }, scope)).toBeNull()
     expect(parseSteeringReconciliationReceipt({ ...value, rationale: "private user text" }, scope)).toBeNull()
+  })
+
+  it("validates a historical failed-branch call without weakening the live lease fence", () => {
+    const relation = failedBranchRepair(), { callId, stepId, expectedRevision, replaceBranch } = relation.agentPlanCall
+    const durableScope = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+      rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId }
+    const event = { type: "tool_call.started", actor: "orchestrator", taskId: scope.rootTaskId, itemId: "history-call",
+      correlationId: callId, idempotencyKey: toolStartKey(callId),
+      payload: { toolCallId: callId, toolName: "agent.plan", taskId: scope.rootTaskId } }
+    const item = { id: "history-call", stepId, taskId: scope.rootTaskId, type: "tool_call",
+      content: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input: {
+        expectedRevision, replaceBranch, nodes: [{ key: "fresh-scout" }, { key: "fresh-analyst" }],
+      } } }
+
+    expect(validHistoricalFailedBranchReplacementToolCall(event, item, durableScope, stepId, expectedRevision, replaceBranch)).toBe(true)
+    expect(steeringReconciliationDurableIdempotencyKey(durableScope, stepId, callId))
+      .toBe(steeringReconciliationIdempotencyKey(scope, callId))
+    expect(validSteeringReconciliationToolCall(event, item, { ...scope, turnLeaseOwner: "" }, stepId, "revise",
+      expectedRevision, undefined, replaceBranch)).toBe(false)
+    expect(validHistoricalFailedBranchReplacementToolCall({ ...event, taskId: "foreign-root" }, item, durableScope,
+      stepId, expectedRevision, replaceBranch)).toBe(false)
   })
 
   it("requires exact sorted unique input IDs and coherent keep or revise revisions", () => {

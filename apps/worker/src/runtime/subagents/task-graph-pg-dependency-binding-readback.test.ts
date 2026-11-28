@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { createHash } from "node:crypto"
 import type pg from "pg"
 import { revalidateTaskGraphDependencyBindings } from "./task-graph-pg-dependency-binding-readback.js"
 import { type LoadedGraph, type GraphIdentityScope, type GraphTaskRow } from "./task-graph-pg-state.js"
@@ -9,8 +10,10 @@ import { ROLE_RESULT_SCHEMA, validateRoleResult } from "./role-results.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { verifyCompletedScoutDependencies, type TaskGraphCompletedDependencyProof } from "./task-graph-pg-completed-dependency-verification.js"
 import { emptyAnalystCoverageDigest } from "./task-graph-empty-analyst-proof.js"
+import { loadTaskGraphVerificationReceipts, type TaskGraphVerificationReceipts } from "./task-graph-pg-verification-receipts.js"
 
 vi.mock("./task-graph-pg-completed-dependency-verification.js", () => ({ verifyCompletedScoutDependencies: vi.fn() }))
+vi.mock("./task-graph-pg-verification-receipts.js", () => ({ loadTaskGraphVerificationReceipts: vi.fn() }))
 
 const scope: GraphIdentityScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
 const snapshotValue = {
@@ -45,7 +48,7 @@ const scoutProjection = {
 }
 const bindings = [{ nodeKey: "scout", taskId: "scout-task", attemptCount: 1, nodeDigest: "a".repeat(64),
   resultDigest: "b".repeat(64), evidenceDigest: "c".repeat(64), reportDigest: "d".repeat(64) }]
-const proof: TaskGraphCompletedDependencyProof = { projections: new Map([["scout", scoutProjection]]), bindings }
+const proof: TaskGraphCompletedDependencyProof = { projections: new Map([["scout", scoutProjection]]), bindings, jobDescriptionWitnesses: new Map() }
 
 const multiSnapshot = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-graph", nodes: [
   ...["scout-a", "scout-b"].map(key => ({ key, taskId: `${key}-task`, templateId: "scout", goal: `Find ${key}`, successCriteria: ["Find"], dependsOn: [], depth: 1,
@@ -71,16 +74,38 @@ function analystResult(jobId = "job-1") {
     findings: [{ jobId, score: 8, evidenceIds: [`read:job:${jobId}`] }],
     evidence: [{ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "jobs.get" }], summary: "Analysis" }
 }
+
+const DESCRIPTION_JOB_ID = "11111111-1111-4111-8111-111111111111"
+const descriptionProjection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout" as const,
+  candidates: [{ jobId: DESCRIPTION_JOB_ID, evidenceIds: [`read:job:${DESCRIPTION_JOB_ID}`] }], evidenceIds: [`read:job:${DESCRIPTION_JOB_ID}`] }
+function descriptionDigest(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex") }
+function descriptionProof(sourceDescription?: string): TaskGraphCompletedDependencyProof {
+  const jobDescriptionWitnesses = sourceDescription
+    ? new Map([["scout", new Map([[DESCRIPTION_JOB_ID, [descriptionDigest(sourceDescription)]]])]])
+    : new Map()
+  return { projections: new Map([["scout", descriptionProjection]]), bindings, jobDescriptionWitnesses }
+}
+function analystDescriptionReceipts(description: string): TaskGraphVerificationReceipts {
+  return {
+    items: [
+      { type: "tool_call", id: "description-call", taskId: "analyst-task", stepId: "description-step", attempt: 2, ordinal: 0,
+        content: { toolCallId: "description-read", toolName: "jobs.get", input: { jobId: DESCRIPTION_JOB_ID }, status: "completed" } },
+      { type: "tool_result", id: "description-result", taskId: "analyst-task", stepId: "description-step", attempt: 2, ordinal: 0,
+        content: { toolCallId: "description-read", status: "completed", output: { job: { id: DESCRIPTION_JOB_ID, description } } } },
+    ],
+    outcomes: new Map([["description-read", "completed"]]), replayReceipts: [], evidenceObservations: [],
+  }
+}
 function emptyAnalystResult() {
   return { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [], evidence: [], summary: "No findings" }
 }
 
-function reportFor(value = analystResult(), currentSnapshot = snapshot) {
+function reportFor(value = analystResult(), currentSnapshot = snapshot, dependencies = proof.projections) {
   const node = currentSnapshot.nodes.find(item => item.key === "analyst")!
   const result = validateRoleResult(value, "analyst")
   const projection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst" as const,
     findings: result.findings.map(({ jobId, score, evidenceIds }) => ({ jobId, score, evidenceIds })), evidenceIds: result.evidence.map(item => item.id) }
-  const evaluation = evaluateTaskGraphVerification(node.verification!, projection, proof.projections)
+  const evaluation = evaluateTaskGraphVerification(node.verification!, projection, dependencies)
   return { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: evaluation.status, reasonCode: evaluation.reasonCode,
     criteria: evaluation.criteria, evidenceDigest: "e".repeat(64), resultDigest: taskGraphResultDigest(result), dependencyBindings: bindings }
 }
@@ -102,7 +127,10 @@ function failedEmptyReport(value = emptyAnalystResult()) {
 }
 
 describe("revalidateTaskGraphDependencyBindings", () => {
-  beforeEach(() => vi.mocked(verifyCompletedScoutDependencies).mockResolvedValue(proof))
+  beforeEach(() => {
+    vi.mocked(verifyCompletedScoutDependencies).mockResolvedValue(proof)
+    vi.mocked(loadTaskGraphVerificationReceipts).mockReset()
+  })
 
   it("does no database reads for a unary graph", async () => {
     const client = { query: async () => { throw new Error("unexpected_query") } } as unknown as Pick<pg.PoolClient, "query">
@@ -121,6 +149,55 @@ describe("revalidateTaskGraphDependencyBindings", () => {
     const current = completedLoaded()
     await expect(revalidateTaskGraphDependencyBindings(client, scope, current)).resolves.toBe(current)
     expect(verifyCompletedScoutDependencies).toHaveBeenCalledWith(client, scope, snapshot, nodes[1])
+  })
+
+  it("accepts matching bounded descriptions for the same verified Scout candidate", async () => {
+    const currentProof = descriptionProof("Current source description")
+    vi.mocked(verifyCompletedScoutDependencies).mockResolvedValue(currentProof)
+    vi.mocked(loadTaskGraphVerificationReceipts).mockResolvedValue(analystDescriptionReceipts("Current source description"))
+    const value = analystResult(DESCRIPTION_JOB_ID)
+    const current = completedLoaded(value, snapshot, reportFor(value, snapshot, currentProof.projections))
+    const client = { query: async () => { throw new Error("unexpected_query") } } as unknown as Pick<pg.PoolClient, "query">
+
+    await expect(revalidateTaskGraphDependencyBindings(client, scope, current)).resolves.toBe(current)
+    expect(loadTaskGraphVerificationReceipts).toHaveBeenCalledTimes(1)
+  })
+
+  it("rejects a changed description read for the exact used Scout candidate", async () => {
+    const currentProof = descriptionProof("Current source description")
+    vi.mocked(verifyCompletedScoutDependencies).mockResolvedValue(currentProof)
+    vi.mocked(loadTaskGraphVerificationReceipts).mockResolvedValue(analystDescriptionReceipts("Changed description"))
+    const value = analystResult(DESCRIPTION_JOB_ID)
+    const current = completedLoaded(value, snapshot, reportFor(value, snapshot, currentProof.projections))
+    const client = { query: async () => { throw new Error("unexpected_query") } } as unknown as Pick<pg.PoolClient, "query">
+
+    await expect(revalidateTaskGraphDependencyBindings(client, scope, current))
+      .rejects.toThrow("task_graph_verification_report_invalid")
+    expect(loadTaskGraphVerificationReceipts).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not load Analyst receipts when no used finding has a comparable Scout witness", async () => {
+    const currentProof = descriptionProof()
+    vi.mocked(verifyCompletedScoutDependencies).mockResolvedValue(currentProof)
+    const value = analystResult(DESCRIPTION_JOB_ID)
+    const current = completedLoaded(value, snapshot, reportFor(value, snapshot, currentProof.projections))
+    const client = { query: async () => { throw new Error("unexpected_query") } } as unknown as Pick<pg.PoolClient, "query">
+
+    await expect(revalidateTaskGraphDependencyBindings(client, scope, current)).resolves.toBe(current)
+    expect(loadTaskGraphVerificationReceipts).not.toHaveBeenCalled()
+  })
+
+  it("surfaces applicable Analyst receipt loader failures as an invalid report", async () => {
+    const currentProof = descriptionProof("Current source description")
+    vi.mocked(verifyCompletedScoutDependencies).mockResolvedValue(currentProof)
+    vi.mocked(loadTaskGraphVerificationReceipts).mockRejectedValue(new Error("canonical_receipt_unavailable"))
+    const value = analystResult(DESCRIPTION_JOB_ID)
+    const current = completedLoaded(value, snapshot, reportFor(value, snapshot, currentProof.projections))
+    const client = { query: async () => { throw new Error("unexpected_query") } } as unknown as Pick<pg.PoolClient, "query">
+
+    await expect(revalidateTaskGraphDependencyBindings(client, scope, current))
+      .rejects.toThrow("task_graph_verification_report_invalid")
+    expect(loadTaskGraphVerificationReceipts).toHaveBeenCalledTimes(1)
   })
 
   it("rejects a changed out-of-set Analyst finding while the source binding stays unchanged", async () => {
@@ -146,7 +223,7 @@ describe("revalidateTaskGraphDependencyBindings", () => {
   })
 
   it("accepts v2 failed empty-Analyst reports only after rechecking current result, receipts, graph, and every Scout", async () => {
-    const multiProof: TaskGraphCompletedDependencyProof = { projections: multiProjections, bindings: multiBindings }
+    const multiProof: TaskGraphCompletedDependencyProof = { projections: multiProjections, bindings: multiBindings, jobDescriptionWitnesses: new Map() }
     vi.mocked(verifyCompletedScoutDependencies).mockResolvedValue(multiProof)
     const value = emptyAnalystResult(), report = failedEmptyReport(value)
     const current = loaded({ structuredResult: value, taskGraphVerificationReport: report }, multiSnapshot, "failed", 5)
@@ -156,7 +233,7 @@ describe("revalidateTaskGraphDependencyBindings", () => {
   })
 
   it("rejects stale/tampered v2 proof material and current-attempt receipt presence", async () => {
-    const multiProof: TaskGraphCompletedDependencyProof = { projections: multiProjections, bindings: multiBindings }
+    const multiProof: TaskGraphCompletedDependencyProof = { projections: multiProjections, bindings: multiBindings, jobDescriptionWitnesses: new Map() }
     vi.mocked(verifyCompletedScoutDependencies).mockResolvedValue(multiProof)
     const value = emptyAnalystResult(), report = failedEmptyReport(value)
     const malformedDigest = loaded({ structuredResult: value, taskGraphVerificationReport: { ...report, evidenceDigest: "f".repeat(64) } }, multiSnapshot, "failed")
