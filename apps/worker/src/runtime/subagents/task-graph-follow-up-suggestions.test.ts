@@ -74,6 +74,24 @@ describe("TaskGraph follow-up suggestion reducer", () => {
     expect(reduceTaskGraphFollowUpSuggestions(malformed)).toContainEqual(expect.objectContaining({ taskId: "resolved-analysis" }))
   })
 
+  it("suppresses only generic task advice covered by a valid failure projection", () => {
+    const current = binding([
+      { taskId: "failed-a", role: "analyst", taskStatus: "failed" },
+      { taskId: "failed-b", role: "scout", taskStatus: "failed" },
+    ])
+    const grounded = { ...current, executionFailureOutcomes: [
+      { taskId: "failed-a", category: "execution_setup_unavailable" as const },
+    ] }
+    const malformed = { ...grounded, executionFailureOutcomes: [
+      { taskId: "foreign-task", category: "execution_setup_unavailable" as const },
+    ] }
+
+    expect(reduceTaskGraphFollowUpSuggestions(grounded)).not.toContainEqual(expect.objectContaining({ taskId: "failed-a", kind: "inspect_task_result" }))
+    expect(reduceTaskGraphFollowUpSuggestions(grounded)).toContainEqual(expect.objectContaining({ taskId: "failed-b", kind: "inspect_task_result" }))
+    expect(reduceTaskGraphFollowUpSuggestions(malformed)).toContainEqual(expect.objectContaining({ taskId: "failed-a", kind: "inspect_task_result" }))
+    expect(reduceTaskGraphFollowUpSuggestions(malformed)).toContainEqual(expect.objectContaining({ taskId: "failed-b", kind: "inspect_task_result" }))
+  })
+
   it.each(["needs_revision", "rejected", "stale"] as const)("references the exact current artifact for a %s review", reviewStatus => {
     const ref = artifact(`private-artifact-${reviewStatus}`)
     const suggestions = reduceTaskGraphFollowUpSuggestions(binding([

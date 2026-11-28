@@ -1,4 +1,5 @@
 import { errorMonitor } from "node:events"
+import { Buffer } from "node:buffer"
 import { isDeepStrictEqual } from "node:util"
 import { Queue, Worker } from "bullmq"
 import { Pool } from "pg"
@@ -1513,9 +1514,13 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
       return state
     }
     : undefined
+  const historyManager = ids.scoutHistoryWitness === true
+    ? new (await import("./manager.ts")).AgentTreeManager(new PgSubagentTaskStore(pool, 12_000), { heartbeatMs: 2_000 })
+    : undefined
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId, productionFlags: flags(), taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => noReservationUsageAuthorization(),
+    ...(historyManager ? { manager: historyManager } : {}),
     ...(stateLoader ? { stateLoader } : {}),
     modelRuntimeFactory() {
       let modelRounds = 0
@@ -2018,9 +2023,127 @@ async function runDiscoverySecondWorker() {
   const ownerId = "p3-process-restart-discovery-worker-" + process.pid
   const runtime = await startDiscoveryRuntime(ownerId, true)
   const { createProductionChildExecutor } = await import("./production-child-runtime.ts")
+  const historyModule = ids.scoutHistoryWitness === true
+    ? await import("./task-graph-scout-history-restart.fixture-support.mjs") : undefined
+  const historySupport = historyModule ? historyModule.createScoutHistoryRestartSupport({
+    candidateJobId: ids.jobId, paddingJobId: ids.paddingJobId,
+  }) : undefined
+  const historyTurnStoreModule = historySupport ? await import("../turns/turn-engine-store.ts") : undefined
+  const historyTurnStore = historyTurnStoreModule?.createPgTurnEngineStore(pool)
+  const finalReadBatchEmitted = new Map()
+  let historyBarrierUsed = false
+  const turnStore = historyTurnStore ? {
+    ...historyTurnStore,
+    async startStep(input) {
+      const taskId = input.owner.kind === "task" ? input.owner.taskId : undefined
+      const executionKey = taskId ? `${taskId}:${input.attempt}` : undefined
+      const finalReadBatch = executionKey ? finalReadBatchEmitted.get(executionKey) : undefined
+      if (!historyBarrierUsed && ids.pauseScoutHistoryBeforeNextStep === true && input.owner.kind === "task"
+        && input.attempt === 1 && finalReadBatch) {
+        historyBarrierUsed = true
+        say("P3_DISCOVERY_SCOUT_HISTORY_COMMITTED " + JSON.stringify({
+          attempt: 1, referenceBytes: finalReadBatch.referenceBytes, readCalls: finalReadBatch.readCalls,
+          lastReadStepClosed: true,
+        }))
+        await waitForCommand("continue-scout-history-next-step")
+      }
+      return historyTurnStore.startStep(input)
+    },
+  } : undefined
   const executeChild = createProductionChildExecutor({
     pool, authorizeUsage: async () => noReservationUsageAuthorization(),
+    ...(turnStore ? { turnStore } : {}),
+    ...(historySupport ? { jobDiscoveryClient: historySupport.client } : {}),
     modelRuntimeFactory({ task }) {
+      if (historySupport && task.role === "scout") {
+        let rounds = 0, readBatchIndex = 0, totalReadCalls = 0
+        const callPrefix = `p3-scout-history:${task.id}:${task.attemptCount}`
+        const completedScout = () => {
+          const evidence = [ids.jobId, ids.paddingJobId].map(jobId => ({
+            id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse",
+          }))
+          return { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+            candidates: [ids.jobId, ids.paddingJobId].map((jobId, index) => ({
+              jobId, source: "greenhouse", url: `https://jobs.example.invalid/discovery-history/${index}`,
+              evidenceIds: [`read:job:${jobId}`],
+            })),
+            evidence, summary: "Completed from digest-verified durable discovery history" }
+        }
+        const projection = (request, expected) => {
+          const prefix = "[harness context layer=tool_observation trust=UNTRUSTED_DATA source=tool-or-subagent]\n"
+          const messages = Array.isArray(request.messages) ? request.messages : []
+          const modelMessageBytes = Buffer.byteLength(JSON.stringify(messages), "utf8")
+          const serialized = JSON.stringify(messages)
+          const blocks = messages.flatMap(message => Array.isArray(message?.content) ? message.content : [])
+            .flatMap(part => part?.type === "text" && typeof part.text === "string" && part.text.startsWith(prefix)
+              ? [part.text.slice(prefix.length)] : [])
+            .flatMap(text => { try { const parsed = record(JSON.parse(text)); return parsed ? [parsed] : [] } catch { return [] } })
+            .filter(block => block.schemaVersion === "agent-harness.v2.child-discovery-history")
+          const block = blocks.length === 1 ? blocks[0] : undefined
+          const reference = record(block?.discoveryReference)
+          const candidates = Array.isArray(block?.candidates) ? block.candidates.map(record) : []
+          const omitted = record(block?.omitted)
+          const compact = Boolean(block && Object.keys(block).sort().join(",") === "candidates,discoveryReference,omitted,schemaVersion"
+            && reference && Object.keys(reference).sort().join(",") === "$ref,sha256,sizeBytes"
+            && reference.$ref === expected.ref && reference.sha256 === expected.sha256 && reference.sizeBytes === expected.sizeBytes
+            && candidates.length === 2 && candidates[0]?.jobId === ids.jobId && candidates[0]?.source === "greenhouse"
+            && candidates[1]?.jobId === ids.paddingJobId && candidates[1]?.source === "greenhouse"
+            && candidates.every(candidate => candidate && Object.keys(candidate).sort().join(",") === "jobId,source")
+            && omitted?.reason === "bounded_context" && Array.isArray(omitted.fields)
+            && omitted.fields.join(",") === "company,description,evidence,fullDescription,location,logo,salary,title,url,usage"
+            && modelMessageBytes < 64 * 1024 && !serialized.includes(historyModule.SCOUT_HISTORY_BODY))
+          return { compact, modelMessageBytes, rawHistoryAbsent: !serialized.includes(historyModule.SCOUT_HISTORY_BODY) }
+        }
+        return { id: `p3-scout-history-model-${task.attemptCount}`, profile: modelProfile(), async *stream(request) {
+          rounds += 1
+          if (task.attemptCount === 1 && rounds === 1) {
+            if (!request.tools.some(tool => record(tool)?.name === "jobs.discover")) throw new Error("p3_scout_history_discover_tool_missing")
+            yield toolCall(`${callPrefix}:discover:415-555-0134`, "jobs.discover", historyModule.SCOUT_HISTORY_DISCOVERY_INPUT)
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (task.attemptCount === 1) {
+            const receipt = latestToolResultForExactToolInput(request, "jobs.discover", historyModule.SCOUT_HISTORY_DISCOVERY_INPUT)
+            const reference = record(receipt?.result)
+            const plan = historySupport.planFor(task)
+            if (!reference || typeof reference.$ref !== "string" || !plan
+              || reference.sizeBytes !== plan.sizeBytes || reference.sha256 !== plan.sha256) {
+              throw new Error("p3_scout_history_discovery_reference_missing")
+            }
+            if (readBatchIndex < plan.cursorBatches.length) {
+              const batch = plan.cursorBatches[readBatchIndex++]
+              for (const cursor of batch) {
+                const readInput = { referenceId: reference.$ref, ...(cursor === undefined ? {} : { cursor }) }
+                yield toolCall(`${callPrefix}:read:${totalReadCalls++}:415-555-0134`, "tool_results.read", readInput)
+              }
+              if (readBatchIndex === plan.cursorBatches.length) {
+                finalReadBatchEmitted.set(`${task.id}:${task.attemptCount}`, {
+                  referenceBytes: plan.sizeBytes, readCalls: totalReadCalls,
+                })
+              }
+              yield { type: "completed", finishReason: "tool_calls" }; return
+            }
+            if (ids.pauseScoutHistoryBeforeNextStep === true) throw new Error("p3_scout_history_pre_step_barrier_missing")
+            const compact = projection(request, { ref: reference.$ref, sha256: reference.sha256, sizeBytes: reference.sizeBytes })
+            if (!compact.compact) throw new Error("p3_scout_history_live_projection_missing")
+            yield { type: "text_delta", text: JSON.stringify(completedScout()) }
+            yield { type: "completed", finishReason: "stop" }; return
+          }
+          if (task.attemptCount === 2 && rounds === 1) {
+            const expected = record(ids.historyReference)
+            if (!expected || typeof expected.ref !== "string" || typeof expected.sha256 !== "string"
+              || !Number.isSafeInteger(expected.sizeBytes)) throw new Error("p3_scout_history_resume_reference_missing")
+            const compact = projection(request, expected)
+            if (!compact.compact) throw new Error("p3_scout_history_resume_projection_missing")
+            say("P3_DISCOVERY_SCOUT_HISTORY_RESUMED " + JSON.stringify({
+              attempt: 2, compactContext: compact.compact, modelMessageBytes: compact.modelMessageBytes,
+              rawHistoryAbsent: compact.rawHistoryAbsent,
+            }))
+            yield { type: "text_delta", text: JSON.stringify(completedScout()) }
+            yield { type: "completed", finishReason: "stop" }; return
+          }
+          throw new Error("p3_unexpected_scout_history_model_attempt")
+        } }
+      }
       let rounds = 0
       const callId = `p3-process-restart-discovery-read:${task.id}:${task.attemptCount}:415-555-0134`
       return { id: `p3-process-restart-discovery-${task.role}-model`, profile: modelProfile(), async *stream(request) {

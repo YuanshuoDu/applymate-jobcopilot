@@ -4,6 +4,7 @@ import type { ContextSeedBlock } from "./step-context-builder.js"
 import { filterRootTaskHistoryLessonsForEmittedNodes, sanitizeRootTaskHistoryNodeLessonForCrossSession, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
 import { parseRootTaskHistoryReportedOutputsFromGraph, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
 import * as rootTaskHistoryPlanShape from "./root-task-history-plan-shape.js"
+import type { RootTaskHistoryBranchReplacementEpisode } from "./root-task-history-branch-replacement-history.js"
 import { isDenseRootTaskHistoryArray, parseRootTaskHistoryCandidate, type RootTaskHistoryCandidate, type RootTaskHistoryCandidateNode, type RootTaskHistorySafeNode } from "./root-task-history-candidate-codec.js"
 export type ValidatedRootTaskHistoryOutcome = Readonly<{
   sourceTurnId: string
@@ -13,8 +14,9 @@ export type ValidatedRootTaskHistoryOutcome = Readonly<{
   sourceNodeOrdinals?: readonly number[]
   nodeLessons?: readonly (RootTaskHistoryNodeLesson | undefined)[]
   reportedOutputs?: readonly (RootTaskHistoryReportedOutput | undefined)[]
+  branchReplacementEpisode?: RootTaskHistoryBranchReplacementEpisode
 }>
-type SelectedTurn = { label: string; candidate: RootTaskHistoryCandidate; nodes: RootTaskHistoryCandidateNode[]; lessonOrdinals: Set<number>; reportedOutputOrdinals: Set<number>; footprintOrdinals: Set<number>; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape }
+type SelectedTurn = { label: string; candidate: RootTaskHistoryCandidate; nodes: RootTaskHistoryCandidateNode[]; lessonOrdinals: Set<number>; reportedOutputOrdinals: Set<number>; footprintOrdinals: Set<number>; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape; branchReplacementEpisode?: RootTaskHistoryBranchReplacementEpisode }
 const MAX_CANDIDATES = 64
 const MAX_TURNS = 2
 const MAX_NODES = 8
@@ -28,6 +30,7 @@ function copyOutcome(value: object, outputs?: readonly (RootTaskHistoryReportedO
     for (const key of keys as string[]) {
       if (key === "reportedOutputs") continue
       const descriptor = descriptors[key]
+      if (key === "branchReplacementEpisode" && (!descriptor || !("value" in descriptor) || !descriptor.enumerable)) continue
       if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return null
       copy[key] = descriptor.value
     }
@@ -51,7 +54,7 @@ function prepareCrossSessionOutcome(value: unknown, crossSession: boolean): unkn
     return outputs?.some(Boolean) ? copyOutcome(value, outputs) : value
   } catch { return null }
 }
-function content(turns: readonly Readonly<{ label: string; nodes: readonly RootTaskHistorySafeNode[]; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape }>[], crossSession = false) {
+function content(turns: readonly Readonly<{ label: string; nodes: readonly RootTaskHistorySafeNode[]; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape; branchReplacementEpisode?: RootTaskHistoryBranchReplacementEpisode }>[], crossSession = false) {
   return {
     kind: "root_task_history",
     informationalOnly: true,
@@ -75,7 +78,8 @@ function emittedNodes(turn: SelectedTurn, withLessons: boolean, withReportedOutp
 }
 function emittedTurns(turns: readonly SelectedTurn[], withLessons: boolean, withReportedOutputs: boolean) {
   return turns.map(turn => ({ label: turn.label, nodes: emittedNodes(turn, withLessons, withReportedOutputs),
-    ...(turn.planShape ? { planShape: turn.planShape } : {}) }))
+    ...(turn.planShape ? { planShape: turn.planShape } : {}),
+    ...(turn.branchReplacementEpisode ? { branchReplacementEpisode: turn.branchReplacementEpisode } : {}) }))
 }
 function withinContentLimit(turns: readonly SelectedTurn[], withLessons = false, withReportedOutputs = false, crossSession = false): boolean {
   const serialized = JSON.stringify({ id: "root-task-history", content: content(emittedTurns(turns, withLessons, withReportedOutputs), crossSession) })
@@ -91,6 +95,9 @@ function projectCandidates(values: readonly RootTaskHistoryCandidate[], crossSes
       || previous.terminalXid8 !== value.terminalXid8 || previous.terminalWitnessEventId !== value.terminalWitnessEventId
       || JSON.stringify(previous.safeNodes) !== JSON.stringify(value.safeNodes) || JSON.stringify(previous.planShape) !== JSON.stringify(value.planShape)) {
       byIdentity.delete(value.identity); conflicts.add(value.identity)
+    } else if (JSON.stringify(previous.branchReplacementEpisode) !== JSON.stringify(value.branchReplacementEpisode)) {
+      const { branchReplacementEpisode: _episode, ...withoutEpisode } = previous
+      byIdentity.set(value.identity, withoutEpisode)
     }
   }
   const ordered = [...byIdentity.values()].sort((left, right) => crossSession
@@ -102,6 +109,7 @@ function projectCandidates(values: readonly RootTaskHistoryCandidate[], crossSes
   for (const value of ordered) {
     if (turns.length >= MAX_TURNS || nodeCount >= MAX_NODES) break
     const entry: SelectedTurn = { label: "earlier terminal attempt", candidate: value, nodes: [], lessonOrdinals: new Set(), reportedOutputOrdinals: new Set(), footprintOrdinals: new Set() }
+    if (!value.sourceSessionDiffers && value.branchReplacementEpisode) entry.branchReplacementEpisode = value.branchReplacementEpisode
     for (const node of value.safeNodes) {
       if (nodeCount >= MAX_NODES) break
       entry.nodes.push(node)
@@ -113,6 +121,11 @@ function projectCandidates(values: readonly RootTaskHistoryCandidate[], crossSes
     if (entry.nodes.length) turns.push(entry)
   }
   if (!turns.length) return undefined
+  while (!withinContentLimit(turns, true, true, crossSession)) {
+    const turn = [...turns].reverse().find(value => value.branchReplacementEpisode)
+    if (!turn) break
+    delete turn.branchReplacementEpisode
+  }
   if (!withinContentLimit(turns, true, true, crossSession) && withinContentLimit(turns, true, false, crossSession)) {
     for (const turn of turns) turn.reportedOutputOrdinals.clear()
   }

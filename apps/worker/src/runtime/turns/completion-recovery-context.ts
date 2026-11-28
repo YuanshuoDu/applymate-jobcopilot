@@ -34,13 +34,13 @@ const NATIVE_FIXED = new Set([
 ])
 const GENERIC_NATIVE_REPAIR = "Revise the candidate or obtain new current owned evidence before retrying."
 const MAX_FEEDBACK = 512, MAX_ENVELOPE = 2_048
-export type TaskGraphRecoveryIssue = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion"
+export type TaskGraphRecoveryIssue = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion" | "result_applicability"
 export type TaskGraphRecoveryRepairState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
 export type TaskGraphRecoveryDetail = Readonly<{ nodeOrdinal: number; criterionOrdinal?: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; repairState?: TaskGraphRecoveryRepairState }>
 export type TaskGraphRecoverySummary = Readonly<{ issue?: TaskGraphRecoveryIssue; details: readonly TaskGraphRecoveryDetail[]; omitted: boolean }>
 type GateFeedbackCode = TaskGraphRecoveryIssue
 type RepairFeedbackState = TaskGraphRecoveryRepairState
-const GATE_FEEDBACK_CODES = { legacy_unverified: true, verification_report: true, repair_receipt: true, repair_criterion: true } satisfies Record<GateFeedbackCode, true>
+const GATE_FEEDBACK_CODES = { legacy_unverified: true, verification_report: true, repair_receipt: true, repair_criterion: true, result_applicability: true } satisfies Record<GateFeedbackCode, true>
 const TASK_GRAPH_REASON_CODES = {
   criteria_met: true, criterion_not_met: true, reported_score_below_minimum: true, contract_invalid: true,
   projection_invalid: true, role_mismatch: true, canonical_evidence_missing: true, canonical_evidence_invalid: true,
@@ -53,13 +53,11 @@ const REPAIR_FEEDBACK_STATES = {
 } satisfies Record<RepairFeedbackState, true>
 const TASK_GRAPH_DETAIL = new RegExp(`^ nodeOrdinal=([1-9][0-9]*)(?: criterionOrdinal=([1-9][0-9]*))? status=(failed|unverified) reasonCode=(${Object.keys(TASK_GRAPH_REASON_CODES).join("|")})(?: repair=(${Object.keys(REPAIR_FEEDBACK_STATES).join("|")}))?(?= |$)`)
 const TASK_GRAPH_ISSUE = new RegExp(`^ issue=(${Object.keys(GATE_FEEDBACK_CODES).join("|")})`)
+const TASK_GRAPH_FINDING_SHORTFALL = /^ issue=finding_count_shortfall required=([1-9][0-9]*) observed=(0|[1-9][0-9]*) criterionId=([a-z][a-z0-9._-]{0,63})$/
 const TASK_GRAPH_OMISSION = /^ \(([1-9][0-9]*) feedback items omitted; inspect TaskGraph before retrying\.\)$/
 const MAX_TASK_GRAPH_FEEDBACK_ITEMS = TASK_GRAPH_LIMITS.maxPersistedNodes * TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria * 2 + 1
 
-function validRevision(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-}
-
+function validRevision(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 }
 function validTaskGraphOrdinal(value: string, maximum: number): boolean {
   const ordinal = Number(value)
   return Number.isSafeInteger(ordinal) && ordinal >= 1 && ordinal <= maximum
@@ -68,6 +66,9 @@ function validTaskGraphOrdinal(value: string, maximum: number): boolean {
 function validTaskGraphFeedback(feedback: string): boolean {
   if (!feedback.startsWith(TASK_GRAPH_FEEDBACK)) return false
   let rest = feedback.slice(TASK_GRAPH_FEEDBACK.length), issueCount = 0, detailCount = 0
+  const findingShortfall = TASK_GRAPH_FINDING_SHORTFALL.exec(rest)
+  if (findingShortfall) return validTaskGraphOrdinal(findingShortfall[1]!, TASK_GRAPH_VERIFICATION_LIMITS.maxItems)
+    && Number(findingShortfall[2]) < Number(findingShortfall[1])
   const issue = TASK_GRAPH_ISSUE.exec(rest)
   if (issue) { issueCount = 1; rest = rest.slice(issue[0].length) }
   for (;;) {
@@ -105,7 +106,6 @@ function safeNativeFeedback(value: string): string | null {
   if (rest && rest !== ` ${GENERIC_NATIVE_REPAIR}`
     && !/^(?: target=[A-Za-z0-9._:-]{1,128} criterion=[A-Za-z0-9._:-]{1,128} status=(?:failed|uncertain) reason=(?:does_not_meet_criterion|evidence_missing|evidence_conflict|unsupported_claim|ambiguous))*$/.test(rest)) return null
   const generic = ` ${GENERIC_NATIVE_REPAIR}`
-  if (rest === generic) rest = generic
   return `${match[0]}${actions}${rest === generic ? generic : ""}`
 }
 

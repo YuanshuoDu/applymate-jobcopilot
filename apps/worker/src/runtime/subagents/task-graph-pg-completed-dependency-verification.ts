@@ -8,12 +8,14 @@ import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verificati
 import { parseStoredTaskGraphVerificationReport, type TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
+import type { TaskGraphJobDescriptionWitnesses } from "./task-graph-job-description-proof.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 export type TaskGraphCompletedDependencyProof = Readonly<{
   projections: ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>
   bindings: readonly TaskGraphVerificationDependencyBinding[]
+  jobDescriptionWitnesses: ReadonlyMap<string, TaskGraphJobDescriptionWitnesses>
 }>
 
 /** Rebuild full current Scout evidence and its binding from one owner-scoped graph snapshot. */
@@ -22,12 +24,13 @@ export async function verifyCompletedScoutDependencies(
 ): Promise<TaskGraphCompletedDependencyProof | null> {
   const contract = analyst.verification
   const keys = contract ? taskGraphVerificationDependencyNodeKeys(contract) : []
-  if (!keys.length) return { projections: new Map(), bindings: [] }
+  if (!keys.length) return { projections: new Map(), bindings: [], jobDescriptionWitnesses: new Map() }
   let snapshot: TaskGraphSnapshot
   try { snapshot = parseTaskGraphSnapshot(currentSnapshot) } catch { return null }
   if (!snapshot.nodes.some(node => node.taskId === analyst.taskId && node.key === analyst.key)
     || !validateTaskGraphVerificationDependencySelectors(snapshot.nodes)) return null
   const projections = new Map<string, TaskGraphVerificationEvidenceProjection>(), bindings: TaskGraphVerificationDependencyBinding[] = []
+  const jobDescriptionWitnesses = new Map<string, TaskGraphJobDescriptionWitnesses>()
   for (const key of keys) {
     const source = snapshot.nodes.find(node => node.key === key)
     if (!source || !analyst.dependsOn.includes(key) || source.templateId !== "scout" || source.verificationDisposition !== "typed"
@@ -60,10 +63,11 @@ export async function verifyCompletedScoutDependencies(
         evidenceDigest: stored.evidenceDigest, resultDigest: stored.resultDigest,
       })) return null
     projections.set(key, verified.projection)
+    if (verified.jobDescriptionWitnesses) jobDescriptionWitnesses.set(key, verified.jobDescriptionWitnesses)
     bindings.push({ nodeKey: key, taskId: source.taskId, attemptCount: Number(task.attemptCount),
       nodeDigest: digest(source), resultDigest: verified.report.resultDigest!, evidenceDigest: verified.report.evidenceDigest!, reportDigest: digest(verified.report) })
   }
-  return { projections, bindings }
+  return { projections, bindings, jobDescriptionWitnesses }
 }
 
 export async function verifyRepairedTaskGraphFindings(

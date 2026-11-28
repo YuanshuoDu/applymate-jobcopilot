@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
-import type { HarnessModelRequest } from "@jobcopilot/agent-model"
 import { redactAgentEvent, redactSensitiveText } from "@jobcopilot/shared"
+import type { HarnessModelRequest, ModelStreamEvent } from "@jobcopilot/agent-model"
 
 import { createAgentArtifactRepository } from "../../db/agent-artifact-repo.js"
 import { createCanonicalScheduledDraftRuntime } from "../scheduled-draft-runtime.js"
@@ -23,7 +23,7 @@ import type { TurnLease } from "../turns/lease.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
-import { reverifyFailedTaskGraphNodeEvidence, taskGraphResultDigest, verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
+import { reverifyFailedTaskGraphNodeEvidence, taskGraphResultDigest, verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { readScheduledDraftCandidateBinding, validateScheduledDraftCandidateWitness } from "./scheduled-draft-candidate.js"
 import type { TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"
 import { createChildDiscoveryObservers } from "./child-discovery-observers.js"
@@ -37,7 +37,9 @@ import type { SteeringReconciliationOperation } from "./steering-reconciliation-
 import type { TaskGraphOperationalFailureReplacement } from "../planning/task-graph-operational-failure-replacement.js"
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
-import type { JobDiscoveryClient, JobDiscoveryRequest } from "../tools/job-discovery-client.js"
+import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import type { JobDiscoveryClient, JobDiscoveryOutput, JobDiscoveryRequest } from "../tools/job-discovery-client.js"
+import type { ProductionChildRuntimeOptions } from "./production-child-runtime.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const ROOT_TASK_GOAL = "P3 TaskGraph command-port integration test"
@@ -46,6 +48,12 @@ const ANALYST_VERIFICATION = {
   role: "analyst",
   criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
 } as const
+const DESCRIPTION_WITNESS_PROFILE = {
+  provider: "fixture", model: "task-graph-description-witness", nativeTools: true, structuredOutput: true, streaming: true,
+  continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+  supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+  supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+}
 
 function dedicatedDisposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
@@ -146,6 +154,36 @@ function selectedJobId(value: Fixture): string { return `p3-task-graph-selected-
 function scheduledDraftJobId(value: Fixture, label: string): string {
   const suffix = createHash("sha256").update(`${value.rootTaskId}:${label}`).digest("hex").slice(0, 24)
   return `c${suffix}`
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : undefined
+  } catch { return undefined }
+}
+
+function observedJobFromToolReceipt(request: HarnessModelRequest, toolName: string, jobId: string): Record<string, unknown> | undefined {
+  const names = new Map<string, string>()
+  for (const message of request.messages) {
+    for (const part of message.content) if (part.type === "tool_use") names.set(part.id, part.name)
+  }
+  for (const message of request.messages) {
+    if (message.role !== "tool") continue
+    for (const part of message.content) {
+      if (part.type !== "tool_result" || part.isError || names.get(part.toolUseId) !== toolName) continue
+      let output: unknown
+      try { output = JSON.parse(part.content) as unknown } catch { continue }
+      const record = plainRecord(output)
+      const candidate = toolName === "jobs.discover"
+        ? Array.isArray(record?.jobs) ? record.jobs.find(item => plainRecord(item)?.id === jobId) : undefined
+        : plainRecord(record?.job)
+      const job = plainRecord(candidate)
+      if (job?.id === jobId) return job
+    }
+  }
+  return undefined
 }
 
 function completedReviewerResultEnvelope() {
@@ -4449,6 +4487,225 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       await adminPool!.query(`DROP FUNCTION IF EXISTS public."${functionName}"()`)
     }
   }, 60_000)
+
+  it("rejects a canonical Scout to Analyst description conflict and accepts the matching Job read", async () => {
+    const runScenario = async (input: Readonly<{
+      discoveryDescription: string
+      storedDescription: string
+      shouldReject: boolean
+    }>): Promise<void> => {
+      const value = fixture()
+      additionalFixtures.push(value)
+      await seed(adminPool!, value)
+      const jobId = `c${randomUUID().replaceAll("-", "").slice(0, 24)}`
+      const url = "https://jobs.example.invalid/description-witness"
+      await adminPool!.query(`INSERT INTO "Job"
+        ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+        VALUES ($1, $2, 'Description Witness Fixture', 'Software Engineer', 'Dublin', 'saved', $3, $4, 'fixture', CURRENT_TIMESTAMP)`,
+      [jobId, value.userId, url, input.storedDescription])
+
+      const scoutKeys = ["description-scout-a", "description-scout-b"] as const
+      const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
+      const inputContract: TaskGraphScheduleInput = {
+        scope: { ...readScope(value), stepId: value.stepId },
+        proposal: {
+          expectedRevision: 0,
+          nodes: [
+            ...scoutKeys.map(key => ({
+              key, templateId: "scout", goal: "Discover the same canonical fixture job",
+              successCriteria: ["Return the discovered job with canonical evidence"],
+              verification: SCHEDULED_DRAFT_SCOUT_VERIFICATION, dependsOn: [],
+            })),
+            {
+              key: "description-analyst", templateId: "analyst", goal: "Read the canonical fixture job",
+              successCriteria: ["Return a finding grounded in the Scout candidates and owned Job read"],
+              verification: {
+                schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+                role: "analyst",
+                criteria: [
+                  { id: "scout-candidate-coverage", check: {
+                    kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: scoutKeys, minimumPercent: 100,
+                  } },
+                  { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+                  { id: "finding-evidence", check: { kind: "all_findings_have_evidence", minimumItems: 1 } },
+                ],
+              },
+              dependsOn: [...scoutKeys],
+            },
+          ],
+        },
+        templates,
+      }
+      const rootActions = selectedJobRootAllowedActions(templates)
+      const updatedRoot = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb
+        WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "rootTaskId" = $1
+          AND "parentTaskId" IS NULL AND "leaseOwner" = $5 AND "attemptCount" = 1 AND "status" = 'running'`,
+      [value.rootTaskId, JSON.stringify(rootActions), value.sessionId, value.turnId, value.parentLeaseOwner])
+      expect(updatedRoot.rowCount).toBe(1)
+      await seedReconciliationAgenda(adminPool!, value, {
+        id: value.stepId, sequence: await nextEventSequence(adminPool!, value), cursor: 0n, planRevision: 0, consumedInputIds: [],
+      })
+      const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+      const scheduled = await command.appendAndSchedule(inputContract)
+      expect(scheduled).toMatchObject({ status: "accepted", revision: 1 })
+      const scoutTaskIds = scoutKeys.map(key => {
+        const node = scheduled.nodes.find(candidate => candidate.key === key)
+        if (!node) throw new Error("Description witness graph lost a Scout node")
+        return node.taskId
+      })
+      const analystNode = scheduled.nodes.find(candidate => candidate.key === "description-analyst")
+      if (!analystNode) throw new Error("Description witness graph lost its Analyst node")
+
+      const jobDiscoveryClient: JobDiscoveryClient = {
+        async discover(request): Promise<JobDiscoveryOutput> {
+          const descriptionEvidenceId = `description-source-${jobId}`
+          return {
+            jobs: [{ id: jobId, title: "Software Engineer", company: "Description Witness Fixture", location: "Dublin",
+              url, description: input.discoveryDescription, fullDescription: "Provider-only expanded details",
+              salary: null, logo: null, source: "fixture", evidenceRefs: [descriptionEvidenceId] }],
+            evidence: [{ evidenceId: descriptionEvidenceId, jobId, kind: "source", source: "fixture", url,
+              summary: "Synthetic server-side discovery result" }],
+            nextCursor: null,
+            usage: { ledgerKey: `description-witness-${request.toolCallId}`, toolName: "jobs.discover", toolVersion: "1",
+              toolCallId: request.toolCallId, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+              requests: 1, jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0, providerFailures: 0,
+              aiCalls: 0, providers: ["fixture"], estimatedCostUsd: 0, durationMs: 1 },
+          }
+        },
+      }
+      const modelRuntimeFactory: NonNullable<ProductionChildRuntimeOptions["modelRuntimeFactory"]> = ({ task }) => {
+        let round = 0
+        return {
+          id: `description-witness-${task.role}`,
+          profile: DESCRIPTION_WITNESS_PROFILE,
+          async *stream(request: HarnessModelRequest): AsyncIterable<ModelStreamEvent> {
+            round += 1
+            const toolName = task.role === "scout" ? "jobs.discover" : "jobs.get"
+            if (round === 1) {
+              expect(request.tools.some(tool => plainRecord(tool)?.name === toolName)).toBe(true)
+              yield {
+                type: "tool_call_completed", callId: randomUUID(), name: toolName,
+                arguments: task.role === "scout"
+                  ? { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "fixture", pageSize: 1 }
+                  : { jobId },
+              }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (round !== 2 || task.role !== "scout" && task.role !== "analyst") throw new Error("Unexpected description witness model round")
+            const observed = observedJobFromToolReceipt(request, toolName, jobId)
+            const expectedDescription = task.role === "scout" ? input.discoveryDescription : input.storedDescription
+            expect(observed?.description === expectedDescription).toBe(true)
+            if (!observed || observed.id !== jobId || observed.description !== expectedDescription
+              || observed.source !== "fixture" || observed.url !== url) {
+              throw new Error("Description witness model did not receive its canonical tool result")
+            }
+            const evidenceId = `model-description-evidence-${task.role}`
+            const evidence = [{ id: evidenceId, kind: "job", ref: jobId, source: observed.source }]
+            const structured = task.role === "scout"
+              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+                candidates: [{ jobId, source: observed.source, url: observed.url, evidenceIds: [evidenceId] }], evidence,
+                summary: "The discovered job is supported by its canonical read evidence." }
+              : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                findings: [{ jobId, score: 8, evidenceIds: [evidenceId] }], evidence,
+                summary: "The owned Job read supports this finding." }
+            yield { type: "text_delta", text: JSON.stringify(structured) }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        }
+      }
+      const authorizeUsage = async (_authorization: WorkerUsageAuthorizationInput) => ({
+        outputReservationRequired: false,
+        maxOutputTokens: null,
+        settle: async () => undefined,
+        settleUnknown: async (_settlement: WorkerUsageSettlementInput) => undefined,
+      })
+      const [
+        { AgentTreeManager }, { createProductionChildExecutor }, { runSubagentQueueJob },
+      ] = await Promise.all([
+        import("./manager.js"), import("./production-child-runtime.js"), import("../../queue/subagent-pause-dispatch.js"),
+      ])
+      const manager = new AgentTreeManager(new PgSubagentTaskStore(adminPool!))
+      const executor = createProductionChildExecutor({
+        pool: adminPool!, authorizeUsage, modelRuntimeFactory, jobDiscoveryClient,
+      })
+      const executeTask = (taskId: string, label: string) => runSubagentQueueJob(adminPool! as never, manager, executor, {
+        taskId, sessionId: value.sessionId, rootTaskId: value.rootTaskId, ownerId: `description-witness-${label}-${randomUUID()}`,
+      })
+      await executeTask(scoutTaskIds[0]!, "scout-a")
+      await executeTask(scoutTaskIds[1]!, "scout-b")
+      await executeTask(analystNode.taskId, "analyst")
+
+      const taskRows = await adminPool!.query<{
+        id: string; role: string; taskType: string; status: string; attemptCount: number; failureReason: string | null; result: unknown
+      }>(`SELECT "id", "role", "taskType", "status", "attemptCount", "failureReason", "result" FROM "sub_agent_tasks"
+        WHERE "id" = ANY($1::text[]) AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 ORDER BY "id"`,
+      [[...scoutTaskIds, analystNode.taskId], value.sessionId, value.turnId, value.rootTaskId])
+      expect(taskRows.rows).toHaveLength(3)
+      expect(taskRows.rows.filter(row => row.role === "scout").map(row => ({ taskType: row.taskType, status: row.status, attemptCount: row.attemptCount })))
+        .toEqual([{ taskType: "job_discovery", status: "completed", attemptCount: 1 }, { taskType: "job_discovery", status: "completed", attemptCount: 1 }])
+      const analyst = taskRows.rows.find(row => row.id === analystNode.taskId)
+      if (!analyst) throw new Error("Description witness graph lost its terminal Analyst row")
+      const result = plainRecord(analyst.result)
+      const report = plainRecord(result?.taskGraphVerificationReport)
+      expect(report).toMatchObject(input.shouldReject
+        ? { status: "unverified", reasonCode: "canonical_evidence_ambiguous" }
+        : { status: "passed", reasonCode: "criteria_met" })
+      expect({ role: analyst.role, taskType: analyst.taskType, status: analyst.status, failureReason: analyst.failureReason,
+        attemptCount: analyst.attemptCount }).toEqual(input.shouldReject
+        ? { role: "analyst", taskType: "job_analysis", status: "failed", failureReason: "task_graph_verification_unverified", attemptCount: 1 }
+        : { role: "analyst", taskType: "job_analysis", status: "completed", failureReason: null, attemptCount: 1 })
+
+      const graphRow = await adminPool!.query<{ content: unknown; revision: number }>(`SELECT "content", "revision" FROM "agent_items"
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
+      [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId])
+      if (graphRow.rows.length !== 1) throw new Error("Description witness graph lost its terminal snapshot")
+      const snapshot = parseTaskGraphSnapshot(graphRow.rows[0]?.content)
+      const analystGraphNode = snapshot.nodes.find(node => node.taskId === analystNode.taskId)
+      if (!analystGraphNode || !result || !report) throw new Error("Description witness terminal proof is incomplete")
+      const graphScope = scheduledDraftGraphScope(value)
+      const dependencyProof = await verifyCompletedScoutDependencies(adminPool!, graphScope, snapshot, analystGraphNode)
+      if (!dependencyProof) throw new Error("Description witness terminal proof lost its completed Scout dependencies")
+      if (input.shouldReject) {
+        expect(analyst.role).toBe("analyst")
+        expect(Object.hasOwn(result, "structuredResult")).toBe(false)
+        expect(report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_ambiguous",
+          evidenceDigest: null, resultDigest: null })
+      } else {
+        const terminalProof = await verifyCompletedTaskGraphNodeEvidence(adminPool!, {
+          scope: { ...graphScope, taskId: analystNode.taskId, attemptCount: 1 }, snapshot,
+          node: analystGraphNode, structuredResult: result.structuredResult,
+          dependencies: dependencyProof.projections, dependencyBindings: dependencyProof.bindings,
+          scoutJobDescriptionWitnesses: dependencyProof.jobDescriptionWitnesses, graphRevision: graphRow.rows[0]!.revision,
+        })
+        expect(terminalProof.verified).toBe(true)
+        expect({ status: terminalProof.report.status, reasonCode: terminalProof.report.reasonCode,
+          evidenceDigest: terminalProof.report.evidenceDigest, resultDigest: terminalProof.report.resultDigest }).toEqual({
+          status: report.status, reasonCode: report.reasonCode,
+          evidenceDigest: report.evidenceDigest, resultDigest: report.resultDigest,
+        })
+      }
+
+      const pairs = await adminPool!.query<{ taskId: string; toolName: string; pairCount: number }>(`SELECT call_item."taskId",
+          call_item."content"->>'toolName' AS "toolName", COUNT(*)::int AS "pairCount"
+        FROM "agent_items" AS call_item JOIN "agent_items" AS result_item
+          ON result_item."sessionId" = call_item."sessionId" AND result_item."turnId" = call_item."turnId"
+            AND result_item."taskId" = call_item."taskId" AND result_item."stepId" = call_item."stepId"
+            AND result_item."type" = 'tool_result' AND result_item."content"->>'toolCallId' = call_item."content"->>'toolCallId'
+        WHERE call_item."sessionId" = $1 AND call_item."turnId" = $2 AND call_item."taskId" = ANY($3::text[])
+          AND call_item."type" = 'tool_call'
+        GROUP BY call_item."taskId", call_item."content"->>'toolName'`,
+      [value.sessionId, value.turnId, [...scoutTaskIds, analystNode.taskId]])
+      expect(pairs.rows.map(row => `${row.taskId}:${row.toolName}:${row.pairCount}`).sort()).toEqual([
+        `${scoutTaskIds[0]}:jobs.discover:1`, `${scoutTaskIds[1]}:jobs.discover:1`, `${analystNode.taskId}:jobs.get:1`,
+      ].sort())
+    }
+
+    await runScenario({ discoveryDescription: "Canonical listing description for the owned fixture job.",
+      storedDescription: "Previously materialized description for a different listing.", shouldReject: true })
+    await runScenario({ discoveryDescription: "Canonical listing description for the owned fixture job.",
+      storedDescription: "Canonical listing description for the owned fixture job.", shouldReject: false })
+  }, 120_000)
 
   it("blocks terminal finalization when a persisted Analyst attempt changes after completion was accepted", async () => {
     const value = fixture()

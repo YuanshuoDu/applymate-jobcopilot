@@ -1,16 +1,18 @@
 import { Buffer } from "node:buffer"
-import { canonicalJson, redactSensitiveText } from "@jobcopilot/shared"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { ChildToolReplayReceipt, ChildWaitReplayReceipt } from "../turns/turn-execution-options.js"
 import type { SubagentLease } from "./types.js"
 import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagentWaitJson, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
-import { buildChildResumeReplayReceipts, type ChildResumeReplayPair, type ChildResumeReplayReceiptSet } from "./child-resume-replay-receipts.js"
+import { buildChildResumeReplayReceipts, type ChildResumeReplayReceiptSet } from "./child-resume-replay-receipts.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
 import { prepareScoutResultsOutput } from "../tools/scout-results-output-redaction.js"
 import { isSubagentTaskId } from "../tools/redaction.js"
-import { createDurableDiscoveryAssembly, parseDurableDiscoveryReference, reduceDurableDiscoveryChunk, type DurableDiscoveryAssembly } from "./child-durable-discovery.js"
+import { parseDurableDiscoveryReference } from "./child-durable-discovery.js"
+import { projectChildDiscoveryHistory, verifiedChildDiscoveryReadPositions } from "./child-discovery-history.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 type Row = Record<string, unknown>
 const MAX_TOOL_OUTPUT_BYTES = 6 * 1024
@@ -88,41 +90,16 @@ function boundedDiscoveryJson(value: unknown, maxBytes: number): RepositoryJsonV
     : redactJobReadOutput("jobs.discover", value)
   return boundedNormalizedJson(normalized, maxBytes)
 }
-function verifiedDiscoveryReadPairs(pairs: readonly ChildResumeReplayPair[]): Set<number> {
-  const assemblies = new Map<string, { assembly: DurableDiscoveryAssembly; positions: number[] }>(), verified = new Set<number>()
-  for (const [index, pair] of pairs.entries()) {
-    if (pair.toolName === "jobs.discover" && pair.status === "completed") {
-      const reference = parseDurableDiscoveryReference(pair.output)
-      if (reference) {
-        const previous = assemblies.get(reference.ref); if (previous && (previous.assembly.reference.byteCount !== reference.byteCount || previous.assembly.reference.sha256 !== reference.sha256)) throw new Error("child_resume_evidence_invalid")
-        if (!previous) assemblies.set(reference.ref, { assembly: createDurableDiscoveryAssembly(reference), positions: [] })
-      }
-      continue
-    }
-    if (pair.toolName !== "tool_results.read" || pair.status !== "completed") continue
-    const input = object(pair.input), output = object(pair.output), inputRef = input?.referenceId, outputRef = output?.ref
-    const ref = typeof inputRef === "string" && assemblies.has(inputRef) ? inputRef : typeof outputRef === "string" && assemblies.has(outputRef) ? outputRef : undefined
-    const state = ref ? assemblies.get(ref) : undefined
-    if (!state) continue
-    const reduction = reduceDurableDiscoveryChunk(state.assembly, pair.output, pair.input); if (reduction.kind === "invalid") throw new Error("child_resume_evidence_invalid")
-    state.positions.push(index)
-    if (reduction.kind === "complete") {
-      const safe = redactJobReadOutput("jobs.discover", reduction.value); if (canonicalJson(safe) !== canonicalJson(reduction.value)) throw new Error("child_resume_evidence_invalid")
-      state.positions.forEach(position => verified.add(position))
-    } else if (state.assembly.complete) verified.add(index)
-  }
-  return verified
-}
 type RestoredScoutDelegate = Readonly<{ taskId: string; status: "queued" | "duplicate" }>
 export function buildChildResumeObservations(rows: readonly Row[], lease: SubagentLease, currentAttemptOrdinal?: number, durableWaits: readonly DurableWaitResume[] = []): ChildResumeObservationSet {
-  return projectChildResumeObservations(buildChildResumeReplayReceipts(rows, lease, currentAttemptOrdinal, durableWaits))
+  return projectChildResumeObservations(buildChildResumeReplayReceipts(rows, lease, currentAttemptOrdinal, durableWaits), undefined, lease)
 }
 export function projectChildResumeObservations(replay: ChildResumeReplayReceiptSet,
-  delegateResults?: ReadonlyMap<string, RestoredScoutDelegate>): ChildResumeObservationSet {
+  delegateResults?: ReadonlyMap<string, RestoredScoutDelegate>, lease?: SubagentLease): ChildResumeObservationSet {
   if (replay.pairs.length > MAX_RESTORED_OBSERVATIONS) throw new Error("child_resume_observation_limit")
   const verifiedScoutResults = new Set(replay.childToolReplayReceipts.filter(receipt =>
     receipt.toolName === "scout.results" && receipt.result.status === "completed" && receipt.result.errorCode === null).map(receipt => receipt.resultItem.id))
-  const verifiedReads = verifiedDiscoveryReadPairs(replay.pairs)
+  const verifiedReads = verifiedChildDiscoveryReadPositions(replay.pairs)
   const restored = replay.pairs.map((item, index) => {
     const delegate = item.toolName === "scout.delegate" && item.status === "completed" ? delegateResults?.get(item.resultItemId) : undefined
     if (delegate && (!isSubagentTaskId(delegate.taskId) || delegate.status !== "queued" && delegate.status !== "duplicate")) throw new Error("child_resume_delegate_receipt_unavailable")
@@ -135,8 +112,20 @@ export function projectChildResumeObservations(replay: ChildResumeReplayReceiptS
             : item.toolName === "tool_results.read" && verifiedReads.has(index) ? boundedNormalizedJson(item.output as RepositoryJsonValue, MAX_TOOL_OUTPUT_BYTES) : boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES),
       errorCode: item.status === "completed" ? null : "tool_execution_failed" } }
   })
-  if (Buffer.byteLength(JSON.stringify(restored), "utf8") > MAX_RESTORED_OBSERVATION_BYTES) throw new Error("child_resume_observation_limit")
+  if (Buffer.byteLength(JSON.stringify(restored), "utf8") > MAX_RESTORED_OBSERVATION_BYTES
+    && (!lease || !ordinaryScoutHistory(lease)
+      || Buffer.byteLength(JSON.stringify(projectChildDiscoveryHistory(restored)), "utf8") > MAX_RESTORED_OBSERVATION_BYTES)) {
+    throw new Error("child_resume_observation_limit")
+  }
   return { observations: restored, childToolReplayReceipts: replay.childToolReplayReceipts, childWaitReplayReceipts: replay.childWaitReplayReceipts }
+}
+function ordinaryScoutHistory(lease: SubagentLease): boolean {
+  const schema = object(lease.expectedOutputSchema), context = object(lease.context), actions = lease.allowedActions
+  return lease.role === "scout" && lease.taskType === "job_discovery"
+    && !!schema && exactKeys(schema, ["role", "schemaVersion"]) && schema.role === "scout" && schema.schemaVersion === ROLE_RESULT_SCHEMA
+    && !!context && !["selectedJobPreparation", "coverLetterBase", "writerReviewFeedback"].some(key => Object.hasOwn(context, key))
+    && Array.isArray(actions) && actions.every((action: unknown) => typeof action === "string")
+    && actions.some((action: unknown) => action === "jobs.discover") && actions.some((action: unknown) => action === "tool_results.read")
 }
 export function countChildResumeToolCalls(rows: readonly Row[], lease: SubagentLease, currentAttemptOrdinal?: number): number {
   let count = 0

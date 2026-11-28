@@ -1185,6 +1185,22 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
   return tinyFallback.length <= 1_400 ? tinyFallback : "{}"
 }
 
+describe("checkpoint resume marker ordering", () => {
+  it("waits for the final question proof when its successful count arrives in an earlier output chunk", async () => {
+    const child = { output: ["CHECKPOINT_QUESTION_CONTEXT_COUNT 1 OPTION_COUNT 1 ANSWER_COUNT 1"],
+      errors: [], exitCode: null, signalCode: null } as unknown as WorkerChild
+    const resume = waitForCheckpointResume(child, "question", 1_000)
+    setTimeout(() => child.output.push("CHECKPOINT_RESUME_CONTEXT_OK question answer:fixture"), 30)
+    await expect(resume).resolves.toBe("CHECKPOINT_RESUME_CONTEXT_OK question answer:fixture")
+  })
+
+  it("still rejects when the Worker exits before the final question proof", async () => {
+    const child = { output: ["CHECKPOINT_QUESTION_CONTEXT_COUNT 1 OPTION_COUNT 1 ANSWER_COUNT 1"],
+      errors: [], exitCode: 1, signalCode: null } as unknown as WorkerChild
+    await expect(waitForCheckpointResume(child, "question", 1_000)).rejects.toThrow("Worker 2 exited before recovering question")
+  })
+})
+
 async function waitForCheckpointResume(
   child: WorkerChild,
   kind: CheckpointKind,
@@ -1195,10 +1211,6 @@ async function waitForCheckpointResume(
   while (Date.now() < deadline) {
     const resumed = child.output.find(value => value.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `))
     if (resumed) return resumed
-    if (kind === "question") {
-      const answerCount = child.output.find(value => value.startsWith("CHECKPOINT_QUESTION_CONTEXT_COUNT "))
-      if (answerCount) throw new Error(`Worker 2 did not receive exactly one durable question answer in its model request: ${answerCount}`)
-    }
     if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Worker 2 exited before recovering ${kind}: ${child.errors.join("\n")}`)
     await new Promise(resolve => setTimeout(resolve, 20))
   }

@@ -10,7 +10,7 @@ import { RootAbortController } from "../interrupt/registry.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxHydrationInput, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { prepareToolResultJson, type CanonicalToolSourceName } from "../tools/tool-result-reference-types.js"
+import { MAX_TOOL_RESULT_READ_BYTES, prepareToolResultJson, type CanonicalToolSourceName } from "../tools/tool-result-reference-types.js"
 import type { SubagentLease } from "./types.js"
 import type { ChildToolReplayReceipt } from "../turns/turn-execution-options.js"
 import type { TreeBudgetExecutionLimits, TreeBudgetReservation, TreeBudgetReservationStore } from "./tree-budget-types.js"
@@ -206,6 +206,26 @@ function restoredRead(id: string, toolName: string, output: unknown, overrides: 
     id,
     content: { toolCallId: `call-${id}`, toolName, input: {}, status: "completed", output, errorCode: null, ...overrides },
   }
+}
+
+function durableDiscoveryObservations(output: unknown) {
+  const prepared = prepareToolResultJson(output, "jobs.discover" as CanonicalToolSourceName)
+  const referenceId = "tool-result-00000000-0000-4000-8000-000000000001"
+  const bytes = Buffer.from(prepared.encoded, "utf8")
+  const observations = [restoredRead("discover-result", "jobs.discover", {
+    $ref: referenceId, sizeBytes: prepared.bytes, sha256: prepared.sha256,
+  }, { input: { targetRoles: ["Engineer"], targetLocations: ["Dublin"] } })]
+  for (let start = 0; start < bytes.length; start += 3_600) {
+    const end = Math.min(bytes.length, start + 3_600)
+    const output = {
+      ref: referenceId, sha256: prepared.sha256, byteCount: prepared.bytes,
+      chunk: bytes.subarray(start, end).toString("utf8"), nextCursor: end === bytes.length ? null : String(end),
+    }
+    if (Buffer.byteLength(JSON.stringify(output), "utf8") > MAX_TOOL_RESULT_READ_BYTES) throw new Error("fixture_discovery_chunk_too_large")
+    observations.push(restoredRead(`discover-read-${start}`, "tool_results.read", output,
+      { input: { referenceId, ...(start > 0 ? { cursor: String(start) } : {}) } }))
+  }
+  return observations
 }
 
 function finalTextExecutor(model: ModelAdapter, outputs: Readonly<Record<string, unknown>> = {}) {
@@ -1218,6 +1238,60 @@ describe("child executor composition", () => {
     expect(context).toContain("descendant-results")
     expect(context).toContain("descendant-wait")
     expect(context).toContain("grandchild-1")
+  })
+
+  it("keeps canonical discovery evidence for verification but projects durable chunks to a compact model prompt", async () => {
+    const child = { ...structuredLease("scout"), taskType: "job_discovery", allowedActions: ["jobs.discover", "tool_results.read"] }
+    const jobIds = ["c123456789012345678901234", "c223456789012345678901234", "c323456789012345678901234"]
+    const sources = ["greenhouse", "lever", "workday"]
+    const privateDescription = "DISCOVERY_DESCRIPTION_CANARY " + "role details ".repeat(6_000)
+    const jobs = jobIds.map((id, index) => ({ id, title: "Senior Engineer", company: `Example ${index + 1}`, location: "Dublin",
+      url: `https://example.test/job/${index + 1}`, description: privateDescription, fullDescription: privateDescription,
+      salary: null, logo: null, source: sources[index]!, evidenceRefs: [`evidence-source-${index + 1}`] }))
+    const job = jobs[0]!, ref = "tool-result-00000000-0000-4000-8000-000000000001"
+    const discovery = { jobs, evidence: jobs.map((item, index) => ({ evidenceId: `evidence-source-${index + 1}`, jobId: item.id,
+      kind: "source", source: item.source, url: item.url, summary: "Employer listing" })), nextCursor: null,
+      usage: { toolName: "jobs.discover", toolVersion: "1", requests: 1, jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0,
+        aiCalls: 0, providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1 } }
+    const wait = restoredRead("historical-wait", "wait_subagents", {
+      waitId: "durable-wait-a", status: "ready", taskIds: ["subagent-child-a"], deadlineAt: "2026-09-09T11:01:00.000Z",
+      matchedTaskIds: ["subagent-child-a"], tasks: [{ taskId: "subagent-child-a", status: "completed", role: "scout", result: null, failureReason: null }],
+    }, { input: { idempotencyKey: "wait-key-a", taskIds: ["subagent-child-a"], mode: "all", timeoutMs: 1_000 } })
+    const observations = [...durableDiscoveryObservations(discovery), wait]
+    const stepCount = Math.ceil(observations.length / 32)
+    const resumeLoader = async () => ({
+      resume: { nextOrdinal: stepCount + 1, stepCount, toolCallCount: observations.length, inputThroughSequence: 0n, consumedInputIds: [],
+        usage: { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.1 } },
+      observations,
+    })
+    const requests: HarnessModelRequest[] = []
+    const resultText = JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId: job.id, source: job.source, url: job.url, evidenceIds: [`read:job:${job.id}`] }],
+      evidence: [{ id: `read:job:${job.id}`, kind: "job", ref: job.id, source: job.source }], summary: "Verified discovered role" })
+    const discoveryTool = { ...tool("jobs.discover", "jobs"), risk: "internal_write" as const, capabilities: ["read", "write"] as const,
+      requiredCapabilities: ["read"] as const, idempotency: "idempotent" as const }
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null, settle: async () => undefined, settleUnknown: async () => undefined }),
+      modelRuntimeFactory: () => textOnlyModel(resultText, request => requests.push(request)),
+      toolRuntimeFactory: () => childToolRuntime([discoveryTool, tool("tool_results.read", "coordination")]), resumeLoader,
+    })
+
+    const completed = await executor({ lease: child })
+    const prompt = JSON.stringify(requests[0]?.messages)
+    expect(completed).toMatchObject({ status: "completed", result: { status: "completed", structuredResult: { role: "scout" } } })
+    expect(Math.ceil(observations.length / stepCount)).toBeLessThanOrEqual(32)
+    expect(prompt).toContain(ref)
+    expect(prompt).toContain("agent-harness.v2.child-discovery-history")
+    for (let index = 0; index < jobs.length; index += 1) {
+      expect(prompt).toContain(jobs[index]!.id)
+      expect(prompt).toContain(jobs[index]!.source)
+    }
+    expect(prompt).toContain("durable-wait-a")
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThan(40 * 1024)
+    expect(prompt).not.toContain("DISCOVERY_DESCRIPTION_CANARY")
+    expect((completed.result as { readonly structuredResult: { readonly candidates: readonly unknown[] } }).structuredResult.candidates)
+      .toEqual([{ jobId: job.id, source: job.source, url: job.url, evidenceIds: [`read:job:${job.id}`] }])
   })
 
   it("binds restored jobs, persona, and resume evidence before a resumed provider call", async () => {
