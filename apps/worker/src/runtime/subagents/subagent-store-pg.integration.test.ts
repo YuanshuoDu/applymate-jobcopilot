@@ -1184,10 +1184,11 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     }
   }, 60_000)
 
-  it("reserves the strict Root output budget for a depth-two Worker lease through the real usage route", async () => {
-    // Seed depth two directly to isolate usage admission. This exercises a real claimed Worker lease and its exact owner/step
-    // through Web, and a synthetic `jobs.discover` response through the real ToolRouter persistence and structured-evidence
-    // binding lifecycle. It bypasses `scout.delegate`, its nested-spawn guard/outbox handoff, and external discovery providers.
+  it("enforces the strict Root output budget before a later depth-two Worker lease reaches the provider", async () => {
+    // Seed depth two directly to isolate usage admission. The first child exercises a real claimed Worker lease and its exact
+    // owner/step through Web, plus a synthetic `jobs.discover` response through real ToolRouter persistence and evidence
+    // binding. Once that usage reaches the Root cap, the later child is stopped by the Worker step-start budget guard before
+    // route authorization. This bypasses `scout.delegate`, its nested-spawn guard/outbox handoff, and external discovery.
     const sessionId = `p1-subagent-depth-two-session-${suffix}`
     const turnId = `p1-subagent-depth-two-turn-${suffix}`
     const rootTaskId = `p1-subagent-depth-two-root-${suffix}`
@@ -1439,11 +1440,15 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       const exhaustedTask = await ownerAStore.get(taskIds[1]!, sessionId)
       expect(exhaustedTask).toMatchObject({
         id: taskIds[1], status: "queued", attemptCount: 1, maxAttempts: 3,
-        failureReason: "output_budget_exhausted",
+        failureReason: "budget_exhausted",
       })
       expect(exhaustedTask?.nextAttemptAt).toEqual(expect.any(Date))
       expect(Number.isFinite(exhaustedTask?.nextAttemptAt?.getTime() ?? Number.NaN)).toBe(true)
       expect(exhaustedTask!.attemptCount).toBeLessThan(exhaustedTask!.maxAttempts)
+
+      const laterChildSteps = await adminPool!.query<{ id: string }>(`SELECT "id" FROM "agent_steps"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`, [sessionId, turnId, taskIds[1]])
+      expect(laterChildSteps.rows).toHaveLength(0)
 
       expect(providerRequests).toHaveLength(2)
       expect(providerRequests.map(request => request.taskId)).toEqual([taskIds[0], taskIds[0]])
@@ -1454,7 +1459,10 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       const authorizeRequests = requests.filter(request => request.body.operation === "authorize")
       const startRequests = requests.filter(request => request.body.operation === "start")
       const settleRequests = requests.filter(request => request.body.operation === "settle")
-      expect(authorizeRequests.map(request => request.status)).toEqual([200, 200, 429])
+      expect(authorizeRequests.map(request => request.status)).toEqual([200, 200])
+      expect(authorizeRequests.every(request => request.body.input?.executionOwner !== null
+        && typeof request.body.input?.executionOwner === "object"
+        && (request.body.input.executionOwner as Record<string, unknown>).taskId === taskIds[0])).toBe(true)
       expect(authorizeRequests[0]?.body.input?.executionOwner).toMatchObject({
         kind: "task", taskId: taskIds[0], rootTaskId, attemptCount: 1,
       })
@@ -1469,14 +1477,22 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
         userId: userA.userId, sessionId, turnId, stepId: providerRequests[1]?.stepId,
         provider: "anthropic", model: "fixture-root-budget-model", requestedOutputTokens: 128, startProtocolVersion: 1,
       })
-      expect(authorizeRequests[2]?.body.input?.executionOwner).toMatchObject({
-        kind: "task", taskId: taskIds[1], rootTaskId, attemptCount: 1,
-      })
-      expect(authorizeRequests[2]?.response).toMatchObject({ code: "output_budget_exhausted" })
       expect(startRequests).toHaveLength(2)
       expect(startRequests.map(request => request.status)).toEqual([200, 200])
+      expect(startRequests.every(request => request.body.input?.executionOwner !== null
+        && typeof request.body.input?.executionOwner === "object"
+        && (request.body.input.executionOwner as Record<string, unknown>).taskId === taskIds[0])).toBe(true)
       expect(settleRequests).toHaveLength(2)
       expect(settleRequests.map(request => request.status)).toEqual([200, 200])
+      const authorizedOperationIds = new Set(authorizeRequests.flatMap(request => {
+        const response = request.response
+        if (!response || typeof response !== "object" || Array.isArray(response)) return []
+        const operationId = (response as Record<string, unknown>).operationId
+        return typeof operationId === "string" ? [operationId] : []
+      }))
+      expect(authorizedOperationIds.size).toBe(2)
+      expect(settleRequests.every(request => typeof request.body.input?.operationId === "string"
+        && authorizedOperationIds.has(request.body.input.operationId))).toBe(true)
 
       const reservation = await adminPool!.query<{
         id: string; userId: string; sessionId: string; turnId: string; rootTaskId: string; taskId: string; stepId: string
