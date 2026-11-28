@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
+import { finalTaskGraphArtifactProofInput } from '@jobcopilot/agent-protocol'
 
 import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, projectFinalAnswerTaskGraphSourceContent, projectFinalTaskGraphSourceDetail } from './final-task-graph-source-detail'
 import { TASK_GRAPH_SOURCES_SCHEMA_VERSION, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
-  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 } from './final-task-graph-source-manifest'
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4 } from './final-task-graph-source-manifest'
 
 const sessionId = 'session_1', userId = 'user_1', finalItemId = 'final_1', turnId = 'turn_1', rootTaskId = 'root_1'
 const sourceKey = canonicalTaskGraphSourceKey(finalItemId, 4, 0)
@@ -134,6 +136,33 @@ describe('projectFinalTaskGraphSourceDetail', () => {
     expect(projectFinalTaskGraphSourceDetail({ ...base,
       graphRows: [{ ...(base.graphRows as object[])[0], id: `task-graph-${'0'.repeat(64)}` }],
     } as never)).toBeNull()
+  })
+
+  it('projects a V3 Writer source without exposing its private version proof', () => {
+    const selectedSourceKey = canonicalTaskGraphSourceKey(finalItemId, 4, 0)
+    const artifactRef = { artifactId: 'artifact_1', version: 2, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }
+    const preimage = finalTaskGraphArtifactProofInput(selectedSourceKey, artifactRef)
+    const artifactVersionProof = `avp_${createHash('sha256').update(preimage).digest('hex')}`
+    const base = input()
+    const updatedGraph = { ...graph, nodes: [
+      { key: 'writer', templateId: 'cover_letter_writer', goal: 'Write a selected-job draft', successCriteria: ['Write'], dependsOn: [], depth: 1, taskId: 'writer_1' },
+    ] }
+    const writer = { id: 'writer_1', sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'writer', taskType: 'cover_letter_draft',
+      status: 'completed', goal: 'Write a selected-job draft', context: { selectedJobPreparation: { jobId: 'job_1' } }, updatedAt,
+      result: { status: 'completed', structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'writer', status: 'completed', artifactRef } } }
+    const proofContent = { taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4, graphRevision: 4,
+      historicalNodeIndices: [], retiredNodeIndices: [], sources: [{ sourceKey: selectedSourceKey, nodeIndex: 0, role: 'writer', taskStatus: 'completed',
+        resultState: 'valid', roleResultStatus: 'completed', artifactVersionProof }] } }
+    const query = (overrides: Record<string, unknown> = {}) => projectFinalTaskGraphSourceDetail({
+      ...base, sourceKey: selectedSourceKey,
+      finalItem: { ...(base.finalItem as object), content: proofContent },
+      graphRows: [{ ...(base.graphRows as object[])[0], content: updatedGraph }],
+      taskRows: [base.taskRows[0], writer], ...overrides,
+    } as never)
+
+    expect(query()).toMatchObject({ role: 'writer', taskStatus: 'completed', resultState: 'valid' })
+    expect(query()).not.toHaveProperty('artifactRef')
+    expect(JSON.stringify(query())).not.toContain(artifactVersionProof)
   })
 
   it('rejects stale status and role-result receipts instead of describing the wrong graph member', () => {

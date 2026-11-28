@@ -1,3 +1,4 @@
+import type { FinalTaskGraphArtifactRef } from '@jobcopilot/agent-protocol'
 import { NextRequest } from 'next/server'
 
 import { isErrorResponse, ok, requireAuth } from '@/lib/api-helpers'
@@ -10,6 +11,7 @@ import {
 } from '@/lib/agent/session/final-task-graph-source-detail'
 import { parseFinalTaskGraphSourceManifest } from '@/lib/agent/session/final-task-graph-source-manifest'
 import { readFinalTaskGraphSourceSnapshot } from '@/lib/agent/session/objective-tailor-final-source-graph'
+import { finalTaskGraphSourceArtifactCandidate, verifiedFinalTaskGraphSourceArtifactRef } from '@/lib/agent/session/final-task-graph-source-artifact'
 
 export const dynamic = 'force-dynamic'
 
@@ -20,7 +22,11 @@ const TURN_SELECT = { id: true, sessionId: true, userId: true, status: true, roo
 const GRAPH_SELECT = { id: true, sessionId: true, turnId: true, taskId: true, type: true, revision: true, content: true } as const
 const TASK_SELECT = {
   id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true, role: true, taskType: true,
-  status: true, goal: true, result: true, failureReason: true, attemptCount: true, updatedAt: true,
+  status: true, goal: true, result: true, context: true, failureReason: true, attemptCount: true, updatedAt: true,
+} as const
+const ARTIFACT_VERSION_SELECT = {
+  artifactId: true, version: true, userId: true, sessionId: true, jobId: true, artifactType: true, taskId: true,
+  contentHash: true, sourceDigest: true,
 } as const
 
 interface RouteContext {
@@ -48,8 +54,9 @@ async function resolveSource(userId: string, sessionId: string, finalItemId: str
   })
   if (!turn || turn.status !== 'completed' || turn.rootTaskId !== finalItem.taskId) return unavailable()
   const manifest = parseFinalTaskGraphSourceManifest(record(finalItem.content)?.taskGraphSources)
-  if (!manifest || !isCanonicalTaskGraphSourceManifest(finalItemId, manifest)
-    || manifest.sources.filter(source => source.sourceKey === sourceKey).length !== 1) return unavailable()
+  const selectedSources = manifest?.sources.filter(source => source.sourceKey === sourceKey) ?? []
+  if (!manifest || !isCanonicalTaskGraphSourceManifest(finalItemId, manifest) || selectedSources.length !== 1) return unavailable()
+  const selectedSource = selectedSources[0]!
 
   const graphRows = await db.agentItem.findMany({
     where: { id: canonicalTaskGraphItemId(turn.rootTaskId), sessionId, turnId: turn.id, taskId: turn.rootTaskId,
@@ -71,7 +78,26 @@ async function resolveSource(userId: string, sessionId: string, finalItemId: str
     userId, sessionId, finalItemId, sourceKey, session, finalItem, turn, graphRows, taskRows,
   })
   if (!detail) return unavailable()
-  const response = ok({ task: detail })
+
+  let artifactRef: FinalTaskGraphArtifactRef | undefined
+  if (selectedSource.artifactVersionProof) {
+    const candidate = finalTaskGraphSourceArtifactCandidate({ source: selectedSource, sourceKey,
+      graphRevision: manifest.graphRevision, graph: graphRows[0], sessionId, turnId: turn.id, rootTaskId: turn.rootTaskId,
+      taskRows, snapshot })
+    if (!candidate) return unavailable()
+    let artifactVersionRows: unknown[]
+    try {
+      artifactVersionRows = await db.agentArtifactVersion.findMany({
+        where: { artifactId: candidate.artifactRef.artifactId, version: candidate.artifactRef.version,
+          userId, sessionId, jobId: candidate.jobId, artifactType: 'cover_letter', taskId: candidate.artifactTaskId,
+          contentHash: candidate.artifactRef.contentHash, sourceDigest: candidate.artifactRef.sourceDigest },
+        take: 2, select: ARTIFACT_VERSION_SELECT,
+      }) as unknown[]
+    } catch { return unavailable() }
+    artifactRef = verifiedFinalTaskGraphSourceArtifactRef(candidate, artifactVersionRows, { userId, sessionId }) ?? undefined
+    if (!artifactRef) return unavailable()
+  }
+  const response = ok({ task: { ...detail, ...(artifactRef ? { artifactRef } : {}) } })
   response.headers.set('Cache-Control', 'private, no-store')
   return response
 }
