@@ -11,9 +11,12 @@ import { emptyAnalystCoverageDigest, hasNoCurrentAttemptTaskGraphToolReceipts } 
 import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
+import { loadTaskGraphVerificationReceipts } from "./task-graph-pg-verification-receipts.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
 import { validateRoleResult } from "./role-results.js"
 import { taskGraphResultDigest, type TaskGraphVerificationScope } from "./task-graph-pg-verification.js"
+import { taskGraphHasScoutJobDescriptionWitness, taskGraphJobDescriptionConflict, taskGraphJobDescriptionDependencyNodeKeys,
+  taskGraphJobDescriptionWitnesses, type TaskGraphJobDescriptionWitnesses } from "./task-graph-job-description-proof.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -45,6 +48,16 @@ export async function revalidateTaskGraphDependencyBindings(client: Queryable, s
     }
     if (report.status === "passed") {
       if (!task) throw new Error("task_graph_verification_report_invalid")
+      if (node.templateId === "analyst" && task.role === "analyst") {
+        let conflict: boolean
+        try {
+          conflict = await hasPersistedAnalystDescriptionConflict(client, scope, task.id, Number(task.attemptCount),
+            result.structuredResult, node, proof.projections, proof.jobDescriptionWitnesses)
+        } catch { throw new Error("task_graph_verification_report_invalid") }
+        if (conflict) {
+          throw new Error("task_graph_verification_report_invalid")
+        }
+      }
       validateCurrentAnalyst(task, result, node, report, proof.projections)
     }
   }
@@ -55,6 +68,26 @@ export async function revalidateTaskGraphDependencyBindings(client: Queryable, s
     if (!composite?.repairComposite) throw new Error("task_graph_verification_report_invalid")
   }
   return loaded
+}
+
+async function hasPersistedAnalystDescriptionConflict(
+  client: Queryable,
+  scope: GraphIdentityScope,
+  taskId: string,
+  attemptCount: number,
+  structuredResult: unknown,
+  node: NonNullable<LoadedGraph["snapshot"]>["nodes"][number],
+  dependencies: ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>,
+  scoutWitnesses: ReadonlyMap<string, TaskGraphJobDescriptionWitnesses>,
+): Promise<boolean> {
+  if (!node.verification || !Number.isSafeInteger(attemptCount) || attemptCount < 1) return false
+  const analyst = validateRoleResult(structuredResult, "analyst")
+  if (analyst.role !== "analyst") return false
+  const requiredScoutNodeKeys = taskGraphJobDescriptionDependencyNodeKeys(node.verification)
+  if (!taskGraphHasScoutJobDescriptionWitness({ analyst, dependencies, requiredScoutNodeKeys, scoutWitnesses })) return false
+  const receipts = await loadTaskGraphVerificationReceipts(client, { ...scope, taskId, attemptCount })
+  const analystWitnesses = taskGraphJobDescriptionWitnesses(receipts, analyst.findings.map(finding => finding.jobId), "analyst")
+  return taskGraphJobDescriptionConflict({ analyst, dependencies, requiredScoutNodeKeys, scoutWitnesses, analystWitnesses })
 }
 
 async function validateFailedEmptyAnalyst(

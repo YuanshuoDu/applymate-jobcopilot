@@ -6,6 +6,7 @@ import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStruc
 import { observedJobLocationProjection } from "./child-observed-job-facts.js"
 import { loadTaskGraphVerificationReceipts } from "./task-graph-pg-verification-receipts.js"
 import { taskGraphEvidenceDigest, type TaskGraphVerificationScope } from "./task-graph-pg-verification-receipt-validation.js"
+import { taskGraphJobDescriptionConflict, taskGraphJobDescriptionDependencyNodeKeys, taskGraphJobDescriptionWitnesses, type TaskGraphJobDescriptionWitnesses } from "./task-graph-job-description-proof.js"
 import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, TASK_GRAPH_VERIFIER_VERSION, type TaskGraphVerificationDependencyBinding, type TaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { validateRoleResult, type AnalystResult } from "./role-results.js"
 import { completedZeroDiscoveryDigest, emptyAnalystCoverageDigest, hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
@@ -23,10 +24,11 @@ type VerifyTaskGraphInput = Readonly<{
   structuredResult: unknown
   dependencies?: ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>
   dependencyBindings?: readonly TaskGraphVerificationDependencyBinding[]
+  scoutJobDescriptionWitnesses?: ReadonlyMap<string, TaskGraphJobDescriptionWitnesses>
   graphRevision?: number
   includeObservedLocation?: boolean
 }>
-export type TaskGraphPgVerificationResult = Readonly<{ verified: boolean; report: TaskGraphVerificationReport; evaluation: TaskGraphVerificationEvaluation; projection?: TaskGraphVerificationEvidenceProjection; structuredResult?: unknown; persistDependencyBindings?: boolean }>
+export type TaskGraphPgVerificationResult = Readonly<{ verified: boolean; report: TaskGraphVerificationReport; evaluation: TaskGraphVerificationEvaluation; projection?: TaskGraphVerificationEvidenceProjection; structuredResult?: unknown; jobDescriptionWitnesses?: TaskGraphJobDescriptionWitnesses; persistDependencyBindings?: boolean }>
 /** Load canonical call/result receipts in one caller-owned transaction and evaluate the immutable node contract. */
 export async function verifyTaskGraphNodeEvidence(client: Queryable, input: VerifyTaskGraphInput): Promise<TaskGraphPgVerificationResult> {
   return verifyTaskGraphEvidenceForStatus(client, input, "running")
@@ -97,6 +99,9 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Verify
     if (!raw || Buffer.byteLength(raw, "utf8") > MAX_ROLE_RESULT_BYTES) return unavailable(contract, "result_invalid")
     const bound = parseAndBindStructuredResult(raw, role, index)
     if (!bound || bound.status !== "completed") return unavailable(contract, index.entries.size === 0 ? "canonical_evidence_missing" : "result_invalid")
+    const jobDescriptionWitnesses = bound.role === "scout"
+      ? taskGraphJobDescriptionWitnesses(receipts, bound.candidates.map(candidate => candidate.jobId), "scout")
+      : bound.role === "analyst" ? taskGraphJobDescriptionWitnesses(receipts, bound.findings.map(finding => finding.jobId), "analyst") : undefined
     let verifiedEmptyDiscoveryDigest: string | undefined
     let projection: TaskGraphVerificationEvidenceProjection
     if (index.entries.size === 0 && role === "scout" && bound.role === "scout" && bound.candidates.length === 0) {
@@ -111,7 +116,7 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Verify
           && objectiveCriterionIds.every(id => evaluation.criteria.some(item => item.criterionId === id && item.status === "failed"))) {
           const resultDigest = taskGraphResultDigest(bound)
           const digest = taskGraphEvidenceDigest(receipts.items, receipts.outcomes, [], resultDigest, receipts.replayReceipts)
-          return { verified: false, report: report(evaluation, digest, resultDigest), evaluation, projection, structuredResult: bound }
+          return { verified: false, report: report(evaluation, digest, resultDigest), evaluation, projection, structuredResult: bound, jobDescriptionWitnesses }
         }
       }
       if (!persistedEmptyScoutResult(task.result, input.structuredResult)) return unavailable(contract, "canonical_evidence_missing")
@@ -135,13 +140,21 @@ async function verifyTaskGraphEvidenceForStatus(client: Queryable, input: Verify
           : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: bound.role === "scout" ? bound.candidates.map(({ jobId, evidenceIds }) => ({ jobId, evidenceIds })) : [], evidenceIds: [...index.entries.values()].map(item => item.id) }
         : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: bound.role === "analyst" ? bound.findings.map(({ jobId, score, evidenceIds }) => ({ jobId, score, evidenceIds })) : [], evidenceIds: [...index.entries.values()].map(item => item.id) }
     }
+    if (role === "analyst" && bound.role === "analyst"
+      && taskGraphJobDescriptionDependencyNodeKeys(contract).length > 0
+      && input.scoutJobDescriptionWitnesses
+      && taskGraphJobDescriptionConflict({ analyst: bound, dependencies: input.dependencies ?? new Map(),
+        requiredScoutNodeKeys: taskGraphJobDescriptionDependencyNodeKeys(contract),
+        scoutWitnesses: input.scoutJobDescriptionWitnesses, analystWitnesses: jobDescriptionWitnesses ?? new Map() })) {
+      return unavailable(contract, "canonical_evidence_ambiguous")
+    }
     const evaluation = verifiedEmptyDiscoveryDigest
       ? evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery(contract, projection, input.dependencies, verifiedEmptyDiscoveryDigest)
       : evaluateTaskGraphVerification(contract, projection, input.dependencies)
     const resultDigest = taskGraphResultDigest(bound)
     const digestEvidenceIds = verifiedEmptyDiscoveryDigest ? [...projection.evidenceIds, `read:source:jobs.discover:${verifiedEmptyDiscoveryDigest}`] : projection.evidenceIds
     const digest = taskGraphEvidenceDigest(receipts.items, receipts.outcomes, digestEvidenceIds, resultDigest, receipts.replayReceipts)
-    return { verified: evaluation.status === "passed", report: report(evaluation, digest, resultDigest), evaluation, projection, structuredResult: bound }
+    return { verified: evaluation.status === "passed", report: report(evaluation, digest, resultDigest), evaluation, projection, structuredResult: bound, jobDescriptionWitnesses }
   } catch (error) {
     const reason = error instanceof Error && /ambiguous|duplicate|conflict|replay_uncertain/.test(error.message)
       ? "canonical_evidence_ambiguous" : "canonical_evidence_invalid"
