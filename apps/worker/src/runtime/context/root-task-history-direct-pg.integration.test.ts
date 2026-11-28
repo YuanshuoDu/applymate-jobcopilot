@@ -255,13 +255,16 @@ function queryRecords(rows: readonly unknown[] | undefined): Array<Record<string
 }
 
 type SafeExplainNode = Readonly<{
-  depth: number; nodeType: string; relation?: string; index?: string; joinType?: string; planRows?: number; totalCost?: number
+  depth: number; nodeType: string; relation?: string; index?: string; joinType?: string
+  planRows?: number; totalCost?: number; actualRows?: number; actualLoops?: number; rowsRemovedByFilter?: number
 }>
 
-function safeExplainNodes(value: unknown): SafeExplainNode[] {
-  if (!Array.isArray(value)) return []
-  const root = value[0] && typeof value[0] === "object" && !Array.isArray(value[0])
-    ? (value[0] as Record<string, unknown>).Plan : undefined
+type SafeExplainPlan = Readonly<{ planningMs?: number; executionMs?: number; nodes: readonly SafeExplainNode[] }>
+
+function safeExplainPlan(value: unknown): SafeExplainPlan {
+  if (!Array.isArray(value) || !value[0] || typeof value[0] !== "object" || Array.isArray(value[0])) return { nodes: [] }
+  const explain = value[0] as Record<string, unknown>
+  const root = explain.Plan
   const pending: Array<Readonly<{ node: unknown; depth: number }>> = [{ node: root, depth: 0 }]
   const result: SafeExplainNode[] = []
   while (pending.length > 0 && result.length < 128) {
@@ -283,12 +286,24 @@ function safeExplainNodes(value: unknown): SafeExplainNode[] {
       ...(safeText("Join Type") ? { joinType: safeText("Join Type") } : {}),
       ...(safeNumber("Plan Rows") !== undefined ? { planRows: safeNumber("Plan Rows") } : {}),
       ...(safeNumber("Total Cost") !== undefined ? { totalCost: safeNumber("Total Cost") } : {}),
+      ...(safeNumber("Actual Rows") !== undefined ? { actualRows: safeNumber("Actual Rows") } : {}),
+      ...(safeNumber("Actual Loops") !== undefined ? { actualLoops: safeNumber("Actual Loops") } : {}),
+      ...(safeNumber("Rows Removed by Filter") !== undefined
+        ? { rowsRemovedByFilter: safeNumber("Rows Removed by Filter") } : {}),
     })
     if (Array.isArray(node.Plans)) {
       for (const child of [...node.Plans].reverse()) pending.push({ node: child, depth: current.depth + 1 })
     }
   }
-  return result
+  const safeTopNumber = (key: string): number | undefined => {
+    const candidate = explain[key]
+    return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined
+  }
+  return {
+    ...(safeTopNumber("Planning Time") !== undefined ? { planningMs: safeTopNumber("Planning Time") } : {}),
+    ...(safeTopNumber("Execution Time") !== undefined ? { executionMs: safeTopNumber("Execution Time") } : {}),
+    nodes: result,
+  }
 }
 
 type SameSessionPageObservation = Readonly<{
@@ -1346,8 +1361,13 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
           const queryValues = [...query.values, baseWitnessId, duplicateWitnessFixtureManifest()]
           if (stage === "manual_page_first") {
             const explain = await manualClient.query<{ "QUERY PLAN": unknown }>(
-              `EXPLAIN (FORMAT JSON, COSTS TRUE) ${querySql}`, queryValues)
-            console.info(`[root-history-keyset-pg-explain] ${JSON.stringify(safeExplainNodes(explain.rows[0]?.["QUERY PLAN"]))}`)
+              `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, COSTS TRUE, TIMING FALSE) ${querySql}`, queryValues)
+            const safePlan = safeExplainPlan(explain.rows[0]?.["QUERY PLAN"])
+            const graphItemNodes = safePlan.nodes.filter(node => node.relation === "agent_items"
+              || node.index?.startsWith("agent_items_")).slice(0, 16)
+            console.info(`[root-history-keyset-pg-explain-analyze] ${JSON.stringify({
+              planningMs: safePlan.planningMs, executionMs: safePlan.executionMs, graphItemNodes,
+            })}`)
           }
           const result = await manualClient.query<Record<string, unknown>>(
             querySql, queryValues)
