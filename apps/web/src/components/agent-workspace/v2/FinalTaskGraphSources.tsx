@@ -6,6 +6,7 @@ import { parseTaskGraphVerificationSummary, type TaskGraphVerificationDisplayNod
 import type { Lang } from '@/lib/i18n'
 import {
   parseFinalTaskGraphSourceManifest,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4,
   TASK_GRAPH_SOURCE_RESULT_STATES,
   TASK_GRAPH_SOURCE_ROLES,
   TASK_GRAPH_SOURCE_ROLE_RESULT_STATUSES,
@@ -17,6 +18,8 @@ import {
 } from '@/lib/agent/session/final-task-graph-source-manifest'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
 import { TaskGraphVerificationSummary } from './TaskGraphVerificationSummary'
+import { SelectedJobDraftArtifact } from './SelectedJobDraftArtifact'
+import { validArtifactRef, type DraftArtifactRef } from './draft-artifact-projection'
 
 export interface FinalTaskGraphSourceDetail {
   readonly goal: string
@@ -24,10 +27,12 @@ export interface FinalTaskGraphSourceDetail {
   readonly taskStatus: TaskGraphSourceTaskStatus
   readonly resultState: TaskGraphSourceResultState
   readonly roleResultStatus?: TaskGraphSourceRoleResultStatus
+  readonly artifactRef?: DraftArtifactRef
   readonly verification: TaskGraphVerificationDisplayNode
 }
 
 type RequestIdentity = Readonly<{ sessionId: string; finalItemId: string; sourceKey: string }>
+type ArtifactViewerIdentity = RequestIdentity & Readonly<{ artifactRef: DraftArtifactRef }>
 type RequestState = RequestIdentity & (Readonly<{ state: 'loading' | 'unavailable' }> | Readonly<{
   state: 'ready'; detail: FinalTaskGraphSourceDetail
 }>)
@@ -58,6 +63,9 @@ export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang }:
   const label = (key: TaskGraphPlanLabelKey) => taskGraphPlanLabel(lang, key)
   const selected = manifest.sources.find(source => source.sourceKey === selectedKey)
   const activeRequest = selected && requestMatchesIdentity(request, { sessionId, finalItemId, sourceKey: selected.sourceKey }) ? request : null
+  const readyDetail = activeRequest?.state === 'ready' ? activeRequest.detail : null
+  const artifactRef = selected && readyDetail ? viewableSourceArtifactRef(manifest, selected, readyDetail) : null
+  const viewerKey = selected && artifactRef ? artifactViewerKey({ sessionId, finalItemId, sourceKey: selected.sourceKey, artifactRef }) : undefined
   return <section aria-label={label('agent.taskGraph.sources.title')} data-agent-related-task-sources="true" style={sectionStyle}>
     <h3 style={headingStyle}>{label('agent.taskGraph.sources.title')}</h3>
     <p style={noteStyle}>{label('agent.taskGraph.sources.disclaimer')}</p>
@@ -72,7 +80,8 @@ export function FinalTaskGraphSources({ content, sessionId, finalItemId, lang }:
           {!activeRequest || activeRequest.state === 'loading'
             ? <p role="status">{label('agent.taskGraph.sources.loading')}</p>
             : activeRequest.state === 'ready'
-              ? <SourceDetail detail={activeRequest.detail} lang={lang} />
+              ? <SourceDetail detail={activeRequest.detail} lang={lang} canViewArtifact={artifactRef !== null}
+                viewerKey={viewerKey} sessionId={sessionId} />
               : <p role="status">{label('agent.taskGraph.sources.unavailable')}</p>}
         </div>}
       </li>
@@ -101,31 +110,94 @@ export function requestMatchesIdentity(request: RequestState | null,
     && request.sourceKey === identity.sourceKey
 }
 
-function SourceDetail({ detail, lang }: { detail: FinalTaskGraphSourceDetail; lang: Lang }) {
+function SourceDetail({ detail, lang, canViewArtifact, viewerKey, sessionId }: {
+  readonly detail: FinalTaskGraphSourceDetail
+  readonly lang: Lang
+  readonly canViewArtifact: boolean
+  readonly viewerKey: string | undefined
+  readonly sessionId: string
+}) {
   const label = (key: TaskGraphPlanLabelKey) => taskGraphPlanLabel(lang, key)
   return <div style={detailStyle}>
     <p><strong>{label('agent.taskGraph.sources.goal')}:</strong> {detail.goal}</p>
     {detail.roleResultStatus && <p><strong>{label('agent.taskGraph.sources.result')}:</strong> {label(resultStatusLabel(detail.roleResultStatus))}</p>}
     <TaskGraphVerificationSummary node={detail.verification} lang={lang} />
+    {canViewArtifact && viewerKey && validArtifactRef(detail.artifactRef) && <section data-cover-letter-version-access="true">
+      <CoverLetterVersionDisclosure key={viewerKey} sessionId={sessionId} artifactRef={detail.artifactRef} lang={lang} />
+    </section>}
   </div>
+}
+
+function CoverLetterVersionDisclosure({ sessionId, artifactRef, lang }: {
+  readonly sessionId: string
+  readonly artifactRef: DraftArtifactRef
+  readonly lang: Lang
+}) {
+  const viewerId = React.useId()
+  const [open, setOpen] = React.useState(false)
+  return <>
+    <button type="button" aria-expanded={open} aria-controls={viewerId} onClick={() => setOpen(current => !current)} style={buttonStyle}>
+      {coverLetterVersionLabel(artifactRef.version, lang)}
+    </button>
+    <div id={viewerId}>
+      {open && <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={artifactRef} />}
+    </div>
+  </>
 }
 
 export function parseFinalTaskGraphSourceDetailResponse(value: unknown): FinalTaskGraphSourceDetail | null {
   const root = record(value), task = root ? record(root.task) : null
   if (!root || !exactKeys(root, ['task']) || !task) return null
-  const keys = Object.hasOwn(task, 'roleResultStatus')
-    ? ['goal', 'resultState', 'role', 'roleResultStatus', 'taskStatus', 'verification']
-    : ['goal', 'resultState', 'role', 'taskStatus', 'verification']
+  const hasArtifactRef = Object.hasOwn(task, 'artifactRef')
+  const hasRoleResultStatus = Object.hasOwn(task, 'roleResultStatus')
+  const keys = [...(hasArtifactRef ? ['artifactRef'] : []), 'goal', 'resultState', 'role',
+    ...(hasRoleResultStatus ? ['roleResultStatus'] : []), 'taskStatus', 'verification']
   if (!exactKeys(task, keys) || typeof task.goal !== 'string' || !task.goal.trim() || task.goal.length > 240 || task.goal.trim() !== task.goal
     || !oneOf(task.role, TASK_GRAPH_SOURCE_ROLES) || !oneOf(task.taskStatus, TASK_GRAPH_SOURCE_TASK_STATUSES)
     || !oneOf(task.resultState, TASK_GRAPH_SOURCE_RESULT_STATES)
-    || Object.hasOwn(task, 'roleResultStatus') && !oneOf(task.roleResultStatus, TASK_GRAPH_SOURCE_ROLE_RESULT_STATUSES)
+    || hasRoleResultStatus && !oneOf(task.roleResultStatus, TASK_GRAPH_SOURCE_ROLE_RESULT_STATUSES)
+    || hasArtifactRef && !validArtifactRef(task.artifactRef)
+    || hasArtifactRef && (!['writer', 'reviewer'].includes(String(task.role)) || task.taskStatus !== 'completed'
+      || task.resultState !== 'valid' || task.roleResultStatus !== 'completed')
     || !coherent(task as unknown as FinalTaskGraphSourceDetail)) return null
   const verification = parseTaskGraphVerificationSummary({ schemaVersion: 1, nodes: [task.verification] }, 1)?.nodes[0]
   if (verification === undefined) return null
   return { goal: task.goal, role: task.role as TaskGraphSourceRole, taskStatus: task.taskStatus as TaskGraphSourceTaskStatus,
     resultState: task.resultState as TaskGraphSourceResultState,
-    ...(task.roleResultStatus ? { roleResultStatus: task.roleResultStatus as TaskGraphSourceRoleResultStatus } : {}), verification }
+    ...(task.roleResultStatus ? { roleResultStatus: task.roleResultStatus as TaskGraphSourceRoleResultStatus } : {}),
+    ...(hasArtifactRef ? { artifactRef: task.artifactRef as DraftArtifactRef } : {}), verification }
+}
+
+function sourceHasVersionProof(manifest: ReturnType<typeof parseFinalTaskGraphSourceManifest>, source: unknown): boolean {
+  const row = record(source)
+  if (!manifest || manifest.schemaVersion !== TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4 || !row) return false
+  const listed = manifest.sources.find(candidate => candidate.sourceKey === row.sourceKey && candidate.nodeIndex === row.nodeIndex)
+  return !!listed && listed.role === row.role && listed.taskStatus === row.taskStatus && listed.resultState === row.resultState
+    && listed.roleResultStatus === row.roleResultStatus && listed.artifactVersionProof === row.artifactVersionProof
+    && (listed.role === 'writer' || listed.role === 'reviewer') && listed.taskStatus === 'completed'
+    && listed.resultState === 'valid' && listed.roleResultStatus === 'completed'
+    && typeof listed.artifactVersionProof === 'string' && listed.artifactVersionProof.length > 0
+}
+
+export function viewableSourceArtifactRef(manifest: ReturnType<typeof parseFinalTaskGraphSourceManifest>, source: unknown,
+  detail: FinalTaskGraphSourceDetail | null): DraftArtifactRef | null {
+  return detail && sourceHasVersionProof(manifest, source) && sourceDetailMatchesSource(source, detail)
+    && validArtifactRef(detail.artifactRef) ? detail.artifactRef : null
+}
+
+function sourceDetailMatchesSource(source: unknown, detail: FinalTaskGraphSourceDetail): boolean {
+  const row = record(source)
+  return !!row && row.role === detail.role && row.taskStatus === detail.taskStatus && row.resultState === detail.resultState
+    && row.roleResultStatus === detail.roleResultStatus
+}
+
+export function artifactViewerKey(identity: ArtifactViewerIdentity): string {
+  const ref = identity.artifactRef
+  return JSON.stringify([identity.sessionId, identity.finalItemId, identity.sourceKey, ref.artifactId, ref.version, ref.contentHash, ref.sourceDigest])
+}
+
+export function coverLetterVersionLabel(version: number, lang: Lang): string {
+  return lang === 'zh' ? '查看求职信第 ' + version + ' 版' : 'View cover letter version ' + version
 }
 
 export function finalTaskGraphSourceDetailUrl(sessionId: string, finalItemId: string, sourceKey: string): string {

@@ -49,6 +49,12 @@ function scored(jobRow: Job, score: number): ScoredJob {
   return { job: jobRow, score, matchedKeywords: ['TypeScript'], missingKeywords: ['AWS'],
     recommendation: 'Apply after tailoring.', analysisFenceAt: '2026-10-19T12:00:00.123Z' }
 }
+function sourceFingerprint(jobId: string) {
+  return { version: "agent-harness.v2.analyze-source-input.v1" as const, digest: jobId === jobAId ? "a".repeat(64) : "b".repeat(64) }
+}
+function sourceFingerprintsByJob(...jobIds: string[]) {
+  return Object.fromEntries(jobIds.map(jobId => [jobId, sourceFingerprint(jobId)]))
+}
 function analyzeResult(scoredJobs: ScoredJob[], failed = 0): StageResult<AnalyzeOutput> {
   return { stage: 'analyze', ok: true, data: { scoredJobs, failed }, metrics: { durationMs: 1, count: scoredJobs.length } }
 }
@@ -75,14 +81,14 @@ describe('runScheduledTaskGraphAnalyze', () => {
       if (ids.includes(jobAId)) {
         attempted.push(jobAId)
         await recovery?.beforeScore?.(jobAId)
-        await recovery?.onScoredJob?.(scoreA, scoreTransaction)
+        await recovery?.onScoredJob?.(scoreA, scoreTransaction, sourceFingerprint(jobAId))
         return analyzeResult([scoreA])
       }
       expect(ids).toEqual([jobBId])
       expect(recovery?.existingScoredJobs).toEqual([scoreA])
       attempted.push(jobBId)
       await recovery?.beforeScore?.(jobBId)
-      await recovery?.onScoredJob?.(scoreB, scoreTransaction)
+      await recovery?.onScoredJob?.(scoreB, scoreTransaction, sourceFingerprint(jobBId))
       return analyzeResult([...(recovery?.existingScoredJobs ?? [])])
     })
     const persist = async (state: PipelineCheckpointState, expectedState: unknown, tx?: Prisma.TransactionClient) => {
@@ -133,7 +139,7 @@ describe('runScheduledTaskGraphAnalyze', () => {
 
     expect(writes).toHaveLength(1)
     expect(writes[0]).toMatchObject({ nextStage: 'scout', scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
-      scheduledTaskGraphAnalyzeJournal: { key: zeroKey, owner, attemptsByJob: {}, failedJobIds: [] } })
+      scheduledTaskGraphAnalyzeJournal: { key: zeroKey, owner, attemptsByJob: {}, failedJobIds: [], sourceFingerprintsByJob: {} } })
     expect(result.checkpoint).toMatchObject({ nextStage: 'prepare', scoutedJobs: [], scoredJobs: [], analysisFailed: 0 })
     expect(result.checkpoint).not.toHaveProperty('scheduledTaskGraphAnalyzeJournal')
   })
@@ -141,8 +147,8 @@ describe('runScheduledTaskGraphAnalyze', () => {
   it('does not make a third model attempt when the prior return was ambiguous twice', async () => {
     const persisted: Array<PipelineCheckpointState & Record<string, unknown>> = []
     const state = { ...initialState(), scoutedJobs: jobs, scoredJobs: [scoreA], analysisFailed: 0,
-      scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v1', key, owner,
-        attemptsByJob: { [jobAId]: 1, [jobBId]: 2 }, failedJobIds: [] } }
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v2', key, owner,
+        attemptsByJob: { [jobAId]: 1, [jobBId]: 2 }, failedJobIds: [], sourceFingerprintsByJob: sourceFingerprintsByJob(jobAId) } }
     vi.mocked(runAnalyze).mockImplementation(async (pending, _ctx, recovery) => {
       expect(pending.map(row => row.id)).toEqual([jobBId])
       try { await recovery?.beforeScore?.(jobBId) }
@@ -175,14 +181,14 @@ describe('runScheduledTaskGraphAnalyze', () => {
       writes.push(state)
     }
     const state = { ...initialState(), scoutedJobs: jobs, scoredJobs: [scoreB], analysisFailed: 0,
-      scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v1', key, owner,
-        attemptsByJob: { [jobBId]: 1 }, failedJobIds: [] } }
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v2', key, owner,
+        attemptsByJob: { [jobBId]: 1 }, failedJobIds: [], sourceFingerprintsByJob: sourceFingerprintsByJob(jobBId) } }
     vi.mocked(runAnalyze).mockImplementation(async (pending, _ctx, recovery) => {
       expect(pending.map(row => row.id)).toEqual([jobAId])
       try {
         await recovery?.beforeScore?.(jobAId)
         modelStarts.push(jobAId)
-        await recovery?.onScoredJob?.(scoreA, scoreTransaction)
+        await recovery?.onScoredJob?.(scoreA, scoreTransaction, sourceFingerprint(jobAId))
         return analyzeResult([...(recovery?.existingScoredJobs ?? [])])
       } catch (error) {
         if (error instanceof AnalyzeRecoveryPersistenceError) throw error
@@ -214,9 +220,9 @@ describe('runScheduledTaskGraphAnalyze', () => {
 
   it.each(['executionId', 'executionAttemptCount'] as const)('rejects a durable journal with a mismatched %s', async field => {
     const state = { ...initialState(), scoutedJobs: jobs, scoredJobs: [], analysisFailed: 0,
-      scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v1', key,
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v2', key,
         owner: { ...owner, [field]: field === 'executionId' ? 'other-execution' : owner.executionAttemptCount + 1 },
-        attemptsByJob: {}, failedJobIds: [] } }
+        attemptsByJob: {}, failedJobIds: [], sourceFingerprintsByJob: {} } }
 
     await expect(runScheduledTaskGraphAnalyze(input(state, vi.fn(async () => undefined))))
       .rejects.toBeInstanceOf(AgentExecutionCancelledError)
@@ -226,8 +232,8 @@ describe('runScheduledTaskGraphAnalyze', () => {
   it('rebinds a valid partial journal across a lease rollover without changing stable execution identity', () => {
     const nextOwner = { ...owner, turnLeaseOwnerId: 'lease-owner-2', turnLeaseVersion: 8 }
     const state = { ...initialState(), scoutedJobs: jobs, scoredJobs: [scoreA], analysisFailed: 0,
-      scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v1', key, owner,
-        attemptsByJob: { [jobAId]: 1 }, failedJobIds: [] } }
+      scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v2', key, owner,
+        attemptsByJob: { [jobAId]: 1 }, failedJobIds: [], sourceFingerprintsByJob: sourceFingerprintsByJob(jobAId) } }
 
     const rebound = rebindScheduledTaskGraphAnalysisJournalForLease({ state, owner: nextOwner, key: 'continuation-next' })
 
@@ -237,11 +243,23 @@ describe('runScheduledTaskGraphAnalyze', () => {
       executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount })
   })
 
+  it('cannot rebind a source-changed terminal checkpoint after its journal and continuation are cleared', () => {
+    const nextOwner = { ...owner, turnLeaseOwnerId: 'lease-owner-2', turnLeaseVersion: 8 }
+    const state = { ...initialState(), scoutedJobs: undefined, scoredJobs: undefined, analysisFailed: 0,
+      scheduledTaskGraphSourceChangeTerminal: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-source-change-terminal.v1',
+        owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+          rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId,
+          executionAttemptCount: owner.executionAttemptCount } } }
+    delete (state as Record<string, unknown>).scheduledTaskGraphClaim
+
+    expect(rebindScheduledTaskGraphAnalysisJournalForLease({ state, owner: nextOwner, key: 'continuation-next' })).toBeNull()
+  })
+
   it.each(['sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'executionId', 'executionAttemptCount'] as const)(
     'does not rebind an Analyze journal with a different %s', field => {
       const state = { ...initialState(), scoutedJobs: jobs, scoredJobs: [], analysisFailed: 0,
-        scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v1', key, owner,
-          attemptsByJob: {}, failedJobIds: [] } }
+        scheduledTaskGraphAnalyzeJournal: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-analysis-journal.v2', key, owner,
+          attemptsByJob: {}, failedJobIds: [], sourceFingerprintsByJob: {} } }
       const nextOwner = { ...owner, turnLeaseOwnerId: 'lease-owner-2', turnLeaseVersion: 8,
         [field]: field === 'rootAttemptCount' || field === 'executionAttemptCount'
           ? owner[field] + 1 : `other-${field}` } as ScheduledTaskGraphPipelineOwner

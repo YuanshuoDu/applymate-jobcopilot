@@ -4,6 +4,7 @@ import {
   appendFencedSubmitAudit,
   withExactAttemptFence,
 } from "../queue/application-submit-fence.js";
+import { acquireSourceMaterialFence } from "./source-material-fence.js";
 
 export const UNCONFIRMED_SUBMISSION_MESSAGE =
   "The previous background attempt was interrupted after it started. ApplyMate did not retry it to avoid sending a duplicate application.";
@@ -13,11 +14,12 @@ export type ExactSubmissionWrite<T> =
   | { readonly kind: "current"; readonly value: T }
   | { readonly kind: "superseded" };
 
-/** Runs a submit-attempt write in the shared recovery lock order. */
-export async function withExactSubmissionWrite<T>(
+/** Shared transaction mechanics; source writers must pass the dedicated fence hook. */
+async function runExactSubmissionWrite<T>(
   pool: Pool,
   identity: ApplicationSubmitIdentity,
   phase: string,
+  beforeAttemptFence: (client: PoolClient) => Promise<void>,
   write: (client: PoolClient) => Promise<T>,
 ): Promise<ExactSubmissionWrite<T>> {
   const client = await pool.connect();
@@ -26,6 +28,7 @@ export async function withExactSubmissionWrite<T>(
     await client.query("BEGIN");
     transactionOpen = true;
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", identity.userId]);
+    await beforeAttemptFence(client);
     const fenced = await withExactAttemptFence(client, identity, () => write(client));
     if (fenced.kind === "superseded") {
       await appendFencedSubmitAudit(client, identity, phase);
@@ -42,6 +45,35 @@ export async function withExactSubmissionWrite<T>(
   } finally {
     client.release();
   }
+}
+
+/** Runs submission callbacks that do not change digest-bearing Job fields. */
+export function withExactSubmissionWrite<T>(
+  pool: Pool,
+  identity: ApplicationSubmitIdentity,
+  phase: string,
+  write: (client: PoolClient) => Promise<T>,
+): Promise<ExactSubmissionWrite<T>> {
+  return runExactSubmissionWrite(pool, identity, phase, async () => undefined, write);
+}
+
+/**
+ * The only source-changing submission wrapper: acquire the shared user fence
+ * before any attempt/owner lock, and use only for Job status writes.
+ */
+async function withExactSubmissionSourceWrite<T>(
+  pool: Pool,
+  identity: ApplicationSubmitIdentity,
+  phase: string,
+  write: (client: PoolClient) => Promise<T>,
+): Promise<ExactSubmissionWrite<T>> {
+  return runExactSubmissionWrite(
+    pool,
+    identity,
+    phase,
+    client => acquireSourceMaterialFence(client, [identity.userId]),
+    write,
+  );
 }
 
 /** Runs under a caller-owned transaction/client; it never begins or commits. */
@@ -164,7 +196,7 @@ export async function updateJobForSubmission(
   input: { readonly status: string; readonly workflowState: string; readonly applied?: boolean; readonly expectedWorkflowStates?: readonly string[] },
   phase: string,
 ): Promise<ExactSubmissionWrite<boolean>> {
-  const outcome = await withExactSubmissionWrite(pool, identity, phase, async client => {
+  const outcome = await withExactSubmissionSourceWrite(pool, identity, phase, async client => {
     const result = await client.query(
       `UPDATE "Job" SET status = $1, "workflowState" = $2,
          "appliedAt" = CASE WHEN $3 THEN NOW() ELSE "appliedAt" END, "updatedAt" = NOW()

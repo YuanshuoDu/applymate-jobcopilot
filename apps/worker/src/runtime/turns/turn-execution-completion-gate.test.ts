@@ -325,6 +325,14 @@ describe("assertCompletionAllowed", () => {
       .resolves.toEqual({ scheduledBlocker: "scheduled_pipeline_entitlement_required" })
   })
 
+  it("surfaces the source-change handoff blocker for dependency waiting", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async () => ({ status: "blocked", errorCode: "scheduled_pipeline_source_changed" })
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "answer"))
+      .resolves.toEqual({ scheduledBlocker: "scheduled_pipeline_source_changed" })
+  })
+
   it("passes through the same refresh-retry instance from scheduled continuation", async () => {
     const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
     const retry = new TurnStateRefreshRetryError()

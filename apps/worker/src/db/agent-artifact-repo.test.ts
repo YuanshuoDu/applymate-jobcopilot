@@ -17,6 +17,7 @@ function createArtifactTransactionPool(race?: ArtifactLeaseRace) {
   const result = (rows: ArtifactTestRow[] = []) => ({ rows, rowCount: rows.length })
   const client = {
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+      if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return result([{ transaction_id: "42" }])
       if (sql === "BEGIN") {
         snapshot = { artifacts: new Map(artifacts), versions: [...versions] }
         return result()
@@ -97,6 +98,123 @@ function createArtifactTransactionPool(race?: ArtifactLeaseRace) {
 }
 
 describe("agent artifact repository", () => {
+  it("fences source base writes while leaving application manifests on the existing path", async () => {
+    const calls: Array<{ scope: "client" | "pool"; sql: string; values?: readonly unknown[] }> = []
+    const sourceRow = {
+      id: "resume-base-a", userId: "user-a", jobId: "job-a", artifactType: "resume", content: { summary: "source" }, hash: "hash-a",
+      constraintHash: "hash-a", provenanceRefs: ["resume:a"], evidenceRefs: ["resume:a"], lifecycle: "base", baseId: "resume-base-a",
+      baseHash: "hash-a", previousHash: null, version: 1, createdAt: new Date(), updatedAt: new Date(),
+    }
+    const manifestRow = { ...sourceRow, id: "application:task-a", artifactType: "application", content: { answersHash: "hash" } }
+    const client = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        calls.push({ scope: "client", sql, values })
+        if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return { rows: [{ transaction_id: "42" }], rowCount: 1 }
+        return sql.startsWith('INSERT INTO "agent_artifact"') ? { rows: [sourceRow], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = {
+      connect: vi.fn(async () => client),
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        calls.push({ scope: "pool", sql, values })
+        return { rows: [manifestRow], rowCount: 1 }
+      }),
+    }
+    const repository = createAgentArtifactRepository(pool as never)
+
+    await expect(repository.insertBase(sourceRow)).resolves.toMatchObject({ id: "resume-base-a", lifecycle: "base" })
+    const sourceLock = calls.findIndex(call => call.scope === "client" && call.sql.includes("hashtextextended($1::text, 0)"))
+    const sourceVerify = calls.findIndex((call, index) => index > sourceLock && call.scope === "client" && call.sql === "SELECT pg_current_xact_id()::text AS transaction_id")
+    const jobLock = calls.findIndex(call => call.scope === "client" && call.sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))"))
+    const baseInsert = calls.findIndex(call => call.scope === "client" && call.sql.startsWith('INSERT INTO "agent_artifact"'))
+    expect(sourceLock).toBeGreaterThan(-1)
+    expect(sourceVerify).toBeGreaterThan(sourceLock)
+    expect(jobLock).toBeGreaterThan(sourceVerify)
+    expect(baseInsert).toBeGreaterThan(jobLock)
+    expect(calls[baseInsert]?.sql).toContain("RETURNING")
+    expect(calls[baseInsert]?.sql).not.toContain("ON CONFLICT")
+
+    await expect(repository.insertBase({ ...sourceRow, id: "application:task-a", artifactType: "application" })).resolves.toMatchObject({ id: "application:task-a" })
+    expect(pool.connect).toHaveBeenCalledTimes(1)
+    expect(calls.at(-1)).toMatchObject({ scope: "pool", sql: expect.stringContaining("INSERT INTO \"agent_artifact\"") })
+  })
+
+  it("writes a standalone resume draft after the source fence, job advisory, and owner locks", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const baseRow = {
+      id: "resume-base-a", userId: "user-a", jobId: "job-a", artifactType: "resume", lifecycle: "base", baseId: "resume-base-a",
+      baseHash: "resume-base-hash", content: { summary: "Original" }, hash: "resume-base-hash", constraintHash: "resume-base-hash",
+      provenanceRefs: ["resume:source"], evidenceRefs: ["resume:source"], previousHash: null, version: 1,
+      createdAt: new Date(), updatedAt: new Date(),
+    }
+    const client = {
+      query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+        calls.push({ sql, values })
+        if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return { rows: [{ transaction_id: "42" }], rowCount: 1 }
+        if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) return { rows: [{ live: true }], rowCount: 1 }
+        if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: "resume-task-a" }], rowCount: 1 }
+        if (sql.includes('FROM "agent_artifact_version"') && sql.includes('"taskId" = $1')) return { rows: [], rowCount: 0 }
+        if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact"')) {
+          return values[0] === baseRow.id ? { rows: [baseRow], rowCount: 1 } : { rows: [], rowCount: 0 }
+        }
+        if (sql.startsWith('INSERT INTO "agent_artifact_version"')) {
+          return { rows: [{
+            id: values[0], artifactId: values[1], version: values[2], userId: values[3], sessionId: values[4], jobId: values[5],
+            artifactType: values[6], content: JSON.parse(String(values[7])) as unknown, contentHash: values[8], sourceDigest: values[9],
+            constraintHash: values[10], provenanceRefs: values[11], evidenceRefs: values[12], baseId: values[13], baseHash: values[14],
+            previousHash: values[15], taskId: values[16], toolCallId: values[17], requestHash: values[18], createdAt: new Date(),
+          }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn(async () => client), query: vi.fn() }
+    const repository = createAgentArtifactRepository(pool as never)
+    const taskFence = {
+      taskId: "resume-task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "resume-task-a",
+      parentTaskId: null, leaseOwner: "worker-a", attemptCount: 1,
+    }
+
+    const version = await repository.saveDraft({
+      id: "resume-draft-a", userId: "user-a", jobId: "job-a", artifactType: "resume", content: { summary: "Tailored" }, hash: "draft-hash",
+      constraintHash: "draft-constraints", provenanceRefs: ["resume:source"], evidenceRefs: ["job:job-a"], sessionId: "session-a",
+      baseId: baseRow.id, baseHash: baseRow.hash, previousHash: null, sourceDigest: "source-digest", taskId: taskFence.taskId,
+      toolCallId: "resume-write-a", requestHash: "resume-request-a", taskFence,
+    })
+
+    const sourceLock = calls.findIndex(call => call.sql.includes("hashtextextended($1::text, 0)"))
+    const sourceVerify = calls.findIndex((call, index) => index > sourceLock && call.sql === "SELECT pg_current_xact_id()::text AS transaction_id")
+    const jobLocks = calls.map((call, index) => call.sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))") ? index : -1).filter(index => index >= 0)
+    const ownerLock = calls.findIndex(call => call.sql.includes('FOR UPDATE OF session, turn, root, task'))
+    const baseRead = calls.findIndex(call => call.sql.startsWith("SELECT") && call.sql.includes('FROM "agent_artifact"') && call.sql.includes("FOR UPDATE"))
+    const draftInsert = calls.findIndex(call => call.sql.startsWith('INSERT INTO "agent_artifact"'))
+    const versionInsert = calls.findIndex(call => call.sql.startsWith('INSERT INTO "agent_artifact_version"'))
+
+    expect(version).toMatchObject({ artifactId: "resume-draft-a", artifactType: "resume", userId: "user-a", jobId: "job-a", version: 1 })
+    expect(pool.connect).toHaveBeenCalledTimes(1)
+    expect(pool.query).not.toHaveBeenCalled()
+    expect(client.query.mock.calls.filter(([sql]) => sql === "BEGIN")).toHaveLength(1)
+    expect(client.query.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(1)
+    expect(client.query.mock.calls.filter(([sql]) => sql === "ROLLBACK")).toHaveLength(0)
+    expect(calls[1]).toMatchObject({ sql: "SELECT set_config($1, $2, true)", values: ["app.user_id", "user-a"] })
+    expect(calls[sourceLock]?.values).toEqual(["applymate:gate-source-fence:v1:user-a"])
+    expect(jobLocks).toHaveLength(2)
+    expect(sourceLock).toBeGreaterThan(1)
+    expect(sourceVerify).toBeGreaterThan(sourceLock)
+    expect(jobLocks[0]).toBeGreaterThan(sourceVerify)
+    expect(ownerLock).toBeGreaterThan(jobLocks[0]!)
+    expect(jobLocks[1]).toBeLessThan(ownerLock)
+    expect(baseRead).toBeGreaterThan(ownerLock)
+    expect(draftInsert).toBeGreaterThan(baseRead)
+    expect(versionInsert).toBeGreaterThan(draftInsert)
+    expect(calls[ownerLock]?.values).toEqual([taskFence.taskId, taskFence.userId, taskFence.sessionId, taskFence.turnId,
+      taskFence.rootTaskId, taskFence.parentTaskId, taskFence.leaseOwner, taskFence.attemptCount, "job-a", "selected_job", null, null])
+    expect(client.release).toHaveBeenCalledTimes(1)
+  })
+
   it("uses the caller transaction and resolves an idempotent base insert without a unique error", async () => {
     const input = { id: "artifact-a", userId: "user-a", jobId: "job-a", artifactType: "application", content: { answerHash: "hash-a" }, hash: "hash-a",
       constraintHash: "constraints-a", provenanceRefs: ["application-task:task-a"], evidenceRefs: ["application-task:task-a"] }
@@ -387,6 +505,7 @@ describe("agent artifact repository", () => {
     let draftRow: Record<string, unknown> | null = null
     const query = vi.fn(async (sql: string, values: readonly unknown[] = []) => {
       calls.push({ sql, values })
+      if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return { rows: [{ transaction_id: "42" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: "task-a" }] }
       if (sql.includes('AS "live"')) return { rows: [{ live: true }] }
       if (sql.includes('FROM "agent_artifact_version"') && sql.includes('"taskId" = $1')) return { rows: [] }
@@ -439,12 +558,95 @@ describe("agent artifact repository", () => {
       { kind: "agent_artifact_version", artifactId: "draft-a", version: 1, contentHash: "hash-one" },
       { kind: "agent_artifact_version", artifactId: "draft-a", version: 2, contentHash: "hash-one" },
     ])
+    const sourceLock = calls.findIndex(call => call.sql.includes("hashtextextended($1::text, 0)"))
+    const sourceVerify = calls.findIndex((call, index) => index > sourceLock && call.sql === "SELECT pg_current_xact_id()::text AS transaction_id")
+    const firstJobLock = calls.findIndex(call => call.sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))"))
+    const taskFenceIndex = calls.findIndex(call => call.sql.includes('FROM "sub_agent_tasks" AS task'))
+    expect(sourceLock).toBeGreaterThan(-1)
+    expect(sourceVerify).toBeGreaterThan(sourceLock)
+    expect(firstJobLock).toBeGreaterThan(sourceVerify)
+    expect(taskFenceIndex).toBeGreaterThan(firstJobLock)
     expect(JSON.stringify(parentContent)).not.toContain(body1)
     expect(JSON.stringify(parentContent)).not.toContain(body2)
     const versionWrites = calls.filter(call => call.sql.startsWith('INSERT INTO "agent_artifact_version"'))
     expect(versionWrites.map(call => JSON.parse(String(call.values[7])) as unknown)).toEqual([body1, body2])
     expect(first.content).toBe(body1)
     expect(second.content).toBe(body2)
+  })
+
+  it("writes a standalone resume draft after the source fence, job advisory, and owner locks", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const baseRow = {
+      id: "resume-base-a", userId: "user-a", jobId: "job-a", artifactType: "resume", lifecycle: "base", baseId: "resume-base-a",
+      baseHash: "resume-base-hash", content: { summary: "Original" }, hash: "resume-base-hash", constraintHash: "resume-base-hash",
+      provenanceRefs: ["resume:source"], evidenceRefs: ["resume:source"], previousHash: null, version: 1,
+      createdAt: new Date(), updatedAt: new Date(),
+    }
+    const client = {
+      query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+        calls.push({ sql, values })
+        if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return { rows: [{ transaction_id: "42" }], rowCount: 1 }
+        if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) return { rows: [{ live: true }], rowCount: 1 }
+        if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: "resume-task-a" }], rowCount: 1 }
+        if (sql.includes('FROM "agent_artifact_version"') && sql.includes('"taskId" = $1')) return { rows: [], rowCount: 0 }
+        if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact"')) {
+          return values[0] === baseRow.id ? { rows: [baseRow], rowCount: 1 } : { rows: [], rowCount: 0 }
+        }
+        if (sql.startsWith('INSERT INTO "agent_artifact_version"')) {
+          return { rows: [{
+            id: values[0], artifactId: values[1], version: values[2], userId: values[3], sessionId: values[4], jobId: values[5],
+            artifactType: values[6], content: JSON.parse(String(values[7])) as unknown, contentHash: values[8], sourceDigest: values[9],
+            constraintHash: values[10], provenanceRefs: values[11], evidenceRefs: values[12], baseId: values[13], baseHash: values[14],
+            previousHash: values[15], taskId: values[16], toolCallId: values[17], requestHash: values[18], createdAt: new Date(),
+          }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn(async () => client), query: vi.fn() }
+    const repository = createAgentArtifactRepository(pool as never)
+    const taskFence = {
+      taskId: "resume-task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "resume-task-a",
+      parentTaskId: null, leaseOwner: "worker-a", attemptCount: 1,
+    }
+
+    const version = await repository.saveDraft({
+      id: "resume-draft-a", userId: "user-a", jobId: "job-a", artifactType: "resume", content: { summary: "Tailored" }, hash: "draft-hash",
+      constraintHash: "draft-constraints", provenanceRefs: ["resume:source"], evidenceRefs: ["job:job-a"], sessionId: "session-a",
+      baseId: baseRow.id, baseHash: baseRow.hash, previousHash: null, sourceDigest: "source-digest", taskId: taskFence.taskId,
+      toolCallId: "resume-write-a", requestHash: "resume-request-a", taskFence,
+    })
+
+    const sourceLock = calls.findIndex(call => call.sql.includes("hashtextextended($1::text, 0)"))
+    const sourceVerify = calls.findIndex((call, index) => index > sourceLock && call.sql === "SELECT pg_current_xact_id()::text AS transaction_id")
+    const jobLocks = calls.map((call, index) => call.sql.includes("pg_advisory_xact_lock(hashtext($1), hashtext($2))") ? index : -1).filter(index => index >= 0)
+    const ownerLock = calls.findIndex(call => call.sql.includes('FOR UPDATE OF session, turn, root, task'))
+    const baseRead = calls.findIndex(call => call.sql.startsWith("SELECT") && call.sql.includes('FROM "agent_artifact"') && call.sql.includes("FOR UPDATE"))
+    const draftInsert = calls.findIndex(call => call.sql.startsWith('INSERT INTO "agent_artifact"'))
+    const versionInsert = calls.findIndex(call => call.sql.startsWith('INSERT INTO "agent_artifact_version"'))
+
+    expect(version).toMatchObject({ artifactId: "resume-draft-a", artifactType: "resume", userId: "user-a", jobId: "job-a", version: 1 })
+    expect(pool.connect).toHaveBeenCalledTimes(1)
+    expect(pool.query).not.toHaveBeenCalled()
+    expect(client.query.mock.calls.filter(([sql]) => sql === "BEGIN")).toHaveLength(1)
+    expect(client.query.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(1)
+    expect(client.query.mock.calls.filter(([sql]) => sql === "ROLLBACK")).toHaveLength(0)
+    expect(calls[1]).toMatchObject({ sql: "SELECT set_config($1, $2, true)", values: ["app.user_id", "user-a"] })
+    expect(calls[sourceLock]?.values).toEqual(["applymate:gate-source-fence:v1:user-a"])
+    expect(jobLocks).toHaveLength(2)
+    expect(sourceLock).toBeGreaterThan(1)
+    expect(sourceVerify).toBeGreaterThan(sourceLock)
+    expect(jobLocks[0]).toBeGreaterThan(sourceVerify)
+    expect(ownerLock).toBeGreaterThan(jobLocks[0]!)
+    expect(jobLocks[1]).toBeLessThan(ownerLock)
+    expect(baseRead).toBeGreaterThan(ownerLock)
+    expect(draftInsert).toBeGreaterThan(baseRead)
+    expect(versionInsert).toBeGreaterThan(draftInsert)
+    expect(calls[ownerLock]?.values).toEqual([taskFence.taskId, taskFence.userId, taskFence.sessionId, taskFence.turnId,
+      taskFence.rootTaskId, taskFence.parentTaskId, taskFence.leaseOwner, taskFence.attemptCount, "job-a", "selected_job", null, null])
+    expect(client.release).toHaveBeenCalledTimes(1)
   })
 
   it("fences scheduled Prepare writes by the captured Turn lease before replaying a stable result", async () => {
@@ -460,6 +662,7 @@ describe("agent artifact repository", () => {
     const client = {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         calls.push({ sql, values })
+        if (sql.includes("pg_current_xact_id()::text AS transaction_id")) return { rows: [{ transaction_id: "42" }], rowCount: 1 }
         if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 0 }
         if (sql.includes('FROM "sub_agent_tasks" AS task')) {
           const scheduledPrepareFenceMatches = values[9] !== "scheduled_prepare"

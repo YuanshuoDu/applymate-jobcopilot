@@ -54,23 +54,38 @@ const mockContext = vi.hoisted(() => ({
 }));
 const mockTurnState = vi.hoisted(() => ({ sessionStatus: "running", turnStatus: "in_progress", interrupted: false }));
 const mockPoolQuery = vi.hoisted(() => vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }));
-const mockTurnClient = vi.hoisted(() => ({
-  query: vi.fn(async (sql: string) => {
-    if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "agent-session-1" }], rowCount: 1 };
-    if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "agent-session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
-    if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler-1" }], rowCount: 1 };
-    if (sql.includes('SELECT "sessionId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId"')) {
-      return { rows: [{ sessionId: "agent-session-1", fillTurnId: "agent-turn-1", fillTurnSessionId: "agent-session-1", fillTurnUserId: "user-1" }], rowCount: 1 };
-    }
-    if (sql.includes('FROM "Job"')) return { rows: [{ id: "job-1" }], rowCount: 1 };
-    if (sql.includes("INSERT INTO apply_results")) return { rows: [{ id: 1 }], rowCount: 1 };
-    if (sql.includes('FROM "agent_sessions"')) return { rows: [{ status: mockTurnState.sessionStatus }], rowCount: 1 };
-    if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: "agent-turn-1", status: mockTurnState.turnStatus }], rowCount: 1 };
-    if (sql.includes('FROM "agent_events"')) return { rows: [{ stopped: mockTurnState.interrupted }], rowCount: 1 };
-    return { rows: [], rowCount: 1 };
-  }),
-  release: vi.fn(),
-}));
+const mockTurnClient = vi.hoisted(() => {
+  const transaction = { nextId: 1000, currentId: null as string | null };
+  return {
+    transaction,
+    query: vi.fn(async (sql: string) => {
+      if (sql === "BEGIN") {
+        transaction.currentId = String(transaction.nextId++);
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.includes("pg_current_xact_id()::text AS transaction_id")) {
+        return { rows: transaction.currentId ? [{ transaction_id: transaction.currentId }] : [], rowCount: 1 };
+      }
+      if (sql === "COMMIT" || sql === "ROLLBACK") {
+        transaction.currentId = null;
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "agent-session-1" }], rowCount: 1 };
+      if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "agent-session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
+      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler-1" }], rowCount: 1 };
+      if (sql.includes('SELECT "sessionId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId"')) {
+        return { rows: [{ sessionId: "agent-session-1", fillTurnId: "agent-turn-1", fillTurnSessionId: "agent-session-1", fillTurnUserId: "user-1" }], rowCount: 1 };
+      }
+      if (sql.includes('FROM "Job"')) return { rows: [{ id: "job-1" }], rowCount: 1 };
+      if (sql.includes("INSERT INTO apply_results")) return { rows: [{ id: 1 }], rowCount: 1 };
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ status: mockTurnState.sessionStatus }], rowCount: 1 };
+      if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: "agent-turn-1", status: mockTurnState.turnStatus }], rowCount: 1 };
+      if (sql.includes('FROM "agent_events"')) return { rows: [{ stopped: mockTurnState.interrupted }], rowCount: 1 };
+      return { rows: [], rowCount: 1 };
+    }),
+    release: vi.fn(),
+  };
+});
 const mockPage = vi.hoisted(() => ({
   goto: vi.fn().mockResolvedValue(undefined),
   url: vi.fn().mockReturnValue("https://example.com/jobs/123/apply"),
@@ -362,6 +377,8 @@ describe("apply-queue (unit — mocked)", () => {
     mockTurnState.sessionStatus = "running";
     mockTurnState.turnStatus = "in_progress";
     mockTurnState.interrupted = false;
+    mockTurnClient.transaction.nextId = 1000;
+    mockTurnClient.transaction.currentId = null;
     mockTurnClient.query.mockClear();
     mockTurnClient.release.mockClear();
     mockPage.goto.mockClear();

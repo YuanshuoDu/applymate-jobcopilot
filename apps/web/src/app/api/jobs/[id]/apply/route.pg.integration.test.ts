@@ -25,11 +25,13 @@ type TransactionEvidence = {
   activityCalls: number
   activityErrors: unknown[]
   backendPid?: number
+  onTransactionStarted?: () => void
   beforeUpdate?: () => Promise<void>
   onUpdateIssued?: () => void
   afterUpdate?: () => Promise<void>
 }
-type RequestScope = { client: PrismaClient; userId: string; barrier?: Barrier; evidence?: TransactionEvidence }
+type JobReadEvidence = { status?: string; appliedAt?: Date | null }
+type RequestScope = { client: PrismaClient; userId: string; barrier?: Barrier; evidence?: TransactionEvidence; readEvidence?: JobReadEvidence }
 const scope = new AsyncLocalStorage<RequestScope>()
 function currentScope(): RequestScope {
   const value = scope.getStore()
@@ -106,6 +108,10 @@ integration('manual application record concurrency with PostgreSQL', () => {
         findFirst: async (args: Prisma.JobFindFirstArgs) => {
           const request = currentScope()
           const row = await request.client.job.findFirst(args)
+          if (row && request.readEvidence) {
+            request.readEvidence.status = row.status
+            request.readEvidence.appliedAt = row.appliedAt
+          }
           if (request.barrier) { request.barrier.arrive(); await request.barrier.wait }
           return row
         },
@@ -120,6 +126,7 @@ integration('manual application record concurrency with PostgreSQL', () => {
           const evidence = request.evidence
           const backend = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`
           evidence.backendPid = backend[0].pid
+          evidence.onTransactionStarted?.()
           // Record actual database outcomes without replacing or faking queries.
           const observed = new Proxy(tx, { get(target, property, receiver) {
             if (property === 'job') return new Proxy(target.job, { get(delegate, operation, innerReceiver) {
@@ -168,55 +175,65 @@ integration('manual application record concurrency with PostgreSQL', () => {
     await admin?.$disconnect()
   }, 30_000)
 
-  function invoke(client: PrismaClient, barrier?: Barrier, requestId?: string, userId = 'owner-a', evidence?: TransactionEvidence) {
+  function invoke(client: PrismaClient, barrier?: Barrier, requestId?: string, userId = 'owner-a', evidence?: TransactionEvidence, readEvidence?: JobReadEvidence) {
     const req = new NextRequest('http://localhost/api/jobs/job-1/apply', {
       method: 'POST', headers: requestId ? { 'X-Manual-Record-Request-Id': requestId } : {},
     })
-    return scope.run({ client, userId, barrier, evidence }, () => POST(req, { params: Promise.resolve({ id: 'job-1' }) }))
+    return scope.run({ client, userId, barrier, evidence, readEvidence }, () => POST(req, { params: Promise.resolve({ id: 'job-1' }) }))
   }
 
   it('commits only one record after both requests read the same saved job', async () => {
-    const gate = makeBarrier(2)
+    const firstRead = makeBarrier(1)
+    const secondRead = makeBarrier(1)
     const winnerUpdated = makeBarrier(1)
-    let signalSecondIssued = () => {}
-    const secondIssued = new Promise<void>(resolve => { signalSecondIssued = resolve })
-    let cancelSecondWait = () => {}
-    let secondWaitCancelled = false
-    const secondWaitCancellation = new Promise<void>(resolve => { cancelSecondWait = resolve })
+    const loserTransactionStarted = makeBarrier(1)
+    let loserUpdateIssued = false
+    const firstReadEvidence: JobReadEvidence = {}
+    const secondReadEvidence: JobReadEvidence = {}
     const winner: TransactionEvidence = {
       updateCounts: [], activityCalls: 0, activityErrors: [],
       afterUpdate: async () => { winnerUpdated.barrier.arrive(); await winnerUpdated.barrier.wait },
     }
     const loser: TransactionEvidence = {
       updateCounts: [], activityCalls: 0, activityErrors: [],
-      beforeUpdate: async () => {
-        await Promise.race([winnerUpdated.reached, secondWaitCancellation])
-        if (secondWaitCancelled) throw new Error('Manual-record lock test cancelled before winner update')
-      },
-      onUpdateIssued: signalSecondIssued,
+      onTransactionStarted: () => loserTransactionStarted.barrier.arrive(),
+      onUpdateIssued: () => { loserUpdateIssued = true },
     }
-    const first = invoke(clientA, gate.barrier, '6bce695c-3c62-4b6b-88b2-8b364629fb78', 'owner-a', winner)
-    const second = invoke(clientB, gate.barrier, 'e9461354-91f4-49ea-80c2-198410c33783', 'owner-a', loser)
+    const first = invoke(clientA, firstRead.barrier, '6bce695c-3c62-4b6b-88b2-8b364629fb78', 'owner-a', winner, firstReadEvidence)
+    const second = invoke(clientB, secondRead.barrier, 'e9461354-91f4-49ea-80c2-198410c33783', 'owner-a', loser, secondReadEvidence)
     const settled = Promise.allSettled([first, second])
     try {
-      await within(gate.reached)
-      gate.release()
+      await within(Promise.all([firstRead.reached, secondRead.reached]))
+      expect(firstReadEvidence).toEqual({ status: 'saved', appliedAt: null })
+      expect(secondReadEvidence).toEqual({ status: 'saved', appliedAt: null })
+      firstRead.release()
       await within(winnerUpdated.reached)
       expect(winner.updateCounts).toEqual([1])
-      await within(secondIssued)
+      secondRead.release()
+      await within(loserTransactionStarted.reached)
       expect(winner.backendPid).toBeTypeOf('number')
       expect(loser.backendPid).toBeTypeOf('number')
-      // The second query must actually be waiting on the first backend's lock;
-      // merely starting two requests or reaching a JS barrier is insufficient.
+      // The second transaction must wait on the advisory source fence before
+      // it can issue the conditional Job update.
       const deadline = Date.now() + 8_000
-      let blocked = false
-      while (!blocked && Date.now() < deadline) {
-        const rows = await within(admin.$queryRaw<Array<{ blocked: boolean }>>`
-          SELECT ${winner.backendPid!}::int = ANY(pg_blocking_pids(${loser.backendPid!}::int)) AS blocked`, 2_000)
-        blocked = rows[0]?.blocked === true
-        if (!blocked) await new Promise(resolve => setTimeout(resolve, 50))
+      let waitingOnAdvisoryFence = false
+      let blockedByWinner = false
+      while ((!waitingOnAdvisoryFence || !blockedByWinner) && Date.now() < deadline) {
+        const rows = await within(admin.$queryRaw<Array<{ waiting: boolean; blocked_by_winner: boolean }>>`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE pid = ${loser.backendPid!}::int AND locktype = 'advisory' AND NOT granted
+          ) AS waiting,
+          ${winner.backendPid!}::int = ANY(pg_blocking_pids(${loser.backendPid!}::int)) AS blocked_by_winner`, 2_000)
+        waitingOnAdvisoryFence = rows[0]?.waiting === true
+        blockedByWinner = rows[0]?.blocked_by_winner === true
+        if (!waitingOnAdvisoryFence || !blockedByWinner) await new Promise(resolve => setTimeout(resolve, 50))
       }
-      expect(blocked).toBe(true)
+      expect(waitingOnAdvisoryFence).toBe(true)
+      expect(blockedByWinner).toBe(true)
+      expect(loserUpdateIssued).toBe(false)
+      expect(loser.updateCounts).toEqual([])
+      expect(loser.activityCalls).toBe(0)
       winnerUpdated.release()
       const responses = await within(Promise.all([first, second]))
       expect(responses.map(response => response.status)).toEqual([200, 409])
@@ -237,9 +254,8 @@ integration('manual application record concurrency with PostgreSQL', () => {
       expect(afterReplay.appliedAt?.getTime()).toBe(job.appliedAt?.getTime())
       expect(await clientA.activity.count({ where: { jobId: 'job-1' } })).toBe(1)
     } finally {
-      gate.release()
-      secondWaitCancelled = true
-      cancelSecondWait()
+      firstRead.release()
+      secondRead.release()
       winnerUpdated.release()
       await within(settled)
     }

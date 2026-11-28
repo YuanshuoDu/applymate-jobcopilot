@@ -1,7 +1,8 @@
 import type { Pool, PoolClient } from "pg"
 import { hashArtifactContent } from "../subagents/artifact-adapters.js"
 import { createAgentArtifactRepository, AgentArtifactRepositoryError, type AgentArtifactRevisionReviewRead, type AgentArtifactRow, type AgentArtifactVersionRow, type AgentArtifactReviewRow, type AgentArtifactReviewWrite, type AgentArtifactSourceDigestReader } from "../../db/agent-artifact-repo.js"
-import { artifactTaskLeaseIsLive, withArtifactTransaction } from "../../db/agent-artifact-repo-helpers.js"
+import { artifactTaskLeaseIsLive } from "../../db/agent-artifact-repo-helpers.js"
+import { withFencedArtifactWriteTransaction } from "../../db/agent-artifact-write-transaction.js"
 import { ArtifactToolError, type ArtifactBaseInput, type ArtifactToolRecord, type ArtifactToolStore, type ArtifactToolDraftInput, type ArtifactToolRevisionContext, type ArtifactToolScope, type ArtifactVersionRef } from "./artifact-tools.js"
 
 function isUniqueViolation(error: unknown): boolean { return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "23505") }
@@ -55,7 +56,7 @@ export class PgArtifactToolStore implements ArtifactToolStore {
         expectedPreviousVersion: input.expectedPreviousVersion,
       }
       if (!this.assertCurrentDraftMaterial) return await this.repository.saveDraft(write)
-      return await withArtifactTransaction(this.pool, scope.userId, async client => {
+      return await withFencedArtifactWriteTransaction(this.pool, scope.userId, scope.jobId, async client => {
         const version = await this.repository.saveDraft(write, client)
         const job = await client.query<{ id: string }>(
           `SELECT "id" FROM "Job" WHERE "id" = $1 AND "userId" = $2 FOR SHARE`, [scope.jobId, scope.userId],

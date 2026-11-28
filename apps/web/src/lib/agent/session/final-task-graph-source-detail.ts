@@ -9,7 +9,7 @@ import {
 import {
   parseFinalTaskGraphSourceManifest,
   TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2,
-  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3,
+  TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3, TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4,
   TASK_GRAPH_SOURCE_ROLES,
   TASK_GRAPH_SOURCE_TASK_STATUSES,
   type FinalTaskGraphSource,
@@ -110,7 +110,7 @@ export function projectFinalTaskGraphSourceDetail(input: {
 
   if (!isCanonicalTaskGraphSourceManifest(input.finalItemId, manifest)) return null
   const historicalNodeIndices = manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V2
-    || manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3
+    || manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 || manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4
     ? new Set(manifest.historicalNodeIndices) : new Set<number>()
   for (const nodeIndex of historicalNodeIndices) {
     const historicalNode = snapshot.nodes[nodeIndex]
@@ -119,7 +119,7 @@ export function projectFinalTaskGraphSourceDetail(input: {
       || (historicalTask.role !== 'scout' && historicalTask.role !== 'analyst')
       || historicalNode.templateId !== historicalTask.role) return null
   }
-  const retiredNodeIndices = manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3
+  const retiredNodeIndices = manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V3 || manifest.schemaVersion === TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4
     ? new Set(manifest.retiredNodeIndices) : new Set<number>()
   for (const nodeIndex of retiredNodeIndices) {
     const retiredNode = snapshot.nodes[nodeIndex]

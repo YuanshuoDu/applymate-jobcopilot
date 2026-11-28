@@ -2,34 +2,30 @@ import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
 import { AgentExecutionCancelledError } from "@/lib/agent/execution-control"
 import type { PipelineCheckpointState, RunReport } from "@/lib/agent/types"
+import { AgentPauseError } from "@/lib/agent/orchestrator"
+import { PipelineInterruptedError } from "@/lib/agent/pipeline"
+import { isAnalyzeSourceChangedError } from "@/lib/agent/stages/analyze-model-input"
+import { createAnalyzeSourceChangedCleanup } from "@/lib/agent/stages/analyze-ownership"
+
 
 export type RunHistoryEvent = { event: string; at: string; data: unknown }
 export type DurableEventWriter = {
-  record: (event: string, data: unknown) => Promise<unknown>
-  publish?: (event: string, data: unknown) => void
+  record: (event: string, data: unknown) => Promise<unknown>; publish?: (event: string, data: unknown) => void
   onError?: (error: unknown) => void
 }
-
 /** Serializes event persistence and publishes each event only after its write commits. */
 export function createDurableEventWriter(input: DurableEventWriter) {
   let pending = Promise.resolve()
   return {
     emit(event: string, data: unknown): void {
-      pending = pending.then(async () => {
-        await input.record(event, data)
-        input.publish?.(event, data)
-      }).catch(error => {
-        input.onError?.(error)
-      })
+      pending = pending.then(async () => { await input.record(event, data); input.publish?.(event, data) }).catch(error => input.onError?.(error))
     },
     drain: () => pending,
   }
 }
-
 export type FinishedExecutionStatus = "completed" | "failed" | "waiting_for_user" | "cancelled"
 export type RecorderTerminalStatus = "completed" | "failed" | "waiting_for_user"
 const ACTIVE_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
-
 function pickNumber(data: unknown, keys: string[]): number | null {
   if (!data || typeof data !== "object") return null
   const row = data as Record<string, unknown>
@@ -39,12 +35,10 @@ function pickNumber(data: unknown, keys: string[]): number | null {
   }
   return null
 }
-
 function historyStatus(report: RunReport | null, failed = false) {
   if (failed || !report) return "failed"
   return report.failed > 0 ? "partial" : "completed"
 }
-
 export function checkpointState(value: unknown): PipelineCheckpointState | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
   const state = value as Partial<PipelineCheckpointState>
@@ -52,6 +46,54 @@ export function checkpointState(value: unknown): PipelineCheckpointState | undef
   return typeof state.nextStage === "string" && stages.includes(state.nextStage)
     ? state as PipelineCheckpointState
     : undefined
+}
+ type PauseStage = "scout" | "analyst" | "writer" | "reviewer" | "executor" | "auditor" | "post-run"
+type AgentRecorderOwner = { turnId: string; executionAttempt: { id: string; userId: string; attemptCount: number }; terminalStatus: RecorderTerminalStatus | "running"; executionTransitionTo?: "waiting_for_user" }
+type RunWaitResult = { status: "waiting_for_user"; waitId: string; stage: string }
+type RunFailureResult = { kind: "return"; result: null | RunWaitResult } | { kind: "throw"; error: unknown }
+export async function handleAgentPipelineFailure(input: {
+  error: unknown; scheduled: boolean; scheduledQuestionPersistenceFailed: boolean; signal?: AbortSignal
+  cleanupAnalyzeSourceChanged: (error: unknown) => Promise<void>
+  drainEvents: () => Promise<void>; isCurrentAttempt: () => Promise<boolean>; scheduledOwnerIsCurrent: () => Promise<boolean>
+  recorderOwner: (status: "running" | "failed", transition?: "waiting_for_user") => AgentRecorderOwner | undefined
+  pause: (message: string, stage: PauseStage, owner: AgentRecorderOwner) => Promise<boolean>; finishAttempt: (status: "failed", error: string) => Promise<boolean>
+  canPublish: (status: string) => Promise<boolean>; emit: (event: string, data: unknown) => void
+  finalize: (status: "failed", report: null) => Promise<boolean>; saveFailedHistory: () => Promise<void>
+}): Promise<RunFailureResult> {
+  const { error } = input
+  if (isAnalyzeSourceChangedError(error) && input.signal?.aborted) { await input.drainEvents(); return { kind: "return", result: null } }
+  if (isAnalyzeSourceChangedError(error) && input.scheduled) { await input.drainEvents(); return { kind: "throw", error } }
+  if (error instanceof AgentExecutionCancelledError || error instanceof PipelineInterruptedError) { await input.drainEvents(); return { kind: "return", result: null } }
+  if (error instanceof AgentPauseError) {
+    await input.drainEvents()
+    if (input.scheduled && input.scheduledQuestionPersistenceFailed) return { kind: "return", result: null }
+    if (!await input.isCurrentAttempt() || input.scheduled && !await input.scheduledOwnerIsCurrent()) return { kind: "return", result: null }
+    const owner = input.recorderOwner("running", "waiting_for_user")
+    if (!owner || !await input.pause(`Waiting for your answer at ${error.stage}.`, error.stage as PauseStage, owner)) return { kind: "return", result: null }
+    return { kind: "return", result: input.scheduled ? { status: "waiting_for_user", waitId: error.questionId, stage: error.stage } : null }
+  }
+  const message = error instanceof Error ? error.message : "Agent run failed"
+  if (!await input.isCurrentAttempt()) {
+    await input.drainEvents(); return { kind: "return", result: null }
+  }
+  if (isAnalyzeSourceChangedError(error)) {
+    await input.drainEvents()
+    try { await input.cleanupAnalyzeSourceChanged(error) }
+    catch (cleanupError) { return cleanupError instanceof AgentExecutionCancelledError || input.signal?.aborted
+      ? { kind: "return", result: null } : { kind: "throw", error: analyzeSourceChangeCleanupFailure() } }
+  }
+  if (!await input.finishAttempt("failed", message) || !await input.canPublish("failed")) { await input.drainEvents(); return { kind: "return", result: null } }
+  input.emit("error", { message })
+  await input.drainEvents()
+  if (!await input.finalize("failed", null)) return { kind: "return", result: null }
+  await input.saveFailedHistory()
+  return isAnalyzeSourceChangedError(error) ? { kind: "throw", error } : { kind: "return", result: null }
+}
+
+function analyzeSourceChangeCleanupFailure(): Error {
+  const error = new Error("Analyze source-change cleanup failed.")
+  error.name = "AnalyzeSourceChangeCleanupError"
+  return error
 }
 
 export async function isActiveAccount(userId: string): Promise<boolean> {
@@ -181,5 +223,8 @@ export function createRunAttemptOwnership(input: {
       ...(executionTransitionTo ? { executionTransitionTo } : {}),
     } : undefined
   }
-  return { isCurrentAttempt, finishAttempt, canPublishAttemptResult, recorderOwner }
+  return { isCurrentAttempt, finishAttempt, canPublishAttemptResult, recorderOwner,
+    cleanupAnalyzeSourceChanged: (error: unknown) => createAnalyzeSourceChangedCleanup({ userId: input.userId,
+      sessionId: input.sessionId, executionAttempt: { id: input.id, attemptCount: input.attemptCount },
+      signal: input.signal })(error) }
 }

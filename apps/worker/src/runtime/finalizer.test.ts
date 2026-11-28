@@ -23,6 +23,19 @@ function graphBinding(taskId = "task-1", graphRevision = 1): TaskGraphFinalSumma
   return binding
 }
 
+function coverLetterGraphBinding(): TaskGraphFinalSummaryBinding {
+  const artifactRef = { artifactId: "private-cover-letter", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+  const task: GraphTaskRow = { id: "private-cover-letter-task", role: "writer", taskType: "cover_letter_draft", status: "completed", failureReason: null,
+    result: { structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef } } }
+  const rootTaskId = "root-cover-letter"
+  const loaded = { rootTaskId, item: { id: taskGraphItemId(rootTaskId), revision: 2, content: {}, createdAt: new Date(0) },
+    snapshot: { nodes: [{ taskId: task.id, key: "writer", templateId: "cover_letter_writer" }] }, state: { revision: 2 },
+    tasks: new Map([[task.id, task]]) } as unknown as LoadedGraph
+  const binding = buildTaskGraphFinalSummaryBinding(loaded)
+  if (!binding) throw new Error("Expected a current cover-letter final-summary binding")
+  return binding
+}
+
 function followUpGraphBinding(): TaskGraphFinalSummaryBinding {
   const rootTaskId = "root-follow-up"
   const scoutTaskId = "task-scout-failed"
@@ -188,6 +201,17 @@ describe("deterministic finalizer", () => {
       ...terminal.finalContent, taskGraphSources: { ...terminal.finalContent.taskGraphSources, sources: [] },
     }, terminal.response, terminal.finalItemId)).toBe(false)
     expect(taskGraphFinalSummaryCopiesMatch(binding, graphBinding(), terminal.finalContent, terminal.response, "different-final-item")).toBe(false)
+  })
+
+  it("rejects a tampered v3 artifact commitment during terminal revalidation", () => {
+    const binding = coverLetterGraphBinding(), groundedResponse = buildGroundedTaskGraphFinalResponse(binding)
+    const terminal = boundTerminal(binding, groundedResponse)
+    const manifest = terminal.finalContent.taskGraphSources
+    if (!manifest || manifest.schemaVersion !== "agent-harness.v2.task-graph-sources.v4") throw new Error("Expected a v4 final source manifest")
+    expect(manifest.sources[0]?.artifactVersionProof).toMatch(/^avp_[a-f0-9]{64}$/)
+    const tampered = { ...terminal.finalContent, taskGraphSources: { ...manifest,
+      sources: manifest.sources.map((source, index) => index === 0 ? { ...source, artifactVersionProof: `avp_${"0".repeat(64)}` } : source) } }
+    expect(taskGraphFinalSummaryCopiesMatch(binding, coverLetterGraphBinding(), tampered, terminal.response, terminal.finalItemId)).toBe(false)
   })
 
   it("preserves exact candidate matching for unbound final responses", () => {

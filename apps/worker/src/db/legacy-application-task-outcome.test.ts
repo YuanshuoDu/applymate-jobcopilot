@@ -1,7 +1,10 @@
 import type { PoolClient } from "pg";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { insertApplyResultWithClient, persistLegacyApplicationTaskOutcome } from "./legacy-application-task-outcome.js";
+
+const mocks = vi.hoisted(() => ({ acquireSourceMaterialFence: vi.fn() }));
+vi.mock("./source-material-fence.js", () => ({ acquireSourceMaterialFence: mocks.acquireSourceMaterialFence }));
 
 function testClient(rows: Array<Record<string, unknown>>) {
   const query = vi.fn(async (_sql: string, _values?: unknown[]) => {
@@ -14,7 +17,11 @@ function testClient(rows: Array<Record<string, unknown>>) {
 const scope = { applicationTaskId: "task-1", userId: "user-1", jobId: "job-1" };
 
 describe("legacy application task outcome fencing", () => {
-  it("writes only after locking the scoped unbound task, with session and turn locks first", async () => {
+  beforeEach(() => {
+    mocks.acquireSourceMaterialFence.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("takes the source fence before the scoped task read and preserves session, turn, and task lock order", async () => {
     const { client, query } = testClient([
       { sessionId: "session-1" },
       { id: "session-1" },
@@ -27,6 +34,9 @@ describe("legacy application task outcome fencing", () => {
       .resolves.toEqual({ status: "persisted", value: "written" });
 
     const statements = query.mock.calls.map(([sql]) => String(sql));
+    expect(mocks.acquireSourceMaterialFence).toHaveBeenCalledOnce();
+    expect(mocks.acquireSourceMaterialFence).toHaveBeenCalledWith(client, [scope.userId]);
+    expect(mocks.acquireSourceMaterialFence.mock.invocationCallOrder[0]).toBeLessThan(query.mock.invocationCallOrder[0]!);
     expect(statements[0]).toContain('WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3');
     expect(statements[1]).toContain('FROM agent_sessions');
     expect(statements[2]).toContain('FROM agent_turns');
@@ -35,6 +45,19 @@ describe("legacy application task outcome fencing", () => {
     expect(statements[3]).toContain("FOR UPDATE");
     expect(write).toHaveBeenCalledWith(client);
     expect(statements.slice(4).some((sql) => /agent_sessions|agent_turns/.test(sql))).toBe(false);
+  });
+
+  it("fails closed before reading or invoking the outcome writer when the source fence fails", async () => {
+    const { client, query } = testClient([{ sessionId: null }]);
+    const fenceError = new Error("source material fence failed");
+    const write = vi.fn(async () => "written");
+    mocks.acquireSourceMaterialFence.mockRejectedValueOnce(fenceError);
+
+    await expect(persistLegacyApplicationTaskOutcome(client, scope, write)).rejects.toBe(fenceError);
+
+    expect(mocks.acquireSourceMaterialFence).toHaveBeenCalledWith(client, [scope.userId]);
+    expect(query).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
   });
 
   it("suppresses every callback when the exact task is already bound to a TaskGraph Turn", async () => {

@@ -5,14 +5,24 @@ import { parseScheduledTaskGraphPrepareProof, scheduledTaskGraphAnalyzeCheckpoin
 import { runScheduledTaskGraphAnalyzeOnly } from "./scheduled-taskgraph-run-service"
 import type { PipelineCtx } from "./pipeline-context"
 import type { Job } from "@prisma/client"
+import { isAnalyzeSourceChangedError, readAnalyzeSourceChangedClaims } from "./stages/analyze-model-input"
 
 const mocks = vi.hoisted(() => ({ analyze: vi.fn(), scoreOwner: vi.fn(), ownerCurrent: vi.fn(), save: vi.fn(), gateInput: vi.fn(), gateCheckpoint: vi.fn(),
-  gateMaterials: vi.fn(), taskRows: vi.fn(), useActualGateInput: false, useActualGateCheckpoint: false, events: vi.fn(), steps: vi.fn(), items: vi.fn() }))
+  gateMaterials: vi.fn(), taskRows: vi.fn(), validateSources: vi.fn(), runCheckpointCurrent: vi.fn(),
+  useActualGateInput: false, useActualGateCheckpoint: false, events: vi.fn(), steps: vi.fn(), items: vi.fn() }))
 vi.mock("@/lib/db", () => ({ db: { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.steps }, agentItem: { findFirst: mocks.items },
   subAgentTask: { findMany: mocks.taskRows } } }))
+vi.mock("./scheduled-taskgraph-audit-action", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-taskgraph-audit-action")>()
+  return { ...actual, scheduledTaskGraphRunCheckpointIsCurrent: mocks.runCheckpointCurrent }
+})
 vi.mock("./scheduled-taskgraph-analysis-journal", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-taskgraph-analysis-journal")>()
   return { ...actual, runScheduledTaskGraphAnalyze: mocks.analyze, scheduledTaskGraphScoreOwnerIsCurrent: mocks.scoreOwner }
+})
+vi.mock("./stages/analyze-model-input", async importOriginal => {
+  const actual = await importOriginal<typeof import("./stages/analyze-model-input")>()
+  return { ...actual, validateAnalyzeSourceFingerprints: mocks.validateSources }
 })
 vi.mock("./scheduled-taskgraph-pipeline-fence", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-taskgraph-pipeline-fence")>()
@@ -122,16 +132,30 @@ function context(): PipelineCtx {
     executionAttempt: { id: owner.executionId, attemptCount: owner.executionAttemptCount } } as PipelineCtx
 }
 
+function buildAnalyzeCheckpoint(input: Parameters<typeof buildScheduledTaskGraphPrepareCheckpoint>[0]) {
+  const result = buildScheduledTaskGraphPrepareCheckpoint(input)
+  const sourceFingerprintsByJob = Object.fromEntries((result.checkpoint.scoredJobs ?? []).map(row => [row.job.id, {
+    version: "agent-harness.v2.analyze-source-input.v1",
+    digest: createHash("sha256").update(row.job.id, "utf8").digest("hex"),
+  }]))
+  return { ...result, checkpoint: { ...result.checkpoint, scheduledTaskGraphAnalyzeSourceFingerprints: sourceFingerprintsByJob } }
+}
+
 describe("runScheduledTaskGraphAnalyzeOnly", () => {
   beforeEach(() => {
     ;[mocks.analyze, mocks.scoreOwner, mocks.ownerCurrent, mocks.save, mocks.gateInput, mocks.gateCheckpoint, mocks.gateMaterials,
-      mocks.taskRows, mocks.events, mocks.steps, mocks.items].forEach(mock => mock.mockReset())
+      mocks.taskRows, mocks.validateSources, mocks.runCheckpointCurrent, mocks.events, mocks.steps, mocks.items].forEach(mock => mock.mockReset())
     mocks.ownerCurrent.mockResolvedValue(true)
     mocks.scoreOwner.mockResolvedValue(true)
     mocks.save.mockResolvedValue(true)
     mocks.gateInput.mockReset()
     mocks.gateCheckpoint.mockReset()
     mocks.gateMaterials.mockReset().mockResolvedValue({ packages: [], materials: [] })
+    mocks.validateSources.mockReset().mockResolvedValue({})
+    mocks.runCheckpointCurrent.mockImplementation(async (raw: unknown) => {
+      const input = raw as { tx: unknown; assertOwnerCurrent: (tx: never) => Promise<boolean> }
+      return input.assertOwnerCurrent(input.tx as never)
+    })
     mocks.taskRows.mockReset()
     mocks.useActualGateInput = false
     mocks.useActualGateCheckpoint = false
@@ -152,7 +176,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
   })
 
   it("persists the authoritative 0-100 Analyze checkpoint and returns only its opaque proof", async () => {
-    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+    const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
       ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
     mocks.analyze.mockResolvedValue({ analysis, checkpoint, persistedState })
     const onStateChange = vi.fn()
@@ -177,7 +201,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     const safeJob = { ...job, coverLetter: null } as Job
     const safeScore = { ...score, job: safeJob }
     const safeAnalysis = { ...analysis, data: { ...analysis.data, scoredJobs: [safeScore] } }
-    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+    const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
       ownedJobs: [jobWithLegacyLetter], analyzeResult: { ...safeAnalysis, data: { ...safeAnalysis.data, scoredJobs: [{ ...safeScore, job: jobWithLegacyLetter }] } },
       existingCheckpoint: initialState }).checkpoint
     const safePersistedState = { ...initialState, scoutedJobs: [safeJob], scoredJobs: [safeScore], analysisFailed: 0,
@@ -197,7 +221,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     const run = async (activeClaimToken: string) => {
       const state = { ...initialState,
         scheduledTaskGraphClaim: { ...initialState.scheduledTaskGraphClaim, claimToken: activeClaimToken } }
-      const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+      const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
         ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: state }).checkpoint
       mocks.analyze.mockResolvedValueOnce({ analysis, checkpoint, persistedState: state })
       return runScheduledTaskGraphAnalyzeOnly({ owner, snapshot, attestation: baseAttestation, continuationKey: key,
@@ -218,20 +242,85 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     expect(JSON.stringify(mocks.save.mock.calls)).not.toContain(second.claimTokenDigest)
   }, 30_000)
 
-  it("replays a persisted Prepare checkpoint without rescoring or mutating execution state", async () => {
-    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+  it("revalidates a persisted Prepare checkpoint under the same owner transaction before replay", async () => {
+    const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
       ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
+    const transaction = { fence: "source_fenced" }
+    mocks.save.mockImplementation(async (saveInput: { assertOwnerCurrent: (tx: unknown) => Promise<boolean> }) =>
+      saveInput.assertOwnerCurrent(transaction))
+
     const result = await runScheduledTaskGraphAnalyzeOnly({ owner, snapshot, attestation: baseAttestation, continuationKey: key,
       claimToken, ownedJobs: [job], context: context(), state: checkpoint, onStateChange: vi.fn() })
 
     expect(result.status).toBe("analyze_checkpointed")
     expect(result.checkpointDigest).toBe(scheduledTaskGraphAnalyzeCheckpointDigest(checkpoint))
     expect(mocks.analyze).not.toHaveBeenCalled()
-    expect(mocks.save).not.toHaveBeenCalled()
+    expect(mocks.save).toHaveBeenCalledWith(expect.objectContaining({ expectedState: checkpoint, state: checkpoint }))
+    expect(mocks.validateSources).toHaveBeenCalledWith(transaction, expect.objectContaining({
+      userId: owner.userId, resumeId: "resume_1", resumeText: "", jobIds: [job.id],
+      sourceFingerprintsByJob: checkpoint.scheduledTaskGraphAnalyzeSourceFingerprints,
+      claimTokens: [{ jobId: job.id, analysisFenceAt: score.analysisFenceAt }],
+    }))
+    expect(mocks.scoreOwner).toHaveBeenCalledWith(expect.objectContaining({ tx: transaction, owner, key, claimToken }))
+  }, 30_000)
+
+  it("fails closed with exact private score claims when a persisted checkpoint lacks provenance", async () => {
+    const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
+      ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
+    const { scheduledTaskGraphAnalyzeSourceFingerprints: _discarded, ...legacy } = checkpoint
+    mocks.save.mockImplementation(async (saveInput: { assertOwnerCurrent: (tx: unknown) => Promise<boolean> }) =>
+      saveInput.assertOwnerCurrent({ fence: "source_fenced" }))
+    let observed: unknown
+    try {
+      await runScheduledTaskGraphAnalyzeOnly({ owner, snapshot, attestation: baseAttestation, continuationKey: key,
+        claimToken, ownedJobs: [job], context: context(), state: legacy, onStateChange: vi.fn() })
+    } catch (error) { observed = error }
+
+    expect(isAnalyzeSourceChangedError(observed)).toBe(true)
+    expect(readAnalyzeSourceChangedClaims(observed)).toEqual([{ jobId: job.id, analysisFenceAt: score.analysisFenceAt }])
+    expect(mocks.validateSources).not.toHaveBeenCalled()
+    expect(mocks.save).toHaveBeenCalledTimes(1)
+  }, 30_000)
+
+  it("source-fences the current Resume for a valid zero-score checkpoint without requiring an empty map", async () => {
+    const empty = { nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner,
+        claimedAt: "2026-10-20T10:00:00.000Z", leaseExpiresAt: "2026-10-20T10:10:00.000Z" },
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner,
+        snapshotDigest: baseAttestation.snapshotDigest, graphRevision: baseAttestation.graphRevision,
+        evidenceDigest: baseAttestation.evidenceDigest } }
+    const transaction = { sourceFence: "same-transaction" }
+    const { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } = await import("./scheduled-taskgraph-run-service")
+
+    await assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent(transaction as never, context(), empty)
+
+    expect(mocks.validateSources).toHaveBeenCalledWith(transaction, expect.objectContaining({
+      userId: owner.userId, resumeId: "resume_1", resumeText: "", jobIds: [],
+      sourceFingerprintsByJob: undefined, claimTokens: [],
+    }))
+  }, 30_000)
+
+  it.each([
+    ["missing scoredJobs", { nextStage: "prepare", scoutedJobs: [], scoredJobs: undefined, analysisFailed: 0 }],
+    ["malformed scoredJobs", { nextStage: "prepare", scoutedJobs: [], scoredJobs: [null], analysisFailed: 0 }],
+    ["malformed empty map", { nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphAnalyzeSourceFingerprints: null }],
+  ])("fails closed for a zero-score checkpoint with %s", async (_label, patch) => {
+    const base = { nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner,
+        claimedAt: "2026-10-20T10:00:00.000Z", leaseExpiresAt: "2026-10-20T10:10:00.000Z" },
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner,
+        snapshotDigest: baseAttestation.snapshotDigest, graphRevision: baseAttestation.graphRevision,
+        evidenceDigest: baseAttestation.evidenceDigest } }
+    const { assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } = await import("./scheduled-taskgraph-run-service")
+
+    await expect(assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent({} as never, context(), { ...base, ...patch }))
+      .rejects.toBeInstanceOf(Error)
+    expect(mocks.validateSources).not.toHaveBeenCalled()
   }, 30_000)
 
   it("rejects an out-of-range persisted score before returning proof", async () => {
-    const invalid = { ...buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+    const invalid = { ...buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
       ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint,
       scoredJobs: [{ ...score, score: 101 }] }
     mocks.analyze.mockResolvedValue({ analysis, checkpoint: invalid, persistedState })
@@ -243,7 +332,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
   }, 30_000)
 
   it("continues to Gate without a scheduled-choice checkpoint when approval is disabled", async () => {
-    const analyzeCheckpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+    const analyzeCheckpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
       ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
     const activeClaim = { ...initialState.scheduledTaskGraphClaim, claimedAt: "2026-10-20T10:00:00.000Z", leaseExpiresAt: "2099-10-20T10:10:00.000Z" }
     const persisted = { ...analyzeCheckpoint, nextStage: "gate", scheduledTaskGraphClaim: activeClaim }
@@ -292,10 +381,44 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     mocks.events.mockImplementation((args: { where: { type: string } }) => Promise.resolve(args.where.type === "agent.plan.scheduled_prepare_binding"
       ? [{ payload: receipt }]
       : [{ type: "native_verification.scheduled_candidate_staged", taskId: owner.rootTaskId, correlationId: finalStepId, payload: candidatePayload }]))
-    const resume = await (await import("./scheduled-taskgraph-run-service")).buildScheduledTaskGraphGateResumeState({
+    const { buildScheduledTaskGraphGateResumeState, prepareRunResumeState, assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent } =
+      await import("./scheduled-taskgraph-run-service")
+    const resume = await buildScheduledTaskGraphGateResumeState({
       owner, snapshot, attestation: baseAttestation, continuationKey: key, claimToken, ownedJobs: [job],
       persistedCheckpoint: persisted, prepareProof,
     })
+    const transaction = { marker: "source-fenced" } as never
+    const checks: string[] = []
+    mocks.validateSources.mockImplementation(async () => { checks.push("source") })
+    mocks.runCheckpointCurrent.mockImplementation(async (raw: unknown) => {
+      checks.push("owner-proof")
+      const input = raw as { tx: unknown; assertOwnerCurrent: (tx: never) => Promise<boolean> }
+      return input.assertOwnerCurrent(input.tx as never)
+    })
+    mocks.save.mockImplementation(async (raw: unknown) => {
+      const input = raw as { assertOwnerCurrent: (tx: never) => Promise<boolean> }
+      return input.assertOwnerCurrent(transaction)
+    })
+    const prepared = await prepareRunResumeState({
+      executionState: null, scheduledState: persisted,
+      scheduled: { owner, snapshot, attestation: baseAttestation, continuationKey: key, claimToken, ownedJobs: [job], prepareProof },
+      assertScheduledOwnerCurrent: async () => true,
+      assertScheduledAnalyzeSourcesCurrent: tx => assertScheduledTaskGraphAnalyzeCheckpointSourcesCurrent(tx, context(), persisted),
+    })
+    expect(mocks.validateSources).toHaveBeenCalledWith(transaction, expect.objectContaining({
+      userId: owner.userId, resumeId: "resume_1", resumeText: "", jobIds: [job.id],
+      sourceFingerprintsByJob: persisted.scheduledTaskGraphAnalyzeSourceFingerprints,
+      claimTokens: [{ jobId: job.id, analysisFenceAt: score.analysisFenceAt }],
+    }))
+    expect(checks).toEqual(["source", "owner-proof"])
+    expect(prepared.scheduledState).toMatchObject({
+      scheduledTaskGraphAnalyzeSourceFingerprints: persisted.scheduledTaskGraphAnalyzeSourceFingerprints,
+    })
+    expect(prepared.resumeState).toMatchObject({
+      scheduledTaskGraphAnalyzeSourceFingerprints: persisted.scheduledTaskGraphAnalyzeSourceFingerprints,
+    })
+    expect(mocks.save).toHaveBeenCalledWith(expect.objectContaining({ expectedState: persisted,
+      state: expect.objectContaining({ scheduledTaskGraphAnalyzeSourceFingerprints: persisted.scheduledTaskGraphAnalyzeSourceFingerprints }) }))
     expect(mocks.gateInput).toHaveBeenCalledWith(expect.objectContaining({ owner, snapshot,
       analyzeCheckpoint: { ...persisted, nextStage: "prepare" }, analyzeAttestation: baseAttestation, prepareProof }))
     expect(mocks.gateInput.mock.calls[0]?.[0].prepareProof).toBe(prepareProof)
@@ -391,7 +514,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
   })
 
   it("still validates TaskGraph completion before Gate when approval is disabled", async () => {
-    const persisted = { ...buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+    const persisted = { ...buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
       ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint,
       scheduledTaskGraphClaim: initialState.scheduledTaskGraphClaim }
     mocks.items.mockResolvedValue(null)
@@ -432,7 +555,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
       packages: [{ userId: owner.userId, sessionId: owner.sessionId, jobId: job.id, package: { job: { id: job.id } } as never }],
       materials: artifactRefs.map(row => ({ userId: owner.userId, sessionId: owner.sessionId, ...row })),
     })
-    const persisted = { ...buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+    const persisted = { ...buildAnalyzeCheckpoint({ owner, snapshot, attestation: baseAttestation,
       ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint,
       scheduledTaskGraphClaim: initialState.scheduledTaskGraphClaim,
       scheduledTaskGraphPreparedArtifacts: [
@@ -467,7 +590,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     const continuationKey = scheduledTaskGraphContinuationKey(owner, attestation)
     const analysisForJobs = { ...analysis, data: { ...analysis.data, scoredJobs: [score, secondScore] },
       metrics: { ...analysis.metrics, count: 2 } }
-    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation, ownedJobs: [job, secondJob],
+    const checkpoint = buildAnalyzeCheckpoint({ owner, snapshot, attestation, ownedJobs: [job, secondJob],
       analyzeResult: analysisForJobs, existingCheckpoint: { ...initialState,
         scheduledTaskGraphClaim: { ...initialState.scheduledTaskGraphClaim, key: continuationKey } } }).checkpoint
     const jobIds = [job.id, secondJob.id]

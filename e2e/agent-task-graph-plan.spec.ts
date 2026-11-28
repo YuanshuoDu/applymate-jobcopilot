@@ -1,8 +1,13 @@
 import { expect, test } from './fixtures'
 import type { Page, Response, Route } from '@playwright/test'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { parsePlanLedger, parseTaskGraphSnapshot, projectPlanLedger, type PlanLedger } from '@jobcopilot/agent-protocol'
+import { finalTaskGraphArtifactProofInput, parsePlanLedger, parseTaskGraphSnapshot, projectPlanLedger,
+  type FinalTaskGraphArtifactRef, type PlanLedger } from '@jobcopilot/agent-protocol'
 import { redactStreamEventPayload } from '../apps/web/src/lib/agent/session/stream-redaction'
+import { canonicalTaskGraphItemId, canonicalTaskGraphSourceKey, projectFinalTaskGraphSourceDetail } from '../apps/web/src/lib/agent/session/final-task-graph-source-detail'
+import { finalTaskGraphSourceArtifactCandidate, verifiedFinalTaskGraphSourceArtifactRef } from '../apps/web/src/lib/agent/session/final-task-graph-source-artifact'
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4 } from '../apps/web/src/lib/agent/session/final-task-graph-source-manifest'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '../apps/web/src/lib/task-graph-plan-labels'
 import { buildGroundedTaskGraphFinalResponse } from '../apps/worker/src/runtime/subagents/task-graph-final-response.js'
 import { reduceTaskGraphFinalSummary } from '../apps/worker/src/runtime/subagents/task-graph-final-summary.js'
@@ -761,6 +766,84 @@ function persistedTraceParserFixture(): PersistedPlanLedgerTrace {
       task(childTaskId, rootTaskId, 'root/research', 'scout', 'research', goal),
     ],
   }
+}
+
+function mountedFinalTaskGraphSourceFixture(sessionId: string, turnId: string) {
+  const userId = 'task-graph-fixture-user'
+  const finalItemId = 'fixture-final-cover-letter-item'
+  const rootTaskId = 'fixture-final-cover-letter-root'
+  const writerTaskId = 'fixture-final-cover-letter-writer'
+  const jobId = 'fixture-final-cover-letter-job'
+  const graphRevision = 7
+  const goal = 'Write a cover letter for Fixture Systems'
+  const artifactRef: FinalTaskGraphArtifactRef = {
+    artifactId: 'fixture-final-cover-letter-artifact',
+    version: 3,
+    contentHash: `sha256:${'a'.repeat(64)}`,
+    sourceDigest: `sha256:${'b'.repeat(64)}`,
+  }
+  const sourceKey = canonicalTaskGraphSourceKey(finalItemId, graphRevision, 0)
+  const proofInput = finalTaskGraphArtifactProofInput(sourceKey, artifactRef)
+  if (!proofInput) throw new Error('Could not bind the final cover-letter fixture proof.')
+  const source = {
+    sourceKey, nodeIndex: 0, role: 'writer', taskStatus: 'completed', resultState: 'valid',
+    roleResultStatus: 'completed',
+    artifactVersionProof: `avp_${createHash('sha256').update(proofInput, 'utf8').digest('hex')}`,
+  } as const
+  const taskGraphSources = {
+    schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION_V4,
+    graphRevision,
+    historicalNodeIndices: [],
+    retiredNodeIndices: [],
+    sources: [source],
+  }
+  const finalItem = {
+    schemaVersion: SCHEMA,
+    id: finalItemId,
+    sessionId,
+    turnId,
+    stepId: null,
+    taskId: rootTaskId,
+    type: 'agent_message',
+    status: 'completed',
+    phase: 'final_answer',
+    revision: 1,
+    content: { text: 'The final cover-letter draft is ready.', taskGraphSources },
+    startedAt: TIME,
+    completedAt: TIME,
+    createdAt: TIME,
+    updatedAt: TIME,
+    sequence: null,
+  }
+  const graph = {
+    id: canonicalTaskGraphItemId(rootTaskId), sessionId, turnId, taskId: rootTaskId,
+    type: 'task_graph', revision: graphRevision,
+    content: { schemaVersion: GRAPH_SCHEMA, nodes: [{
+      key: 'cover-letter', templateId: 'cover_letter_writer', goal,
+      successCriteria: ['Save a reviewable cover letter draft'], dependsOn: [], depth: 1, taskId: writerTaskId,
+    }] },
+  }
+  const writerResult = {
+    status: 'completed', stepCount: 1, toolCallCount: 1,
+    structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: 'writer', status: 'completed', artifactRef },
+  }
+  const taskRows = [
+    { id: rootTaskId, sessionId, turnId, rootTaskId, parentTaskId: null, role: 'orchestrator', taskType: 'root',
+      status: 'completed', goal: 'Prepare the selected-job draft', context: null, result: null, hasResult: false, updatedAt: TIME },
+    { id: writerTaskId, sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, role: 'writer', taskType: 'cover_letter_draft',
+      status: 'completed', goal, context: { selectedJobPreparation: { jobId } }, result: writerResult, hasResult: true, updatedAt: TIME },
+  ]
+  const ownerSession = { id: sessionId, userId }
+  const completedTurn = { id: turnId, sessionId, userId, status: 'completed', rootTaskId }
+  const detail = projectFinalTaskGraphSourceDetail({ userId, sessionId, finalItemId, sourceKey,
+    session: ownerSession, finalItem, turn: completedTurn, graphRows: [graph], taskRows })
+  const candidate = finalTaskGraphSourceArtifactCandidate({ source, sourceKey, graphRevision, graph,
+    sessionId, turnId, rootTaskId, taskRows })
+  const artifactVersion = candidate ? verifiedFinalTaskGraphSourceArtifactRef(candidate, [{
+    ...candidate.artifactRef, userId, sessionId, jobId, artifactType: 'cover_letter', taskId: candidate.artifactTaskId,
+  }], { userId, sessionId }) : null
+  if (!detail || !artifactVersion) throw new Error('Could not build the exact owned final-source fixture.')
+  return { finalItem, finalItemId, sourceKey, detail: { task: { ...detail, artifactRef: artifactVersion } }, artifactRef: artifactVersion }
 }
 
 async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlanLedgerTrace) {
@@ -1571,5 +1654,90 @@ test('mounted Workbench shows the successor objective after replacement and relo
     activeTurn: { id: fixture.successorTurnId, goal: fixture.successorGoal },
   })
   await expect(page.locator('.agent-session-console')).toContainText(fixture.sessionGoal)
+  expect(fixture.externalRequests).toEqual([])
+})
+
+test('mounted Workbench opens the exact historical cover-letter version only after the source and version clicks', async ({ page }, testInfo) => {
+  const persistedTrace = persistedTraceParserFixture()
+  const fixture = await installTaskGraphFixture(page, persistedTrace)
+  const sourceFixture = mountedFinalTaskGraphSourceFixture(fixture.sessionA, persistedTrace.graphItem.turnId)
+  const sourceDetailRequests: string[] = []
+  const artifactRequests: string[] = []
+  const timelinePath = `/api/agent/sessions/${fixture.sessionA}/timeline`
+  const sessionPath = timelinePath.replace(/\/timeline$/, '')
+  const sourcePath = `${sessionPath}/final-items/${sourceFixture.finalItemId}/task-graph-sources/${sourceFixture.sourceKey}`
+  const artifactPath = `${sessionPath}/artifacts/${sourceFixture.artifactRef.artifactId}/versions/${sourceFixture.artifactRef.version}`
+  const artifactPrefix = `${sessionPath}/artifacts/`
+  const pathMatches = (path: string) => (url: URL) => url.pathname === path
+  const headArtifactVersion = sourceFixture.artifactRef.version + 1
+  const draftText = 'Exact immutable historical cover-letter version 3.'
+
+  await page.route(pathMatches(timelinePath), route => json(route, {
+    items: [sourceFixture.finalItem], agenda: null, page: { hasMore: false, nextCursor: null },
+  }))
+  await page.route(pathMatches(sourcePath), route => {
+    sourceDetailRequests.push(route.request().url())
+    return json(route, sourceFixture.detail)
+  })
+  await page.route((url: URL) => url.pathname.startsWith(artifactPrefix), route => {
+    const requestedUrl = new URL(route.request().url())
+    artifactRequests.push(requestedUrl.toString())
+    if (requestedUrl.pathname !== artifactPath) {
+      return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'not_found' }) })
+    }
+    return json(route, {
+      job: { company: 'Fixture Systems', role: 'Systems Engineer' },
+      isCurrentVersion: sourceFixture.artifactRef.version === headArtifactVersion,
+      artifact: { ...sourceFixture.artifactRef, content: { text: draftText },
+        provenanceRefs: ['job:fixture-final-cover-letter-job'], evidenceRefs: ['job:fixture-final-cover-letter-job'] },
+      review: null,
+      sourceEvidence: { freshness: 'stale', items: [] },
+    })
+  })
+
+  const locale = testInfo.project.name.endsWith('-zh') ? 'zh' : 'en'
+  await page.goto(`/agent-preview?supervisor=1&locale=${locale}&sessionId=${encodeURIComponent(fixture.sessionA)}`)
+  const finalItem = page.locator(`[data-agent-harness-item="${sourceFixture.finalItemId}"]`)
+  const sources = finalItem.locator('[data-agent-related-task-sources="true"]')
+  await expect(sources).toBeVisible({ timeout: 20_000 })
+  expect(sourceDetailRequests).toEqual([])
+  expect(artifactRequests).toEqual([])
+
+  const sourceRow = sources.getByRole('button')
+  await expect(sourceRow).toHaveCount(1)
+  await sourceRow.click()
+  const versionLabel = locale === 'zh' ? '查看求职信第 3 版' : 'View cover letter version 3'
+  const versionButton = sources.getByRole('button', { name: versionLabel })
+  await expect(versionButton).toBeVisible()
+  expect(sourceDetailRequests).toHaveLength(1)
+  expect(new URL(sourceDetailRequests[0]!).pathname).toBe(sourcePath)
+  expect(artifactRequests).toEqual([])
+
+  await versionButton.click()
+  const draft = sources.locator('[data-selected-job-draft="true"]')
+  await expect(draft).toContainText(draftText, { timeout: 10_000 })
+  await expect(draft.locator('[data-draft-version-state="historical"]')).toBeVisible()
+  await expect.poll(() => artifactRequests.length).toBe(1)
+  const requestedArtifact = new URL(artifactRequests[0]!)
+  expect(requestedArtifact.pathname).toBe(artifactPath)
+  expect(requestedArtifact.searchParams.get('contentHash')).toBe(sourceFixture.artifactRef.contentHash)
+  expect(requestedArtifact.searchParams.get('sourceDigest')).toBe(sourceFixture.artifactRef.sourceDigest)
+
+  const viewportWidth = await page.evaluate(() => window.innerWidth)
+  if (viewportWidth <= 900) await page.getByRole('button', { name: locale === 'zh' ? '对话' : 'Conversations', exact: true }).click()
+  await page.locator('.agent-session-console').getByRole('button').filter({ hasText: GOAL_B }).first().click()
+  await showTaskDetails(page, locale)
+  await expect.poll(() => fixture.eventRequests.get(SESSION_B)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThan(0)
+  await expect(page.locator('[data-agent-related-task-sources="true"]')).toHaveCount(0)
+  await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
+
+  if (viewportWidth <= 900) await page.getByRole('button', { name: locale === 'zh' ? '对话' : 'Conversations', exact: true }).click()
+  await page.locator('.agent-session-console').getByRole('button').filter({ hasText: persistedTrace.planLedger.goal! }).first().click()
+  if (viewportWidth > 900) await showTaskDetails(page, locale)
+  await expect(sources).toBeVisible({ timeout: 10_000 })
+  await expect(sources.locator('[data-task-graph-source-detail="true"]')).toHaveCount(0)
+  expect(sourceDetailRequests).toHaveLength(1)
+  expect(artifactRequests).toHaveLength(1)
+  expect(fixture.forbiddenApiRequests).toEqual([])
   expect(fixture.externalRequests).toEqual([])
 })

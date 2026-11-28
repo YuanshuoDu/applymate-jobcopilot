@@ -1,36 +1,21 @@
 /** Stage 2 — Analyst scores jobs and persists results. */
 import type { Job, Prisma } from '@prisma/client'
 import { db }           from '@/lib/db'
-import { stripFences } from '@/lib/model-router'
 import { completeAnalyzeModelCall } from './analyze-model-call'
+import { acceptAnalyze, isAnalyzeSourceChangedError, analyzeScoreColor, assertAnalyzeModelInputsCurrent, buildAnalyzeMessages, parseScoreResult } from './analyze-model-input'
 import type {
-  PipelineCtx, ScoredJob, AnalyzeOutput, StageResult, AcceptResult,
+  PipelineCtx, ScoredJob, AnalyzeOutput, StageResult,
 } from '../types'
 import { stageOk, stageFail } from '../types'
 import { roleAiConfig } from '../role-config'
 import { forEachConcurrent } from '../concurrency'
 import { assessApplicationPreflight } from '../application-preflight'
-import { assertAnalyzeSignalActive, claimAnalyzeTask, transitionAnalyzeTask } from './analyze-ownership'
+import { AnalyzeRecoveryPersistenceError, assertAnalyzeSignalActive, claimAnalyzeTask, cleanupAnalyzeSourceChangedClaims, transitionAnalyzeTask, validateAnalyzeRecoverySources } from './analyze-ownership'
+import type { AnalyzeRecoveryHooks } from './analyze-ownership'
 import { AgentExecutionCancelledError } from '../execution-control'
-
-const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
-
-export interface AnalyzeRecoveryHooks {
-  existingScoredJobs?: readonly ScoredJob[]
-  initialFailed?: number
-  beforeScore?: (jobId: string) => Promise<void>
-  onScoredJob?: (scored: ScoredJob, tx: Prisma.TransactionClient) => Promise<void>
-  onScoreFailure?: (jobId: string) => Promise<void>
-  assertScoreOwnerCurrent?: (tx: Prisma.TransactionClient) => Promise<boolean>
-}
-
-export class AnalyzeRecoveryPersistenceError extends AgentExecutionCancelledError {
-  constructor() {
-    super()
-    this.message = 'Failed to persist Analyze recovery state'
-    this.name = 'AnalyzeRecoveryPersistenceError'
-  }
-}
+export { acceptAnalyze }
+export { AnalyzeRecoveryPersistenceError }
+export type { AnalyzeRecoveryHooks }
 
 export async function runAnalyze(
   jobs: Job[],
@@ -45,16 +30,25 @@ export async function runAnalyze(
   const analystCfg = roleConfigs.analyst
   const scoringConfig = roleAiConfig('analyst', analystCfg, aiConfig)
 
-  const scoredJobs: ScoredJob[] = [...(recovery?.existingScoredJobs ?? [])]
+  const existingScoredJobs = recovery?.existingScoredJobs ?? []
+  if (existingScoredJobs.length > 0) await validateAnalyzeRecoverySources({ userId, sessionId: ctx.sessionId,
+    executionAttempt: ctx.executionAttempt, signal: ctx.signal, resumeId: ctx.defaultResume.id, resumeText,
+    scoredJobs: existingScoredJobs, sourceFingerprintsByJob: recovery?.sourceFingerprintsByJob,
+    assertOwnerCurrent: recovery?.assertScoreOwnerCurrent })
+  const scoredJobs: ScoredJob[] = [...existingScoredJobs]
   const alreadyScored = new Set(scoredJobs.map(item => item.job.id))
   const jobsToScore = jobs.filter(job => !alreadyScored.has(job.id))
+  const analysisClaims = new Map<string, Date>()
+  for (const scored of existingScoredJobs) {
+    if (typeof scored.analysisFenceAt !== 'string') continue
+    const fenceAt = new Date(scored.analysisFenceAt)
+    if (Number.isFinite(fenceAt.getTime())) analysisClaims.set(scored.job.id, fenceAt)
+  }
   let failed = recovery?.initialFailed ?? 0
   let fenceSkipped = 0
   let hasFatalError = false
   let fatalError: unknown
   const throwIfFatal = () => { if (hasFatalError) throw fatalError }
-
-  // Ask the candidate before scoring jobs without descriptions.
   const noDescCount = jobsToScore.filter(j => !j.description && !!j.role).length
   let skipNoDescription = false
   if (noDescCount > 0) {
@@ -84,6 +78,7 @@ export async function runAnalyze(
         fenceSkipped++
         return
       }
+      analysisClaims.set(job.id, analysisFenceAt)
       let recoveryHookFailed = false
       const assertRecoveryOwnerCurrent = async (tx: Prisma.TransactionClient) => {
         if (!recovery?.assertScoreOwnerCurrent) return
@@ -98,7 +93,6 @@ export async function runAnalyze(
           action: `score ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
         })
       }
-      // Reject ineligible records before spending model credits.
       if (hardPreflightIssues.length > 0) {
         const reason = hardPreflightIssues.map(issue => issue.message).join(" ")
         const skipped = await db.$transaction(async tx => {
@@ -153,23 +147,20 @@ export async function runAnalyze(
         try { await recovery?.beforeScore?.(job.id) }
         catch (error) { recoveryHookFailed = true; throw error }
         throwIfFatal()
-        const prompt = buildScorePrompt(resumeText, job)
-        const systemPrompt = ctx.roleConfigs.analyst?.systemPrompt ?? undefined
-        const messages = systemPrompt
-          ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
-          : [{ role: 'user' as const, content: prompt }]
+        const messages = buildAnalyzeMessages(resumeText, job, ctx.roleConfigs.analyst?.systemPrompt ?? undefined)
         const result = await completeAnalyzeModelCall({
           scoringConfig, messages, userId, sessionId: ctx.sessionId, turnId: ctx.turnId,
           executionAttempt: ctx.executionAttempt, jobId: job.id, analysisFenceAt, signal: ctx.signal,
         })
         throwIfFatal()
         const parsed = parseScoreResult(result)
-        const color = SCORE_COLOR(parsed.score)
+        const color = analyzeScoreColor(parsed.score)
         const scored = { job, ...parsed, analysisFenceAt: analysisFenceAt.toISOString() }
         // This conditional UPDATE locks the task through both writes; NULL is
         // explicit because PostgreSQL NOT IN does not match NULL values.
         const persisted = await db.$transaction(async tx => {
           throwIfFatal()
+          const sourceFingerprint = await assertAnalyzeModelInputsCurrent(tx, { userId, job, resumeId: ctx.defaultResume.id, resumeText })
           await assertRecoveryOwnerCurrent(tx)
           throwIfFatal()
           const owned = await transitionAnalyzeTask(tx, {
@@ -185,7 +176,7 @@ export async function runAnalyze(
           throwIfFatal()
           assertAnalyzeSignalActive(ctx.signal)
           if (recovery?.onScoredJob) {
-            try { await recovery.onScoredJob(scored, tx) }
+            try { await recovery.onScoredJob(scored, tx, sourceFingerprint) }
             catch (error) { recoveryHookFailed = true; throw error }
             recoveryScorePersisted = true
           }
@@ -197,7 +188,6 @@ export async function runAnalyze(
         }
         scoredJobs.push(scored)
 
-        // Emit per-job observation with AI reasoning
         const matchStr  = parsed.matchedKeywords.length  ? `match: ${parsed.matchedKeywords.slice(0, 4).join(', ')}` : ''
         const missStr   = parsed.missingKeywords.length   ? `Missing: ${parsed.missingKeywords.slice(0, 3).join(', ')}` : ''
         const scoreTag  = parsed.score >= 80 ? '✦ High match' : parsed.score >= 60 ? '◆ medium' : '◇ On the low side'
@@ -216,7 +206,7 @@ export async function runAnalyze(
         await new Promise(r => setTimeout(r, THROTTLE_MS))
       } catch (err) {
         if (hasFatalError) throw fatalError
-        if (err instanceof AgentExecutionCancelledError || recoveryScorePersisted || recoveryHookFailed) throw err
+        if (err instanceof AgentExecutionCancelledError || isAnalyzeSourceChangedError(err) || recoveryScorePersisted || recoveryHookFailed) throw err
         assertAnalyzeSignalActive(ctx.signal)
         const message = err instanceof Error ? err.message : 'Unknown AI scoring error'
         const markedFailed = await db.$transaction(async tx => {
@@ -243,58 +233,18 @@ export async function runAnalyze(
       if (!hasFatalError) { fatalError = error; hasFatalError = true }
     }
   })
-  if (hasFatalError) throw fatalError
+  if (hasFatalError) {
+    if (isAnalyzeSourceChangedError(fatalError)) {
+      await cleanupAnalyzeSourceChangedClaims({ claims: [...analysisClaims].map(([jobId, analysisFenceAt]) => ({ jobId, analysisFenceAt })),
+        maxClaims: analysisClaims.size, sourceError: fatalError, userId, sessionId: ctx.sessionId,
+        executionAttempt: ctx.executionAttempt, signal: ctx.signal, assertOwnerCurrent: recovery?.assertScoreOwnerCurrent })
+    }
+    throw fatalError
+  }
 
   if (scoredJobs.length === 0 && jobs.length > 0 && fenceSkipped === 0) {
     return stageFail('analyze', 'All jobs failed to score')
   }
 
   return stageOk('analyze', { scoredJobs, failed }, scoredJobs.length, Date.now() - t0)
-}
-
-export function acceptAnalyze(result: StageResult<AnalyzeOutput>): AcceptResult {
-  if (!result.ok || !result.data) return { ok: false, reason: result.error ?? 'Analyze returned no data' }
-  for (const sj of result.data.scoredJobs) {
-    if (typeof sj.score !== 'number' || sj.score < 0 || sj.score > 100) return { ok: false, reason: `Job ${sj.job.id} has invalid score: ${sj.score}` }
-    if (!Array.isArray(sj.matchedKeywords)) return { ok: false, reason: `Job ${sj.job.id} missing matchedKeywords array` }
-  }
-  return { ok: true }
-}
-
-function buildScorePrompt(resumeText: string, job: Job): string {
-  return `You are an expert ATS analyzer. Score this resume-job fit.
-
-IMPORTANT: Output ONLY the JSON object below. No explanation, no preamble, no markdown fences.
-
-RESUME (excerpt):
-${resumeText.slice(0, 2000)}
-
-JOB: ${job.role} at ${job.company}${job.location ? ` (${job.location})` : ''}
-${job.description ? `DESCRIPTION:\n${job.description.slice(0, 1000)}` : '(no description — score based on role/company only)'}
-
-Output this exact JSON structure:
-{"score":75,"matchedKeywords":["skill1","skill2"],"missingKeywords":["skill3"],"recommendation":"One actionable sentence."}
-
-Now output the JSON for this specific job:`
-}
-
-function parseScoreResult(raw: string): Omit<ScoredJob, 'job'> {
-  const stripped = stripFences(raw)
-  const start = stripped.indexOf('{')
-  const end = stripped.lastIndexOf('}')
-  if (start === -1 || end === -1) throw new Error('AI returned no JSON score')
-
-  let result: Record<string, unknown>
-  try { result = JSON.parse(stripped.slice(start, end + 1)) as Record<string, unknown> }
-  catch { throw new Error('AI returned malformed score JSON') }
-
-  const score = Number(result.score)
-  if (!Number.isFinite(score) || score < 0 || score > 100) throw new Error('AI returned an invalid match score')
-
-  return {
-    score: Math.round(score),
-    matchedKeywords: Array.isArray(result.matchedKeywords) ? result.matchedKeywords.filter((value): value is string => typeof value === 'string') : [],
-    missingKeywords: Array.isArray(result.missingKeywords) ? result.missingKeywords.filter((value): value is string => typeof value === 'string') : [],
-    recommendation: typeof result.recommendation === 'string' ? result.recommendation : '',
-  }
 }
