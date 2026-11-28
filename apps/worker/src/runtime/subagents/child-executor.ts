@@ -19,6 +19,7 @@ import { dispatchNativeVerificationTask } from "./native-verification-executor.j
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ChildAttemptResume, ChildResumeLoader, ChildSameAttemptResume, ChildSameAttemptResumeLoader } from "./child-resume.js"
 import { projectChildFinalText } from "./child-mailbox-continuation.js"
+import { createChildDiscoveryModelContextBuilder } from "./child-discovery-model-context.js"
 import type { DiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import type { DiscoveryRecoverySnapshot } from "./task-graph-discovery-recovery-contract.js"
 import { SubagentLeaseError, type SubagentContinuation, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -187,10 +188,11 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       }
       return toolResult
     }
-    const contextBuilder = createChildContextBuilder(lease, snapshot, options.mailboxReader,
+    const contextBuilder = createChildDiscoveryModelContextBuilder(createChildContextBuilder(lease, snapshot, options.mailboxReader,
       lease.role === "writer" || lease.role === "reviewer" ? runtime.selectedJobArtifactContext?.transientSources : undefined,
       lease.role === "writer" ? runtime.writerReviewRevision?.feedback : undefined,
-      continuation?.kind === "mailbox_input_pending" ? continuation.missingMessageIds : [])
+      continuation?.kind === "mailbox_input_pending" ? continuation.missingMessageIds : []),
+    { lease, structuredRole, selectedJob, selectedJobPreparation, definitions })
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,
       contextBuilder, store: acknowledgeDurableWaitAtContinuationStart(safeStore, lease, durableWaitResume, options.durableWaitResumeCommitter, step => durableWaitReplay?.acknowledgeContinuation(step)), model, tools: definitions,

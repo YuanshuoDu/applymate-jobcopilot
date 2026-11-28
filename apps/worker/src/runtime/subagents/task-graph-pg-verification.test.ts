@@ -66,10 +66,23 @@ function durableRows(overrides: { items?: Record<string, unknown>[]; events?: Re
     { id: "completed", ...common, type: "tool_call.completed", sequence: 2, payload: { taskId: scope.taskId, toolCallId: "call-1", toolName, status: "completed", errorCode: null } },
   ]
   const turn = overrides.turn ?? scheduledTurnFixture
-  const task = { ...(overrides.task ?? { id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 1, status: "running", role: "scout", userId: scope.userId }), turnSource: turn.source, turnExecutionMode: turn.executionMode, turnInput: turn.input }
+  const task = { ...(overrides.task ?? { id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 1, status: "running", role: "scout", userId: scope.userId }), taskType: "job_discovery", context: {}, allowedActions: ["jobs.discover", "tool_results.read"], turnSource: turn.source, turnExecutionMode: turn.executionMode, turnInput: turn.input }
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
     if (sql.includes('SELECT task."id"')) return { rows: [task], rowCount: 1 }
-    if (sql.includes('SELECT item."id"')) {
+    if (sql.includes('WITH task_attempt_steps AS')) return { rows: [], rowCount: 0 }
+    if (sql.includes('LEFT JOIN "agent_steps" AS step')) return { rows: [], rowCount: 0 }
+    if (sql.includes('COUNT(item."id")::int AS "itemCount"')) {
+      const before = Number(values?.[6]), attempts = items.filter(item => Number(item.attempt) < before).map(item => Number(item.attempt))
+      const latest = attempts.length ? Math.max(...attempts) : undefined
+      const candidateItems = latest === undefined ? [] : items.filter(item => Number(item.attempt) === latest)
+      return { rows: latest === undefined ? [] : [{ attempt: latest, itemCount: candidateItems.length }], rowCount: latest === undefined ? 0 : 1 }
+    }
+    if (sql.startsWith('SELECT item."id" FROM "agent_steps" AS step')) {
+      const attempt = values?.[6]
+      const attemptItems = items.filter(item => item.attempt === attempt)
+      return { rows: attemptItems, rowCount: attemptItems.length }
+    }
+    if (sql.startsWith('SELECT item."id", item."sessionId"')) {
       const attempt = values?.[6]
       const attemptItems = items.filter(item => item.attempt === attempt)
       return { rows: attemptItems, rowCount: attemptItems.length }
@@ -84,6 +97,38 @@ function durableRows(overrides: { items?: Record<string, unknown>[]; events?: Re
     throw new Error("unexpected_verification_query")
   })
   return { client: { query } as unknown as Pick<pg.PoolClient, "query">, query, items, events }
+}
+
+function priorScoutDiscoveryRows() {
+  const jobId = `c${"a".repeat(24)}`, jobUrl = `https://jobs.example.test/${jobId}`
+  const output = {
+    jobs: [{ id: jobId, title: "Engineer", company: "Example", location: "Dublin", url: jobUrl, description: "", fullDescription: "",
+      salary: null, logo: null, source: "greenhouse", evidenceRefs: ["source-ref"] }],
+    evidence: [{ evidenceId: "source-ref", jobId, kind: "source", source: "greenhouse", url: jobUrl, summary: "Listing" }], nextCursor: null,
+    usage: { toolName: "jobs.discover", toolVersion: "1", requests: 1, jobsProcessed: 1, jobsSucceeded: 1,
+      jobsFailed: 0, aiCalls: 0, providers: ["fixture"], estimatedCostUsd: 0, durationMs: 1 },
+  }
+  const bytes = Buffer.from(JSON.stringify(output), "utf8"), ref = "tool-result-00000000-0000-4000-8000-000000000001"
+  const sha256 = createHash("sha256").update(bytes).digest("hex"), reference = { $ref: ref, sizeBytes: bytes.length, sha256 }
+  const chunk = { ref, sha256, byteCount: bytes.length, chunk: bytes.toString("utf8"), nextCursor: null }
+  const rows: Record<string, unknown>[] = [], events: Record<string, unknown>[] = []
+  const addPair = (ordinal: number, toolName: string, input: unknown, value: unknown) => {
+    const callId = `history-${ordinal}`, stepId = `history-step-${ordinal}`, callItemId = `${callId}-item`
+    const common = { sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId, joinedStepId: stepId,
+      rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, stepStatus: "completed", attempt: 1, ordinal }
+    rows.push({ ...common, id: callItemId, type: "tool_call", status: "completed", revision: 2,
+      content: { toolCallId: callId, toolName, toolVersion: "1", input, status: "completed", errorCode: null } },
+    { ...common, id: `${callId}-result`, type: "tool_result", status: "completed", revision: 1,
+      content: { toolCallId: callId, output: value, errorCode: null } })
+    const commonEvent = { itemId: callItemId, taskId: scope.taskId, correlationId: callId }
+    events.push({ id: `${callId}-started`, ...commonEvent, type: "tool_call.started", sequence: ordinal * 2 + 1,
+      payload: { taskId: scope.taskId, toolCallId: callId, toolName } },
+    { id: `${callId}-completed`, ...commonEvent, type: "tool_call.completed", sequence: ordinal * 2 + 2,
+      payload: { taskId: scope.taskId, toolCallId: callId, toolName, status: "completed", errorCode: null } })
+  }
+  addPair(0, "jobs.discover", { targetRoles: ["Engineer"], targetLocations: ["Dublin"] }, reference)
+  addPair(1, "tool_results.read", { referenceId: ref }, chunk)
+  return { jobId, rows, events }
 }
 
 function emptyDiscoveryRows(output: unknown, options: { input?: unknown; turn?: Record<string, unknown>; persistedResult?: unknown } = {}) {
@@ -736,6 +781,80 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
       report: { status: "unverified", reasonCode: "canonical_evidence_missing", evidenceDigest: null, resultDigest: null },
     })
     expect(result.projection).toBeUndefined()
+  })
+
+  it("verifies a nonempty ordinary Scout retry from its newest complete prior discovery attempt", async () => {
+    const prior = priorScoutDiscoveryRows(), retryScope = { ...scope, attemptCount: 3 }
+    const data = durableRows({ items: prior.rows, events: prior.events, task: {
+      id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId,
+      parentTaskId: scope.parentTaskId, attemptCount: 3, status: "running", role: "scout", taskType: "job_discovery",
+      context: {}, allowedActions: ["jobs.discover", "tool_results.read"], userId: scope.userId,
+    } })
+    const evidenceId = `read:job:${prior.jobId}`
+    const scoutResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId: prior.jobId, source: "greenhouse", url: null, evidenceIds: [evidenceId] }],
+      evidence: [{ id: evidenceId, kind: "job", ref: prior.jobId, source: "greenhouse" }], summary: "Found one job",
+    }
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope: retryScope, snapshot, node, structuredResult: scoutResult })
+    const selected = data.query.mock.calls.find(([sql]) => sql.includes('COUNT(item."id")::int AS "itemCount"'))
+
+    expect(selected?.[0]).toContain('step."attempt" < $7')
+    expect(selected?.[1]).toEqual([scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId, 3])
+    expect(result).toMatchObject({ verified: true, report: { status: "passed" },
+      projection: { role: "scout", candidates: [{ jobId: prior.jobId, evidenceIds: [evidenceId] }] } })
+    expect(result.report.evidenceDigest).toMatch(/^[0-9a-f]{64}$/)
+
+    const completedData = durableRows({ items: prior.rows, events: prior.events, task: {
+      id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId,
+      parentTaskId: scope.parentTaskId, attemptCount: 3, status: "completed", role: "scout", taskType: "job_discovery",
+      context: {}, allowedActions: ["jobs.discover", "tool_results.read"], userId: scope.userId,
+      result: { status: "completed", structuredResult: scoutResult },
+    } })
+    const completed = await verifyCompletedTaskGraphNodeEvidence(completedData.client, {
+      scope: retryScope, snapshot, node, structuredResult: scoutResult,
+    })
+    expect(completed.verified).toBe(true)
+    expect(completed.report.evidenceDigest).toBe(result.report.evidenceDigest)
+
+    const failureGraph = parseTaskGraphSnapshot({ schemaVersion: snapshot.schemaVersion, nodes: [{ ...node, verification: {
+      ...verification, criteria: verification.criteria.map(item => item.id === "candidate-count"
+        ? { ...item, check: { kind: "candidate_count_gte" as const, minimum: 2 } } : item),
+    } }] })
+    const failureNode = failureGraph.nodes[0] as StoredTaskGraphNode
+    const failureData = durableRows({ items: prior.rows, events: prior.events, task: {
+      id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId,
+      parentTaskId: scope.parentTaskId, attemptCount: 3, status: "running", role: "scout", taskType: "job_discovery",
+      context: {}, allowedActions: ["jobs.discover", "tool_results.read"], userId: scope.userId,
+    } })
+    const failed = await verifyTaskGraphNodeEvidence(failureData.client, {
+      scope: retryScope, snapshot: failureGraph, node: failureNode, structuredResult: scoutResult,
+    })
+    expect(failed).toMatchObject({ verified: false, report: { status: "failed", reasonCode: "criterion_not_met" } })
+    const reverifyData = durableRows({ items: prior.rows, events: prior.events, task: {
+      id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId,
+      parentTaskId: scope.parentTaskId, attemptCount: 3, status: "failed", failureReason: "task_graph_verification_failed",
+      role: "scout", taskType: "job_discovery", context: {}, allowedActions: ["jobs.discover", "tool_results.read"],
+      userId: scope.userId, result: { status: "completed", structuredResult: scoutResult },
+    } })
+    const reverified = await reverifyFailedTaskGraphNodeEvidence(reverifyData.client, {
+      scope: retryScope, snapshot: failureGraph, node: failureNode, structuredResult: scoutResult,
+    })
+    expect(reverified).toMatchObject({ verified: false, report: { status: "failed", reasonCode: "criterion_not_met" } })
+    expect(reverified.report.evidenceDigest).toBe(failed.report.evidenceDigest)
+  })
+
+  it("keeps empty Scout results on the existing exact-empty path", async () => {
+    const prior = priorScoutDiscoveryRows(), retryScope = { ...scope, attemptCount: 3 }
+    const data = durableRows({ items: prior.rows, events: prior.events, task: {
+      id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId,
+      parentTaskId: scope.parentTaskId, attemptCount: 3, status: "running", role: "scout", taskType: "job_discovery",
+      context: {}, allowedActions: ["jobs.discover", "tool_results.read"], userId: scope.userId,
+    } })
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope: retryScope, snapshot, node, structuredResult: emptyScoutResult })
+
+    expect(data.query.mock.calls.some(([sql]) => sql.includes('COUNT(item."id")::int AS "itemCount"'))).toBe(false)
+    expect(result.verified).toBe(false)
   })
 
   it("rejects Scout source attribution that differs from the fresh jobs.get receipt", async () => {
