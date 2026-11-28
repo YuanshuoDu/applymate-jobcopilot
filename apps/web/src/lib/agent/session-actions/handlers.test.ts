@@ -16,6 +16,12 @@ const mocks = vi.hoisted(() => ({
   assertJobPreflight: vi.fn(),
   applicationTaskFindFirst: vi.fn(),
   jobFindFirst: vi.fn(),
+  jobUpdateMany: vi.fn(),
+  resumeFindFirst: vi.fn(),
+  txQueryRaw: vi.fn(),
+  transaction: vi.fn(),
+  eventCreate: vi.fn(),
+  updateAgentSession: vi.fn(),
   approvalFindFirst: vi.fn(),
   queueApplicationFill: vi.fn(),
   confirmSubmissionNotReceived: vi.fn(),
@@ -24,10 +30,14 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/db", () => ({
   db: {
     applicationTask: { findFirst: mocks.applicationTaskFindFirst },
-    job: { findFirst: mocks.jobFindFirst },
+    job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdateMany },
+    resume: { findFirst: mocks.resumeFindFirst },
     agentApproval: { findFirst: mocks.approvalFindFirst },
+    agentTranscriptEvent: { create: mocks.eventCreate },
+    $transaction: mocks.transaction,
   },
 }))
+vi.mock("../session/repository", () => ({ updateAgentSession: mocks.updateAgentSession }))
 
 vi.mock("@/lib/auto-apply", () => ({
   applicationFillTaskGraphEnabled: mocks.applicationFillTaskGraphEnabled,
@@ -43,7 +53,7 @@ vi.mock("../control-plane/commands/application-submission-recovery-command", () 
   confirmSubmissionNotReceived: mocks.confirmSubmissionNotReceived,
 }))
 
-import { handleConfirmSubmissionNotReceivedAction, handleRetryApplicationFillAction, validateReceiptForApproval } from "./handlers"
+import { handleConfirmSubmissionNotReceivedAction, handleRetryApplicationFillAction, handleConfirmedTailoredResume, validateReceiptForApproval } from "./handlers"
 
 describe("session action handlers", () => {
   beforeEach(() => {
@@ -54,9 +64,107 @@ describe("session action handlers", () => {
     mocks.assertJobPreflight.mockReset().mockResolvedValue(undefined)
     mocks.applicationTaskFindFirst.mockReset()
     mocks.jobFindFirst.mockReset()
+    mocks.jobUpdateMany.mockReset()
+    mocks.resumeFindFirst.mockReset()
+    mocks.txQueryRaw.mockReset()
+    mocks.transaction.mockReset()
+    mocks.eventCreate.mockReset()
+    mocks.updateAgentSession.mockReset()
     mocks.queueApplicationFill.mockReset()
     mocks.confirmSubmissionNotReceived.mockReset()
     mocks.approvalFindFirst.mockReset()
+  })
+
+  it("fences tailored-resume Job status writes before the row lock and applies an exact CAS", async () => {
+    const order: string[] = []
+    let queryCount = 0
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({
+      $queryRaw: mocks.txQueryRaw,
+      resume: { findFirst: mocks.resumeFindFirst },
+      job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdateMany },
+    }))
+    mocks.txQueryRaw.mockImplementation(async () => {
+      queryCount += 1
+      order.push(queryCount === 1 ? "source-lock" : queryCount === 2 ? "source-verify" : "job-row-lock")
+      return queryCount < 3 ? [{ transaction_id: "31", lock_acquired: "" }] : [{ id: "job_1" }]
+    })
+    mocks.resumeFindFirst.mockImplementation(async () => { order.push("resume-read"); return { id: "resume_1", name: "Tailored" } })
+    mocks.jobFindFirst.mockImplementation(async () => { order.push("job-read"); return {
+      id: "job_1", company: "Acme", role: "Engineer", url: "https://jobs.example/1", status: "discovered",
+      workflowState: "draft", finalResumeId: null,
+    } })
+    mocks.jobUpdateMany.mockImplementation(async () => { order.push("job-cas"); return { count: 1 } })
+    mocks.eventCreate.mockResolvedValue({ id: "event_1", sessionId: "session_1", taskId: null, type: "resume_finalized",
+      speaker: "Reviewer", title: "Application pack ready", durationMs: null, createdAt: new Date() })
+
+    const response = await handleConfirmedTailoredResume("session_1", "user_1", {
+      id: "approval_1", payload: { resumeId: "resume_1", jobId: "job_1" },
+    } as Parameters<typeof handleConfirmedTailoredResume>[2])
+
+    expect(response.status).toBe(200)
+    expect(order).toEqual(["source-lock", "source-verify", "resume-read", "job-row-lock", "job-read", "job-cas"])
+    expect(mocks.txQueryRaw).toHaveBeenCalledTimes(3)
+    const rowLock = mocks.txQueryRaw.mock.calls[2]?.[0] as { sql?: string }
+    expect(rowLock.sql).toContain('FROM "Job"')
+    expect(rowLock.sql).toContain('"userId" =')
+    expect(mocks.jobUpdateMany).toHaveBeenCalledWith({
+      where: { id: "job_1", userId: "user_1", status: "discovered", workflowState: "draft", finalResumeId: null },
+      data: expect.objectContaining({ finalResumeId: "resume_1", status: "saved", workflowState: "ready_to_apply" }),
+    })
+    expect(mocks.updateAgentSession).toHaveBeenCalledOnce()
+  })
+
+  it("does not overwrite a Job that became applied before the locked read", async () => {
+    let queryCount = 0
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({
+      $queryRaw: mocks.txQueryRaw,
+      resume: { findFirst: mocks.resumeFindFirst },
+      job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdateMany },
+    }))
+    mocks.txQueryRaw.mockImplementation(async () => {
+      queryCount += 1
+      return queryCount < 3 ? [{ transaction_id: "32", lock_acquired: "" }] : [{ id: "job_1" }]
+    })
+    mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1", name: "Tailored" })
+    mocks.jobFindFirst.mockResolvedValue({ id: "job_1", company: "Acme", role: "Engineer", url: null,
+      status: "applied", workflowState: "submitted", finalResumeId: "resume_old" })
+
+    const response = await handleConfirmedTailoredResume("session_1", "user_1", {
+      id: "approval_1", payload: { resumeId: "resume_1", jobId: "job_1" },
+    } as Parameters<typeof handleConfirmedTailoredResume>[2])
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: "This job has already been submitted." })
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.eventCreate).not.toHaveBeenCalled()
+    expect(mocks.updateAgentSession).not.toHaveBeenCalled()
+  })
+
+  it("reports a CAS miss without emitting a finalized event", async () => {
+    let queryCount = 0
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({
+      $queryRaw: mocks.txQueryRaw,
+      resume: { findFirst: mocks.resumeFindFirst },
+      job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdateMany },
+    }))
+    mocks.txQueryRaw.mockImplementation(async () => {
+      queryCount += 1
+      return queryCount < 3 ? [{ transaction_id: "33", lock_acquired: "" }] : [{ id: "job_1" }]
+    })
+    mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1", name: "Tailored" })
+    mocks.jobFindFirst.mockResolvedValue({ id: "job_1", company: "Acme", role: "Engineer", url: null,
+      status: "discovered", workflowState: "draft", finalResumeId: null })
+    mocks.jobUpdateMany.mockResolvedValue({ count: 0 })
+
+    const response = await handleConfirmedTailoredResume("session_1", "user_1", {
+      id: "approval_1", payload: { resumeId: "resume_1", jobId: "job_1" },
+    } as Parameters<typeof handleConfirmedTailoredResume>[2])
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: "The job changed while confirming the final resume." })
+    expect(mocks.jobUpdateMany).toHaveBeenCalledOnce()
+    expect(mocks.eventCreate).not.toHaveBeenCalled()
+    expect(mocks.updateAgentSession).not.toHaveBeenCalled()
   })
 
   it("validates canonical submission receipts with the stored hashes and rejects a wrong nonce when answers exist", async () => {

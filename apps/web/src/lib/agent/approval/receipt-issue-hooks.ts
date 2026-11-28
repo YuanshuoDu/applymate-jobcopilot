@@ -68,6 +68,9 @@ export async function issueApprovalReceipt(
   },
 ): Promise<StoreApprovalReceiptResult> {
   assertScopeInput(input.scope)
+  if (input.scheduledOwnerFence && !input.scheduledSourceHooks) {
+    throw new ApprovalStoreError("approval_scope_mismatch", "Scheduled Gate receipt requires current source validation")
+  }
   if (input.replayExisting && (!input.approvalId || !input.nonce?.trim() || !input.executionAttempt || !input.scheduledOwnerFence)) {
     throw new ApprovalStoreError("approval_scope_mismatch", "Approval replay requires its stable id and nonce")
   }

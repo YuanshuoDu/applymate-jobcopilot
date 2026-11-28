@@ -3,8 +3,18 @@ import type { PipelineCtx, ApplicationPackage, GateOutput, StageResult } from '.
 import { AgentExecutionCancelledError } from '../execution-control'
 import { runGatePolicy } from './gate-policy'
 import type { ScheduledTaskGraphGateCompletion, ScheduledTaskGraphGateQuestion } from '../scheduled-taskgraph-gate-service'
+import { hasEffectiveEntitlement, isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
+import { isActiveAccount } from '../run-service-helpers'
 
 export type ScheduledGateRunResult = ScheduledTaskGraphGateQuestion | ScheduledTaskGraphGateCompletion
+
+export async function scheduledGateAdmissionFailure(userId: string, autoApply: boolean): Promise<string | null> {
+  if (!await isActiveAccount(userId)) return 'scheduled_pipeline_account_unavailable'
+  if (!await isFeatureAllowed(userId, 'auto_apply')) return 'scheduled_pipeline_entitlement_required'
+  if (await resolveAiAccess(userId) === 'disabled') return 'scheduled_pipeline_ai_unavailable'
+  if (autoApply && !await hasEffectiveEntitlement(userId, 'auto_apply')) return 'scheduled_pipeline_entitlement_required'
+  return null
+}
 
 export async function runGate(packages: ApplicationPackage[], ctx: PipelineCtx): Promise<StageResult<GateOutput>> {
   const result = await runGatePolicy(packages, ctx, false)

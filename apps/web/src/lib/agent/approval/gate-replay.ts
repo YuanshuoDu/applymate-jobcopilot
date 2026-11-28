@@ -24,12 +24,18 @@ type ApprovalRow = Prisma.AgentApprovalGetPayload<{}>
 
 export const SCHEDULED_GATE_REVIEW_MARKER_SCHEMA = "agent-harness.v2.scheduled-gate-review-marker.v1"
 
+export type ScheduledGateSourceHooks = {
+  acquireFence: (tx: Prisma.TransactionClient, userId: string) => Promise<void>
+  validateSource: (tx: Prisma.TransactionClient, jobId: string) => Promise<void>
+}
+
 export type ScheduledGateReplayOwnerFence = {
   owner: ScheduledTaskGraphPipelineOwner
   key: string
   claimToken: string
   gateTaskId?: string
   assertCurrent: (tx: Prisma.TransactionClient) => Promise<boolean>
+  sourceHooks?: ScheduledGateSourceHooks
 }
 
 export type ReplayReceiptExpectation = {

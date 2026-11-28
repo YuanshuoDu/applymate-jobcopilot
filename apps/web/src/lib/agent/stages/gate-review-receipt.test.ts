@@ -166,6 +166,7 @@ describe("Gate review receipt ownership", () => {
       claimToken: "claim_token_1",
       gateTaskId: "gate_task_1",
       assertCurrent: vi.fn(async () => true),
+      sourceHooks: { acquireFence: vi.fn(async () => {}), validateSource: vi.fn(async () => {}) },
     }
     const pipeline = ctx({
       executionAttempt: { id: "execution_1", attemptCount: 0 },
@@ -189,6 +190,7 @@ describe("Gate review receipt ownership", () => {
         turnLeaseOwnerId: "lease_owner_1", turnLeaseVersion: 5, executionId: "execution_1", executionAttemptCount: 4 },
       key: "continuation_key_1", claimToken: "claim_token_1",
       gateTaskId: "gate_task_1", assertCurrent: vi.fn(async () => true),
+      sourceHooks: { acquireFence: vi.fn(async () => {}), validateSource: vi.fn(async () => {}) },
     }
 
     await expect(findGateReviewReceiptReplay(ctx({ scheduledTaskGraphOwnerFence: ownerFence }), pkg)).resolves.toBeNull()

@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApplicationPackage, PipelineCtx } from '../types'
 
-const mocks = vi.hoisted(() => ({ createGateReviewReceipt: vi.fn(), findGateReviewReceiptReplay: vi.fn(), skipApplicationForGate: vi.fn(), modelChat: vi.fn() }))
+const mocks = vi.hoisted(() => ({ createGateReviewReceipt: vi.fn(), findGateReviewReceiptReplay: vi.fn(), skipApplicationForGate: vi.fn(), modelChat: vi.fn(),
+  active: vi.fn(), feature: vi.fn(), access: vi.fn(), entitlement: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: {} }))
 vi.mock('@/lib/model-router', () => ({ modelChat: mocks.modelChat }))
+vi.mock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: mocks.entitlement, isFeatureAllowed: mocks.feature, resolveAiAccess: mocks.access }))
+vi.mock('../run-service-helpers', () => ({ isActiveAccount: mocks.active }))
 vi.mock('../execution-control', () => ({ AgentExecutionCancelledError: class AgentExecutionCancelledError extends Error {
   constructor() { super('Agent execution was cancelled'); this.name = 'AgentExecutionCancelledError' }
 } }))
@@ -11,7 +14,7 @@ vi.mock('../application-control', () => ({ skipApplicationForGate: mocks.skipApp
 vi.mock('./gate-review-receipt', () => ({ createGateReviewReceipt: mocks.createGateReviewReceipt, findGateReviewReceiptReplay: mocks.findGateReviewReceiptReplay }))
 vi.mock('./prepare', () => ({ tailoringConstraints: vi.fn(() => ({})) }))
 
-import { runGate, runScheduledGate } from './gate'
+import { runGate, runScheduledGate, scheduledGateAdmissionFailure } from './gate'
 import { createScheduledTaskGraphGateQuestion } from '../scheduled-taskgraph-gate-service'
 
 function context(overrides: Partial<PipelineCtx['agentCfg']> = {}): PipelineCtx {
@@ -57,6 +60,22 @@ beforeEach(() => {
   mocks.skipApplicationForGate.mockReset()
   mocks.skipApplicationForGate.mockResolvedValue(true)
   mocks.modelChat.mockReset()
+  mocks.active.mockResolvedValue(true)
+  mocks.feature.mockResolvedValue(true)
+  mocks.access.mockResolvedValue('enabled')
+  mocks.entitlement.mockResolvedValue(true)
+})
+
+describe('scheduled Gate admission', () => {
+  it('preserves account, feature, AI, then auto-apply entitlement checks', async () => {
+    await expect(scheduledGateAdmissionFailure('user_1', false)).resolves.toBeNull()
+    mocks.entitlement.mockResolvedValue(false)
+    await expect(scheduledGateAdmissionFailure('user_1', true)).resolves.toBe('scheduled_pipeline_entitlement_required')
+    mocks.access.mockResolvedValue('disabled')
+    await expect(scheduledGateAdmissionFailure('user_1', false)).resolves.toBe('scheduled_pipeline_ai_unavailable')
+    mocks.active.mockResolvedValue(false)
+    await expect(scheduledGateAdmissionFailure('user_1', false)).resolves.toBe('scheduled_pipeline_account_unavailable')
+  })
 })
 
 describe('runGate', () => {

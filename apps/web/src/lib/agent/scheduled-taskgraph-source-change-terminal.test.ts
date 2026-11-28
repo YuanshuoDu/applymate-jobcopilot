@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint";
-import { isScheduledTaskGraphSourceChangeTerminal, respondToScheduledTaskGraphAnalyzeSourceChange, terminalizeScheduledTaskGraphSourceChange } from "./scheduled-taskgraph-source-change-terminal";
+import { buildScheduledTaskGraphSourceChangeTerminalState, isScheduledTaskGraphSourceChangeTerminal, respondToScheduledTaskGraphAnalyzeSourceChange, terminalizeScheduledTaskGraphSourceChange } from "./scheduled-taskgraph-source-change-terminal";
 import { createAnalyzeSourceChangedErrorWithClaims } from "./stages/analyze-model-input";
 import { scheduledAnalyzeSourceChangedErrorForUntrustedState } from "./scheduled-taskgraph-source-change-task-cleanup";
 
@@ -53,6 +53,15 @@ function resetMocks() {
 
 describe("scheduled TaskGraph source-change terminalization", () => {
   beforeEach(resetMocks);
+
+  it("builds a terminal marker only from a valid scheduled source checkpoint", () => {
+    const expectedState = stateFor();
+    expect(buildScheduledTaskGraphSourceChangeTerminalState({ owner, attestationSnapshotDigest: oldDigest, expectedState }))
+      .toMatchObject({ scheduledTaskGraphSourceChangeTerminal: { schemaVersion: "agent-harness.v2.scheduled-pipeline-source-change-terminal.v1" } });
+    expect(buildScheduledTaskGraphSourceChangeTerminalState({ owner, attestationSnapshotDigest: oldDigest,
+      expectedState: { ...expectedState, scheduledTaskGraphClaim: { ...expectedState.scheduledTaskGraphClaim, claimToken: "" } } }))
+      .toBeNull();
+  });
 
   it("terminalizes source drift for the exact current owner and clears only stale scheduled checkpoints", async () => {
     const state = stateFor();

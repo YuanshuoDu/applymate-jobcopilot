@@ -36,11 +36,12 @@ type GateWriteOwner = {
   executionAttempt?: { id: string; attemptCount: number }
   signal?: AbortSignal
   assertScheduledGateCurrent?: (tx: Prisma.TransactionClient) => Promise<boolean>
+  sourceHooks?: GateSkipSourceHooks
 }
 
 type GateSkipSourceHooks = {
-  acquireFence: (tx: Prisma.TransactionClient) => Promise<void>
-  validateSource: (tx: Prisma.TransactionClient) => Promise<void>
+  acquireFence: (tx: Prisma.TransactionClient, userId: string) => Promise<void>
+  validateSource: (tx: Prisma.TransactionClient, jobId: string) => Promise<void>
 }
 
 const ACTIVE_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
@@ -162,13 +163,15 @@ export async function skipApplicationForGate(input: {
   sourceHooks?: GateSkipSourceHooks
 }): Promise<boolean> {
   return db.$transaction(async tx => {
-    await input.sourceHooks?.acquireFence(tx)
+    const sourceHooks = input.sourceHooks ?? input.owner?.sourceHooks
+    if (input.owner?.assertScheduledGateCurrent && !sourceHooks) throw new AgentExecutionCancelledError()
+    await sourceHooks?.acquireFence(tx, input.userId)
     if (input.owner) {
       const sessionId = input.sessionId?.trim()
       if (!sessionId) throw new Error("application_review_session_scope_required")
       await assertGateWriteOwner(tx, { userId: input.userId, sessionId, owner: input.owner })
     }
-    await input.sourceHooks?.validateSource(tx)
+    await sourceHooks?.validateSource(tx, input.jobId)
     const updated = await tx.applicationTask.updateMany({
       where: {
         userId: input.userId,
