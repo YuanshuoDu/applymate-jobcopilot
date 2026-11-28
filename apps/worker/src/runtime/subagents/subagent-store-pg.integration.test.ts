@@ -1435,7 +1435,15 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       expect(toolReceipts.rows[0]?.toolCallId).toEqual(expect.any(String))
       expect(toolReceipts.rows[1]?.toolCallId).toBe(toolReceipts.rows[0]?.toolCallId)
       const exhausted = await manager.run({ taskId: taskIds[1]!, sessionId, rootTaskId, ownerId: `depth-two-budget-worker-${suffix}-2` }, executor)
-      expect(exhausted).toMatchObject({ taskId: taskIds[1], status: "failed" })
+      expect(exhausted).toMatchObject({ taskId: taskIds[1], status: "retrying" })
+      const exhaustedTask = await ownerAStore.get(taskIds[1]!, sessionId)
+      expect(exhaustedTask).toMatchObject({
+        id: taskIds[1], status: "queued", attemptCount: 1, maxAttempts: 3,
+        failureReason: "output_budget_exhausted",
+      })
+      expect(exhaustedTask?.nextAttemptAt).toEqual(expect.any(Date))
+      expect(Number.isFinite(exhaustedTask?.nextAttemptAt?.getTime() ?? Number.NaN)).toBe(true)
+      expect(exhaustedTask!.attemptCount).toBeLessThan(exhaustedTask!.maxAttempts)
 
       expect(providerRequests).toHaveLength(2)
       expect(providerRequests.map(request => request.taskId)).toEqual([taskIds[0], taskIds[0]])
