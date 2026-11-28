@@ -26,7 +26,7 @@ import type { ProductionAgentFlags } from "../production-agent-flags.js"
 import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
-import { sanitizeLifecyclePreview } from "../tools/redaction.js"
+import { prepareLifecycleValue, sanitizeLifecyclePreview } from "../tools/redaction.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { consumeDurableWaitOutcomes } from "./durable-wait-consumer.js"
 import { reconcileDurableWaits } from "./durable-wait-resolver.js"
@@ -441,6 +441,70 @@ function recordTaskGraphFixtureLease(
 function record(value: unknown): RecordValue | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : null
 }
+
+type RetirementListDiagnosticShape = "not_checked" | "missing_or_null" | "non_object" | "tasks_missing" | "tasks_not_array" | "tasks_array"
+type RetirementListIdMatch = "not_checked" | "exact" | "redacted_only" | "missing" | "ambiguous"
+type RetirementListStatus = "not_checked" | "not_listed" | "ambiguous" | "other" | "queued" | "running" | "retrying"
+  | "waiting" | "waiting_for_user" | "completed" | "failed" | "interrupted" | "cancelled" | "closed"
+const RETIREMENT_LIST_TASK_STATUSES = new Set([
+  "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
+])
+
+function retirementListTaskDiagnostic(value: unknown, expectedTaskId: string): {
+  shape: RetirementListDiagnosticShape
+  idMatch: RetirementListIdMatch
+  status: RetirementListStatus
+} {
+  if (value === null || value === undefined) return { shape: "missing_or_null", idMatch: "not_checked", status: "not_checked" }
+  const listing = record(value)
+  if (!listing) return { shape: "non_object", idMatch: "not_checked", status: "not_checked" }
+  if (!Object.hasOwn(listing, "tasks")) return { shape: "tasks_missing", idMatch: "not_checked", status: "not_checked" }
+  if (!Array.isArray(listing.tasks)) return { shape: "tasks_not_array", idMatch: "not_checked", status: "not_checked" }
+
+  const tasks = listing.tasks.map(record).filter((task): task is RecordValue => task !== null)
+  const exactMatches = tasks.filter(task => task.taskId === expectedTaskId)
+  const projectedId = prepareLifecycleValue(expectedTaskId).safe
+  const redactedMatches = typeof projectedId === "string" && projectedId !== expectedTaskId
+    ? tasks.filter(task => task.taskId === projectedId) : []
+  const matched = exactMatches.length === 1 ? exactMatches[0]
+    : exactMatches.length > 1 ? null
+      : redactedMatches.length === 1 ? redactedMatches[0] : null
+  const idMatch: RetirementListIdMatch = exactMatches.length > 1 || (exactMatches.length === 0 && redactedMatches.length > 1)
+    ? "ambiguous" : exactMatches.length === 1 ? "exact"
+      : redactedMatches.length === 1 ? "redacted_only" : "missing"
+  const status: RetirementListStatus = !matched
+    ? idMatch === "missing" ? "not_listed" : idMatch === "ambiguous" ? "ambiguous" : "not_checked"
+    : typeof matched.status === "string" && RETIREMENT_LIST_TASK_STATUSES.has(matched.status)
+      ? matched.status as RetirementListStatus : "other"
+  return { shape: "tasks_array", idMatch, status }
+}
+
+describe("retirement list failure diagnostics", () => {
+  it("identifies an old task ID that matches only after the existing lifecycle redactor", () => {
+    const taskId = "subagent-48273164-2059-4873-8942-123456789012"
+    const projectedId = prepareLifecycleValue(taskId).safe
+    expect(typeof projectedId === "string" && projectedId !== taskId).toBe(true)
+
+    const diagnostic = retirementListTaskDiagnostic({ tasks: [{ taskId: projectedId, status: "interrupted" }] }, taskId)
+    expect(diagnostic).toEqual({ shape: "tasks_array", idMatch: "redacted_only", status: "interrupted" })
+    const serializedDiagnostic = JSON.stringify(diagnostic)
+    expect(!serializedDiagnostic.includes(taskId)
+      && typeof projectedId === "string" && !serializedDiagnostic.includes(projectedId)).toBe(true)
+  })
+
+  it("reports exact identity, malformed shapes, and unknown statuses only through closed values", () => {
+    expect(retirementListTaskDiagnostic({ tasks: [{ taskId: "task-1", status: "running" }] }, "task-1"))
+      .toEqual({ shape: "tasks_array", idMatch: "exact", status: "running" })
+    expect(retirementListTaskDiagnostic({ tasks: [{ taskId: "task-1", status: "private status" }] }, "task-1"))
+      .toEqual({ shape: "tasks_array", idMatch: "exact", status: "other" })
+    expect(retirementListTaskDiagnostic({ tasks: [] }, "task-1"))
+      .toEqual({ shape: "tasks_array", idMatch: "missing", status: "not_listed" })
+    expect(retirementListTaskDiagnostic({ tasks: "invalid" }, "task-1"))
+      .toEqual({ shape: "tasks_not_array", idMatch: "not_checked", status: "not_checked" })
+    expect(retirementListTaskDiagnostic(null, "task-1"))
+      .toEqual({ shape: "missing_or_null", idMatch: "not_checked", status: "not_checked" })
+  })
+})
 
 function deferredSignal<T>() {
   let resolve!: (value: T) => void
@@ -15784,10 +15848,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let adapterStage = "not_started", proofKind = "not_read", requestHasConfirmation = false, requestHasDublin = false
     let retirementWaitOldMatched: boolean | null = null, retirementWaitReplacementMatched: boolean | null = null
     let retirementListOldMatched: boolean | null = null, retirementListReplacementMatched: boolean | null = null
+    let retirementListShape: RetirementListDiagnosticShape = "not_checked"
+    let retirementListOldIdMatch: RetirementListIdMatch = "not_checked"
+    let retirementListOldStatus: RetirementListStatus = "not_checked"
     let retirementFinalCandidateEmitted = false
     let preRetirementGuards: {
       acceptedPlanMatchesReplacement: boolean | null
       replacementHeld: boolean | null
+      replacementListedPresent: boolean | null
+      replacementListedStatus: "not_checked" | "missing" | "other" | "queued" | "running" | "retrying" | "waiting" | "waiting_for_user" | "completed" | "failed" | "interrupted" | "cancelled" | "closed"
       replacementListedRunning: boolean | null
       persistedGraphUnique: boolean | null
       persistedGraphRevisionMatches: boolean | null
@@ -15797,7 +15866,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       noSeattleDescendants: boolean | null
       seattleHeld: boolean | null
     } = {
-      acceptedPlanMatchesReplacement: null, replacementHeld: null, replacementListedRunning: null,
+      acceptedPlanMatchesReplacement: null, replacementHeld: null, replacementListedPresent: null,
+      replacementListedStatus: "not_checked", replacementListedRunning: null,
       persistedGraphUnique: null, persistedGraphRevisionMatches: null, retirementToolAvailable: null,
       seattleTaskMatchesOriginalLease: null, seattleLeaseStillLive: null, noSeattleDescendants: null, seattleHeld: null,
     }
@@ -15946,8 +16016,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                  AND session."userId" = $5 AND turn."userId" = $5 LIMIT 2`,
               [taskGraphItemId(rootTaskId), value.sessionId, value.turnId, rootTaskId, value.userId])
             preRetirementGuards.replacementHeld = dublinHeld
-            preRetirementGuards.replacementListedRunning = listedTasks.some(task => task?.taskId === replacement.taskId
-              && task?.status === "running")
+            const listedReplacement = listedTasks.find(task => task?.taskId === replacement.taskId)
+            const listedReplacementStatus = listedReplacement?.status
+            const safeListedStatuses = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user",
+              "completed", "failed", "interrupted", "cancelled", "closed"])
+            preRetirementGuards.replacementListedPresent = listedReplacement !== undefined
+            preRetirementGuards.replacementListedStatus = listedReplacement === undefined ? "missing"
+              : typeof listedReplacementStatus === "string" && safeListedStatuses.has(listedReplacementStatus)
+                ? listedReplacementStatus as typeof preRetirementGuards.replacementListedStatus
+                : "other"
+            preRetirementGuards.replacementListedRunning = listedReplacementStatus === "running"
             preRetirementGuards.persistedGraphUnique = persistedGraph.rows.length === 1
             preRetirementGuards.persistedGraphRevisionMatches = persistedGraph.rows.length === 1
               && typeof revision === "number" && revision === persistedGraph.rows[0]?.revision
@@ -16048,8 +16126,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             adapterStage = "final_after_retirement_refresh"
-            const listing = record(latestToolResult(request, postReviseListCallId))
+            const rawListing = latestToolResult(request, postReviseListCallId)
+            const listing = record(rawListing)
             const listedTasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
+            const oldTaskListDiagnostic = retirementListTaskDiagnostic(rawListing, seattleTaskId)
+            retirementListShape = oldTaskListDiagnostic.shape
+            retirementListOldIdMatch = oldTaskListDiagnostic.idMatch
+            retirementListOldStatus = oldTaskListDiagnostic.status
             retirementListOldMatched = listedTasks.some(task => task?.taskId === seattleTaskId && task?.status === "interrupted")
             retirementListReplacementMatched = listedTasks.some(task => task?.taskId === replacementTaskId && task?.status === "completed")
             if (!retirementListOldMatched || !retirementListReplacementMatched) {
@@ -16310,6 +16393,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         console.info(`P1329_RETIREMENT_RESUME_DIAGNOSTIC:${JSON.stringify({
           adapterStage: knownStages.has(adapterStage) ? adapterStage : "other", postReviseWaitIssued, postReviseListIssued,
           retirementWaitOldMatched, retirementWaitReplacementMatched, retirementListOldMatched, retirementListReplacementMatched,
+          retirementListShape, retirementListOldIdMatch, retirementListOldStatus,
           retirementFinalCandidateEmitted,
         })}`)
         throw error
