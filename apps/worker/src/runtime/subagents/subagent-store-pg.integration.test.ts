@@ -46,6 +46,35 @@ vi.mock("@jobcopilot/shared/llm", () => ({ loadWorkerAiConfig: usageRouteMocks.l
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RUNTIME_ROLE = "agent_runtime_p1_test"
+const ROOT_BUDGET_DIAGNOSTIC_CODES = new Set([
+  "ai_credits_disabled", "ai_credits_exhausted", "model_not_authorized", "output_budget_exhausted",
+  "root_usage_budget_unsupported", "root_usage_invalid", "root_usage_limit_invalid", "root_usage_unmarked",
+  "usage_attempt_conflict", "usage_attempt_in_flight", "usage_attempt_missing", "usage_attempt_not_started",
+  "usage_attempt_released", "usage_attempt_settled", "usage_attempt_started", "usage_authorization_unavailable",
+  "usage_broker_unavailable", "usage_context_unavailable", "usage_credit_refund_unavailable", "usage_denied",
+  "usage_fence_rejected", "usage_settlement_conflict", "usage_settlement_invalid", "usage_start_conflict",
+  "usage_start_protocol_required", "usage_start_replayed", "usage_start_unavailable", "usage_settlement_unknown",
+  "tree_step_budget_exhausted", "reservation_conflict", "reservation_missing", "settlement_conflict",
+  "lineage_rejected", "root_not_found", "invalid_input",
+])
+
+function rootBudgetDiagnosticCode(value: unknown): string {
+  if (value === null || value === undefined) return "none"
+  return typeof value === "string" && ROOT_BUDGET_DIAGNOSTIC_CODES.has(value) ? value : "other"
+}
+
+function diagnosticStatus(value: unknown): string {
+  return typeof value === "string" && ["queued", "running", "completed", "failed", "interrupted", "cancelled", "waiting", "waiting_for_user", "retrying", "closed"].includes(value)
+    ? value : "other"
+}
+
+function diagnosticHttpStatus(value: unknown): string {
+  if (typeof value !== "number" || !Number.isInteger(value)) return "missing"
+  if (value >= 200 && value < 300) return "success"
+  if (value >= 400 && value < 500) return "client_error"
+  if (value >= 500 && value < 600) return "server_error"
+  return "other"
+}
 
 function dedicatedDisposableUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -1266,9 +1295,70 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     const manager = new (await import("./manager.js")).AgentTreeManager(ownerAStore)
     const usageMonth = utcMonth()
     const before = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+    const firstOwnerId = `depth-two-budget-worker-${suffix}-1`
 
     try {
-      const first = await manager.run({ taskId: taskIds[0]!, sessionId, rootTaskId, ownerId: `depth-two-budget-worker-${suffix}-1` }, executor)
+      const first = await manager.run({ taskId: taskIds[0]!, sessionId, rootTaskId, ownerId: firstOwnerId }, executor)
+      if (first.status !== "completed") {
+        let failureReadSucceeded = false
+        let persistedStatus: unknown = null
+        let persistedFailureReason: unknown = null
+        try {
+          const failureSnapshot = await adminPool!.query<{ status: string; failureReason: string | null }>(
+            `SELECT task."status", task."failureReason" FROM "sub_agent_tasks" AS task
+             JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+             JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+             WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+               AND task."parentTaskId" = $5 AND task."attemptCount" = 1
+               AND session."userId" = $6 AND turn."userId" = $6 AND turn."rootTaskId" = $4`,
+            [taskIds[0], sessionId, turnId, rootTaskId, parentTaskId, userA.userId],
+          )
+          failureReadSucceeded = true
+          persistedStatus = failureSnapshot.rows[0]?.status ?? null
+          persistedFailureReason = failureSnapshot.rows[0]?.failureReason ?? null
+        } catch {
+          // The original completion assertion remains authoritative; diagnostics never surface query errors.
+        }
+        const matchesFirstAuthorizationScope = (request: typeof requests[number]): boolean => {
+          const input = request.body.input
+          const owner = input?.executionOwner
+          return input?.userId === userA.userId && input.sessionId === sessionId && input.turnId === turnId
+            && input.featureKey === "autoApply" && input.provider === "anthropic" && input.model === "fixture-root-budget-model"
+            && input.attemptId === "route-1" && typeof input.stepId === "string" && input.stepId.length > 0
+            && owner !== null && typeof owner === "object" && !Array.isArray(owner)
+            && (owner as Record<string, unknown>).kind === "task"
+            && (owner as Record<string, unknown>).taskId === taskIds[0]
+            && (owner as Record<string, unknown>).rootTaskId === rootTaskId
+            && (owner as Record<string, unknown>).ownerId === firstOwnerId
+            && (owner as Record<string, unknown>).attemptCount === 1
+        }
+        const firstAuthorize = requests.find(request => request.body.operation === "authorize" && matchesFirstAuthorizationScope(request))
+        const firstAuthorizeResponse = firstAuthorize?.response
+        const firstAuthorizeCode = firstAuthorizeResponse !== null && typeof firstAuthorizeResponse === "object" && !Array.isArray(firstAuthorizeResponse)
+          ? (firstAuthorizeResponse as Record<string, unknown>).code : null
+        const firstOperationId = firstAuthorizeResponse !== null && typeof firstAuthorizeResponse === "object" && !Array.isArray(firstAuthorizeResponse)
+          && typeof (firstAuthorizeResponse as Record<string, unknown>).operationId === "string"
+          ? (firstAuthorizeResponse as Record<string, unknown>).operationId : null
+        const firstStartSeen = requests.some(request => request.body.operation === "start"
+          && matchesFirstAuthorizationScope(request)
+          && request.body.input?.operationId === firstOperationId && request.body.input?.startProtocolVersion === 1)
+        const firstSettleSeen = firstOperationId !== null && requests.some(request => request.body.operation === "settle"
+          && request.body.input?.operationId === firstOperationId && request.body.input?.userId === userA.userId
+          && request.body.input?.provider === "anthropic" && request.body.input?.model === "fixture-root-budget-model")
+        console.error("[root-output-reservation-fixture]", JSON.stringify({
+          managerStatus: diagnosticStatus(first.status),
+          failureReadSucceeded,
+          persistedStatus: persistedStatus === null ? "missing" : diagnosticStatus(persistedStatus),
+          persistedFailureReason: rootBudgetDiagnosticCode(persistedFailureReason),
+          firstAuthorizeSeen: firstAuthorize !== undefined,
+          firstAuthorizeHttpStatus: diagnosticHttpStatus(firstAuthorize?.status),
+          firstAuthorizeResponseCode: rootBudgetDiagnosticCode(firstAuthorizeCode),
+          firstStartSeen,
+          firstProviderCallSeen: firstAuthorize !== undefined && providerRequests.some(request =>
+            request.taskId === taskIds[0] && request.stepId === firstAuthorize.body.input?.stepId),
+          firstSettleSeen,
+        }))
+      }
       expect(first).toMatchObject({ taskId: taskIds[0], status: "completed" })
       const exhausted = await manager.run({ taskId: taskIds[1]!, sessionId, rootTaskId, ownerId: `depth-two-budget-worker-${suffix}-2` }, executor)
       expect(exhausted).toMatchObject({ taskId: taskIds[1], status: "failed" })
