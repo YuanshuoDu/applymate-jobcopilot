@@ -71,6 +71,76 @@ describe("Root output token reservations", () => {
     expect(statements[0]?.values).toContain(28)
   })
 
+  it("classifies negotiated exhaustion from settled actuals or active holds without inserting a denied reservation", async () => {
+    for (const [sums, disposition] of [
+      [{ settled: 100, active: 0 }, "settled_exhausted"],
+      [{ settled: 20, active: 80 }, "active_reservation_hold"],
+    ] as const) {
+      const statements: Prisma.Sql[] = []
+      const tx = query((text, values) => {
+        statements.push({ text, values } as Prisma.Sql)
+        return text.includes('SUM("actualOutputTokens") FILTER') ? [sums] : []
+      })
+      await expect(reserveRootOutputTokens(tx, scope, {
+        operationId: "op-classified", attemptId: "attempt-1", provider: "minimax", model: "MiniMax-M3",
+        requestedOutputTokens: 20, startProtocolVersion: 1, outputBudgetClassificationVersion: 1,
+      })).rejects.toMatchObject({ code: "output_budget_exhausted", status: 429, outputBudgetDisposition: disposition })
+      const aggregate = statements.find(statement => statement.text.includes('SUM("actualOutputTokens") FILTER'))
+      expect(aggregate?.text).toContain('"status" IN (\'reserved\', \'started\')')
+      expect(aggregate?.values).toEqual(expect.arrayContaining([scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId]))
+      expect(statements.some(statement => statement.text.includes('INSERT INTO "agent_root_usage_reservations"'))).toBe(false)
+    }
+  })
+
+  it("classifies a negotiated zero-token cap as configured zero, without treating it as spent usage", async () => {
+    const statements: Prisma.Sql[] = []
+    const tx = query((text, values) => { statements.push({ text, values } as Prisma.Sql); return [] })
+    await expect(reserveRootOutputTokens(tx, { ...scope, budgetSnapshot: { limits: { maxOutputTokens: 0 } } }, {
+      operationId: "op-zero-cap", attemptId: "attempt-1", provider: "minimax", model: "MiniMax-M3",
+      requestedOutputTokens: 20, startProtocolVersion: 1, outputBudgetClassificationVersion: 1,
+    })).rejects.toMatchObject({ code: "output_budget_exhausted", status: 429, outputBudgetDisposition: "configured_zero_limit" })
+    expect(statements.some(statement => statement.text.includes("SUM("))).toBe(false)
+    expect(statements.some(statement => statement.text.includes('INSERT INTO "agent_root_usage_reservations"'))).toBe(false)
+  })
+
+  it("keeps a missing output cap unclassified when the caller negotiates classification", async () => {
+    const statements: Prisma.Sql[] = []
+    const tx = query((text, values) => { statements.push({ text, values } as Prisma.Sql); return [] })
+    await expect(reserveRootOutputTokens(tx, { ...scope, budgetSnapshot: {} }, {
+      operationId: "op-default-cap", attemptId: "attempt-1", provider: "minimax", model: "MiniMax-M3",
+      requestedOutputTokens: 20, startProtocolVersion: 1, outputBudgetClassificationVersion: 1,
+    })).resolves.toEqual({ required: false, maxOutputTokens: null })
+    expect(statements.some(statement => statement.text.includes("SUM("))).toBe(false)
+    expect(statements.some(statement => statement.text.includes('INSERT INTO "agent_root_usage_reservations"'))).toBe(true)
+  })
+
+  it("admits the requested amount under a nonzero cap when there is no prior usage", async () => {
+    const statements: Prisma.Sql[] = []
+    const tx = query((text, values) => {
+      statements.push({ text, values } as Prisma.Sql)
+      return text.includes('SUM("actualOutputTokens") FILTER') ? [{ settled: 0, active: 0 }] : []
+    })
+    await expect(reserveRootOutputTokens(tx, scope, {
+      operationId: "op-no-usage", attemptId: "attempt-1", provider: "minimax", model: "MiniMax-M3",
+      requestedOutputTokens: 20, startProtocolVersion: 1, outputBudgetClassificationVersion: 1,
+    })).resolves.toEqual({ required: true, maxOutputTokens: 20 })
+    expect(statements.some(statement => statement.text.includes('INSERT INTO "agent_root_usage_reservations"'))).toBe(true)
+  })
+
+  it("keeps the legacy exhausted code unclassified when the caller does not negotiate", async () => {
+    const tx = query(text => text.includes("SUM(CASE WHEN") ? [{ used: 100 }] : [])
+    await expect(reserveRootOutputTokens(tx, scope, {
+      operationId: "op-legacy-exhausted", attemptId: "attempt-1", provider: "minimax", model: "MiniMax-M3",
+      requestedOutputTokens: 20, startProtocolVersion: 1,
+    })).rejects.toMatchObject({ code: "output_budget_exhausted", status: 429, outputBudgetDisposition: undefined })
+
+    const zeroCap = query(text => text.includes("SUM(CASE WHEN") ? [{ used: 0 }] : [])
+    await expect(reserveRootOutputTokens(zeroCap, { ...scope, budgetSnapshot: { limits: { maxOutputTokens: 0 } } }, {
+      operationId: "op-legacy-zero-cap", attemptId: "attempt-1", provider: "minimax", model: "MiniMax-M3",
+      requestedOutputTokens: 20, startProtocolVersion: 1,
+    })).rejects.toMatchObject({ code: "output_budget_exhausted", status: 429, outputBudgetDisposition: undefined })
+  })
+
   it("fails closed for unmarked Roots, unknown ceilings, unsupported providers, and unsupported budget dimensions", async () => {
     const empty = query(() => [])
     await expect(reserveRootOutputTokens(empty, { ...scope, outputTokenReservationVersion: null }, {

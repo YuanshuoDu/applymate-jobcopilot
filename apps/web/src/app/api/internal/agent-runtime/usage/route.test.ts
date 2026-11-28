@@ -7,7 +7,12 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/db", () => ({ db: {} }))
 vi.mock("@/lib/entitlements", () => ({ resolveAiAccess: mocks.resolveAiAccess }))
 vi.mock("@/lib/agent/control-plane/usage-broker", () => ({
-  admitAiUsage: mocks.admitAiUsage, startAiUsage: mocks.startAiUsage, settleAiUsage: mocks.settleAiUsage, UsageBrokerError: class UsageBrokerError extends Error {},
+  admitAiUsage: mocks.admitAiUsage, startAiUsage: mocks.startAiUsage, settleAiUsage: mocks.settleAiUsage,
+  OUTPUT_BUDGET_CLASSIFICATION_VERSION: 1,
+  UsageBrokerError: class UsageBrokerError extends Error {
+    constructor(readonly code: string, readonly status: number, message = code,
+      readonly outputBudgetDisposition?: "configured_zero_limit" | "settled_exhausted" | "active_reservation_hold") { super(message) }
+  },
 }))
 vi.mock("@jobcopilot/shared/llm", () => ({ loadWorkerAiConfig: mocks.loadWorkerAiConfig }))
 
@@ -36,6 +41,69 @@ describe("internal agent runtime usage route", () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1, outputReservationRequired: true, maxOutputTokens: 128 })
     expect(mocks.admitAiUsage).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ ...admission, credentialSource: "platform" }))
+  })
+
+  it("echoes an explicitly negotiated output-budget classification version on success", async () => {
+    const { POST } = await import("./route")
+    const input = { ...admission, outputBudgetClassificationVersion: 1 }
+    const response = await POST(new Request("http://localhost/api/internal/agent-runtime/usage", {
+      method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" },
+      body: JSON.stringify({ operation: "authorize", input }),
+    }) as never)
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ status: "authorized", operationId: "agent-usage-1", startProtocolVersion: 1,
+      outputReservationRequired: true, maxOutputTokens: 128, outputBudgetClassificationVersion: 1 })
+    expect(mocks.admitAiUsage).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ ...input, credentialSource: "platform" }))
+  })
+
+  it("keeps legacy 429 bodies unchanged and adds classification only for a negotiated request", async () => {
+    const { POST } = await import("./route")
+    const { UsageBrokerError } = await import("@/lib/agent/control-plane/usage-broker")
+    mocks.admitAiUsage.mockRejectedValue(new UsageBrokerError(
+      "output_budget_exhausted", 429, "output_budget_exhausted", "active_reservation_hold",
+    ))
+    const request = (input: unknown) => new Request("http://localhost/api/internal/agent-runtime/usage", {
+      method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" },
+      body: JSON.stringify({ operation: "authorize", input }),
+    }) as never
+
+    const legacy = await POST(request(admission))
+    expect(legacy.status).toBe(429)
+    await expect(legacy.json()).resolves.toEqual({ error: "output_budget_exhausted", code: "output_budget_exhausted" })
+
+    const negotiated = await POST(request({ ...admission, outputBudgetClassificationVersion: 1 }))
+    expect(negotiated.status).toBe(429)
+    await expect(negotiated.json()).resolves.toEqual({ error: "output_budget_exhausted", code: "output_budget_exhausted",
+      outputBudgetClassificationVersion: 1, outputBudgetDisposition: "active_reservation_hold" })
+  })
+
+  it("returns the configured-zero classification only on negotiated exhaustion", async () => {
+    const { POST } = await import("./route")
+    const { UsageBrokerError } = await import("@/lib/agent/control-plane/usage-broker")
+    mocks.admitAiUsage.mockRejectedValue(new UsageBrokerError(
+      "output_budget_exhausted", 429, "output_budget_exhausted", "configured_zero_limit",
+    ))
+    const response = await POST(new Request("http://localhost/api/internal/agent-runtime/usage", {
+      method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" },
+      body: JSON.stringify({ operation: "authorize", input: { ...admission, outputBudgetClassificationVersion: 1 } }),
+    }) as never)
+    expect(response.status).toBe(429)
+    await expect(response.json()).resolves.toEqual({ error: "output_budget_exhausted", code: "output_budget_exhausted",
+      outputBudgetClassificationVersion: 1, outputBudgetDisposition: "configured_zero_limit" })
+  })
+
+  it("rejects unsupported classification versions and their use outside authorization", async () => {
+    const { POST } = await import("./route")
+    const request = (body: unknown) => new Request("http://localhost", {
+      method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }) as never
+    expect((await POST(request({ operation: "authorize", input: { ...admission, outputBudgetClassificationVersion: 2 } }))).status).toBe(400)
+    expect((await POST(request({ operation: "release", input: { ...admission, outputBudgetClassificationVersion: 1 } }))).status).toBe(400)
+    expect((await POST(request({ operation: "start", input: { ...admission, operationId: "agent-usage-1", outputBudgetClassificationVersion: 1 } }))).status).toBe(400)
+    expect(mocks.admitAiUsage).not.toHaveBeenCalled()
+    expect(mocks.startAiUsage).not.toHaveBeenCalled()
+    expect(mocks.settleAiUsage).not.toHaveBeenCalled()
   })
 
   it("fails closed for missing secret, exhausted credits, or an untrusted model", async () => {
