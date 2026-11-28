@@ -4,7 +4,8 @@ import { Pool as PgPool, type PoolClient } from "pg"
 import { Type } from "@sinclair/typebox"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
-import type { RuntimeToolDefinition } from "../tools/types.js"
+import type { RuntimeToolDefinition, ToolRouterContext } from "../tools/types.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type PgSubagentPool, type SubagentJobPayload } from "./types.js"
@@ -46,6 +47,35 @@ vi.mock("@jobcopilot/shared/llm", () => ({ loadWorkerAiConfig: usageRouteMocks.l
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RUNTIME_ROLE = "agent_runtime_p1_test"
+const ROOT_BUDGET_DIAGNOSTIC_CODES = new Set([
+  "ai_credits_disabled", "ai_credits_exhausted", "model_not_authorized", "output_budget_exhausted",
+  "root_usage_budget_unsupported", "root_usage_invalid", "root_usage_limit_invalid", "root_usage_unmarked",
+  "usage_attempt_conflict", "usage_attempt_in_flight", "usage_attempt_missing", "usage_attempt_not_started",
+  "usage_attempt_released", "usage_attempt_settled", "usage_attempt_started", "usage_authorization_unavailable",
+  "usage_broker_unavailable", "usage_context_unavailable", "usage_credit_refund_unavailable", "usage_denied",
+  "usage_fence_rejected", "usage_settlement_conflict", "usage_settlement_invalid", "usage_start_conflict",
+  "usage_start_protocol_required", "usage_start_replayed", "usage_start_unavailable", "usage_settlement_unknown",
+  "tree_step_budget_exhausted", "reservation_conflict", "reservation_missing", "settlement_conflict",
+  "lineage_rejected", "root_not_found", "invalid_input",
+])
+
+function rootBudgetDiagnosticCode(value: unknown): string {
+  if (value === null || value === undefined) return "none"
+  return typeof value === "string" && ROOT_BUDGET_DIAGNOSTIC_CODES.has(value) ? value : "other"
+}
+
+function diagnosticStatus(value: unknown): string {
+  return typeof value === "string" && ["queued", "running", "completed", "failed", "interrupted", "cancelled", "waiting", "waiting_for_user", "retrying", "closed"].includes(value)
+    ? value : "other"
+}
+
+function diagnosticHttpStatus(value: unknown): string {
+  if (typeof value !== "number" || !Number.isInteger(value)) return "missing"
+  if (value >= 200 && value < 300) return "success"
+  if (value >= 400 && value < 500) return "client_error"
+  if (value >= 500 && value < 600) return "server_error"
+  return "other"
+}
 
 function dedicatedDisposableUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -1148,6 +1178,375 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       expect(authorizeRequests.filter(request => request.status === 200).every(request => request.body.input?.credentialSource === "platform")).toBe(true)
       expect(requests.every(request => !Object.prototype.hasOwnProperty.call(request.body.input ?? {}, "apiKey"))).toBe(true)
       expect(JSON.stringify(requests)).not.toContain("server-only-fixture-key")
+    } finally {
+      await manager.shutdown()
+      vi.unstubAllEnvs()
+    }
+  }, 60_000)
+
+  it("enforces the strict Root output budget before a later depth-two Worker lease reaches the provider", async () => {
+    // Seed depth two directly to isolate usage admission. The first child exercises a real claimed Worker lease and its exact
+    // owner/step through Web, plus a synthetic `jobs.discover` response through real ToolRouter persistence and evidence
+    // binding. Once that usage reaches the Root cap, the later child is stopped by the Worker step-start budget guard before
+    // route authorization. This bypasses `scout.delegate`, its nested-spawn guard/outbox handoff, and external discovery.
+    const sessionId = `p1-subagent-depth-two-session-${suffix}`
+    const turnId = `p1-subagent-depth-two-turn-${suffix}`
+    const rootTaskId = `p1-subagent-depth-two-root-${suffix}`
+    const parentTaskId = `p1-subagent-depth-two-parent-${suffix}`
+    const taskIds = [`p1-subagent-grandchild-a-${suffix}`, `p1-subagent-grandchild-b-${suffix}`]
+    const rootBudget = { limits: { maxSteps: 32, maxToolCalls: 40, maxOutputTokens: 64 } }
+    await adminPool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Depth-two usage budget fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userA.userId])
+    await adminPool!.query(`INSERT INTO "agent_turns"
+      ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+      VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, $4::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+    [turnId, sessionId, userA.userId, JSON.stringify({ provider: "anthropic", model: "fixture-root-budget-model" })])
+    await adminPool!.query(`INSERT INTO "sub_agent_tasks"
+      ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+       "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+      VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'Depth-two usage budget fixture',
+        '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $4::jsonb, 0, 1, CURRENT_TIMESTAMP)`,
+    [rootTaskId, sessionId, turnId, JSON.stringify(rootBudget)])
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1, "outputTokenReservationVersion" = 1
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [rootTaskId, sessionId, turnId])
+    await adminPool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2 AND "sessionId" = $3 AND "userId" = $4`,
+      [rootTaskId, turnId, sessionId, userA.userId])
+    await adminPool!.query(`INSERT INTO "sub_agent_tasks"
+      ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+       "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+      VALUES ($1, $2, $3, $4, $4, $5, 1, 'scout', 'job_discovery', 'waiting', 'Depth-two usage budget parent',
+        '{}'::jsonb, '[]'::jsonb, '["jobs.search", "scout.delegate"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        '{}'::jsonb, '{}'::jsonb, 1, 3, CURRENT_TIMESTAMP)`, [parentTaskId, sessionId, turnId, rootTaskId, `/root/${parentTaskId}`])
+    for (const [index, taskId] of taskIds.entries()) {
+      await adminPool!.query(`INSERT INTO "sub_agent_tasks"
+        ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status",
+         "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot",
+         "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, $6, 2, 'scout', 'job_discovery', 'queued', 'Depth-two usage budget fixture',
+          '{}'::jsonb, '[]'::jsonb, '["jobs.discover", "tool_results.read"]'::jsonb, '{}'::jsonb, $7::jsonb, '{}'::jsonb,
+          '{}'::jsonb, '{}'::jsonb, 0, 3, CURRENT_TIMESTAMP)`,
+      [taskId, sessionId, turnId, rootTaskId, parentTaskId, `/root/${parentTaskId}/grandchild-${index + 1}`,
+        JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" })])
+    }
+    const hierarchy = await adminPool!.query<{ depth: number; parentTaskId: string; parentDepth: number; rootTaskId: string }>(
+      `SELECT child."depth", child."parentTaskId", parent."depth" AS "parentDepth", child."rootTaskId"
+       FROM "sub_agent_tasks" child JOIN "sub_agent_tasks" parent
+         ON parent."id" = child."parentTaskId" AND parent."sessionId" = child."sessionId" AND parent."turnId" = child."turnId"
+       WHERE child."id" = ANY($1::text[]) AND child."sessionId" = $2 AND child."turnId" = $3
+         AND child."rootTaskId" = $4 ORDER BY child."id"`,
+      [taskIds, sessionId, turnId, rootTaskId])
+    expect(hierarchy.rows).toHaveLength(taskIds.length)
+    expect(hierarchy.rows.every(row => row.depth === 2 && row.parentTaskId === parentTaskId
+      && row.parentDepth === 1 && row.rootTaskId === rootTaskId)).toBe(true)
+
+    const executionPool = runtimePool(ownerAPool!, userA.userId)
+    usageRouteMocks.database = createPgUsageDatabase(executionPool)
+    usageRouteMocks.resolveAiAccess.mockResolvedValue("allowed")
+    usageRouteMocks.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 10 } })
+    usageRouteMocks.loadWorkerAiConfig.mockResolvedValue({
+      provider: "anthropic", model: "fixture-root-budget-model", apiKey: "server-only-root-budget-key",
+    })
+    const secret = "fixture-root-budget-worker-secret"
+    vi.stubEnv("AGENT_WORKER_SECRET", secret)
+    // @ts-expect-error The Worker Vitest alias resolves this allowlisted Web route at runtime.
+    const { POST } = await import("@/app/api/internal/agent-runtime/usage/route")
+
+    type BridgeBody = { operation?: string; input?: Record<string, unknown> }
+    const requests: { body: BridgeBody; status: number; response: unknown }[] = []
+    const bridge = createWorkerUsageAuthorizer({
+      endpointUrl: "http://agent-fixture/api/internal/agent-runtime/usage",
+      secret,
+      fetch: async (input, init) => {
+        const body = JSON.parse(String(init?.body)) as BridgeBody
+        const response = await POST(new Request(String(input), init) as never)
+        const payload: unknown = await response.clone().json().catch(() => null)
+        requests.push({ body, status: response.status, response: payload })
+        return response
+      },
+    })
+    const modelProfile: ModelAdapter["profile"] = {
+      provider: "anthropic", model: "fixture-root-budget-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null,
+      defaultMaxOutputTokens: 128, costClass: "low",
+    }
+    const fixtureJobId = "c123456789012345678901234"
+    const fixtureEvidenceId = "00000000-0000-4000-8000-000000000000"
+    const discoveryInput = { targetRoles: ["Software Engineer"], targetLocations: [], source: "greenhouse", pageSize: 1 }
+    const providerRequests: Array<{
+      taskId: string; stepId: string; maxOutputTokens: number | undefined; sawSyntheticToolResult: boolean
+    }> = []
+    const syntheticDiscoveryOutput = (context: Pick<ToolRouterContext, "sessionId" | "turnId" | "stepId">, toolCallId: string) => ({
+      jobs: [{
+        id: fixtureJobId, title: "Software Engineer", company: "Synthetic fixture employer", location: "Dublin",
+        url: "https://jobs.example/depth-two/1", description: "Synthetic fixture listing.", fullDescription: "Synthetic fixture listing.",
+        salary: null, logo: null, source: "greenhouse", evidenceRefs: [fixtureEvidenceId],
+      }],
+      evidence: [{
+        evidenceId: fixtureEvidenceId, jobId: fixtureJobId, kind: "source" as const, source: "greenhouse",
+        url: "https://jobs.example/depth-two/1", summary: "Synthetic fixture source evidence.",
+      }],
+      nextCursor: null,
+      usage: {
+        ledgerKey: `synthetic-depth-two-${suffix}`, toolName: "jobs.discover", toolVersion: "1", toolCallId,
+        sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId, requests: 1,
+        jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0, aiCalls: 0, providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 0,
+      },
+    })
+    const discoverTool: RuntimeToolDefinition = {
+      schemaVersion, name: "jobs.discover", version: "1", description: "Read synthetic fixture jobs",
+      capabilities: ["read", "write"],
+      inputSchema: Type.Object({
+        targetRoles: Type.Array(Type.String({ minLength: 1, maxLength: 160 }), { minItems: 1, maxItems: 8 }),
+        targetLocations: Type.Array(Type.String({ maxLength: 160 }), { maxItems: 8 }),
+        source: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+        pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+        cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+      }, { additionalProperties: false }),
+      outputSchema: Type.Object({}, { additionalProperties: true }),
+      risk: "internal_write", domain: "jobs", idempotency: "idempotent", timeoutMs: 1_000, requiredCapabilities: ["read"],
+      async execute(context) { return syntheticDiscoveryOutput(context, context.toolCallId ?? "synthetic-discovery") },
+    }
+    const executor = createProductionChildExecutor({
+      pool: executionPool as unknown as PgPool,
+      turnStore: createPgTurnEngineStore(executionPool as never),
+      treeBudget: createPgTreeBudgetReservationStore(executionPool as never),
+      authorizeUsage: bridge,
+      modelRuntimeFactory: ({ task }) => ({
+        id: `root-budget-fixture-${task.id}`, profile: modelProfile,
+        async *stream(request: HarnessModelRequest) {
+          const call = providerRequests.filter(item => item.taskId === task.id).length
+          providerRequests.push({ taskId: task.id, stepId: request.metadata.stepId, maxOutputTokens: request.maxOutputTokens,
+            sawSyntheticToolResult: JSON.stringify(request.messages).includes(fixtureJobId) })
+          if (call === 0) {
+            yield { type: "tool_call_completed", callId: `synthetic-discover-${task.id}`, name: "jobs.discover", arguments: discoveryInput }
+            yield { type: "usage", inputTokens: 20, outputTokens: 4, estimatedCostUsd: 0.001 }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          const result = {
+            schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+            candidates: [{ jobId: fixtureJobId, source: "greenhouse", url: "https://jobs.example/depth-two/1", evidenceIds: ["model-evidence-1"] }],
+            evidence: [{ id: "model-evidence-1", kind: "job", ref: fixtureJobId, source: "greenhouse" }],
+            summary: "One synthetic fixture job.",
+          }
+          yield { type: "text_delta", text: JSON.stringify(result) }
+          yield { type: "usage", inputTokens: 20, outputTokens: 60, estimatedCostUsd: 0.009 }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }),
+      toolRuntimeFactory: () => ({
+        definitions: [discoverTool],
+        router: { async execute(context, request) {
+          return { ...request, status: "completed", output: syntheticDiscoveryOutput(context, request.id), errorCode: null }
+        } },
+        validateArguments: () => true,
+      }),
+      resumeLoader: async () => undefined,
+    })
+    const manager = new (await import("./manager.js")).AgentTreeManager(ownerAStore)
+    const usageMonth = utcMonth()
+    const before = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+    const firstOwnerId = `depth-two-budget-worker-${suffix}-1`
+
+    try {
+      const first = await manager.run({ taskId: taskIds[0]!, sessionId, rootTaskId, ownerId: firstOwnerId }, executor)
+      if (first.status !== "completed") {
+        let failureReadSucceeded = false
+        let persistedStatus: unknown = null
+        let persistedFailureReason: unknown = null
+        try {
+          const failureSnapshot = await adminPool!.query<{ status: string; failureReason: string | null }>(
+            `SELECT task."status", task."failureReason" FROM "sub_agent_tasks" AS task
+             JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+             JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+             WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+               AND task."parentTaskId" = $5 AND task."attemptCount" = 1
+               AND session."userId" = $6 AND turn."userId" = $6 AND turn."rootTaskId" = $4`,
+            [taskIds[0], sessionId, turnId, rootTaskId, parentTaskId, userA.userId],
+          )
+          failureReadSucceeded = true
+          persistedStatus = failureSnapshot.rows[0]?.status ?? null
+          persistedFailureReason = failureSnapshot.rows[0]?.failureReason ?? null
+        } catch {
+          // The original completion assertion remains authoritative; diagnostics never surface query errors.
+        }
+        const matchesFirstAuthorizationScope = (request: typeof requests[number]): boolean => {
+          const input = request.body.input
+          const owner = input?.executionOwner
+          return input?.userId === userA.userId && input.sessionId === sessionId && input.turnId === turnId
+            && input.featureKey === "autoApply" && input.provider === "anthropic" && input.model === "fixture-root-budget-model"
+            && input.attemptId === "route-1" && typeof input.stepId === "string" && input.stepId.length > 0
+            && owner !== null && typeof owner === "object" && !Array.isArray(owner)
+            && (owner as Record<string, unknown>).kind === "task"
+            && (owner as Record<string, unknown>).taskId === taskIds[0]
+            && (owner as Record<string, unknown>).rootTaskId === rootTaskId
+            && (owner as Record<string, unknown>).ownerId === firstOwnerId
+            && (owner as Record<string, unknown>).attemptCount === 1
+        }
+        const firstAuthorize = requests.find(request => request.body.operation === "authorize" && matchesFirstAuthorizationScope(request))
+        const firstAuthorizeResponse = firstAuthorize?.response
+        const firstAuthorizeCode = firstAuthorizeResponse !== null && typeof firstAuthorizeResponse === "object" && !Array.isArray(firstAuthorizeResponse)
+          ? (firstAuthorizeResponse as Record<string, unknown>).code : null
+        const firstOperationId = firstAuthorizeResponse !== null && typeof firstAuthorizeResponse === "object" && !Array.isArray(firstAuthorizeResponse)
+          && typeof (firstAuthorizeResponse as Record<string, unknown>).operationId === "string"
+          ? (firstAuthorizeResponse as Record<string, unknown>).operationId : null
+        const firstStartSeen = requests.some(request => request.body.operation === "start"
+          && matchesFirstAuthorizationScope(request)
+          && request.body.input?.operationId === firstOperationId && request.body.input?.startProtocolVersion === 1)
+        const firstSettleSeen = firstOperationId !== null && requests.some(request => request.body.operation === "settle"
+          && request.body.input?.operationId === firstOperationId && request.body.input?.userId === userA.userId
+          && request.body.input?.provider === "anthropic" && request.body.input?.model === "fixture-root-budget-model")
+        console.error("[root-output-reservation-fixture]", JSON.stringify({
+          managerStatus: diagnosticStatus(first.status),
+          failureReadSucceeded,
+          persistedStatus: persistedStatus === null ? "missing" : diagnosticStatus(persistedStatus),
+          persistedFailureReason: rootBudgetDiagnosticCode(persistedFailureReason),
+          firstAuthorizeSeen: firstAuthorize !== undefined,
+          firstAuthorizeHttpStatus: diagnosticHttpStatus(firstAuthorize?.status),
+          firstAuthorizeResponseCode: rootBudgetDiagnosticCode(firstAuthorizeCode),
+          firstStartSeen,
+          firstProviderCallSeen: firstAuthorize !== undefined && providerRequests.some(request =>
+            request.taskId === taskIds[0] && request.stepId === firstAuthorize.body.input?.stepId),
+          firstSettleSeen,
+        }))
+      }
+      expect(first).toMatchObject({ taskId: taskIds[0], status: "completed" })
+      const firstTask = await ownerAStore.get(taskIds[0]!, sessionId)
+      expect(firstTask?.result).toMatchObject({
+        status: "completed", stepCount: 2, toolCallCount: 1,
+        structuredResult: {
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+          candidates: [{ jobId: fixtureJobId, source: "greenhouse", evidenceIds: [`read:job:${fixtureJobId}`] }],
+          evidence: [{ id: `read:job:${fixtureJobId}`, kind: "job", ref: fixtureJobId, source: "greenhouse" }],
+        },
+      })
+      const toolReceipts = await adminPool!.query<{ type: string; status: string; toolCallId: string | null; toolName: string | null }>(
+        `SELECT "type", "status", "content"->>'toolCallId' AS "toolCallId", "content"->>'toolName' AS "toolName"
+         FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+           AND "type" IN ('tool_call', 'tool_result') ORDER BY "type", "id"`,
+        [sessionId, turnId, taskIds[0]],
+      )
+      expect(toolReceipts.rows).toHaveLength(2)
+      expect(toolReceipts.rows[0]).toMatchObject({ type: "tool_call", status: "completed", toolName: "jobs.discover" })
+      expect(toolReceipts.rows[1]).toMatchObject({ type: "tool_result", status: "completed", toolName: null })
+      expect(toolReceipts.rows[0]?.toolCallId).toEqual(expect.any(String))
+      expect(toolReceipts.rows[1]?.toolCallId).toBe(toolReceipts.rows[0]?.toolCallId)
+      const exhausted = await manager.run({ taskId: taskIds[1]!, sessionId, rootTaskId, ownerId: `depth-two-budget-worker-${suffix}-2` }, executor)
+      expect(exhausted).toMatchObject({ taskId: taskIds[1], status: "retrying" })
+      const exhaustedTask = await ownerAStore.get(taskIds[1]!, sessionId)
+      expect(exhaustedTask).toMatchObject({
+        id: taskIds[1], status: "queued", attemptCount: 1, maxAttempts: 3,
+        failureReason: "budget_exhausted",
+      })
+      expect(exhaustedTask?.nextAttemptAt).toEqual(expect.any(Date))
+      expect(Number.isFinite(exhaustedTask?.nextAttemptAt?.getTime() ?? Number.NaN)).toBe(true)
+      expect(exhaustedTask!.attemptCount).toBeLessThan(exhaustedTask!.maxAttempts)
+
+      const laterChildSteps = await adminPool!.query<{ id: string }>(`SELECT "id" FROM "agent_steps"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`, [sessionId, turnId, taskIds[1]])
+      expect(laterChildSteps.rows).toHaveLength(0)
+
+      expect(providerRequests).toHaveLength(2)
+      expect(providerRequests.map(request => request.taskId)).toEqual([taskIds[0], taskIds[0]])
+      expect(providerRequests.map(request => request.maxOutputTokens)).toEqual([64, 60])
+      expect(providerRequests.map(request => request.sawSyntheticToolResult)).toEqual([false, true])
+      expect(new Set(providerRequests.map(request => request.stepId)).size).toBe(2)
+      expect(providerRequests.every(request => typeof request.stepId === "string" && request.stepId.length > 0)).toBe(true)
+      const authorizeRequests = requests.filter(request => request.body.operation === "authorize")
+      const startRequests = requests.filter(request => request.body.operation === "start")
+      const settleRequests = requests.filter(request => request.body.operation === "settle")
+      expect(authorizeRequests.map(request => request.status)).toEqual([200, 200])
+      expect(authorizeRequests.every(request => request.body.input?.executionOwner !== null
+        && typeof request.body.input?.executionOwner === "object"
+        && (request.body.input.executionOwner as Record<string, unknown>).taskId === taskIds[0])).toBe(true)
+      expect(authorizeRequests[0]?.body.input?.executionOwner).toMatchObject({
+        kind: "task", taskId: taskIds[0], rootTaskId, attemptCount: 1,
+      })
+      expect(authorizeRequests[0]?.body.input).toMatchObject({
+        userId: userA.userId, sessionId, turnId, stepId: providerRequests[0]?.stepId,
+        provider: "anthropic", model: "fixture-root-budget-model", requestedOutputTokens: 128, startProtocolVersion: 1,
+      })
+      expect(authorizeRequests[1]?.body.input?.executionOwner).toMatchObject({
+        kind: "task", taskId: taskIds[0], rootTaskId, attemptCount: 1,
+      })
+      expect(authorizeRequests[1]?.body.input).toMatchObject({
+        userId: userA.userId, sessionId, turnId, stepId: providerRequests[1]?.stepId,
+        provider: "anthropic", model: "fixture-root-budget-model", requestedOutputTokens: 128, startProtocolVersion: 1,
+      })
+      expect(startRequests).toHaveLength(2)
+      expect(startRequests.map(request => request.status)).toEqual([200, 200])
+      expect(startRequests.every(request => request.body.input?.executionOwner !== null
+        && typeof request.body.input?.executionOwner === "object"
+        && (request.body.input.executionOwner as Record<string, unknown>).taskId === taskIds[0])).toBe(true)
+      expect(settleRequests).toHaveLength(2)
+      expect(settleRequests.map(request => request.status)).toEqual([200, 200])
+      const authorizedOperationIds = new Set(authorizeRequests.flatMap(request => {
+        const response = request.response
+        if (!response || typeof response !== "object" || Array.isArray(response)) return []
+        const operationId = (response as Record<string, unknown>).operationId
+        return typeof operationId === "string" ? [operationId] : []
+      }))
+      expect(authorizedOperationIds.size).toBe(2)
+      expect(settleRequests.every(request => typeof request.body.input?.operationId === "string"
+        && authorizedOperationIds.has(request.body.input.operationId))).toBe(true)
+
+      const reservation = await adminPool!.query<{
+        id: string; userId: string; sessionId: string; turnId: string; rootTaskId: string; taskId: string; stepId: string
+        executionOwnerKind: string; executionOwnerId: string; executionOwnerVersion: number; attempt: number; attemptId: string
+        provider: string; model: string; outputReservationRequired: boolean; reservedOutputTokens: number; actualOutputTokens: number
+        status: string; outcomeStatus: string; errorCode: string | null
+      }>(`SELECT "id", "userId", "sessionId", "turnId", "rootTaskId", "taskId", "stepId", "executionOwnerKind",
+          "executionOwnerId", "executionOwnerVersion", "attempt", "attemptId", "provider", "model",
+          "outputReservationRequired", "reservedOutputTokens", "actualOutputTokens", "status", "outcomeStatus", "errorCode"
+        FROM "agent_root_usage_reservations" WHERE "sessionId" = $1 AND "rootTaskId" = $2 ORDER BY "id"`,
+      [sessionId, rootTaskId])
+      expect(reservation.rows).toHaveLength(2)
+      const reservationByStep = new Map(reservation.rows.map(row => [row.stepId, row]))
+      expect(reservationByStep.size).toBe(2)
+      expect(providerRequests.every(request => reservationByStep.has(request.stepId))).toBe(true)
+      const usageExpectations = new Map([
+        [providerRequests[0]!.stepId, { reservedOutputTokens: 64, actualOutputTokens: 4 }],
+        [providerRequests[1]!.stepId, { reservedOutputTokens: 60, actualOutputTokens: 60 }],
+      ])
+      for (const [stepId, usageExpectation] of usageExpectations) {
+        expect(reservationByStep.get(stepId)).toMatchObject({
+        userId: userA.userId, sessionId, turnId, rootTaskId,
+        taskId: taskIds[0], stepId, executionOwnerKind: "task",
+        executionOwnerId: `depth-two-budget-worker-${suffix}-1`, executionOwnerVersion: 1,
+        attempt: 1, attemptId: "route-1", provider: "anthropic", model: "fixture-root-budget-model",
+        outputReservationRequired: true, ...usageExpectation,
+        status: "settled", outcomeStatus: "success", errorCode: null,
+      })
+      }
+      const usage = await adminPool!.query<{
+        id: string; status: string; providerStartedAt: Date | null; outputReservationRequired: boolean
+        startProtocolVersion: number; outputTokens: number; credentialSource: string
+      }>(`SELECT id, status, provider_started_at AS "providerStartedAt", output_reservation_required AS "outputReservationRequired",
+          usage_start_protocol_version AS "startProtocolVersion", output_tokens AS "outputTokens", credential_source AS "credentialSource"
+        FROM ai_usage_events WHERE id = ANY($1::text[])`, [reservation.rows.map(row => row.id)])
+      expect(usage.rows).toHaveLength(2)
+      const usageById = new Map(usage.rows.map(row => [row.id, row]))
+      for (const [stepId, usageExpectation] of usageExpectations) {
+        const reservationRow = reservationByStep.get(stepId)
+        expect(reservationRow).toBeDefined()
+        const usageRow = reservationRow ? usageById.get(reservationRow.id) : undefined
+        expect(usageRow).toMatchObject({
+          id: reservationRow?.id, status: "success", outputReservationRequired: true,
+          startProtocolVersion: 1, outputTokens: usageExpectation.actualOutputTokens, credentialSource: "user",
+        })
+        expect(usageRow?.providerStartedAt).toEqual(expect.any(Date))
+      }
+      const deniedReservation = await adminPool!.query(`SELECT "id" FROM "agent_root_usage_reservations"
+        WHERE "sessionId" = $1 AND "rootTaskId" = $2 AND "taskId" = $3`, [sessionId, rootTaskId, taskIds[1]])
+      expect(deniedReservation.rows).toHaveLength(0)
+      const after = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+      expect(after.ledger).toHaveLength(before.ledger.length + 2)
+      expect(after.budgets.find(row => row.month === usageMonth)?.used)
+        .toBe((before.budgets.find(row => row.month === usageMonth)?.used ?? 0) + 2)
     } finally {
       await manager.shutdown()
       vi.unstubAllEnvs()
