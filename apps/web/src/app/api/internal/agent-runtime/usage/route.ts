@@ -12,6 +12,7 @@ import {
   type UsageStartInput,
   type UsageSettlementInput,
 } from "@/lib/agent/control-plane/usage-broker"
+import { OUTPUT_BUDGET_CLASSIFICATION_VERSION } from "@/lib/agent/control-plane/root-output-budget-classification"
 import type { UsageExecutionOwner } from "@/lib/agent/control-plane/usage-owner-fence"
 
 type RequestBody =
@@ -70,6 +71,9 @@ function parseInput(value: unknown): RequestBody | null {
   if (!row || (row.operation !== "authorize" && row.operation !== "start" && row.operation !== "settle" && row.operation !== "release")) return null
   const input = record(row.input)
   if (!input || !text(input.userId) || !text(input.provider) || !text(input.model)) return null
+  const hasBudgetClassificationVersion = Object.prototype.hasOwnProperty.call(input, "outputBudgetClassificationVersion")
+  if (hasBudgetClassificationVersion && (row.operation !== "authorize" ||
+      input.outputBudgetClassificationVersion !== OUTPUT_BUDGET_CLASSIFICATION_VERSION)) return null
   if (row.operation === "start") {
     const owner = parseOwner(input)
     if (!text(input.operationId) || input.startProtocolVersion !== 1 || !text(input.sessionId) || !text(input.turnId) || !text(input.stepId) || !text(input.featureKey) || !owner ||
@@ -89,13 +93,19 @@ function parseInput(value: unknown): RequestBody | null {
         !text(input.sessionId) || !text(input.turnId) || !text(input.stepId) || !text(input.featureKey) || !owner) return null
     if (Object.prototype.hasOwnProperty.call(input, "requestedOutputTokens") &&
         (!Number.isSafeInteger(input.requestedOutputTokens) || Number(input.requestedOutputTokens) < 1 || Number(input.requestedOutputTokens) > 2_147_483_647)) return null
-    return { operation: row.operation, input: {
-      userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, ...owner,
+    const commonInput = {
+      userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
       featureKey: input.featureKey,
       provider: input.provider, model: input.model, ...(text(input.attemptId) ? { attemptId: input.attemptId } : {}),
       ...(input.startProtocolVersion === 1 ? { startProtocolVersion: 1 as const } : {}),
       ...(Object.prototype.hasOwnProperty.call(input, "requestedOutputTokens") ? { requestedOutputTokens: Number(input.requestedOutputTokens) } : {}),
+    }
+    if (row.operation === "authorize") return { operation: "authorize", input: {
+      ...commonInput, ...owner,
+      ...(input.outputBudgetClassificationVersion === OUTPUT_BUDGET_CLASSIFICATION_VERSION
+        ? { outputBudgetClassificationVersion: OUTPUT_BUDGET_CLASSIFICATION_VERSION } : {}),
     } }
+    return { operation: "release", input: { ...commonInput, ...owner } }
   }
   if (!text(input.operationId) || (input.status !== "success" && input.status !== "error") ||
       !Object.prototype.hasOwnProperty.call(input, "inputTokens") || !nullableUsage(input.inputTokens, true) ||
@@ -108,8 +118,11 @@ function parseInput(value: unknown): RequestBody | null {
   } }
 }
 
-function failure(error: unknown): NextResponse {
-  if (error instanceof UsageBrokerError) return NextResponse.json({ error: error.code, code: error.code }, { status: error.status })
+function failure(error: unknown, outputBudgetClassificationVersion?: 1): NextResponse {
+  if (error instanceof UsageBrokerError) return NextResponse.json({ error: error.code, code: error.code,
+    ...(outputBudgetClassificationVersion === OUTPUT_BUDGET_CLASSIFICATION_VERSION && error.outputBudgetDisposition
+      ? { outputBudgetClassificationVersion: OUTPUT_BUDGET_CLASSIFICATION_VERSION,
+        outputBudgetDisposition: error.outputBudgetDisposition } : {}) }, { status: error.status })
   return NextResponse.json({ error: "usage_broker_unavailable", code: "usage_broker_unavailable" }, { status: 503 })
 }
 
@@ -144,8 +157,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       // platform credential or a user-owned key; never accept this from the Worker.
       credentialSource: trusted.credentialSource ?? (trusted.apiKey ? "user" : "platform"),
     })
-    return NextResponse.json({ status: "authorized", ...result })
+    return NextResponse.json({ status: "authorized", ...result,
+      ...(body.input.outputBudgetClassificationVersion === OUTPUT_BUDGET_CLASSIFICATION_VERSION
+        ? { outputBudgetClassificationVersion: OUTPUT_BUDGET_CLASSIFICATION_VERSION } : {}) })
   } catch (error: unknown) {
-    return failure(error)
+    return failure(error, body.operation === "authorize" ? body.input.outputBudgetClassificationVersion : undefined)
   }
 }

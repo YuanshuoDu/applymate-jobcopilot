@@ -1,4 +1,5 @@
 import { Prisma } from "@prisma/client"
+import { classifyRootOutputBudget, readLegacyRootOutputBudgetRemaining, type RootOutputBudgetDisposition } from "./root-output-budget-classification"
 
 export type RootUsageOwner =
   | { kind: "turn"; leaseOwnerId: string; leaseVersion: number }
@@ -19,7 +20,7 @@ export type RootUsageReservationRef = {
 export type RootOutputAdmission = { required: false; maxOutputTokens: null } | { required: true; maxOutputTokens: number }
 
 export class RootUsageReservationError extends Error {
-  constructor(readonly code: string, readonly status = 409) { super(code); this.name = "RootUsageReservationError" }
+  constructor(readonly code: string, readonly status = 409, readonly outputBudgetDisposition?: RootOutputBudgetDisposition) { super(code); this.name = "RootUsageReservationError" }
 }
 
 const ACTIVE_TURN = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"]
@@ -148,7 +149,7 @@ export async function lockRootUsageReservationScope(tx: RootUsageQuery, row: Roo
 export async function reserveRootOutputTokens(
   tx: RootUsageQuery,
   scope: RootUsageScope,
-  input: { operationId: string; attemptId: string; provider: string; model: string; requestedOutputTokens?: number; startProtocolVersion: 0 | 1 },
+  input: { operationId: string; attemptId: string; provider: string; model: string; requestedOutputTokens?: number; startProtocolVersion: 0 | 1; outputBudgetClassificationVersion?: 1 },
 ): Promise<RootOutputAdmission> {
   const limit = outputLimit(scope.budgetSnapshot)
   const strict = limit !== null
@@ -162,15 +163,15 @@ export async function reserveRootOutputTokens(
     if (!SUPPORTED_OUTPUT_ROUTES.has(input.provider)) throw new RootUsageReservationError("output_route_unsupported", 403)
     const requested = input.requestedOutputTokens
     if (typeof requested !== "number" || !Number.isSafeInteger(requested) || requested < 1 || requested > 2_147_483_647) throw new RootUsageReservationError("output_reservation_unknown", 403)
-    const sums = await tx.$queryRaw<Array<{ used: number | bigint | string }>>(Prisma.sql`
-      SELECT COALESCE(SUM(CASE WHEN "status" = 'settled' THEN "actualOutputTokens" ELSE "reservedOutputTokens" END), 0)::bigint AS "used"
-      FROM "agent_root_usage_reservations"
-      WHERE "userId" = ${scope.userId} AND "sessionId" = ${scope.sessionId} AND "turnId" = ${scope.turnId}
-        AND "rootTaskId" = ${scope.rootTaskId} AND "status" IN ('reserved', 'started', 'settled')`)
-    const used = safeCount(sums[0]?.used ?? 0)
-    const remaining = limit! - used
-    if (remaining <= 0) throw new RootUsageReservationError("output_budget_exhausted", 429)
-    maxOutputTokens = Math.min(requested, remaining)
+    if (input.outputBudgetClassificationVersion === 1) {
+      const classification = await classifyRootOutputBudget(tx, scope, limit!, safeCount)
+      if (classification.disposition) throw new RootUsageReservationError("output_budget_exhausted", 429, classification.disposition)
+      maxOutputTokens = Math.min(requested, classification.remaining)
+    } else {
+      const remaining = await readLegacyRootOutputBudgetRemaining(tx, scope, limit!, safeCount)
+      if (remaining <= 0) throw new RootUsageReservationError("output_budget_exhausted", 429)
+      maxOutputTokens = Math.min(requested, remaining)
+    }
     required = true
   }
   await tx.$queryRaw(Prisma.sql`

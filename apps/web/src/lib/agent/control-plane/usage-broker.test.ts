@@ -262,6 +262,23 @@ describe("AI usage broker", () => {
     expect(inserted.values).toEqual(expect.arrayContaining([input.userId, input.featureKey, input.provider, input.model]))
   })
 
+  it("does not change the deterministic admission identity when only classification is negotiated", async () => {
+    mocked.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 2 } })
+    const strict = { ...input, startProtocolVersion: 1 as const, requestedOutputTokens: 80 }
+    const resultFor = async (admission: UsageAdmissionInput) => {
+      const { db } = database(async (...args) => {
+        const text = sqlText(args[0])
+        if (text.includes("INSERT INTO ai_usage_events")) return [{ id: "agent-usage-inserted" }]
+        if (text.includes("UPDATE ai_budgets SET used")) return [{ used: 1 }]
+        return []
+      }, false, admission)
+      return admitAiUsage(db, admission, new Date("2026-09-07T12:00:00.000Z"))
+    }
+    const legacy = await resultFor(strict)
+    const negotiated = await resultFor({ ...strict, outputBudgetClassificationVersion: 1 })
+    expect(negotiated.operationId).toBe(legacy.operationId)
+  })
+
   it("admits inside a caller-owned transaction without opening a nested transaction", async () => {
     mocked.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 2 } })
     let step = 0

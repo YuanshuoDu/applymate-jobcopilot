@@ -15,6 +15,7 @@ import {
   startRootOutputReservation,
   type RootUsageReservationRef,
 } from "./agent-root-usage-reservations"
+import type { RootOutputBudgetDisposition } from "./root-output-budget-classification"
 
 export type UsageBrokerQuery = { $queryRaw<T>(query: Prisma.Sql): Promise<T> }
 export type UsageBrokerDatabase = { $transaction<T>(work: (tx: UsageBrokerQuery) => Promise<T>): Promise<T> }
@@ -25,17 +26,17 @@ type UsageAdmissionCommon = {
   /** Resolved by the trusted route from the server-side AI configuration. */
   credentialSource?: "platform" | "user"
 }
-export type UsageAdmissionInput = UsageAdmissionCommon & UsageAdmissionOwnerInput
-export type UsageReleaseInput = UsageAdmissionInput & { status: "released" }
+export type UsageAdmissionInput = UsageAdmissionCommon & { outputBudgetClassificationVersion?: 1 } & UsageAdmissionOwnerInput
+export type UsageReleaseInput = UsageAdmissionCommon & UsageAdmissionOwnerInput & { status: "released" }
 export type UsageSettlementInput = UsageReleaseInput | {
   operationId: string; userId: string; provider: string; model: string; status: "success" | "error"
   inputTokens: number | null; outputTokens: number | null; estimatedCostUsd: number | null; errorCode?: string
 }
-export type UsageStartInput = UsageAdmissionInput & { operationId: string; startProtocolVersion: 1 }
+export type UsageStartInput = UsageAdmissionCommon & UsageAdmissionOwnerInput & { operationId: string; startProtocolVersion: 1 }
 export type UsageStartResult = { startProtocolVersion: 1; outputReservationRequired: boolean; maxOutputTokens: number | null }
 export type UsageAdmissionResult = { operationId: string; startProtocolVersion: 0 | 1; outputReservationRequired: boolean; maxOutputTokens: number | null }
 export class UsageBrokerError extends Error {
-  constructor(readonly code: string, readonly status: number, message = code) { super(message); this.name = "UsageBrokerError" }
+  constructor(readonly code: string, readonly status: number, message = code, readonly outputBudgetDisposition?: RootOutputBudgetDisposition) { super(message); this.name = "UsageBrokerError" }
 }
 
 function month(now: Date): string { return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}` }
@@ -49,7 +50,7 @@ function ownerFor(input: UsageAdmissionInput): UsageExecutionOwner {
   try { return normalizeUsageOwner(input) }
   catch (error: unknown) { if (error instanceof UsageOwnerFenceError) throw new UsageBrokerError("usage_fence_rejected", 409); throw error }
 }
-function rootError(error: unknown): never { if (error instanceof RootUsageReservationError) throw new UsageBrokerError(error.code, error.status); throw error }
+function rootError(error: unknown): never { if (error instanceof RootUsageReservationError) throw new UsageBrokerError(error.code, error.status, error.message, error.outputBudgetDisposition); throw error }
 function rejectExisting(row: { id: string; status: string; userId: string | null; provider: string; model: string }, input: UsageAdmissionInput): never {
   if (row.userId !== input.userId || row.provider !== input.provider || row.model !== input.model) throw new UsageBrokerError("usage_attempt_conflict", 409)
   if (row.status === "released") throw new UsageBrokerError("usage_attempt_released", 409)
@@ -88,7 +89,8 @@ export async function admitAiUsageInTransaction(tx: UsageBrokerQuery, input: Usa
     const previous = await findRootOutputReservation(tx, id, input.userId)
     if (previous) rejectExisting({ id, status: previous.status, userId: previous.userId, provider: previous.provider, model: previous.model }, input)
     const output = await reserveRootOutputTokens(tx, scope, { operationId: id, attemptId: input.attemptId ?? "1",
-      provider: input.provider, model: input.model, requestedOutputTokens: input.requestedOutputTokens, startProtocolVersion })
+      provider: input.provider, model: input.model, requestedOutputTokens: input.requestedOutputTokens, startProtocolVersion,
+      ...(input.outputBudgetClassificationVersion === 1 ? { outputBudgetClassificationVersion: 1 as const } : {}) })
     const existing = await tx.$queryRaw<Array<{ id: string; status: string; userId: string | null; provider: string; model: string }>>(Prisma.sql`
       SELECT id, user_id AS "userId", provider, model, status FROM ai_usage_events WHERE id = ${id} FOR UPDATE`)
     if (existing[0]) rejectExisting(existing[0], input)

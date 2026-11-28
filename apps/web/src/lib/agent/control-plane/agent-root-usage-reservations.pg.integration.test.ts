@@ -70,12 +70,12 @@ function owner(taskIndex: number) {
   return { kind: "task" as const, taskId: ids.tasks[taskIndex]!, rootTaskId: ids.root, ownerId: `worker-${taskIndex}`, attemptCount: 1 }
 }
 
-async function admit(taskIndex: number, operationId = operationIds[taskIndex]!) {
+async function admit(taskIndex: number, operationId = operationIds[taskIndex]!, outputBudgetClassificationVersion?: 1) {
   return runtimeTransaction(ids.user, async tx => {
     const locked = await lockRootUsageAdmissionScope(tx, scope(taskIndex), owner(taskIndex))
     const admitted = await reserveRootOutputTokens(tx, locked, {
       operationId, attemptId: `attempt-${taskIndex}`, provider: "minimax", model: "MiniMax-M3", requestedOutputTokens: 80,
-      startProtocolVersion: 1,
+      startProtocolVersion: 1, ...(outputBudgetClassificationVersion === 1 ? { outputBudgetClassificationVersion: 1 as const } : {}),
     })
     return { ...admitted, operationId }
   })
@@ -159,7 +159,7 @@ describePg("Root output-token reservations on disposable PostgreSQL", () => {
   })
 
   it("serializes sibling reservations and retains a started unknown-usage hold under tenant RLS", async () => {
-    const results = await Promise.all([admit(0), admit(1)])
+    const results = await Promise.all([admit(0), admit(1, operationIds[1], 1)])
     expect(results.map(value => value.maxOutputTokens).sort((a, b) => Number(a) - Number(b))).toEqual([20, 80])
 
     const admitted = results.find(value => value.maxOutputTokens === 80)!
@@ -174,12 +174,35 @@ describePg("Root output-token reservations on disposable PostgreSQL", () => {
       await settleRootOutputReservation(tx, row!, { status: "error", outputTokens: null, errorCode: "provider_error" })
     })
 
-    await expect(admit(2)).rejects.toMatchObject({ code: "output_budget_exhausted" })
+    await expect(admit(2)).rejects.toMatchObject({ code: "output_budget_exhausted", status: 429 })
+    await expect(admit(2, operationIds[2], 1)).rejects.toMatchObject({ code: "output_budget_exhausted", status: 429,
+      outputBudgetDisposition: "active_reservation_hold" })
     const persisted = await runtimeTransaction(ids.user, tx => findRootOutputReservation(tx, admitted.operationId, ids.user))
     expect(persisted).toMatchObject({ status: "started", actualOutputTokens: null, outcomeStatus: "error" })
+    const reservations = await runtimeTransaction(ids.user, tx => tx.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS "count" FROM "agent_root_usage_reservations"
+      WHERE "userId" = ${ids.user} AND "sessionId" = ${ids.session} AND "turnId" = ${ids.turn} AND "rootTaskId" = ${ids.root}`))
+    expect(reservations[0]?.count).toBe(BigInt(2))
     await expect(runtimeTransaction(ids.otherUser, tx => findRootOutputReservation(tx, admitted.operationId, ids.otherUser))).resolves.toBeNull()
     await expect(runtimeTransaction(ids.otherUser, tx => lockRootUsageAdmissionScope(tx, {
       ...scope(0), userId: ids.otherUser,
     }, owner(0)))).rejects.toMatchObject({ code: "usage_fence_rejected" })
+
+    const otherAdmitted = results.find(value => value.operationId !== admitted.operationId)!
+    const otherRow = await runtimeTransaction(ids.user, tx => findRootOutputReservation(tx, otherAdmitted.operationId, ids.user))
+    expect(otherRow).not.toBeNull()
+    await runtimeTransaction(ids.user, async tx => {
+      await lockRootUsageReservationScope(tx, row!)
+      await settleRootOutputReservation(tx, row!, { status: "error", outputTokens: 80, errorCode: "provider_error" })
+      await lockRootUsageReservationScope(tx, otherRow!)
+      await startRootOutputReservation(tx, otherRow!)
+      await settleRootOutputReservation(tx, otherRow!, { status: "success", outputTokens: 20, errorCode: null })
+    })
+    await expect(admit(2, operationIds[2], 1)).rejects.toMatchObject({ code: "output_budget_exhausted", status: 429,
+      outputBudgetDisposition: "settled_exhausted" })
+    const finalReservations = await runtimeTransaction(ids.user, tx => tx.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS "count" FROM "agent_root_usage_reservations"
+      WHERE "userId" = ${ids.user} AND "sessionId" = ${ids.session} AND "turnId" = ${ids.turn} AND "rootTaskId" = ${ids.root}`))
+    expect(finalReservations[0]?.count).toBe(BigInt(2))
   })
 })
