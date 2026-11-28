@@ -8,6 +8,7 @@ import { NoProgressError } from "../progress.js"
 import { commitTurnNoProgress, matchedTaskGraphDenialCheckpoint, terminalizeNoProgressFailure, terminalizeTurnExecutionError, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminalization.js"
 import { TurnEngineError } from "./turn-engine-types.js"
 import { stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
+import { createWorkerUsageAuthorizer, UsageBridgeError } from "../../queue/ai-usage-bridge.js"
 
 const { cleanupMock } = vi.hoisted(() => ({ cleanupMock: vi.fn(async () => undefined) }))
 vi.mock("../subagents/task-graph-pg-root-failure-cleanup.js", () => ({ cleanupFailedRootTaskGraph: cleanupMock }))
@@ -131,6 +132,73 @@ describe("atomic no-progress terminalization", () => {
     const failed = events.find(event => event.type === "turn.failed")
     expect(failed?.payload).toMatchObject({ errorCode: "discovery_memory_overflow", final: { response: recovery, summary: recovery } })
     expect(JSON.stringify({ result, final, finalItemContent, events })).not.toContain(privateValue)
+  })
+
+  it.each([
+    ["configured_zero_limit", "root_output_budget_configured_zero_limit", "configured output limit is zero"],
+    ["settled_exhausted", "root_output_budget_settled_exhausted", "settled usage leaves no output allowance"],
+    ["active_reservation_hold", "root_output_budget_active_reservation_hold", "holds the remaining allowance"],
+  ] as const)("persists a negotiated Root budget outcome as fixed code %s", async (disposition, code, messageFragment) => {
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      code: "output_budget_exhausted", outputBudgetClassificationVersion: 1, outputBudgetDisposition: disposition,
+    }), { status: 429, headers: { "content-type": "application/json" } }))
+    const authorize = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher, outputBudgetClassificationVersion: 1 })
+    let error: unknown
+    try {
+      await authorize({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId: "step-budget",
+        leaseOwnerId: owner.ownerId, leaseVersion: owner.leaseVersion, featureKey: "agent", provider: "minimax", model: "MiniMax-M3" })
+    } catch (caught: unknown) { error = caught }
+
+    const events: Array<{ type: string; payload: unknown }> = []
+    let persistedResponse = ""
+    const writer = {
+      startItem: vi.fn(async (item: { id: string; type: string; phase: string }) => ({ ...item, revision: 0 })),
+      completeItem: vi.fn(async () => undefined),
+      append: vi.fn(async (type: string, _correlationId: string, _itemId: string | null, payload: unknown) => { events.push({ type, payload }) }),
+    }
+    const result = await terminalizeTurnExecutionError({
+      error, options: { identity: owner, goal: "Find jobs", store: { recordFinalResponse: vi.fn(async (input: { response: string }) => { persistedResponse = input.response }) } } as unknown as TurnExecutionOptions,
+      writer: writer as never, signal: new AbortController().signal, lastStep: { id: "step-budget", ordinal: 0 }, stepOpen: false,
+      stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, now: () => now,
+      inputThroughSequence: 0n, consumedInputIds: [],
+    })
+
+    expect(result).toMatchObject({ status: "failed", errorCode: code })
+    const final = JSON.parse(persistedResponse) as Record<string, unknown>
+    expect(final.response).toContain(messageFragment)
+    expect(final.next).toEqual([expect.stringContaining("before starting")])
+    expect(JSON.stringify(events)).toContain(code)
+    expect(JSON.stringify({ final, events })).not.toContain("outputBudgetDisposition")
+    expect(JSON.stringify({ final, events })).not.toContain("private server detail")
+  })
+
+  it("keeps untrusted, legacy, and child budget errors on the existing failure code", async () => {
+    const run = async (identity: unknown, error: unknown) => {
+      const writer = {
+        startItem: vi.fn(async (item: { id: string; type: string; phase: string }) => ({ ...item, revision: 0 })),
+        completeItem: vi.fn(async () => undefined), append: vi.fn(async () => undefined),
+      }
+      return terminalizeTurnExecutionError({
+        error, options: { identity, goal: "Find jobs", store: {} } as unknown as TurnExecutionOptions,
+        writer: writer as never, signal: new AbortController().signal, lastStep: { id: "step-budget", ordinal: 0 }, stepOpen: false,
+        stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, now: () => now,
+        inputThroughSequence: 0n, consumedInputIds: [],
+      })
+    }
+    const trustedResponse = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      code: "output_budget_exhausted", outputBudgetClassificationVersion: 1, outputBudgetDisposition: "active_reservation_hold",
+    }), { status: 429, headers: { "content-type": "application/json" } }))
+    const authorize = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: trustedResponse, outputBudgetClassificationVersion: 1 })
+    let trustedError: unknown
+    try {
+      await authorize({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId: "step-budget",
+        leaseOwnerId: owner.ownerId, leaseVersion: owner.leaseVersion, featureKey: "agent", provider: "minimax", model: "MiniMax-M3" })
+    } catch (caught: unknown) { trustedError = caught }
+
+    await expect(run(owner, new UsageBridgeError("output_budget_exhausted", "output_budget_exhausted", false, "settled_exhausted")))
+      .resolves.toMatchObject({ status: "failed", errorCode: "output_budget_exhausted" })
+    await expect(run({ ...owner, kind: "task", attemptCount: 1 }, trustedError))
+      .resolves.toMatchObject({ status: "failed", errorCode: "output_budget_exhausted" })
   })
 
   it.each([{ pending: true }, { staleStepFence: true }, { differentConsumedInputs: true }])("returns input_changed without terminal writes when the input or Step fence changed", async race => {

@@ -83,6 +83,7 @@ describe("production Worker runtime composition", () => {
     const childOptions = fixture.createOptionalProductionChildExecutor.mock.calls[0]?.[0]
     expect(childOptions?.subagentManager?.()).toBe(fixture.manager)
     expect(fixture.resolvedDependencies.createWorkerUsageAuthorizer).toHaveBeenCalledOnce()
+    expect(fixture.resolvedDependencies.createWorkerUsageAuthorizer).toHaveBeenCalledWith(undefined)
     expect(fixture.resolvedDependencies.createCanonicalExecutionProjection).toHaveBeenCalledWith(fixture.pool)
     expect(fixture.resolvedDependencies.createCanonicalSessionProjection).toHaveBeenCalledWith(fixture.pool)
     expect(fixture.resolvedDependencies.createCanonicalTurnRuntime).toHaveBeenCalledWith(fixture.pool, {
@@ -101,6 +102,25 @@ describe("production Worker runtime composition", () => {
     expect(startupOptions?.startAgentRunWorker).toBe(startAgentRunWorker)
     expect(onBootstrapReady).not.toHaveBeenCalled()
     expect(startAgentRunWorker).not.toHaveBeenCalled()
+  })
+
+  it("opts the Root authorizer into output-budget classification only behind its explicit gate", async () => {
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: false, childExecutionEnabled: true, coordinationEnabled: false,
+      consumeWaitOutcomes: false, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+      outputBudgetClassificationEnabled: true,
+    }
+    const fixture = dependencies()
+
+    await startProductionWorkerRuntime({
+      pool: fixture.pool, workerId: "worker_budget_fixture", productionFlags: flags, startAgentRunWorker: vi.fn(),
+    }, fixture.resolvedDependencies)
+
+    expect(fixture.resolvedDependencies.createWorkerUsageAuthorizer).toHaveBeenCalledWith({ outputBudgetClassificationVersion: 1 })
+    expect(fixture.resolvedDependencies.createOptionalProductionChildExecutor).toHaveBeenCalledWith(expect.objectContaining({
+      enabled: true, pool: fixture.pool, subagentManager: expect.any(Function),
+    }))
+    expect(fixture.createOptionalProductionChildExecutor.mock.calls[0]?.[0]).not.toHaveProperty("authorizeUsage")
   })
 
   it("omits disabled child and wait consumers while preserving the resolved flags", async () => {

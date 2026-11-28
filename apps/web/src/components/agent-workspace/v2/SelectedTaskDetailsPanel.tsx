@@ -13,6 +13,7 @@ import { taskInterruptEventVersion, TaskInterruptControl, flattenTaskTree } from
 import { projectSelectedTaskInterrupt, type SupervisorTurnSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
 import type { TaskTreeNode } from './types'
+import { rootOutputBudgetFailureText } from './root-output-budget-failure'
 
 export interface SelectedTaskDetailsPanelProps {
   readonly sessionId: string
@@ -32,7 +33,7 @@ export interface SelectedTaskDetailsPanelProps {
 }
 
 export function SelectedTaskDetailsPanel(props: SelectedTaskDetailsPanelProps) {
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
   const { selectedNode, selectedWorker } = props
   const taskNodeIds = useMemo(() => new Set(flattenTaskTree(props.treeNodes)
     .filter(node => node.kind === 'task').map(node => node.id.slice('task:'.length))), [props.treeNodes])
@@ -40,6 +41,7 @@ export function SelectedTaskDetailsPanel(props: SelectedTaskDetailsPanelProps) {
   const interrupt = projectSelectedTaskInterrupt(props.tasks, props.turns, selectedNode, props.items)
   const interruptVersion = interrupt ? taskInterruptEventVersion(props.items, interrupt.task.id) : null
   const selectedTaskId = selectedNode.kind === 'task' ? selectedNode.id.slice('task:'.length) : undefined
+  const selectedDetail = rootOutputBudgetFailureText(selectedNode.detail, lang) ?? selectedNode.detail
   const writerDraft = selectedWorkerDraftForSelection(props.sessionId, selectedNode, selectedWorker, props.tasks)
   const selectTarget = (taskId: string) => selectAuthorizedWaitTarget(taskId, taskNodeIds, props.onSelectNode)
 
@@ -48,7 +50,7 @@ export function SelectedTaskDetailsPanel(props: SelectedTaskDetailsPanelProps) {
       <div style={{ display: 'grid', gap: 4 }}>
         <strong style={{ fontSize: 12, overflowWrap: 'anywhere' }}>{selectedNode.label}</strong>
         <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{t('agent.status')}: {statusLabel(selectedNode.status, t)}</span>
-        {selectedNode.detail && <span style={{ color: 'var(--c-danger)', fontSize: 10, overflowWrap: 'anywhere' }}>{selectedNode.detail}</span>}
+        {selectedDetail && <span style={{ color: 'var(--c-danger)', fontSize: 10, overflowWrap: 'anywhere' }}>{selectedDetail}</span>}
         {selectedNode.resultAvailable && <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{t('agent.toolResult')}</span>}
       </div>
       {selectedWorker && <AgentTaskWaitDetailsCard

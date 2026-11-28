@@ -431,6 +431,21 @@ describe("createPgRootTaskStore", () => {
     expect(fake.calls).toContain("ROLLBACK")
   })
 
+  it("persists only the fixed classified Root budget code through the current owner fence", async () => {
+    const fake = fakePool()
+    const code = "root_output_budget_active_reservation_hold"
+    await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: {
+      status: "failed", errorCode: code, stepCount: 2, toolCallCount: 1,
+    } })
+
+    const update = fake.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))
+    expect(update?.[0]).toContain('"leaseOwner" = $8 AND "attemptCount" = 1 AND "status" = \'running\'')
+    expect(update?.[1]?.[0]).toBe("failed")
+    expect(update?.[1]?.[1]).toBe(JSON.stringify({ status: "failed", stepCount: 2, toolCallCount: 1, finalItemId: null, waitId: null }))
+    expect(update?.[1]?.[2]).toBe(code)
+    expect(String(update?.[1]?.[2])).not.toContain("reservation id")
+  })
+
   it("leaves same-root descendants alone when no durable TaskGraph proposal exists", async () => {
     const fake = graphTerminalPool(false)
     await createPgRootTaskStore(fake.pool).finish({

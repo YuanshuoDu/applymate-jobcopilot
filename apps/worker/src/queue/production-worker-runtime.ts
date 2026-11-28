@@ -17,7 +17,7 @@ export type ProductionWorkerRuntimeDependencies = {
     pool: pg.Pool,
     options: CanonicalTurnRuntimeOptions,
   ) => ReturnType<typeof import("../runtime/canonical-turn-runtime.js").createCanonicalTurnRuntime>
-  readonly createWorkerUsageAuthorizer: () => NonNullable<CanonicalTurnRuntimeOptions["authorizeUsage"]>
+  readonly createWorkerUsageAuthorizer: (options?: { readonly outputBudgetClassificationVersion?: 1 }) => NonNullable<CanonicalTurnRuntimeOptions["authorizeUsage"]>
   readonly createCanonicalExecutionProjection: (
     pool: pg.Pool,
   ) => NonNullable<CanonicalTurnRuntimeOptions["executionProjection"]>
@@ -51,7 +51,8 @@ export async function startProductionWorkerRuntime(
     createRuntime: async () => {
       const runtime = await dependencies.createCanonicalTurnRuntime(pool, {
         workerId: input.workerId,
-        authorizeUsage: dependencies.createWorkerUsageAuthorizer(),
+        authorizeUsage: dependencies.createWorkerUsageAuthorizer(productionFlags.outputBudgetClassificationEnabled === true
+          ? { outputBudgetClassificationVersion: 1 } : undefined),
         productionFlags,
         executionProjection: dependencies.createCanonicalExecutionProjection(pool),
         sessionProjection: dependencies.createCanonicalSessionProjection(pool),

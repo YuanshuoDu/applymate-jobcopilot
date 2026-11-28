@@ -29,6 +29,21 @@ const item: TimelineItem = {
 }
 
 describe('SelectedTaskDetailsPanel', () => {
+  it('renders a localized Root budget stop without exposing its internal code', () => {
+    const rootNode: TaskTreeNode = {
+      id: 'task:root-1', kind: 'task', label: 'Find roles', status: 'failed',
+      detail: 'root_output_budget_active_reservation_hold',
+    }
+    const html = renderToStaticMarkup(<SelectedTaskDetailsPanel
+      sessionId="session-1" selectedNode={rootNode} selectedWorker={null} selectedTurn={null} selectedItem={undefined}
+      tasks={[]} turns={[]} items={[]} treeNodes={[rootNode]} lifecycleRevision={0}
+      onSelectNode={vi.fn()} onReturnToCurrent={vi.fn()} onAccepted={vi.fn()} onConflict={vi.fn()}
+    />)
+    expect(html).toContain('existing usage reservation holds the remaining allowance')
+    expect(html).toContain('not automatically replayed')
+    expect(html).not.toContain('root_output_budget_active_reservation_hold')
+  })
+
   it('keeps worker activity and interrupt controls beside the read-only wait card', () => {
     const html = renderToStaticMarkup(<SelectedTaskDetailsPanel
       sessionId="session-1" selectedNode={node} selectedWorker={child} selectedTurn={turn} selectedItem={item}

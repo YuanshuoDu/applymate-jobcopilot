@@ -8,6 +8,8 @@ export type ProductionAgentFlags = {
   readonly nativeSemanticProgressMemoryEnabled?: boolean
   readonly crossSessionRootTaskHistoryEnabled?: boolean
   readonly objectiveHistoryIndexEnabled?: boolean
+  /** Root-only negotiated output-budget failures; disabled unless explicitly enabled by operations. */
+  readonly outputBudgetClassificationEnabled?: boolean
 }
 
 /** Resolve server-owned production gates; model input and policy snapshots cannot change them. */
@@ -29,5 +31,6 @@ export function resolveProductionAgentFlags(env: Record<string, string | undefin
     nativeSemanticProgressMemoryEnabled: env.ENABLE_AGENT_NATIVE_SEMANTIC_PROGRESS_MEMORY === "1",
     crossSessionRootTaskHistoryEnabled: env.ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY === "1",
     objectiveHistoryIndexEnabled: env.ENABLE_AGENT_OBJECTIVE_HISTORY_INDEX === "1",
+    outputBudgetClassificationEnabled: env.ENABLE_AGENT_OUTPUT_BUDGET_CLASSIFICATION_V1 === "1",
   }
 }

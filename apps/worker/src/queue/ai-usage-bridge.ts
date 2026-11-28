@@ -68,6 +68,15 @@ export class UsageBridgeError extends Error {
   }
 }
 
+const NEGOTIATED_ROOT_OUTPUT_BUDGET_ERRORS = new WeakMap<UsageBridgeError, WorkerOutputBudgetDisposition>()
+
+/** Read classification only from the exact bridge error produced by a negotiated v1 Root authorization. */
+export function negotiatedRootOutputBudgetDisposition(error: unknown): WorkerOutputBudgetDisposition | undefined {
+  if (!(error instanceof UsageBridgeError) || error.code !== "output_budget_exhausted"
+    || !NEGOTIATED_ROOT_OUTPUT_BUDGET_ERRORS.has(error)) return undefined
+  return NEGOTIATED_ROOT_OUTPUT_BUDGET_ERRORS.get(error)
+}
+
 export async function settleWorkerUsage(authorization: WorkerUsageAuthorization, input: WorkerUsageSettlementInput): Promise<void> {
   if (input.inputTokens === null || input.outputTokens === null || input.estimatedCostUsd === null) {
     if (authorization.settleUnknown) return authorization.settleUnknown(input)
@@ -175,7 +184,9 @@ async function post(
         row.outputBudgetDisposition === "active_reservation_hold")
       ? row.outputBudgetDisposition
       : undefined
-    throw new UsageBridgeError(code, undefined, transient, disposition)
+    const error = new UsageBridgeError(code, undefined, transient, disposition)
+    if (disposition) NEGOTIATED_ROOT_OUTPUT_BUDGET_ERRORS.set(error, disposition)
+    throw error
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new UsageBridgeError("usage_broker_unavailable")
   return payload as Record<string, unknown>
@@ -214,13 +225,16 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
     requiredContext(input)
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
     const baseProtocolInput = protocolInput(input)
-    const authorizationInput = outputBudgetClassificationVersion === OUTPUT_BUDGET_CLASSIFICATION_VERSION
-      ? { ...baseProtocolInput, outputBudgetClassificationVersion }
+    const executionOwner = baseProtocolInput.executionOwner
+    const isRootOwner = !executionOwner || executionOwner.kind === "turn"
+    const negotiatedClassificationVersion = isRootOwner ? outputBudgetClassificationVersion : undefined
+    const authorizationInput = negotiatedClassificationVersion === OUTPUT_BUDGET_CLASSIFICATION_VERSION
+      ? { ...baseProtocolInput, outputBudgetClassificationVersion: negotiatedClassificationVersion }
       : baseProtocolInput
     let response: Record<string, unknown>
     try {
       response = await post(endpoint, secret, { operation: "authorize", input: authorizationInput }, fetcher, timeoutMs,
-        outputBudgetClassificationVersion)
+        negotiatedClassificationVersion)
     } catch (error: unknown) {
       if (error instanceof UsageBridgeError && error.code === "usage_broker_unavailable") await release(input).catch(() => undefined)
       throw error
