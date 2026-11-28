@@ -14974,11 +14974,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const safeListProjectionDiagnostic = (request: HarnessModelRequest): RecordValue => {
       const output = record(latestToolResult(request, postReviseListCallId))
       const tasks = Array.isArray(output?.tasks) ? output.tasks : null
+      const seattle = tasks?.map(record).find(task => task?.taskId === seattleTaskId) ?? null
       return {
         resultFound: output !== null,
         taskCount: tasks ? diagnosticBoundedCount(tasks.length) : null,
         taskStatuses: tasks ? tasks.slice(0, 8).map(task =>
           diagnosticEnum(record(task)?.status, TASK_DIAGNOSTIC_STATUSES) ?? "other") : [],
+        seattlePresent: seattle !== null,
+        seattleStatus: seattle ? diagnosticEnum(seattle.status, TASK_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
         expectedSeattleInterrupted: Boolean(tasks?.some(task => record(task)?.taskId === seattleTaskId
           && record(task)?.status === "interrupted")),
         expectedReplacementCompleted: Boolean(replacementTaskId && tasks?.some(task => record(task)?.taskId === replacementTaskId
