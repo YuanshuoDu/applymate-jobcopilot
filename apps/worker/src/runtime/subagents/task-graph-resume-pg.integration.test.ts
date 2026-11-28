@@ -7109,17 +7109,23 @@ describe("persisted TaskGraph wait scope", () => {
       id: "foreign-wait", status: "waiting", suspendedAt: new Date(), idempotencyKey: "same-key",
       userId: expectedScope.userId, sessionId: expectedScope.sessionId, turnId: "turn-1", parentTaskId: "foreign-parent",
     }
+    let foreignParentReturned = false
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
       expect(sql).toContain('AND "parentTaskId" = $4 AND "idempotencyKey" = $5 LIMIT 1')
       expect(values).toEqual([expectedScope.userId, expectedScope.sessionId, "turn-1", expectedScope.parentTaskId, "same-key"])
       const matched = values?.[3] === foreignWait.parentTaskId
+      foreignParentReturned = true
       return { rows: matched ? [foreignWait] : [], rowCount: matched ? 1 : 0 } as QueryResult<ScopedPersistedTaskWaitRow>
     })
     const pool = { query } as unknown as Pool
-
-    await expect(waitForPersistedTaskWait(pool, "turn-1", "same-key", 1, undefined, undefined, undefined, expectedScope))
-      .rejects.toThrow("Follow-up parent wait was not durably suspended")
-    expect(query).toHaveBeenCalledTimes(1)
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => foreignParentReturned ? 1 : 0)
+    try {
+      await expect(waitForPersistedTaskWait(pool, "turn-1", "same-key", 1, undefined, undefined, undefined, expectedScope))
+        .rejects.toThrow("Follow-up parent wait was not durably suspended")
+      expect(query).toHaveBeenCalledTimes(1)
+    } finally {
+      dateNowSpy.mockRestore()
+    }
   })
 })
 
