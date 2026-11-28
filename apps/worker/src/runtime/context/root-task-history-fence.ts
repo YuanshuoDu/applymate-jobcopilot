@@ -5,7 +5,7 @@ import type { TurnLease } from "../turns/lease.js"
 import { lockTaskGraphScope, type GraphScope } from "../subagents/task-graph-pg-state.js"
 import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
 import { isScheduledAutomationTurn, scheduledAutomationCriteria, type ScheduledAutomationCriteria } from "../subagents/scheduled-automation-snapshot.js"
-import { resolveRootTaskObjective, resolveRootTaskVerificationRequirements } from "./root-task-objective.js"
+import { resolveRootTaskObjective, resolveRootTaskSponsorshipTargetCountry, resolveRootTaskVerificationRequirements } from "./root-task-objective.js"
 import { readRootTaskHistoryChronologyWitness, type RootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
 import { rootTaskHistoryFootprintOrigin } from "./root-task-history-footprint-origin.js"
 
@@ -114,6 +114,8 @@ export function rootTaskHistoryObjectiveDigest(turnInput: unknown, root: Row, _i
   }))
   const requirements = resolveRootTaskVerificationRequirements(turnInput)
   if (requirements.status === "invalid") return undefined
+  const sponsorshipTargetCountry = resolveRootTaskSponsorshipTargetCountry(turnInput)
+  if (sponsorshipTargetCountry.status === "invalid") return undefined
   const verificationRequirements = requirements.status === "valid"
     ? [...requirements.requirements]
       .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
@@ -124,6 +126,8 @@ export function rootTaskHistoryObjectiveDigest(turnInput: unknown, root: Row, _i
   return digestNativeVerificationValue({
     goal: resolved.goal, criteria,
     verificationRequirements,
+    ...(sponsorshipTargetCountry.status === "valid"
+      ? { sponsorshipTargetCountry: sponsorshipTargetCountry.sponsorshipTargetCountry } : {}),
   })
 }
 

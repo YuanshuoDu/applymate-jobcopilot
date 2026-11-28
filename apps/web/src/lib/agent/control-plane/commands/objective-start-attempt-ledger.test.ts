@@ -116,6 +116,47 @@ describe("objective start attempt ledger", () => {
       .rejects.toMatchObject({ code: "objective_start_idempotency_conflict", status: 409 })
   })
 
+  it("binds a legacy accepted Objective receipt to its persisted target country", async () => {
+    const ireland = {
+      schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1",
+      countryCode: "IE",
+    } as const
+    const base = legacyInput()
+    const baseTurn = base.targetTurn as { input: Record<string, unknown> }
+    const persistedCountry = {
+      ...base,
+      targetTurn: { ...baseTurn, input: { ...baseTurn.input, sponsorshipTargetCountry: ireland } },
+    }
+    const makeTx = (legacy: unknown) => ({
+      agentObjectiveStartAttempt: {
+        findUnique: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockResolvedValue({}),
+      },
+      agentInput: { findMany: vi.fn().mockResolvedValue([legacy]) },
+      agentEvent: { findFirst: vi.fn().mockResolvedValue(legacyEvent()) },
+    })
+    const matching = { ...command, objective: "Find Dublin roles", sponsorshipTargetCountry: ireland }
+    const mismatched = { ...matching, sponsorshipTargetCountry: { ...ireland, countryCode: "US" as const } }
+
+    await expect(lookupAttemptForStart(
+      makeTx(persistedCountry) as unknown as CommandTransaction,
+      matching,
+      objectiveStartRequestHash(matching),
+    )).resolves.toEqual({ sessionId: "session_1", inputId: "input_1", turnId: "turn_1", sequence: "7" })
+    await expect(lookupAttemptForStart(
+      makeTx(persistedCountry) as unknown as CommandTransaction,
+      mismatched,
+      objectiveStartRequestHash(mismatched),
+    )).rejects.toMatchObject({ code: "objective_start_idempotency_conflict", status: 409 })
+
+    const countrylessTx = makeTx(base)
+    const countryless = { ...command, objective: "Find Dublin roles" }
+    await expect(lookupAttemptForStart(
+      countrylessTx as unknown as CommandTransaction,
+      countryless,
+      objectiveStartRequestHash(countryless),
+    )).resolves.toEqual({ sessionId: "session_1", inputId: "input_1", turnId: "turn_1", sequence: "7" })
+  })
   it("reads a verified legacy Objective receipt without writing an adoption row", async () => {
     const ledgerFindUnique = vi.fn().mockResolvedValue(null)
     const findMany = vi.fn().mockResolvedValue([legacyInput()])

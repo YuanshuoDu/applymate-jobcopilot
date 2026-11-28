@@ -34,6 +34,10 @@
       "types": "./dist/agent-location-normalization.d.ts",
       "default": "./dist/agent-location-normalization.js"
     },
+    "./objective-sponsorship-target-country": {
+      "types": "./dist/objective-sponsorship-target-country.d.ts",
+      "default": "./dist/objective-sponsorship-target-country.js"
+    },
     "./agent-redaction": {
       "types": "./dist/agent-redaction.d.ts",
       "default": "./dist/agent-redaction.js"

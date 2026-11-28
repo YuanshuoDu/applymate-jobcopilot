@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
+import { canonicalJson } from "@jobcopilot/shared"
 
 import { objectiveStartRequestHash, samePersistedJson } from "./objective-start-attempt-request-identity"
 import type { ObjectiveStartCommand } from "./types"
@@ -38,6 +40,24 @@ describe("objective start request identity", () => {
     expect(objectiveStartRequestHash({ ...ordered, content: [ordered.content[0], { type: "text", text: "Changed" }] })).not.toBe(objectiveStartRequestHash(ordered))
   })
 
+  it("preserves the pre-country hash for omitted values and distinguishes explicit target countries", () => {
+    const legacyCanonical = {
+      sessionId: command.sessionId,
+      objective: command.objective.trim(),
+      content: command.content,
+      verificationRequirements: { present: false },
+    }
+    const expectedLegacyHash = createHash("sha256")
+      .update(canonicalJson(JSON.parse(JSON.stringify(legacyCanonical))))
+      .digest("hex")
+
+    expect(objectiveStartRequestHash(command)).toBe(expectedLegacyHash)
+    const ireland = { schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1", countryCode: "IE" } as const
+    const unitedStates = { ...ireland, countryCode: "US" } as const
+    expect(objectiveStartRequestHash({ ...command, sponsorshipTargetCountry: ireland })).not.toBe(expectedLegacyHash)
+    expect(objectiveStartRequestHash({ ...command, sponsorshipTargetCountry: ireland }))
+      .not.toBe(objectiveStartRequestHash({ ...command, sponsorshipTargetCountry: unitedStates }))
+  })
   it("keeps optional JSON fields persistence-compatible while retaining the requirements sentinel", () => {
     const withUndefinedFilename = {
       ...command,

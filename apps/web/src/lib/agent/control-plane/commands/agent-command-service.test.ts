@@ -457,6 +457,27 @@ describe("AgentCommandService", () => {
     expect(foreign.state.outbox).toHaveLength(0)
   })
 
+  it("keeps the first explicit country when two Objective starts race on one Session", async () => {
+    const fake = makeDb({ sessionStatus: "running" })
+    const service = new ObjectiveStartCommandService(fake.db)
+    const ireland = {
+      schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1",
+      countryCode: "IE",
+    } as const
+    const unitedStates = { ...ireland, countryCode: "US" } as const
+
+    const results = await Promise.allSettled([
+      service.start({ ...objectiveStartCommand("objective_country_ie"), sponsorshipTargetCountry: ireland }),
+      service.start({ ...objectiveStartCommand("objective_country_us"), sponsorshipTargetCountry: unitedStates }),
+    ])
+
+    expect(results[0]).toMatchObject({ status: "fulfilled", value: { disposition: "started" } })
+    expect(results[1]).toMatchObject({ status: "rejected", reason: { code: "retry_active_conflict", status: 409 } })
+    expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.turns[0]?.input).toMatchObject({ sponsorshipTargetCountry: ireland })
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
   it("serializes concurrent same-key objective starts and rolls failed dispatch back", async () => {
     const concurrent = makeDb({ sessionStatus: "running" })
     const service = new ObjectiveStartCommandService(concurrent.db)
@@ -1174,6 +1195,27 @@ describe("AgentCommandService", () => {
     expect(fake.state.active?.input).toMatchObject({ goal: "Retry discovery", content, intent })
   })
 
+  it("preserves the selected sponsorship country on an Objective retry", async () => {
+    const sponsorshipTargetCountry = {
+      schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1",
+      countryCode: "IE",
+    } as const
+    const input = {
+      goal: "Find eligible roles",
+      content: [...content],
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      sponsorshipTargetCountry,
+    }
+    const fake = makeDb({ retryTarget: retryTarget("failed", input, "user", "canonical_task_graph") })
+
+    await new AgentCommandService(fake.db).retry(retryCommand("retry_objective_country"))
+
+    expect(fake.state.active?.input).toMatchObject({
+      goal: "Find eligible roles",
+      intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT,
+      sponsorshipTargetCountry,
+    })
+  })
   it("preserves objective intent and verification requirements on the retry successor", async () => {
     vi.stubEnv("AGENT_OBJECTIVE_LOCATION_VERIFICATION_ENABLED", "0")
     const verificationRequirements = {

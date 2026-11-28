@@ -293,4 +293,20 @@ describe("root task history current fence", () => {
     await expect(readRootTaskHistoryFence(invalidRequirements.client, invalidRequirements.input)).resolves.toBeUndefined()
     expect(invalidRequirements.queries.some(sql => sql.includes("turn.started"))).toBe(false)
   })
+  it("keeps selected sponsorship country inside exact objective history identity", () => {
+    const root = { goal: "Plan a role", successCriteria: ["Compare roles"] }
+    const base = { goal: root.goal, successCriteria: root.successCriteria, intent: OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT }
+    const target = (countryCode: string) => ({
+      schemaVersion: "agent-harness.v2.objective-sponsorship-target-country.v1",
+      countryCode,
+    })
+    const absent = rootTaskHistoryObjectiveDigest(base, root)
+    const ireland = rootTaskHistoryObjectiveDigest({ ...base, sponsorshipTargetCountry: target("IE") }, root)
+    const unitedStates = rootTaskHistoryObjectiveDigest({ ...base, sponsorshipTargetCountry: target("US") }, root)
+    expect(absent).toBeDefined()
+    expect(ireland).not.toBe(absent)
+    expect(unitedStates).not.toBe(ireland)
+    expect(rootTaskHistoryObjectiveDigest({ ...base, sponsorshipTargetCountry: target("XK") }, root)).toBeUndefined()
+  })
+
 })

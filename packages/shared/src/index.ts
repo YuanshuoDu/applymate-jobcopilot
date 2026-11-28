@@ -41,6 +41,14 @@ export {
   sortUniqueAgentSourceMaterialFenceUserIds,
 } from "./agent-source-material-fence.js";
 export { normalizeAgentLocation, normalizeAgentLocationAllowlist } from "./agent-location-normalization.js";
+export {
+  ISO_3166_1_ALPHA_2_CODES,
+  OBJECTIVE_SPONSORSHIP_TARGET_COUNTRY_SCHEMA_VERSION,
+  isIso3166Alpha2CountryCode,
+  parseObjectiveSponsorshipTargetCountry,
+  type Iso3166Alpha2CountryCode,
+  type ObjectiveSponsorshipTargetCountry,
+} from "./objective-sponsorship-target-country.js";
 export { normalizeExternalApiErrorCode, sharedExternalApiErrorCode, type ExternalApiErrorCode, type SharedExternalApiUsage, recordSharedExternalApiUsage } from "./external-api-usage.js";
 export { getAzureManagementToken, type AzureManagementTokenCredential } from "./azure-management.js";
 export { canonicalJson, CanonicalJsonError, hashContent } from "./canonical-json.js";
