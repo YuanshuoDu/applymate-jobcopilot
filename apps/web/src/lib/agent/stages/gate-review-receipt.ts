@@ -35,7 +35,7 @@ export async function findGateReviewReceiptReplay(ctx: PipelineCtx, pkg: Applica
 async function buildGateReviewReceiptInput(ctx: PipelineCtx, pkg: ApplicationPackage, projectedWaitAlreadyIssued: boolean, scheduledGate: boolean) {
   const { sessionId, turnId } = ctx
   if (!sessionId || !turnId || !ctx.executionAttempt || ctx.signal?.aborted) throw new AgentExecutionCancelledError()
-  if (scheduledGate && !ctx.scheduledTaskGraphOwnerFence) throw new AgentExecutionCancelledError()
+  if (scheduledGate && !ctx.scheduledTaskGraphOwnerFence?.sourceHooks) throw new AgentExecutionCancelledError()
   const gateTaskId = scheduledGate ? ctx.scheduledTaskGraphOwnerFence?.gateTaskId : undefined
   if (scheduledGate && (!gateTaskId || !gateTaskId.trim() || gateTaskId.length > 256)) throw new AgentExecutionCancelledError()
   const currentTurn = await db.agentTurn.findFirst({

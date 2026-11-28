@@ -7,10 +7,15 @@ import { createGateReviewReceipt, findGateReviewReceiptReplay } from './gate-rev
 import { reviewApplicationQuality } from './gate-quality-review'
 import { parseScheduledTaskGraphGateChoiceHistory, scheduledTaskGraphGateChoiceKey,
   type ScheduledTaskGraphGateQuestion } from '../scheduled-taskgraph-gate-service'
-import { assertScheduledGateCurrent, emitArtifactResult, gateWriteOwner, prepareReviewedPackage,
+import { assertScheduledGateCurrent, emitArtifactResult, gateWriteOwner as baseGateWriteOwner, prepareReviewedPackage,
   scheduledGateQuestion } from './gate-policy-helpers'
 
 export type GatePolicyResult = ScheduledTaskGraphGateQuestion | { status: 'stage_completed'; result: StageResult<GateOutput> }
+
+function gateWriteOwnerWithSourceHooks(ctx: PipelineCtx) {
+  const owner = baseGateWriteOwner(ctx), sourceHooks = ctx.scheduledTaskGraphOwnerFence?.sourceHooks
+  return owner && sourceHooks ? { ...owner, sourceHooks } : owner
+}
 
 export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx: PipelineCtx, scheduled: boolean,
   validatedChoice?: unknown, priorChoiceValues: readonly unknown[] = []): Promise<GatePolicyResult> {
@@ -97,7 +102,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
         appliedPrior.add(scheduledTaskGraphGateChoiceKey(priorChoice))
         if (priorChoice.choiceId === 'skip') {
           skipped.push(pkg)
-          await skipApplicationForGate({ userId: ctx.userId, jobId: pkg.job.id, sessionId: ctx.sessionId, checkpoint: 'review_quality_declined', owner: gateWriteOwner(ctx) })
+          await skipApplicationForGate({ userId: ctx.userId, jobId: pkg.job.id, sessionId: ctx.sessionId, checkpoint: 'review_quality_declined', owner: gateWriteOwnerWithSourceHooks(ctx) })
           continue
         }
       }
@@ -152,7 +157,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
             jobId: pkg.job.id,
             sessionId: ctx.sessionId,
             checkpoint: 'review_quality_declined',
-            owner: gateWriteOwner(ctx),
+            owner: gateWriteOwnerWithSourceHooks(ctx),
           })
           if (deferredQuestion && appliedPrior.size === priorChoices.length) break
           continue
@@ -164,7 +169,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
       choiceMatched = true
       if (scheduledChoice.choiceId === 'skip') {
         skipped.push(pkg)
-        await skipApplicationForGate({ userId: ctx.userId, jobId: pkg.job.id, sessionId: ctx.sessionId, checkpoint: 'review_quality_declined', owner: gateWriteOwner(ctx) })
+        await skipApplicationForGate({ userId: ctx.userId, jobId: pkg.job.id, sessionId: ctx.sessionId, checkpoint: 'review_quality_declined', owner: gateWriteOwnerWithSourceHooks(ctx) })
         if (deferredQuestion && appliedPrior.size === priorChoices.length) break
         continue
       }
@@ -177,7 +182,7 @@ export async function runGatePolicy(packages: readonly ApplicationPackage[], ctx
         jobId: pkg.job.id,
         sessionId: ctx.sessionId,
         checkpoint: 'below_match_threshold',
-        owner: gateWriteOwner(ctx),
+        owner: gateWriteOwnerWithSourceHooks(ctx),
       })
       emit('agent_observation', {
         role:        'reviewer',

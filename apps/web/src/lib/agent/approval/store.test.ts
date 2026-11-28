@@ -182,6 +182,10 @@ function gateReplayInput(
     projectWait: true,
     executionAttempt: { id: "execution_1", attemptCount: 4 },
     prepareInTransaction,
+    scheduledSourceHooks: {
+      acquireFence: vi.fn(async () => undefined),
+      validateFinalSource: vi.fn(async () => undefined),
+    },
   }
 }
 

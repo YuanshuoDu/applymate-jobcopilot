@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
 import { err, ok } from "@/lib/api-helpers"
 import { nextRunAtFromCron } from "@/lib/agent/automation-schedule"
@@ -12,6 +13,7 @@ import { validatePendingApprovalReceipt } from "@/lib/agent/approval/store"
 import { ensureV2Turn } from "@/lib/agent/session/v2-turn"
 import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
+import { acquireSourceMaterialFence } from "@/lib/agent/source-material-fence"
 import { AgentCommandError } from "../control-plane/commands/errors"
 import { confirmSubmissionNotReceived } from "../control-plane/commands/application-submission-recovery-command"
 import {
@@ -172,23 +174,41 @@ export async function handleApprovedResumeTailoring(sessionId: string, userId: s
 export async function handleConfirmedTailoredResume(sessionId: string, userId: string, approval: ScopedApproval) {
   const payload = resumeTailoringPayload(approval.payload)
   if (!payload) return err("Final resume approval is missing its job or resume.", 400)
-  const resume = await db.resume.findFirst({ where: { id: payload.resumeId, userId, targetJobId: payload.jobId }, select: { id: true, name: true } })
-  const job = await db.job.findFirst({ where: { id: payload.jobId, userId }, select: { id: true, company: true, role: true, url: true, status: true } })
-  if (!resume || !job) return err("The tailored resume or job is no longer available.", 404)
-  if (job.status === "applied") return err("This job has already been submitted.", 409)
-  await db.job.update({ where: { id: job.id }, data: {
-    finalResumeId: resume.id, status: "saved", workflowState: "ready_to_apply",
-    analysisNote: job.url
-      ? "[Application ready] Open the employer form, use the ApplyMate extension to fill it, then review and submit it yourself."
-      : "[Application ready] Missing application URL.",
-  } })
+  const result = await db.$transaction(async tx => {
+    await acquireSourceMaterialFence(tx, [userId])
+    const resume = await tx.resume.findFirst({ where: { id: payload.resumeId, userId, targetJobId: payload.jobId }, select: { id: true, name: true } })
+    if (!resume) return { kind: "missing" } as const
+    const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT "id" FROM "Job" WHERE "id" = ${payload.jobId} AND "userId" = ${userId} FOR UPDATE
+    `)
+    if (rows.length !== 1 || rows[0]?.id !== payload.jobId) return { kind: "missing" } as const
+    const job = await tx.job.findFirst({ where: { id: payload.jobId, userId }, select: {
+      id: true, company: true, role: true, url: true, status: true, workflowState: true, finalResumeId: true,
+    } })
+    if (!job) return { kind: "missing" } as const
+    if (job.status === "applied") return { kind: "submitted" } as const
+    const updated = await tx.job.updateMany({
+      where: { id: job.id, userId, status: job.status, workflowState: job.workflowState, finalResumeId: job.finalResumeId },
+      data: {
+        finalResumeId: resume.id, status: "saved", workflowState: "ready_to_apply",
+        analysisNote: job.url
+          ? "[Application ready] Open the employer form, use the ApplyMate extension to fill it, then review and submit it yourself."
+          : "[Application ready] Missing application URL.",
+      },
+    })
+    return updated.count === 1 ? { kind: "ready" as const, job, resume } : { kind: "changed" as const }
+  })
+  if (result.kind === "missing") return err("The tailored resume or job is no longer available.", 404)
+  if (result.kind === "submitted") return err("This job has already been submitted.", 409)
+  if (result.kind === "changed") return err("The job changed while confirming the final resume.", 409)
+  const { job, resume } = result
   const event = await db.agentTranscriptEvent.create({
     data: {
       sessionId, taskId: null, type: "resume_finalized", speaker: "Reviewer", title: "Application pack ready", durationMs: null,
       ...safeEventFields("resume_finalized", job.url
         ? `${resume.name} is confirmed for ${job.company} · ${job.role}. Open the employer form, let the extension fill the fields, review everything, then submit it yourself.`
         : `${resume.name} is confirmed and linked to ${job.company} · ${job.role}, but this job has no application URL.`,
-      { resume: { id: resume.id, name: resume.name }, job }),
+        { resume: { id: resume.id, name: resume.name }, job: { id: job.id, company: job.company, role: job.role, url: job.url, status: job.status } }),
     },
   })
   await updateAgentSession(db, { sessionId, status: "completed", completedAt: new Date() })

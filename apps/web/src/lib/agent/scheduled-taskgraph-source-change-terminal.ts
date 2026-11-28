@@ -118,6 +118,12 @@ function terminalStateFor(value: unknown, owner: ScheduledTaskGraphPipelineOwner
   return state;
 }
 
+export function buildScheduledTaskGraphSourceChangeTerminalState(input: {
+  owner: ScheduledTaskGraphPipelineOwner; attestationSnapshotDigest: string; expectedState: unknown;
+}): Record<string, unknown> | null {
+  return terminalStateFor(input.expectedState, input.owner, input.attestationSnapshotDigest);
+}
+
 export async function terminalizeScheduledTaskGraphSourceChange(input: TerminalizeInput): Promise<TerminalizeResult> {
   const expectedState = objectRow(input.expectedState);
   if (!expectedState || !validId(input.key) || !validDigest(input.attestationSnapshotDigest)

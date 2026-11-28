@@ -81,24 +81,38 @@ describe("application control plane", () => {
 
   it("rejects a scheduled Gate skip after its child lease fence is lost", async () => {
     const assertScheduledGateCurrent = vi.fn(async () => false)
+    const sourceHooks = { acquireFence: vi.fn(async () => {}), validateSource: vi.fn(async () => {}) }
     mocks.queryRaw.mockResolvedValueOnce([{ id: "session_1" }]).mockResolvedValueOnce([{ id: "turn_1", status: "waiting_for_user" }])
 
     await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
-      checkpoint: "review_quality_declined", owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
+      checkpoint: "review_quality_declined", owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent, sourceHooks } }))
       .rejects.toMatchObject({ name: "AgentExecutionCancelledError" })
+    expect(sourceHooks.acquireFence).toHaveBeenCalledOnce()
     expect(assertScheduledGateCurrent).toHaveBeenCalledOnce()
     expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
   })
 
   it("allows a scheduled Gate skip only after its transactional child fence accepts", async () => {
     const assertScheduledGateCurrent = vi.fn(async () => true)
+    const sourceHooks = { acquireFence: vi.fn(async () => {}), validateSource: vi.fn(async () => {}) }
     mocks.queryRaw.mockResolvedValueOnce([{ id: "session_1" }]).mockResolvedValueOnce([{ id: "turn_1", status: "waiting_for_user" }])
 
     await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
-      checkpoint: "below_match_threshold", owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
+      checkpoint: "below_match_threshold", owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent, sourceHooks } }))
       .resolves.toBe(true)
+    expect(sourceHooks.acquireFence).toHaveBeenCalledOnce()
+    expect(sourceHooks.validateSource).toHaveBeenCalledWith(expect.anything(), "job_1")
     expect(assertScheduledGateCurrent).toHaveBeenCalledOnce()
     expect(mocks.taskUpdateMany).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed when a scheduled Gate skip has no source fence", async () => {
+    const assertScheduledGateCurrent = vi.fn(async () => true)
+    await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      checkpoint: "below_match_threshold", owner: { turnId: "turn_1", assertScheduledGateCurrent } }))
+      .rejects.toMatchObject({ name: "AgentExecutionCancelledError" })
+    expect(mocks.queryRaw).not.toHaveBeenCalled()
+    expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
   })
 
   it("acquires the source fence before owner locks and validates through the same transaction before skipping", async () => {
@@ -118,8 +132,8 @@ describe("application control plane", () => {
       .mockImplementationOnce(async () => { order.push("turn-lock"); return [{ id: "turn_1", status: "waiting_for_user" }] })
     mocks.taskUpdateMany.mockImplementationOnce(async () => { order.push("skip-update"); return { count: 1 } })
     const sourceHooks = {
-      acquireFence: vi.fn(async (tx: unknown) => { expect(tx).toBe(transactionClient); order.push("source-fence") }),
-      validateSource: vi.fn(async (tx: unknown) => { expect(tx).toBe(transactionClient); order.push("source-validation") }),
+      acquireFence: vi.fn(async (tx: unknown, userId: string) => { expect(tx).toBe(transactionClient); expect(userId).toBe("user_1"); order.push("source-fence") }),
+      validateSource: vi.fn(async (tx: unknown, jobId: string) => { expect(tx).toBe(transactionClient); expect(jobId).toBe("job_1"); order.push("source-validation") }),
     }
     const assertScheduledGateCurrent = vi.fn(async (tx: unknown) => {
       expect(tx).toBe(transactionClient)
@@ -128,13 +142,14 @@ describe("application control plane", () => {
     })
 
     await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
-      checkpoint: "below_match_threshold", sourceHooks,
-      owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
+      checkpoint: "below_match_threshold",
+      owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent, sourceHooks } }))
       .resolves.toBe(true)
 
     expect(order).toEqual(["source-fence", "session-lock", "turn-lock", "owner-validation", "source-validation", "skip-update"])
     expect(sourceHooks.acquireFence).toHaveBeenCalledOnce()
-    expect(sourceHooks.validateSource).toHaveBeenCalledOnce()
+    expect(sourceHooks.acquireFence).toHaveBeenCalledWith(transactionClient, "user_1")
+    expect(sourceHooks.validateSource).toHaveBeenCalledWith(transactionClient, "job_1")
   })
 
   it("rolls back and skips no task when final source validation fails", async () => {

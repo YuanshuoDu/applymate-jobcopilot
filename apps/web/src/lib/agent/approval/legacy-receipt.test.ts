@@ -209,6 +209,7 @@ describe("Gate receipt replay identity", () => {
       claimToken: "claim_token_1",
       gateTaskId: "gate_task_1",
       assertCurrent: async () => true,
+      sourceHooks: { acquireFence: vi.fn(async () => {}), validateSource: vi.fn(async () => {}) },
     }
     return {
       userId: "user_1",
@@ -313,15 +314,24 @@ describe("Gate receipt replay identity", () => {
     expect(issued[2]?.nonce).not.toBe(issued[0]?.nonce)
     expect(issued[3]?.approvalId).toBe(issued[0]?.approvalId)
     expect(issued[3]?.payload).not.toEqual(issued[0]?.payload)
+    expect(mocks.issueApprovalReceipt.mock.calls[0]?.[1]).toMatchObject({
+      scheduledSourceHooks: { acquireFence: expect.any(Function), validateFinalSource: expect.any(Function) },
+    })
   })
 
   it("probes a scheduled Gate receipt without preparation or writes when absent", async () => {
     const { findScheduledGateReviewReceiptReplay } = await import("./legacy-receipt")
     const prepareInTransaction = vi.fn()
-    const input = gateInput({ replayMode: "scheduled-taskgraph-gate-review", prepareInTransaction })
+    const order: string[] = []
+    const base = gateInput({ replayMode: "scheduled-taskgraph-gate-review", prepareInTransaction })
+    const sourceHooks = { acquireFence: vi.fn(async () => { order.push("source-fence") }),
+      validateSource: vi.fn(async () => { order.push("source-validation") }) }
+    const input = { ...base, scheduledOwnerFence: { ...base.scheduledOwnerFence!, sourceHooks,
+      assertCurrent: vi.fn(async () => { order.push("owner-assertion"); return true }) } }
+    mocks.lockOpenSession.mockImplementation(async () => { order.push("session-lock") })
     const tx = {
-      agentExecution: { findFirst: vi.fn().mockResolvedValue({ id: "execution_1" }) },
-      agentApproval: { findFirst: vi.fn().mockResolvedValue(null) },
+      agentExecution: { findFirst: vi.fn(async () => { order.push("execution-read"); return { id: "execution_1" } }) },
+      agentApproval: { findFirst: vi.fn(async () => { order.push("receipt-read"); return null }) },
       applicationTask: { findFirst: vi.fn() },
     }
     const db = { $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx)) } as unknown as PrismaClient
@@ -330,6 +340,7 @@ describe("Gate receipt replay identity", () => {
 
     expect(tx.agentApproval.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { id: expect.stringMatching(/^gate_review_[a-f0-9]{64}$/), userId: "user_1" } }))
     expect(tx.applicationTask.findFirst).not.toHaveBeenCalled()
+    expect(order).toEqual(["source-fence", "session-lock", "owner-assertion", "execution-read", "source-validation", "receipt-read"])
     expect(tx.agentExecution.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: {
       id: "execution_1", userId: "user_1", status: "running", attemptCount: 4,
     } }))

@@ -183,6 +183,7 @@ const diagnosticGateErrorCodes = new Set([
   "scheduled_pipeline_execution_failed", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_gate_proof_invalid",
   "scheduled_pipeline_audit_child_fenced", "scheduled_pipeline_audit_gate_proof_invalid",
   "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_owner_mismatch",
+  "scheduled_pipeline_source_changed",
   "scheduled_pipeline_request_invalid", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_snapshot_mismatch",
   "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
 ])
@@ -213,6 +214,7 @@ const scheduledRunServicePath = "@/lib/agent/run-service"
 const scheduledTaskGraphRunServicePath = "@/lib/agent/scheduled-taskgraph-run-service"
 const scheduledTaskGraphFencePath = "@/lib/agent/scheduled-taskgraph-pipeline-fence"
 const scheduledTaskGraphGateInputPath = "@/lib/agent/scheduled-taskgraph-gate-input"
+const scheduledTaskGraphGateServicePath = "@/lib/agent/scheduled-taskgraph-gate-service"
 const scheduledTaskGraphGateCheckpointPath = "@/lib/agent/scheduled-taskgraph-gate-checkpoint"
 const scheduledTaskGraphAuditChildFencePath = "@/lib/agent/scheduled-taskgraph-audit-child-fence"
 const scheduledTaskGraphAuditPrepareSourcePath = "@/lib/agent/scheduled-taskgraph-audit-prepare-source"
@@ -258,6 +260,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledTaskGraphRunServicePath)
     vi.doUnmock(scheduledTaskGraphFencePath)
     vi.doUnmock(scheduledTaskGraphGateInputPath)
+    vi.doUnmock(scheduledTaskGraphGateServicePath)
     vi.doUnmock(scheduledTaskGraphAuditChildFencePath)
     vi.doUnmock(scheduledTaskGraphAuditPrepareSourcePath)
     vi.doUnmock(scheduledWebDbPath)
@@ -621,6 +624,204 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       AND "type"='approval_request'`, [fixture.ids.sessionId, fixture.ids.turnId])
     expect(approvals.rows).toHaveLength(0)
     expect(projectedItems.rows).toHaveLength(0)
+  })
+
+  it("rejects Gate after the production Job writer changes source between preflight and policy", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    await seedScheduledAuditAgentConfig(fixture)
+    await seedScheduledAuditByokSettings(fixture)
+    const sourceJob = fixture.jobRecords.find(job => job.id === fixture.selectedJobIds[0])
+    if (!sourceJob) throw new Error("scheduled Gate fixture has no selected source Job")
+    let writes = 0
+    const response = await setupFetcher(fixture, { beforeGatePolicy: async () => {
+      const writer = await vi.importActual<{
+        saveCanonicalJob(userId: string, url: string, createData: object,
+          updateData: (existing: { description: string | null }) => object): Promise<{ created: boolean }>
+      }>("@/lib/agent/jobs-source-write")
+      const saved = await writer.saveCanonicalJob(fixture.ids.userId, sourceJob.url, {
+        id: sourceJob.id, userId: sourceJob.userId, company: sourceJob.company, role: sourceJob.role,
+        location: sourceJob.location, url: sourceJob.url, source: sourceJob.source, description: sourceJob.description,
+        salary: sourceJob.salary, score: sourceJob.score, status: sourceJob.status,
+      }, existing => ({ description: `${existing.description ?? ""} refreshed during Gate` }))
+      if (saved.created) throw new Error("scheduled Gate source writer did not update the existing Job")
+      writes += 1
+    } })
+    const commandPort = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
+    const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
+      nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
+    const initialGateWait = await continuation({ owner: fixture.owner,
+      executionOwner: fixture.turnExecutionOwner as TurnExecutionOwnerFence, attestation: fixture.attestation,
+      handoff: fixture.handoff, prepareProof: fixture.prepareProof, scheduledWaitId: fixture.prepareChoiceWaitId,
+      finalStepId: fixture.rootQuestionStepId, recoveryStepId: fixture.rootQuestionStepId,
+      signal: new AbortController().signal })
+    expect(initialGateWait.status).toBe("waiting_for_dependency")
+    if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Gate wait missing")
+    const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+    runner = startRunner(fixture, response.fetcher)
+    await expect(dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId))
+      .rejects.toThrow("Subagent lease was fenced")
+    expect(writes).toBe(1)
+    expect(response.gateHttpFailures()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 409, errorCode: "scheduled_pipeline_source_changed" }),
+    ]))
+    const current = await pool!.query<{ description: string }>(
+      `SELECT "description" FROM "Job" WHERE "id"=$1 AND "userId"=$2`, [sourceJob.id, fixture.ids.userId])
+    expect(current.rows[0]?.description).toBe(`${sourceJob.description ?? ""} refreshed during Gate`)
+    const approvals = await pool!.query(`SELECT "id" FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2
+      AND "turnId"=$3 AND "type"='review_application'`, [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId])
+    const projectedItems = await pool!.query(`SELECT "id" FROM "agent_items" WHERE "sessionId"=$1 AND "turnId"=$2
+      AND "type"='approval_request'`, [fixture.ids.sessionId, fixture.ids.turnId])
+    expect(approvals.rows).toHaveLength(0)
+    expect(projectedItems.rows).toHaveLength(0)
+  })
+
+  it("holds the source fence through Gate receipt commit while the production Job writer waits", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const sourceJob = fixture.jobRecords.find(job => job.id === fixture.selectedJobIds[0])
+    if (!sourceJob) throw new Error("scheduled Gate fixture has no selected source Job")
+    await seedScheduledAuditAgentConfig(fixture)
+    await seedScheduledAuditByokSettings(fixture)
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "budgetSnapshot"=$2::jsonb, "outputTokenReservationVersion"=1 WHERE "id"=$1`,
+      [fixture.ids.rootTaskId, JSON.stringify({ limits: { maxOutputTokens: 64 } })])
+    let sourceWriter: Promise<{ created: boolean }> | undefined
+    let writerWasBlockedByGate = false
+    const response = await setupFetcher(fixture, { useReservedQualityReview: true, useStoredAiSettings: true,
+      beforeSecondGateReceiptFence: async transactionClient => {
+        if (!transactionClient || !pool) throw new Error("scheduled Gate receipt transaction is unavailable")
+        const queryRawUnsafe = Reflect.get(transactionClient, "$queryRawUnsafe", transactionClient)
+        if (typeof queryRawUnsafe !== "function") throw new Error("scheduled Gate receipt transaction cannot read its backend PID")
+        const pidRows = await Reflect.apply(queryRawUnsafe, transactionClient, ["SELECT pg_backend_pid()::int AS pid"])
+        const blockerPid = Array.isArray(pidRows) ? debugRecord(pidRows[0])?.pid : undefined
+        if (typeof blockerPid !== "number" || !Number.isSafeInteger(blockerPid) || blockerPid < 1) {
+          throw new Error("scheduled Gate receipt backend PID is invalid")
+        }
+        const writer = await vi.importActual<{
+          saveCanonicalJob(userId: string, url: string, createData: object,
+            updateData: (existing: { description: string | null }) => object): Promise<{ created: boolean }>
+        }>("@/lib/agent/jobs-source-write")
+        sourceWriter = writer.saveCanonicalJob(fixture.ids.userId, sourceJob.url, {
+          id: sourceJob.id, userId: sourceJob.userId, company: sourceJob.company, role: sourceJob.role,
+          location: sourceJob.location, url: sourceJob.url, source: sourceJob.source, description: sourceJob.description,
+          salary: sourceJob.salary, score: sourceJob.score, status: sourceJob.status,
+        }, existing => ({ description: `${existing.description ?? ""} refreshed after Gate` }))
+        void sourceWriter.catch(() => undefined)
+        await waitForScheduledGateSourceFenceWaiters(blockerPid, 1)
+        writerWasBlockedByGate = true
+        const unchanged = await pool.query<{ description: string | null }>(
+          `SELECT "description" FROM "Job" WHERE "id"=$1 AND "userId"=$2`, [sourceJob.id, fixture.ids.userId])
+        if (unchanged.rows[0]?.description !== sourceJob.description) {
+          throw new Error("scheduled Gate source writer changed Job before receipt commit")
+        }
+      } })
+    const commandPort = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
+    const continuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
+      nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
+    const initialGateWait = await continuation({ owner: fixture.owner,
+      executionOwner: fixture.turnExecutionOwner as TurnExecutionOwnerFence, attestation: fixture.attestation,
+      handoff: fixture.handoff, prepareProof: fixture.prepareProof, scheduledWaitId: fixture.prepareChoiceWaitId,
+      finalStepId: fixture.rootQuestionStepId, recoveryStepId: fixture.rootQuestionStepId,
+      signal: new AbortController().signal })
+    expect(initialGateWait.status).toBe("waiting_for_dependency")
+    if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Gate wait missing")
+    const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
+    runner = startRunner(fixture, response.fetcher)
+    const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
+    if (!sourceWriter) throw new Error("scheduled Gate receipt did not start the source writer")
+    const saved = await sourceWriter
+
+    expect(debugRecord(gateOutcome)?.status).toBe("completed")
+    expect(response.gateReceiptFenceAssertions()).toBeGreaterThanOrEqual(2)
+    expect(writerWasBlockedByGate).toBe(true)
+    expect(saved.created).toBe(false)
+    expect(await assertPersistedGateApprovalWitnesses(pool!, fixture, gateTaskId)).toHaveLength(1)
+    const current = await pool!.query<{ description: string | null }>(
+      `SELECT "description" FROM "Job" WHERE "id"=$1 AND "userId"=$2`, [sourceJob.id, fixture.ids.userId])
+    expect(current.rows[0]?.description).toBe(`${sourceJob.description ?? ""} refreshed after Gate`)
+  })
+
+  it("rejects a Gate skip queued behind a production Job source update", async () => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+    fixtureUsers.push(fixture.ids.userId)
+    const sourceJob = fixture.jobRecords.find(job => job.id === fixture.selectedJobIds[0])
+    if (!sourceJob) throw new Error("scheduled Gate fixture has no selected source Job")
+    const applicationTaskId = `scheduled-gate-skip-${randomUUID()}`
+    await pool!.query(`INSERT INTO "application_tasks" ("id", "userId", "jobId", "sessionId", "status", "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, 'analyzing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [applicationTaskId, fixture.ids.userId, sourceJob.id, fixture.ids.sessionId])
+    const gateSource = await vi.importActual<{
+      acquireScheduledTaskGraphGateSourceFence(tx: unknown, userId: string, ownerUserId: string): Promise<void>
+      assertScheduledTaskGraphGateSourcesCurrent(tx: unknown, input: { owner: Fixture["owner"]; jobId: string }): Promise<void>
+    }>("@/lib/agent/scheduled-taskgraph-gate-source")
+    const sourceHooks = {
+      acquireFence: (tx: unknown, userId: string) => gateSource.acquireScheduledTaskGraphGateSourceFence(tx, userId, fixture.ids.userId),
+      validateSource: (tx: unknown, jobId: string) => gateSource.assertScheduledTaskGraphGateSourcesCurrent(tx,
+        { owner: fixture.owner, jobId }),
+    }
+    const control = await vi.importActual<{
+      skipApplicationForGate(input: { userId: string; jobId: string; sessionId: string; checkpoint: "below_match_threshold";
+        owner: { turnId: string; executionAttempt: { id: string; attemptCount: number }; sourceHooks: typeof sourceHooks } }): Promise<boolean>
+    }>("@/lib/agent/application-control")
+    const writer = await vi.importActual<{
+      saveCanonicalJob(userId: string, url: string, createData: object,
+        updateData: (existing: { description: string | null }) => object): Promise<{ created: boolean }>
+    }>("@/lib/agent/jobs-source-write")
+    const analysis = await vi.importActual<{ isAnalyzeSourceChangedError(error: unknown): boolean }>("@/lib/agent/stages/analyze-model-input")
+    const jobLock = await pool!.connect()
+    let lockTransactionStarted = false
+    let sourceWriter: Promise<{ created: boolean }> | undefined
+    let skipOutcome: Promise<{ kind: "resolved"; value: boolean } | { kind: "rejected"; error: unknown }> | undefined
+    let fixtureFailed = false, fixtureError: unknown
+    try {
+      await jobLock.query("BEGIN")
+      lockTransactionStarted = true
+      const locked = await jobLock.query<{ pid: number }>(`SELECT pg_backend_pid()::int AS pid FROM "Job"
+        WHERE "id"=$1 AND "userId"=$2 FOR UPDATE`, [sourceJob.id, fixture.ids.userId])
+      const writerBlockerPid = locked.rows[0]?.pid
+      if (typeof writerBlockerPid !== "number" || !Number.isSafeInteger(writerBlockerPid) || writerBlockerPid < 1) {
+        throw new Error("Gate skip Job-lock fixture backend PID is invalid")
+      }
+      sourceWriter = writer.saveCanonicalJob(fixture.ids.userId, sourceJob.url, {
+        id: sourceJob.id, userId: sourceJob.userId, company: sourceJob.company, role: sourceJob.role,
+        location: sourceJob.location, url: sourceJob.url, source: sourceJob.source, description: sourceJob.description,
+        salary: sourceJob.salary, score: sourceJob.score, status: sourceJob.status,
+      }, existing => ({ description: `${existing.description ?? ""} changed before Gate skip` }))
+      void sourceWriter.catch(() => undefined)
+      const sourceWriterPid = await waitForScheduledGateJobWriterBlocked(writerBlockerPid)
+      skipOutcome = control.skipApplicationForGate({ userId: fixture.ids.userId, jobId: sourceJob.id,
+        sessionId: fixture.ids.sessionId, checkpoint: "below_match_threshold",
+        owner: { turnId: fixture.owner.turnId,
+          executionAttempt: { id: fixture.owner.executionId, attemptCount: fixture.owner.executionAttemptCount }, sourceHooks } })
+        .then(value => ({ kind: "resolved" as const, value }), error => ({ kind: "rejected" as const, error }))
+      await waitForScheduledGateSourceFenceWaiters(sourceWriterPid, 1)
+    } catch (error) {
+      fixtureFailed = true
+      fixtureError = error
+    } finally {
+      if (lockTransactionStarted) await jobLock.query("ROLLBACK").catch(() => undefined)
+      jobLock.release()
+      await Promise.allSettled([...(sourceWriter ? [sourceWriter] : []), ...(skipOutcome ? [skipOutcome] : [])])
+    }
+    if (fixtureFailed) throw fixtureError
+    if (!sourceWriter || !skipOutcome) throw new Error("Gate skip source race did not start both contenders")
+    expect((await sourceWriter).created).toBe(false)
+    const skipped = await skipOutcome
+    expect(skipped.kind).toBe("rejected")
+    if (skipped.kind !== "rejected") throw new Error("Gate skip unexpectedly committed after source drift")
+    expect(analysis.isAnalyzeSourceChangedError(skipped.error)).toBe(true)
+    const state = await pool!.query<{ status: string; checkpoint: string | null; eventCount: number }>(
+      `SELECT task."status", task."checkpoint", COUNT(event."id")::int AS "eventCount"
+       FROM "application_tasks" AS task LEFT JOIN "application_task_events" AS event ON event."taskId"=task."id"
+       WHERE task."id"=$1 AND task."userId"=$2 GROUP BY task."id"`, [applicationTaskId, fixture.ids.userId])
+    expect(state.rows).toEqual([{ status: "analyzing", checkpoint: null, eventCount: 0 }])
+    const approvals = await pool!.query(`SELECT "id" FROM "agent_approvals" WHERE "userId"=$1 AND "sessionId"=$2
+      AND "turnId"=$3 AND "jobId"=$4 AND "type"='review_application'`,
+    [fixture.ids.userId, fixture.ids.sessionId, fixture.ids.turnId, sourceJob.id])
+    const approvalEvents = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId"=$1 AND "turnId"=$2
+      AND "type"='approval.requested'`, [fixture.ids.sessionId, fixture.ids.turnId])
+    expect(approvals.rows).toHaveLength(0)
+    expect(approvalEvents.rows).toHaveLength(0)
   })
 
   it("serializes concurrent PostgreSQL admissions for the final AI credit", async () => {
@@ -2273,6 +2474,36 @@ async function waitForScheduledGateRpcSessionLock(blockerPid: number, waiterPid:
   throw new Error("Scheduled Gate RPC did not block on the resolver-held Session lock")
 }
 
+async function waitForScheduledGateJobWriterBlocked(blockerPid: number, timeoutMs = 15_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const pid = (await pool!.query<{ pid: number }>(
+      `SELECT waiter.pid::int AS pid FROM pg_stat_activity AS waiter
+       WHERE waiter.datname=current_database() AND waiter.state='active' AND waiter.wait_event_type='Lock'
+         AND $1=ANY(pg_blocking_pids(waiter.pid)) AND waiter.query ILIKE '%UPDATE%' AND waiter.query ILIKE '%"Job"%'
+       ORDER BY waiter.pid LIMIT 1`, [blockerPid])).rows[0]?.pid
+    if (typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0) return pid
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error("Scheduled Gate production Job writer did not reach the fixture row lock")
+}
+
+async function waitForScheduledGateSourceFenceWaiters(blockerPid: number, minimumWaiters: number, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const waiters = (await pool!.query<{ count: number }>(
+      `SELECT COUNT(DISTINCT waiter.pid)::int AS count
+       FROM pg_stat_activity AS waiter
+       JOIN pg_locks AS pending ON pending.pid=waiter.pid AND pending.locktype='advisory' AND NOT pending.granted
+       WHERE waiter.datname=current_database() AND waiter.pid<>$1 AND waiter.state='active'
+         AND waiter.wait_event_type='Lock' AND $1=ANY(pg_blocking_pids(waiter.pid))
+         AND waiter.query ILIKE '%pg_advisory_xact_lock%'`, [blockerPid])).rows[0]?.count ?? 0
+    if (waiters >= minimumWaiters) return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error("Scheduled Gate source-fence contenders did not reach the expected wait state")
+}
+
 function startRunner(fixture: Fixture, fetcher: typeof fetch): Runner {
   const redis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
   const queueName = `scheduled-audit-${randomUUID()}`
@@ -2413,7 +2644,7 @@ async function stopRunner(): Promise<void> {
   await active.redis.quit().catch(() => active.redis.disconnect())
 }
 async function setupFetcher(fixture: Fixture, options: { useReservedQualityReview?: boolean; useStoredAiSettings?: boolean;
-  beforeSecondGateReceiptFence?: () => Promise<void>; beforeGateRpc?: () => Promise<void>;
+  beforeSecondGateReceiptFence?: (transactionClient: unknown) => Promise<void>; beforeGatePolicy?: () => Promise<void>; beforeGateRpc?: () => Promise<void>;
   gateRpcConnectionProbe?: GateRpcConnectionProbe } = {}) {
   if (options.useReservedQualityReview) vi.doMock(scheduledGateQualityReviewPath, async importOriginal => importOriginal())
   else vi.doMock(scheduledGateQualityReviewPath, () => ({ reviewApplicationQuality: async () => ({ kind: "unavailable" }) }))
@@ -2521,7 +2752,7 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
         ...(typeof originalAssert === "function" ? { scheduledTaskGraphOwnerFence: { ...scheduledOwnerFence,
           assertCurrent: async (transaction: unknown) => {
             gateReceiptFenceAssertions += 1
-            if (gateReceiptFenceAssertions === 2) await options.beforeSecondGateReceiptFence?.()
+            if (gateReceiptFenceAssertions === 2) await options.beforeSecondGateReceiptFence?.(transaction)
             return originalAssert(transaction)
           } } } : {}),
         emit: (event: unknown, payload: unknown) => {
@@ -2769,6 +3000,20 @@ async function setupFetcher(fixture: Fixture, options: { useReservedQualityRevie
       throw error
     }
   } }))
+  if (options.beforeGatePolicy) {
+    const gateService = await vi.importActual<Record<string, unknown>>(scheduledTaskGraphGateServicePath)
+    const execute = gateService.executeScheduledTaskGraphGate as (...args: unknown[]) => Promise<unknown>
+    let sourceChangeApplied = false
+    vi.doMock(scheduledTaskGraphGateServicePath, () => ({ ...gateService,
+      executeScheduledTaskGraphGate: async (...args: unknown[]) => {
+        if (!sourceChangeApplied) {
+          sourceChangeApplied = true
+          await options.beforeGatePolicy?.()
+        }
+        return execute(...args)
+      },
+    }))
+  }
   const route = await vi.importActual<ScheduledPipelineRoute>(scheduledPipelineRoutePath)
   disconnectWebDatabase = () => fixtureWebDb.db.$disconnect()
   const inspectAuditPreflight = async (body: Record<string, unknown>): Promise<AuditPreflightDiagnostics> => {

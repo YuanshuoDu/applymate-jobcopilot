@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   isProof: vi.fn(), auditProof: vi.fn(), auditPrepareSource: vi.fn(), loadInput: vi.fn(), buildCheckpoint: vi.fn(), validateWait: vi.fn(), executeGate: vi.fn(),
   policy: vi.fn(), completedReplay: vi.fn(), auditCompletedReplay: vi.fn(),
   childFence: vi.fn(),
+  sourceAcquire: vi.fn(), sourceValidate: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -25,6 +26,20 @@ vi.mock('./types', () => ({ resumeToText: vi.fn(() => 'resume') }))
 vi.mock('./role-config', () => ({ loadRoleConfigs: mocks.roles, toRoleConfigMap: vi.fn(() => ({})) }))
 vi.mock('./run-service-helpers', () => ({ isActiveAccount: mocks.active }))
 vi.mock('./scheduled-taskgraph-gate-checkpoint', () => ({ buildScheduledTaskGraphGateCheckpoint: mocks.buildCheckpoint }))
+vi.mock('./scheduled-taskgraph-gate-source', () => ({
+  isScheduledTaskGraphGateSourceChangedError: () => false,
+  isScheduledTaskGraphGateSourceProofInvalidError: () => false,
+  acquireScheduledTaskGraphGateSourceFence: mocks.sourceAcquire,
+  assertScheduledTaskGraphGateSourcesCurrent: mocks.sourceValidate,
+  createScheduledTaskGraphGateOwnerFence: (locked: Record<string, unknown>, gateTaskId: string, assertCurrent: unknown) => ({
+    owner: locked.owner, key: locked.key, claimToken: locked.claimToken, gateTaskId, assertCurrent,
+    sourceHooks: { acquireFence: mocks.sourceAcquire, validateSource: mocks.sourceValidate },
+  }),
+  scheduledTaskGraphGateMaterialReferences: (rows: readonly { jobId: string; kind: string; artifactRef: unknown }[]) => rows
+    .map(row => [row.jobId, row.kind, row.artifactRef]).sort((left, right) => String(left[0]).localeCompare(String(right[0]))
+      || String(left[1]).localeCompare(String(right[1]))),
+  scheduledTaskGraphGateRecord: (value: unknown) => value && typeof value === 'object' && !Array.isArray(value) ? value : null,
+}))
 vi.mock('./scheduled-taskgraph-gate-input', () => ({ isScheduledTaskGraphGateProofCurrent: mocks.isProof,
   isScheduledTaskGraphAuditChildGateProofCurrent: mocks.auditProof,
   loadScheduledTaskGraphGateInput: mocks.loadInput, scheduledTaskGraphAnalyzeCheckpointForGate: (value: unknown) => value }))
@@ -38,7 +53,9 @@ vi.mock('./scheduled-taskgraph-pipeline-checkpoint', () => ({ scheduledAutomatio
 vi.mock('./scheduled-taskgraph-run-service', () => ({ validateScheduledPrepareWaitIdentity: mocks.validateWait }))
 vi.mock('./scheduled-taskgraph-completed-report-replay', () => ({ replayCompletedScheduledTaskGraphReport: mocks.completedReplay,
   replayCompletedScheduledTaskGraphAuditReport: mocks.auditCompletedReplay }))
-vi.mock('./stages/gate', () => ({ runScheduledGate: mocks.policy }))
+vi.mock('./stages/gate', async importOriginal => ({
+  ...await importOriginal<typeof import('./stages/gate')>(), runScheduledGate: mocks.policy,
+}))
 vi.mock('./scheduled-taskgraph-gate-service', () => ({ executeScheduledTaskGraphGate: mocks.executeGate }))
 
 import { runScheduledTaskGraphActionRpc } from './scheduled-taskgraph-gate-runtime-rpc'
@@ -172,6 +189,8 @@ beforeEach(() => {
   mocks.childFence.mockResolvedValue(true)
   mocks.loadInput.mockResolvedValue(loaded)
   mocks.buildCheckpoint.mockReturnValue({ checkpoint: { nextStage: 'gate' }, packages: [] })
+  mocks.sourceAcquire.mockResolvedValue(undefined)
+  mocks.sourceValidate.mockResolvedValue(undefined)
   mocks.validateWait.mockResolvedValue(true)
   mocks.completedReplay.mockResolvedValue(null)
   mocks.auditCompletedReplay.mockResolvedValue(null)
@@ -222,6 +241,7 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(responseBody).toMatchObject({ status: 'question_required', jobIds: ['job-1'] })
     expect(mocks.update).toHaveBeenCalledOnce()
     expect(mocks.executeGate).toHaveBeenCalledOnce()
+    expect(mocks.sourceAcquire.mock.invocationCallOrder[0]).toBeLessThan(mocks.queryRaw.mock.invocationCallOrder[0])
     expect(mocks.executeGate.mock.calls[0]?.[0]).toMatchObject({ handoff: { checkpoint: { nextStage: 'gate' } }, priorChoices: [] })
     expect(JSON.stringify(responseBody)).not.toContain('private-claim')
   })
