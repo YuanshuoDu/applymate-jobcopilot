@@ -203,6 +203,8 @@ describe("agent session actions API", () => {
     mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => work({
       $queryRaw: mocks.queryRaw,
       agentTurn: { findFirst: mocks.agentTurnFindFirst, updateMany: mocks.agentTurnUpdateMany },
+      resume: { findFirst: mocks.resumeFindFirst },
+      job: { findFirst: mocks.jobFindFirst, updateMany: mocks.jobUpdate },
     }))
     mocks.sessionUpdate.mockResolvedValue({})
     mocks.approvalFindFirst.mockResolvedValue(approvalRecord())
@@ -971,10 +973,17 @@ describe("agent session actions API", () => {
   })
 
   it('prepares the assisted application only after the Reviewer confirmation binds the final resume', async () => {
+    // Approval resolution locks the Session before the handler verifies its source fence and locks the Job.
+    mocks.queryRaw
+      .mockReset()
+      .mockResolvedValueOnce([{ id: "session_1" }])
+      .mockResolvedValueOnce([{ transaction_id: "42", lock_acquired: "" }])
+      .mockResolvedValueOnce([{ transaction_id: "42" }])
+      .mockResolvedValueOnce([{ id: "job_1" }])
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: 'confirm_tailored_resume', payload: { resumeId: 'resume_tailored', jobId: 'job_1' } }))
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_tailored', name: 'Tailored for N26' })
-    mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', company: 'N26', role: 'Backend Engineer', url: 'https://jobs.example/apply', status: 'saved' })
-    mocks.jobUpdate.mockResolvedValue({})
+    mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', company: 'N26', role: 'Backend Engineer', url: 'https://jobs.example/apply', status: 'saved', workflowState: null, finalResumeId: null })
+    mocks.jobUpdate.mockResolvedValueOnce({ count: 1 })
     mocks.transcriptCreate.mockResolvedValueOnce({ id: 'event_ready', sessionId: 'session_1', taskId: null, type: 'resume_finalized', speaker: 'Reviewer', title: 'Application pack ready', body: 'Ready', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:03:00Z') })
 
     const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_reviewer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
@@ -982,9 +991,10 @@ describe("agent session actions API", () => {
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({ event: { type: 'resume_finalized', title: 'Application pack ready' } })
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
-    expect(mocks.jobUpdate).toHaveBeenCalledWith({ where: { id: 'job_1' }, data: expect.objectContaining({
+    expect(mocks.jobUpdate).toHaveBeenCalledWith({ where: { id: 'job_1', userId: 'user_1', status: 'saved', workflowState: null, finalResumeId: null }, data: expect.objectContaining({
       finalResumeId: 'resume_tailored', status: 'saved', workflowState: 'ready_to_apply', analysisNote: expect.stringContaining('extension'),
     }) })
+    expect(mocks.queryRaw).toHaveBeenCalledTimes(4)
   })
 
   it("rejects unsupported action types", async () => {
