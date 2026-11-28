@@ -5169,6 +5169,9 @@ const SCOUT_HISTORY_RESUME_STAGES = new Set([
 const SCOUT_HISTORY_RESUME_CATEGORIES = new Set([
   "wait_invalid", "wait_conflict", "wait_scope_error", "child_resume_owner_mismatch", "child_resume_lease_expired",
   "child_resume_step_lineage", "child_resume_usage_overflow", "child_resume_step_limit", "child_resume_item_limit",
+  "child_resume_observation_limit", "child_resume_delegate_receipt_unavailable", "child_resume_item_lineage",
+  "child_resume_invalid_tool_call", "child_resume_wait_lineage", "child_resume_tool_call_conflict",
+  "child_resume_tool_item_conflict", "child_resume_tool_result_conflict",
   "child_resume_wait_step_lineage", "child_resume_wait_tool_call_conflict", "child_resume_invalid_shape",
   "database_deadlock", "database_serialization", "database_lock", "database_cancelled", "database_permission",
   "database_error", "other",
@@ -7340,6 +7343,19 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     })
     expect(JSON.stringify(projected)).not.toContain("private")
     expect(JSON.stringify(projected)).not.toContain("taskId")
+  })
+
+  it.each([
+    "child_resume_observation_limit", "child_resume_delegate_receipt_unavailable", "child_resume_item_lineage",
+    "child_resume_invalid_tool_call", "child_resume_wait_lineage", "child_resume_tool_call_conflict",
+    "child_resume_tool_item_conflict", "child_resume_tool_result_conflict",
+  ] as const)("accepts the fixed Scout resume category %s", category => {
+    expect(scoutHistoryResumeFailureDiagnostics([`${SCOUT_HISTORY_RESUME_FAILURE_PREFIX}${JSON.stringify({
+      stage: "load_attempt_history", category, validationStage: null,
+    })}`])).toEqual({
+      markerCount: 1,
+      events: [{ stage: "load_attempt_history", category, validationStage: null }],
+    })
   })
 
   it("projects restart child markers through the safe diagnostic allowlists", () => {

@@ -9,7 +9,10 @@ import { loadDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js
 type ResumeFailureStage = "repair_consumed_wait_sources" | "read_durable_wait" | "load_attempt_history"
 type ResumeFailureCategory = "wait_invalid" | "wait_conflict" | "wait_scope_error" | "child_resume_owner_mismatch"
   | "child_resume_lease_expired" | "child_resume_step_lineage" | "child_resume_usage_overflow" | "child_resume_step_limit"
-  | "child_resume_item_limit" | "child_resume_wait_step_lineage" | "child_resume_wait_tool_call_conflict"
+  | "child_resume_item_limit" | "child_resume_observation_limit" | "child_resume_delegate_receipt_unavailable"
+  | "child_resume_item_lineage" | "child_resume_invalid_tool_call" | "child_resume_wait_lineage"
+  | "child_resume_tool_call_conflict" | "child_resume_tool_item_conflict" | "child_resume_tool_result_conflict"
+  | "child_resume_wait_step_lineage" | "child_resume_wait_tool_call_conflict"
   | "child_resume_invalid_shape" | "database_deadlock" | "database_serialization" | "database_lock" | "database_cancelled"
   | "database_permission" | "database_error" | "other"
 type ResumeValidationStage = "lease_fence" | "source_ordinal" | "wait_state" | "wait_result_shape" | "target_scope"
@@ -25,6 +28,13 @@ const RESUME_VALIDATION_STAGES = new Set<ResumeValidationStage>([
   "output_target_ids", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set",
   "wait_record_shape", "provenance_marker", "source_lifecycle", "reconciliation",
 ])
+const CHILD_RESUME_FAILURE_CATEGORIES = new Set<ResumeFailureCategory>([
+  "child_resume_owner_mismatch", "child_resume_lease_expired", "child_resume_step_lineage", "child_resume_usage_overflow",
+  "child_resume_step_limit", "child_resume_item_limit", "child_resume_observation_limit", "child_resume_delegate_receipt_unavailable",
+  "child_resume_item_lineage", "child_resume_invalid_tool_call", "child_resume_wait_lineage", "child_resume_tool_call_conflict",
+  "child_resume_tool_item_conflict", "child_resume_tool_result_conflict", "child_resume_wait_step_lineage",
+  "child_resume_wait_tool_call_conflict",
+])
 
 function resumeFailureCategory(error: unknown): ResumeFailureCategory {
   try {
@@ -32,11 +42,7 @@ function resumeFailureCategory(error: unknown): ResumeFailureCategory {
     const code = typeof row?.code === "string" ? row.code : ""
     if (["wait_invalid", "wait_conflict", "wait_scope_error"].includes(code)) return code as ResumeFailureCategory
     const message = error instanceof Error ? error.message : ""
-    const childCodes = new Set<ResumeFailureCategory>([
-      "child_resume_owner_mismatch", "child_resume_lease_expired", "child_resume_step_lineage", "child_resume_usage_overflow",
-      "child_resume_step_limit", "child_resume_item_limit", "child_resume_wait_step_lineage", "child_resume_wait_tool_call_conflict",
-    ])
-    if (childCodes.has(message as ResumeFailureCategory)) return message as ResumeFailureCategory
+    if (CHILD_RESUME_FAILURE_CATEGORIES.has(message as ResumeFailureCategory)) return message as ResumeFailureCategory
     if (message.startsWith("child_resume_invalid_")) return "child_resume_invalid_shape"
     if (code === "40P01") return "database_deadlock"
     if (code === "40001") return "database_serialization"
