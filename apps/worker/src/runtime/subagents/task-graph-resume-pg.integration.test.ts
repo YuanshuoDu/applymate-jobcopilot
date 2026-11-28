@@ -16128,7 +16128,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             adapterStage = "final_after_retirement_refresh"
             const listing = record(latestToolResult(request, postReviseListCallId))
             const listedTasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
-            retirementListOldMatched = listedTasks.some(task => task?.taskId === seattleTaskId && task?.status === "interrupted")
+            // Legacy agent.list uses generic sensitive-text redaction for task IDs.
+            const oldTaskIdProjection = redactSensitiveText(seattleTaskId)
+            const oldTaskMatches = listedTasks.filter(task => task?.taskId === oldTaskIdProjection)
+            retirementListOldMatched = oldTaskMatches.length === 1 && oldTaskMatches[0]?.status === "interrupted"
             retirementListReplacementMatched = listedTasks.some(task => task?.taskId === replacementTaskId && task?.status === "completed")
             if (!retirementListOldMatched || !retirementListReplacementMatched) {
               throw new Error("agent.list did not refresh the exact retirement acknowledgement")
