@@ -659,9 +659,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Gate wait missing")
     const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
     runner = startRunner(fixture, response.fetcher)
-    const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
-
-    expect(debugRecord(gateOutcome)?.status).not.toBe("completed")
+    await expect(dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId))
+      .rejects.toThrow("Subagent lease was fenced")
     expect(writes).toBe(1)
     expect(response.gateHttpFailures()).toEqual(expect.arrayContaining([
       expect.objectContaining({ status: 409, errorCode: "scheduled_pipeline_source_changed" }),
