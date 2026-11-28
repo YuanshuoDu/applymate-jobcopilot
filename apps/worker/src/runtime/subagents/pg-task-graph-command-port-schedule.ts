@@ -91,7 +91,7 @@ function rejectPrivateScheduledGate(proposal: TaskGraphScheduleInput["proposal"]
   }
 }
 
-async function requireTaskGraphContinuationBudget(client: Queryable, scope: TaskGraphScheduleInput["scope"]): Promise<void> {
+export async function requireTaskGraphContinuationBudget(client: Queryable, scope: TaskGraphScheduleInput["scope"]): Promise<void> {
   try {
     await enforceRootStepBudget(client, { kind: "turn", taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId,
       userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId }, 2)

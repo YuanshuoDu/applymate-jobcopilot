@@ -8,6 +8,9 @@ import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 import type { TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import { Buffer } from "node:buffer"
+import { bindObjectiveTailorCandidateWitness, makeObjectiveTailorCandidateSelection } from "./objective-tailor-witness.js"
+import { objectiveTailorNodeKeysForCandidate } from "./objective-task-graph-child-authority.js"
+import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 
 const task = {
   id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1,
@@ -17,6 +20,14 @@ const task = {
   budgetSnapshot: { subagentPolicy: { maxAttempts: 3 } }, toolPolicySnapshot: {},
 } satisfies SubagentTaskRecord
 const identity: ExecutionOwnerFence = { kind: "task", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId!, taskId: task.id, rootTaskId: task.rootTaskId, ownerId: "worker-1", attemptCount: task.attemptCount, leaseExpiresAt: task.leaseExpiresAt! }
+const objectiveScope: GraphIdentityScope = { userId: task.userId, sessionId: task.sessionId, turnId: task.turnId!, rootTaskId: task.rootTaskId, parentTaskId: task.rootTaskId }
+const objectiveJobId = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+const objectiveSelection = makeObjectiveTailorCandidateSelection({ scope: objectiveScope, sourceGraphRevision: 1,
+  sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+  candidate: { jobId: objectiveJobId, score: 8.5, materialDigest: `sha256:${"d".repeat(64)}` }, sourceAnalystKeys: ["analyst-1"] })!
+const objectiveWitness = bindObjectiveTailorCandidateWitness(objectiveSelection, {
+  ...objectiveTailorNodeKeysForCandidate(objectiveSelection.candidateRef)!, admittedRevision: 2,
+})!
 
 function mailboxMessage(payload: unknown, overrides: Partial<CoordinationMailboxMessage> = {}): CoordinationMailboxMessage {
   return {
@@ -161,6 +172,41 @@ describe("child context", () => {
     expect(modelInput).not.toContain("scheduledDraftCandidateWitness")
     expect(modelInput).toContain('"jobId":"job-1"')
     expect(modelInput).toContain(ordinaryCanary)
+  })
+
+  it("filters Objective dependency results to the witnessed Job and hides its private binding", async () => {
+    const objectiveTask = {
+      ...task, role: "writer", taskType: "cover_letter_draft",
+      context: {
+        objectiveTailorCandidateMode: true,
+        objectiveTailorCandidateWitness: objectiveWitness,
+        selectedJobPreparation: { jobId: objectiveJobId },
+        taskGraphDependencyResults: { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [
+          { role: "analyst", result: { role: "analyst", findings: [{ jobId: objectiveJobId, finding: "selected evidence" }, { jobId: "2b9c7d54-008f-4d88-a716-8ba51497c63b", finding: "foreign evidence" }], findingCount: 2 } },
+          { role: "scout", result: { role: "scout", candidates: [{ jobId: objectiveJobId, score: 88 }, { jobId: "2b9c7d54-008f-4d88-a716-8ba51497c63b", score: 91 }], candidateCount: 2 } },
+        ] },
+      },
+    }
+    const snapshot = childContextSnapshot(objectiveTask)
+    const context = await createChildContextBuilder(objectiveTask, snapshot).build({
+      scope: { userId: objectiveTask.userId }, identity, stepId: "step-objective-tailor", snapshot,
+    })
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context, model, tools: [], sessionId: objectiveTask.sessionId, turnId: objectiveTask.turnId!, stepId: "step-objective-tailor",
+      userId: objectiveTask.userId, taskId: objectiveTask.id, rootTaskId: objectiveTask.rootTaskId,
+      signal: new AbortController().signal,
+    })
+    const modelInput = request.messages.flatMap(message => message.content
+      .flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")
+
+    expect(modelInput).toContain("selected evidence")
+    expect(modelInput).toContain(`"jobId":"${objectiveJobId}"`)
+    expect(modelInput).not.toContain("foreign evidence")
+    expect(modelInput).not.toContain("2b9c7d54-008f-4d88-a716-8ba51497c63b")
+    expect(modelInput).not.toContain("objectiveTailorCandidateMode")
+    expect(modelInput).not.toContain("objectiveTailorCandidateWitness")
+    expect(modelInput).not.toContain(objectiveWitness.candidateRef)
   })
 
   it("keeps selected-job source material transient, untrusted, role-scoped, and bounded", async () => {

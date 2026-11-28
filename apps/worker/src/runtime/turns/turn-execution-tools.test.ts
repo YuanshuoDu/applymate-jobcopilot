@@ -572,6 +572,37 @@ describe("executeTools persisted replay", () => {
     expect(result.snapshot).toBe(refreshed)
   })
 
+  it.each(["accepted", "duplicate"] as const)("refreshes current graph after a fresh %s agent.tailor receipt", async status => {
+    const tailorCall = { id: `tailor-${status}`, name: "agent.tailor", arguments: { expectedRevision: 4, candidateRef: `otc1_${"a".repeat(64)}` } }
+    const executeTool = vi.fn(async () => ({ id: tailorCall.id, toolName: tailorCall.name, toolVersion: "1", status: "completed" as const,
+      output: { status, revision: 5, nodes: [], readyTaskIds: [] }, errorCode: null }))
+    const fixture = execution(pending, executeTool as never)
+    const refreshed = { ...fixture.options.snapshot, taskGraphRevision: 5 }
+    const refresh = vi.fn(async () => refreshed)
+    Object.assign(fixture.options, { refreshTaskGraphAfterPlan: refresh })
+
+    const result = await executeTools(fixture.options, fixture.writer, { id: "tailor-step", ordinal: 1 },
+      { text: "", reasoningSummary: "", toolCalls: [tailorCall], provider: "fixture", model: "fixture", finishReason: "tool_calls", usage: null, continuation: null },
+      fixture.options.snapshot, new Set(), fixture.options.signal!, () => new Date("2026-09-09T00:00:00.000Z"), undefined, vi.fn())
+
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(result.snapshot).toBe(refreshed)
+  })
+
+  it.each(["accepted", "duplicate"] as const)("refreshes current graph after a completed replay of %s agent.tailor", async status => {
+    const tailorCall = { id: `tailor-replay-${status}`, name: "agent.tailor", arguments: { expectedRevision: 4, candidateRef: `otc1_${"b".repeat(64)}` } }
+    const fixture = replayFixture({ status, revision: 5, nodes: [], readyTaskIds: [] }, tailorCall)
+    const refreshed = { ...fixture.options.snapshot, taskGraphRevision: 5 }
+    const refresh = vi.fn(async () => refreshed)
+    Object.assign(fixture.options, { refreshTaskGraphAfterPlan: refresh })
+
+    const result = await replay(fixture, tailorCall)
+
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(result.snapshot).toBe(refreshed)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
   it("persists an attempt-scoped receipt and exact resume link without re-executing the tool", async () => {
     const fixture = childResumeReplayFixture()
     const onCallPersisted = vi.fn()

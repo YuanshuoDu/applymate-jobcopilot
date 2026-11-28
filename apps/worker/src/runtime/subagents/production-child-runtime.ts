@@ -15,7 +15,8 @@ import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime }
 import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
 import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.js"
 import { readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
-import { createArtifactToolStoreForChild, loadSelectedJobArtifactContextForChild } from "./scheduled-draft-writer-source.js"
+import { createArtifactToolStoreForChild } from "./scheduled-draft-writer-source.js"
+import { loadChildSelectedJobSource } from "./child-selected-job-context.js"
 import { assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedbackFrame, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext, type TaskGraphWriterReviewDependency, type TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
@@ -124,7 +125,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     }
     await assertPersistedWriterReviewDependency(pool, task, lease, writerReviewDependency)
   }
-  const selectedJobSource = selectedJob ? await loadSelectedJobArtifactContextForChild(pool, task.userId, selectedJob, task.role === "writer" ? lease.context : undefined) : undefined
+  const selectedJobSource = await loadChildSelectedJobSource(pool, lease, selectedJob)
   const selectedJobArtifactContext = selectedJobSource?.context
   const selectedJobPreparation = selectedJobArtifactContext?.preparation
   const artifacts = selectedJobPreparation && (task.role === "writer" || task.role === "reviewer")

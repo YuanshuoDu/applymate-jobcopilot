@@ -12,6 +12,8 @@ import { selectVerifiedScheduledDraftCandidate } from "./scheduled-draft-candida
 import * as pgCreate from "./pg-store-create.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-template-definitions.js"
 import { templatesForInteractiveScoutDelegation } from "./nested-scout-profile.js"
+import { objectiveTailorNodeKeysForCandidate, objectiveTailorPlan } from "./objective-task-graph-child-authority.js"
+import { bindObjectiveTailorCandidateWitness, makeObjectiveTailorCandidateSelection } from "./objective-tailor-witness.js"
 
 vi.mock("./scheduled-draft-candidate.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-draft-candidate.js")>()
@@ -886,6 +888,105 @@ describe("createGraphTasks", () => {
     await expect(createGraphTasks(fixture.client, fullTypedInput, fullPlanParent, createInitialTaskGraphState(), new Map()))
       .rejects.toMatchObject({ code: "node_limit" })
     expect(fixture.query).not.toHaveBeenCalled()
+  })
+
+  it("denies the Objective Tailor pair when only one of eight graph slots remains", async () => {
+    const fixture = repairFixture({ additionalTypedNodes: 6, ordinaryOnly: true })
+    const selection = makeObjectiveTailorCandidateSelection({ scope: fixture.input.scope, sourceGraphRevision: fixture.current.revision,
+      sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+      candidate: { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8.4, materialDigest: `sha256:${"d".repeat(64)}` },
+      sourceAnalystKeys: ["filler-0"] })!
+    const keys = objectiveTailorNodeKeysForCandidate(selection.candidateRef)!
+    const witness = bindObjectiveTailorCandidateWitness(selection, { ...keys, admittedRevision: fixture.current.revision + 1 })!
+    const plan = objectiveTailorPlan(witness)!
+    const input: TaskGraphScheduleInput = { ...fixture.input, proposal: plan.proposal, templates: plan.templates }
+
+    expect(fixture.current.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxNodes - 1)
+    expect(plan.proposal.nodes).toHaveLength(2)
+    await expect(createGraphTasks(fixture.client, input, fixture.parent, fixture.current, fixture.taskIds,
+      undefined, undefined, true, undefined, true)).rejects.toMatchObject({ code: "node_limit" })
+    expect(fixture.query).not.toHaveBeenCalled()
+  })
+
+  it("covers an Objective Tailor pair from the exact typed Scout and Analyst prefix", async () => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 }
+    const scoutWithLocation = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION_V2, role: "scout", criteria: [
+      { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+      { id: "candidate-location", check: { kind: "candidate_location_in", locations: ["dublin"] } },
+    ] } as const
+    const current: TaskGraphState = { revision: 2, appliedEvents: [], nodes: [
+      { key: "scout-source", templateId: "scout", goal: "Find matching jobs", successCriteria: ["Return candidates"], dependsOn: [],
+        depth: 1, status: "completed", taskId: "scout-task", verificationDisposition: "typed", verification: scoutWithLocation },
+      { key: "analyst-source", templateId: "analyst", goal: "Analyze matching jobs", successCriteria: ["Return findings"], dependsOn: ["scout-source"],
+        depth: 2, status: "completed", taskId: "analyst-task", verificationDisposition: "typed", verification: analystVerification },
+    ] }
+    const selection = makeObjectiveTailorCandidateSelection({ scope, sourceGraphRevision: current.revision,
+      sourceGraphDigest: "a".repeat(64), sourceStatusDigest: "b".repeat(64), analystProofDigest: "c".repeat(64),
+      candidate: { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8.4, materialDigest: `sha256:${"d".repeat(64)}` },
+      sourceAnalystKeys: ["analyst-source"] })!
+    const keys = objectiveTailorNodeKeysForCandidate(selection.candidateRef)!
+    const witness = bindObjectiveTailorCandidateWitness(selection, { ...keys, admittedRevision: current.revision + 1 })!
+    const plan = objectiveTailorPlan(witness)!
+    const input: TaskGraphScheduleInput = { scope, proposal: plan.proposal, templates: plan.templates,
+      verificationRequirements: { status: "valid", requirements: [
+        { id: "candidate-count", kind: "candidate_count_gte", minimum: 1 },
+        { id: "finding-count", kind: "finding_count_gte", minimum: 1 },
+        { id: "candidate-location", kind: "candidate_location_in", locations: ["dublin"] },
+      ] } }
+    const parent = { budgetSnapshot: { subagentPolicy: { maxConcurrency: 4, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } }
+    const priorIds = new Map([["scout-source", "scout-task"], ["analyst-source", "analyst-task"]])
+    const analystResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [
+      { jobId: "f47ac10b-58cc-4372-a567-0e02b2c3d479", score: 8.4, evidenceIds: ["evidence-1"] },
+    ], evidence: [{ id: "evidence-1", kind: "job", ref: "f47ac10b-58cc-4372-a567-0e02b2c3d479", source: "greenhouse" }], summary: "Verified finding" }
+    const analystEnvelope = { finalItemId: "analyst-item", finalText: "Verified finding", status: "completed", stepCount: 1, toolCallCount: 1,
+      structuredResult: analystResult, taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed",
+        reasonCode: "criteria_met", criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "e".repeat(64), resultDigest: taskGraphResultDigest(analystResult) } }
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('WHERE task."id" = ANY($1::text[])')) return { rows: [{
+        id: "analyst-task", status: "completed", role: "analyst", failureReason: null, attemptCount: 1,
+        taskType: "job_analysis", allowedActions: TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+        expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema, result: analystEnvelope, context: {},
+        sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+        parentTaskId: scope.parentTaskId, userId: scope.userId,
+      }], rowCount: 1 }
+      if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [{ id: "outbox-1" }], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const withoutScoutProof: TaskGraphState = { ...current, nodes: current.nodes.map(node => {
+      if (node.key !== "scout-source") return node
+      const { verification: _verification, ...legacy } = node
+      return { ...legacy, verificationDisposition: "legacy_unverified" as const }
+    }) }
+    const withoutAnalystProof: TaskGraphState = { ...current, nodes: current.nodes.map(node => {
+      if (node.key !== "analyst-source") return node
+      const { verification: _verification, ...legacy } = node
+      return { ...legacy, verificationDisposition: "legacy_unverified" as const }
+    }) }
+    await expect(createGraphTasks(client, input, parent, withoutScoutProof, priorIds, undefined, undefined, true, undefined, true))
+      .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [
+        { id: "candidate-count", role: "scout" }, { id: "candidate-location", role: "scout" },
+      ] })
+    await expect(createGraphTasks(client, input, parent, withoutAnalystProof, priorIds, undefined, undefined, true, undefined, true))
+      .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [{ id: "finding-count", role: "analyst" }] })
+    expect(query).not.toHaveBeenCalled()
+
+    const create = vi.spyOn(pgCreate, "createSubagentTask")
+      .mockResolvedValueOnce({ id: "writer-task", rootTaskId: scope.rootTaskId } as never)
+      .mockResolvedValueOnce({ id: "reviewer-task", rootTaskId: scope.rootTaskId } as never)
+    try {
+      const result = await createGraphTasks(client, input, parent, current, priorIds, undefined, undefined, true, undefined, true)
+      expect(result.created.map(node => [node.key, node.status])).toEqual([
+        [keys.writerNodeKey, "queued"], [keys.reviewerNodeKey, "waiting"],
+      ])
+      expect(result.state.nodes.filter(node => node.key === keys.writerNodeKey || node.key === keys.reviewerNodeKey)).toHaveLength(2)
+      expect(Object.keys(input.templates).sort()).toEqual(["cover_letter_reviewer", "cover_letter_writer"])
+      expect(input.templates).toEqual(plan.templates)
+      expect(create).toHaveBeenCalledTimes(2)
+      expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(true)
+    } finally { create.mockRestore() }
   })
 
   it("admits a mixed first-repair batch through the reserved eighth position", async () => {

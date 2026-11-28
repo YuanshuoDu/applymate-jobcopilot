@@ -25,6 +25,7 @@ import { SCHEDULED_APPLICATION_PREPARE_OUTPUT_SCHEMA } from "./scheduled-applica
 const call: LifecycleCall = { id: "call-1", toolName: "jobs.search", toolVersion: "1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1" }
 const ordinaryCall: LifecycleCall = { ...call, toolName: "notes.read" }
 const planCall: LifecycleCall = { ...call, toolName: "agent.plan" }
+const tailorCall: LifecycleCall = { ...call, toolName: "agent.tailor" }
 const numericDelegateTaskId = "subagent-00000000-0000-4000-8000-000000000002"
 const scoutDelegateCall: LifecycleCall = { ...call, id: "delegate-call", toolName: "scout.delegate", taskId: "parent-1", rootTaskId: "root-1" }
 const retirementCall: LifecycleCall = { ...call, toolName: "agent.retire_superseded_scout", taskId: "root-1", rootTaskId: "root-1" }
@@ -748,6 +749,16 @@ describe("ToolLifecycle", () => {
     expect(sink.events[0]?.payload.output).toEqual(planReceipt)
   })
 
+  it("uses the same strict bounded TaskGraph receipt projection for agent.tailor", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const output = await lifecycle.completed(tailorCall, planReceipt)
+    expect(output).toEqual(planReceipt)
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: planReceipt })
+    await expect(new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), maxEventBytes: 256 }).completed(tailorCall, planReceipt))
+      .rejects.toMatchObject({ code: "tool_result_too_large" })
+  })
+
   it("returns phone-like generated spawn IDs intact for the following agent.wait call", async () => {
     const sink = new InMemoryToolLifecycleSink()
     const lifecycle = new ToolLifecycle({ sink })
@@ -997,11 +1008,13 @@ describe("ToolLifecycle", () => {
       { ...planReceipt, nodes: [{ ...planReceipt.nodes[0], key: "+1 (415) 555-0132" }, planReceipt.nodes[1]] },
       { ...planReceipt, nodes: [{ ...planReceipt.nodes[0], key: "password=private-token-value" }, planReceipt.nodes[1]] },
     ]
-    for (const receipt of malformedReceipts) {
-      const sink = new InMemoryToolLifecycleSink()
-      const lifecycle = new ToolLifecycle({ sink })
-      await expect(lifecycle.completed(planCall, receipt)).rejects.toMatchObject({ code: "task_graph_receipt_invalid" })
-      expect(sink.events).toHaveLength(0)
+    for (const toolName of ["agent.plan", "agent.tailor"] as const) {
+      for (const receipt of malformedReceipts) {
+        const sink = new InMemoryToolLifecycleSink()
+        const lifecycle = new ToolLifecycle({ sink })
+        await expect(lifecycle.completed({ ...planCall, toolName }, receipt)).rejects.toMatchObject({ code: "task_graph_receipt_invalid" })
+        expect(sink.events).toHaveLength(0)
+      }
     }
   })
 

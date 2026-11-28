@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT } from "@jobcopilot/agent-protocol"
 
 const setupMocks = vi.hoisted(() => ({
   prepareBatch: vi.fn(), failBatch: vi.fn(), graph: vi.fn(), registerPlanning: vi.fn(), ensure: vi.fn(),
@@ -149,8 +150,8 @@ function setupState(intent: unknown = batchIntent) {
     modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {}, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } } as never
 }
 
-function setupInput(state = setupState(), batchGate?: () => unknown) {
-  const tools = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile", "jobs.search", "artifact.create", "agent.spawn"]
+function setupInput(state = setupState(), batchGate?: () => unknown, commandPort: unknown = {}, objectiveTailorEnabled = false) {
+  const tools: Array<{ name: string }> = ["agent.plan", "agent.ask_user", "agent.wait", "agent.list", "agent.reconcile", "jobs.search", "artifact.create", "agent.spawn"]
     .map(name => ({ name }))
   const root = { id: "root-1", attemptCount: 1 }
   setupMocks.ensure.mockResolvedValue(root)
@@ -159,9 +160,12 @@ function setupInput(state = setupState(), batchGate?: () => unknown) {
   return {
     pool: {} as never, lease: owner as never, signal: new AbortController().signal, now: () => new Date(),
     options: {
-      stateLoader: vi.fn(async () => state), productionFlags: { taskGraphPlanningEnabled: true } as never,
-      taskGraphCommandPort: {} as never, toolRuntimeFactory: () => ({
-        registry: { list: () => tools, resolve: () => ({ idempotency: "pure" }), validateArguments: () => true }, router: {},
+      stateLoader: vi.fn(async () => state), productionFlags: { taskGraphPlanningEnabled: true, objectiveTailorEnabled } as never,
+      taskGraphCommandPort: commandPort as never, toolRuntimeFactory: () => ({
+        registry: { list: () => tools, register: (tool: unknown) => {
+          const name = tool && typeof tool === "object" && "name" in tool ? tool.name : undefined
+          if (typeof name === "string") tools.push({ name })
+        }, resolve: () => ({ idempotency: "pure" }), validateArguments: () => true }, router: {},
       } as never),
     } as never,
     manager: {} as never, rootTasks: rootTasks as never, executionProjection: {} as never, sessionProjection: {} as never,
@@ -224,5 +228,46 @@ describe("canonical batch production setup", () => {
     expect(setup.selectedJobBatch).toBeUndefined()
     expect(setupMocks.graph).toHaveBeenCalledOnce()
     expect(setupMocks.registerPlanning.mock.calls.at(-1)?.[2]).not.toHaveProperty("selectedJobBatchSlots")
+  })
+
+  it("registers tailoring only for an ordinary user Objective root with both command seams", async () => {
+    setupMocks.prepareBatch.mockResolvedValue({ status: "not_batch" })
+    setupMocks.graph.mockResolvedValue({ enabled: true, selectedJobMode: false, selectedJobPreparation: undefined,
+      scheduledDraftMode: false, templates: { analyst: { role: "analyst" } } })
+    const commandPort = { readObjectiveTailorCatalog: vi.fn(), appendObjectiveTailor: vi.fn() }
+    const state = setupState(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT)
+    const setup = await prepareCanonicalTurnSetup(setupInput(state, undefined, commandPort, true) as never)
+
+    expect("earlyResult" in setup).toBe(false)
+    if ("earlyResult" in setup) return
+    expect(setup.rootTools.map(tool => (tool as { name: string }).name)).toContain("agent.tailor")
+    expect(setupMocks.ensure.mock.calls.at(-1)?.[0].allowedActions).toContain("agent.tailor")
+    expect(setup.rootTools.find(tool => (tool as { name: string }).name === "agent.tailor")).toBeDefined()
+  })
+
+  it("does not register tailoring when either owner-fenced command seam is missing", async () => {
+    setupMocks.prepareBatch.mockResolvedValue({ status: "not_batch" })
+    setupMocks.graph.mockResolvedValue({ enabled: true, selectedJobMode: false, selectedJobPreparation: undefined,
+      scheduledDraftMode: false, templates: { analyst: { role: "analyst" } } })
+    const setup = await prepareCanonicalTurnSetup(setupInput(setupState(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT), undefined,
+      { appendObjectiveTailor: vi.fn() }) as never)
+
+    expect("earlyResult" in setup).toBe(false)
+    if ("earlyResult" in setup) return
+    expect(setup.rootTools.map(tool => (tool as { name: string }).name)).not.toContain("agent.tailor")
+    expect(setupMocks.ensure.mock.calls.at(-1)?.[0].allowedActions).not.toContain("agent.tailor")
+  })
+
+  it("keeps tailoring unavailable while the server rollout gate is disabled", async () => {
+    setupMocks.prepareBatch.mockResolvedValue({ status: "not_batch" })
+    setupMocks.graph.mockResolvedValue({ enabled: true, selectedJobMode: false, selectedJobPreparation: undefined,
+      scheduledDraftMode: false, templates: { analyst: { role: "analyst" } } })
+    const setup = await prepareCanonicalTurnSetup(setupInput(setupState(OBJECTIVE_TASK_GRAPH_EXECUTION_INTENT), undefined,
+      { readObjectiveTailorCatalog: vi.fn(), appendObjectiveTailor: vi.fn() }) as never)
+
+    expect("earlyResult" in setup).toBe(false)
+    if ("earlyResult" in setup) return
+    expect(setup.rootTools.map(tool => (tool as { name: string }).name)).not.toContain("agent.tailor")
+    expect(setupMocks.ensure.mock.calls.at(-1)?.[0].allowedActions).not.toContain("agent.tailor")
   })
 })

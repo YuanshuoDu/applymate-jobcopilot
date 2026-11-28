@@ -40,7 +40,7 @@ beforeEach(() => {
   discoveryPersonaMemory.load.mockClear()
   discoveryPersonaMemory.read.mockClear()
 })
-afterEach(() => vi.unstubAllEnvs())
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks() })
 
 import { redactSensitiveValue } from "@jobcopilot/shared"
 import * as canonicalTurnContextBuilderModule from "./canonical-turn-context-builder.js"
@@ -62,6 +62,7 @@ import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types
 import { TurnStateRefreshRetryError } from "./turns/turn-execution-question.js"
 import { createCanonicalTurnRuntime as createCanonicalTurnRuntimeImpl, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { assertSessionTerminalAdmission } from "./session-gate.js"
+import * as objectiveTailorRuntimeModule from "./objective-tailor-runtime.js"
 import { createChildExecutor, type ChildPublicDefinition } from "./subagents/child-executor.js"
 import type { TreeBudgetReservationStore } from "./subagents/tree-budget-types.js"
 import type { SubagentLease } from "./subagents/types.js"
@@ -1775,6 +1776,9 @@ describe("createCanonicalTurnRuntime", () => {
     const laterAnsweredOlderQuestionText = "Which city should I prioritize?"
     const laterAnsweredOlderAnswerText = "Berlin, please."
     const objectiveIntent = { kind: "objective_task_graph_execution" as const, version: 1 as const }
+    vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime").mockReturnValue({
+      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), clear: () => undefined,
+    })
     let questionRecovery: "none" | "waiting" | "answered" = "none"
     const questionReads: Array<"none" | "waiting" | "answered"> = []
     const planningSummary = { observedPlanRevision: 0, graphRevisionAtAsk: 1, pendingSteerCount: 1,
@@ -3173,6 +3177,9 @@ describe("createCanonicalTurnRuntime", () => {
   })
 
   it("passes the TaskGraph requirement to explicit-objective terminal assessment", async () => {
+    vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime").mockReturnValue({
+      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), clear: () => undefined,
+    })
     const objective = await taskGraphRootSurface(false, false, "jobs.search", "agent.interrupt", false,
       undefined, true, false, false, undefined, undefined, true)
 
@@ -3184,6 +3191,75 @@ describe("createCanonicalTurnRuntime", () => {
       usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
     await expect(guard(client, terminal)).resolves.toEqual({ ok: true })
     expect(objective.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ requireTaskGraph: true, client }))
+  })
+
+  it("wires Objective terminal revalidation into the Root terminal guard", async () => {
+    const complete = vi.fn(async () => ({ ok: true as const }))
+    const finalize = vi.fn(async () => ({ ok: true as const }))
+    const clear = vi.fn()
+    const factory = vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime")
+      .mockReturnValue({ complete, finalize, clear })
+    try {
+      const objective = await taskGraphRootSurface(false, false, "", "agent.interrupt", false,
+        undefined, true, false, false, undefined, undefined, true)
+      expect(factory).toHaveBeenCalledOnce()
+      const guard = objective.terminalGuard
+      if (typeof guard !== "function") throw new Error("explicit Objective terminal guard was not created")
+      const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
+      await expect(guard(client, { stepId: "step-1", finalItemId: "final-1", finalContent: null,
+        stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never))
+        .resolves.toEqual({ ok: true })
+      expect(objective.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ requireTaskGraph: true, client }))
+      expect(finalize).toHaveBeenCalledOnce()
+    } finally {
+      factory.mockRestore()
+    }
+  })
+
+  it("injects the catalog reader only for an enabled Objective Tailor Root", async () => {
+    const objectiveIntent = { kind: "objective_task_graph_execution" as const, version: 1 as const }
+    const catalogReader = vi.fn(async (_scope: TaskGraphReadScope) => undefined)
+    const current: TaskGraphCurrentState = { revision: 1, nodes: [] }
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      appendObjectiveTailor: vi.fn(async () => ({ status: "accepted" as const, revision: 2, nodes: [], readyTaskIds: [] })),
+      readObjectiveTailorCatalog: catalogReader,
+      readCurrent: vi.fn(async () => current),
+    }
+    const definitions = [...coordinationDefinitions(), { name: "jobs.search", version: "1" }]
+    const registry = {
+      list: () => definitions,
+      resolve: () => ({ idempotency: "read_only" as const }),
+      validateArguments: () => true as const,
+      register: vi.fn((definition: RuntimeToolDefinition) => definitions.push({ name: definition.name, version: definition.version })),
+    }
+    const factory = vi.spyOn(canonicalTurnContextBuilderModule, "createCanonicalTurnContextBuilder")
+    vi.spyOn(objectiveTailorRuntimeModule, "createCanonicalObjectiveTailorRuntime").mockReturnValue({
+      complete: async () => ({ ok: true }), finalize: async () => ({ ok: true }), clear: () => undefined,
+    })
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: lease.ownerId,
+      productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1",
+        ENABLE_AGENT_WAIT_RESOLVER: "1", ENABLE_AGENT_OBJECTIVE_TAILOR: "1" }),
+      stateLoader: async () => state({ source: "user", intent: objectiveIntent, turnInput: { intent: objectiveIntent } }),
+      taskGraphCommandPort, taskGraphTemplates: TASK_GRAPH_TEMPLATES, rootTaskStore: rootStore() as never,
+      toolRuntimeFactory: () => ({ registry, router: { execute: vi.fn(async () => ({ status: "failed" })) } }) as never,
+      contextBuilderFactory: () => contextBuilder(), turnEngineStoreFactory: () => store(),
+      modelRuntimeFactory: async () => ({ adapter: model(() => [
+        { type: "text_delta", text: "Done." }, { type: "completed", finishReason: "stop" },
+      ]), registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ outputReservationRequired: false, maxOutputTokens: null,
+        settleUnknown: async () => undefined, settle: async () => undefined }),
+    })
+    await runtime.execute({ lease, signal: new AbortController().signal })
+    const builderInput = factory.mock.calls.map(([value]) => value).find(value => value.objectiveTaskGraphMode === true)
+    expect(builderInput?.readObjectiveTailorCatalog).toEqual(expect.any(Function))
+    const scope: TaskGraphReadScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+      rootTaskId: "root-1", parentTaskId: "root-1", turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+      parentLeaseOwner: lease.ownerId, parentAttemptCount: 1 }
+    await builderInput?.readObjectiveTailorCatalog?.(scope)
+    expect(catalogReader).toHaveBeenCalledWith(scope)
+    expect(registry.register).toHaveBeenCalledWith(expect.objectContaining({ name: "agent.tailor" }))
   })
 
   it("fails an explicit objective closed when planning is unavailable", async () => {

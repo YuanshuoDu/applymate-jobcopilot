@@ -43,6 +43,7 @@ import { type ScheduledPipelineCandidateStore } from "./subagents/scheduled-pipe
 import { createCanonicalTurnScheduledPipeline } from "./canonical-turn-scheduled-pipeline.js"
 import { prepareCanonicalTurnSetup, taskGraphDenialCheckpointReader, turnStoreForInteractiveDiscovery } from "./canonical-turn-runtime-turn-setup.js"
 import { createCanonicalSelectedJobBatchRuntime, prepareCanonicalSelectedJobBatchRuntime, scopeSelectedJobBatchRootState } from "./canonical-selected-job-batch-runtime.js"
+import { createCanonicalObjectiveTailorRuntime } from "./objective-tailor-runtime.js"
 import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
 import type { TurnQuestionStore } from "./turns/turn-question-contract.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"; export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
@@ -143,9 +144,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       accept: witness => { acceptedGraphWitness = witness },
     }) : undefined
     const scheduledDraftRuntime = scheduledDraftMode && !selectedJobMode ? createCanonicalScheduledDraftRuntime({
-      pool, commandPort: options.taskGraphCommandPort, lease, root, artifactRepository,
-      draftHeadReader: options.selectedJobArtifactHeadReader, sourceDigestLoader: options.selectedJobSourceDigestLoader,
+      pool, commandPort: options.taskGraphCommandPort, lease, root, artifactRepository, draftHeadReader: options.selectedJobArtifactHeadReader, sourceDigestLoader: options.selectedJobSourceDigestLoader,
     }) : undefined
+    const objectiveTailorRuntime = objectiveTaskGraphMode ? createCanonicalObjectiveTailorRuntime({ pool, commandPort: options.taskGraphCommandPort, lease, root }) : undefined
     const terminalGuard = createCanonicalTurnTerminalGuard({
       enabled: selectedJobMode || objectiveTaskGraphMode || !!rootTasks.checkCompletion || taskGraphPlanningEnabled, nativeVerification,
       checkRootGraph: rootTasks.checkCompletion || taskGraphPlanningEnabled ? async (client, nativeVerificationPassed, terminalAdmission) => batchRuntime
@@ -154,7 +155,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
           nativeVerificationPassed, client, requireTaskGraph: objectiveTaskGraphMode, terminalAdmission }) : undefined,
       finalizeSelectedJob: selectedJobMode ? client => selectedJobArtifactFinalizationGuard({ client, commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId, acceptedGraphWitness,
         readCurrentDraftHead: findCurrentDraftHeadWithClient, readCurrentSourceDigest: (queryClient, scope) => readSelectedJobSourceDigestWithClient(queryClient, scope.userId, scope.jobId), readCurrentReviewReceipt: findReviewReceiptWithClient,
-      }) : scheduledDraftRuntime ? client => scheduledDraftRuntime.finalize(client) : undefined,
+      }) : scheduledDraftRuntime ? client => scheduledDraftRuntime.finalize(client) : objectiveTailorRuntime ? client => objectiveTailorRuntime.finalize(client) : undefined,
     })
     let atomicNoProgressCommitted = false
     const rawTurnStore = options.turnEngineStoreFactory?.(pool, terminalGuard) ?? createPgTurnEngineStore(pool, terminalGuard)
@@ -205,7 +206,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       rootTaskId: root.id, rootAttemptCount: root.attemptCount, rootInputId: state.rootInputId,
       turnInput: state.turnInput, rootTaskObjective: { goal: root.goal, successCriteria: root.successCriteria },
       taskGraphTemplateRoles: setup.taskGraphTemplateRoles,
-      planningEnabled: taskGraphPlanningEnabled, selectedJobMode: selectedJobRootMode, discoveryPersonaMemoryEnabled,
+      planningEnabled: taskGraphPlanningEnabled, selectedJobMode: selectedJobRootMode, objectiveTaskGraphMode, discoveryPersonaMemoryEnabled,
+      readObjectiveTailorCatalog: productionFlags?.objectiveTailorEnabled === true ? options.taskGraphCommandPort?.readObjectiveTailorCatalog?.bind(options.taskGraphCommandPort) : undefined,
       crossSessionRootTaskHistoryEnabled: productionFlags?.crossSessionRootTaskHistoryEnabled === true && taskGraphPlanningEnabled && !selectedJobRootMode,
       objectiveHistoryIndexEnabled: productionFlags?.objectiveHistoryIndexEnabled === true && taskGraphPlanningEnabled && !selectedJobRootMode,
       selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,
@@ -214,11 +216,11 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     let webOwnsExecution = false
     const rootCompletionGate = scheduledPipeline.attachCompletion({ gate: createCanonicalRootCompletionGate({
       enabled: !!rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode || objectiveTaskGraphMode || taskGraphPlanningEnabled, nativeVerification,
-      onCandidateStart: () => { acceptedGraphWitness = undefined; scheduledDraftRuntime?.clear(); batchRuntime?.clear() },
+      onCandidateStart: () => { acceptedGraphWitness = undefined; scheduledDraftRuntime?.clear(); objectiveTailorRuntime?.clear(); batchRuntime?.clear() },
       checkChildren: () => batchRuntime ? batchRuntime.checkCandidate(nativeVerification.accepted()) : rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: nativeVerification.accepted(), requireTaskGraph: objectiveTaskGraphMode }),
       readTaskGraphDenialCheckpoint: taskGraphDenialCheckpointReader({ enabled: taskGraphPlanningEnabled, rootTasks, lease, rootTaskId: root.id, now }),
       interactiveDiscovery: interactiveDiscoveryMode ? () => interactiveDiscoveryCompletionGate({ pool, lease, root, load: options.interactiveDiscoveryShortlistLoader, accept: shortlist => { acceptedDiscoveryShortlist = shortlist }, markUnavailable: () => { discoveryFailureCode = "discovery_runtime_unavailable" } }) : undefined,
-      selectedJobMode, selectedJobCompletion: selectedJobCompletion ?? (scheduledDraftRuntime ? () => scheduledDraftRuntime.complete() : undefined),
+      selectedJobMode, selectedJobCompletion: selectedJobCompletion ?? (scheduledDraftRuntime ? () => scheduledDraftRuntime.complete() : objectiveTailorRuntime ? () => objectiveTailorRuntime.complete() : undefined),
     }), owner: scheduledPipelineOwner, onWebAccepted: () => { webOwnsExecution = true },
       candidateStore: scheduledCandidateStore, rootAttemptCount: scheduledPipelineOwner?.rootAttemptCount ?? 1,
       waitPort: durableWaitPort,

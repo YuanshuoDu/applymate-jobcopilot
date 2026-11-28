@@ -19,7 +19,7 @@ import { evaluateTaskGraphPlanObjectiveCoverage } from "./task-graph-plan-object
 import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext, selectVerifiedScheduledDraftCandidate, type ScheduledDraftCandidateBinding } from "./scheduled-draft-candidate.js"
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
-import { isRegisteredObjectiveTaskGraphChildTemplate } from "./objective-task-graph-child-authority.js"
+import { isRegisteredObjectiveTaskGraphChildTemplate, objectiveTailorNodeKeys } from "./objective-task-graph-child-authority.js"
 import type { PreparedSteeringReconciliation } from "./steering-reconciliation-contract.js"
 import { assertWriterReviewPlan } from "./selected-job-batch-plan.js"
 import { assertSelectedJobBatchPlanAdmission } from "./selected-job-batch-correction-admission.js"
@@ -50,7 +50,7 @@ export async function createGraphTasks(
   client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState,
   priorTaskIds: ReadonlyMap<string, string>, provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">,
   operationalFailureReuse?: OperationalFailureCapacityReuse, objectiveTaskGraphChildAuthority = false,
-  preparedReconciliation?: PreparedSteeringReconciliation,
+  preparedReconciliation?: PreparedSteeringReconciliation, objectiveTailorCommand = false,
 ): Promise<CreatedGraphTasks> {
   if (input.verificationRequirements?.status === "invalid") {
     throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
@@ -60,6 +60,11 @@ export async function createGraphTasks(
   const parentTask = { budgetSnapshot: parent.budgetSnapshot } as Pick<SubagentTaskRecord, "budgetSnapshot">
   const policy = policyFromTask(parentTask)
   safeProposalSize(input.proposal)
+  const tailorNodeKeys = objectiveTailorCommand ? objectiveTailorNodeKeys(input.proposal, input.templates) : undefined
+  if (objectiveTailorCommand && !tailorNodeKeys) throw new Error("objective_tailor_pair_invalid")
+  const coverageInput = tailorNodeKeys
+    ? { ...input, templates: { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst, ...input.templates } }
+    : input
   if (input.proposal.nodes.length > policy.maxFanOut) throw new Error("task_graph_proposal_fan_out_limit")
   for (const [id, template] of Object.entries(input.templates)) safeTemplate(id, template)
   const applicationFillerCount = current.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length + input.proposal.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length
@@ -120,7 +125,7 @@ export async function createGraphTasks(
     preflightStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
   })
   await validateTaskGraphRepairTargets(client, input, current, priorTaskIds)
-  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input, nodes: appended.state.nodes, provenance, prepared: preparedReconciliation })
+  const coverage = await evaluateTaskGraphPlanObjectiveCoverage({ client, input: coverageInput, nodes: appended.state.nodes, provenance, prepared: preparedReconciliation })
   if (coverage.status === "invalid") throw Object.assign(new Error("Canonical objective verification requirements are invalid"), {
     code: "task_graph_objective_requirements_invalid",
   })
@@ -185,7 +190,7 @@ export async function createGraphTasks(
     }, true, {
       preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType),
       taskGraphChildDeadline: true,
-      ...(objectiveTaskGraphChildAuthority && isRegisteredObjectiveTaskGraphChildTemplate(node.templateId, template) ? { objectiveTaskGraphChildAuthority: input.scope } : {}),
+      ...(objectiveTaskGraphChildAuthority && (isRegisteredObjectiveTaskGraphChildTemplate(node.templateId, template) || tailorNodeKeys?.has(node.key)) ? { objectiveTaskGraphChildAuthority: input.scope } : {}),
       ...(nestedScoutAuthority ? { nestedScoutAuthority } : {}),
     })
     if (status === "waiting") {

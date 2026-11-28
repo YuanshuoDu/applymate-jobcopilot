@@ -156,7 +156,7 @@ export async function executeTools(
       }
       const wait = replayed.status === "completed" ? dependencyWaitReceipt(replayed.output, call.name, options.identity.kind) : null
       if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId, replayed.input)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState, receipts }
-      if (hasNativeCoordinationReceipt(call.name, replayed.status, replayed.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
+      if (hasAcceptedTaskGraphPlan(call.name, replayed.status, replayed.output) || hasNativeCoordinationReceipt(call.name, replayed.status, replayed.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
       continue
     }
     if (sourceResultItemId && !claimedWaitSurface) throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
@@ -180,7 +180,7 @@ export async function executeTools(
     })
     if (archivedWait) return { wait: { status: "waiting_for_dependency", waitId: archivedWait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState, receipts }
     if (questionCall) return { wait: await questionWaitResult(options, questionCall.stepId, questionCall.toolCallId, now, 0, 0), snapshot, steeringMarkerState: markerState, receipts }
-    if (call.name === "agent.plan" && result.status === "completed" && hasAcceptedTaskGraphPlan(result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
+    if (hasAcceptedTaskGraphPlan(call.name, result.status, result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if (hasNativeCoordinationReceipt(call.name, result.status, result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if ((call.name === "agent.wait" || call.name === "wait_subagents") && options.identity.kind === "turn"
       && result.status === "completed" && isInlineReadyWait(result.output)) snapshot = await options.refreshTaskGraphAfterReadyWait?.(snapshot) ?? snapshot
@@ -243,8 +243,8 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
   }
   return observations
 }
-function hasAcceptedTaskGraphPlan(value: unknown): boolean {
-  const status = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).status : null
-  return status === "accepted" || status === "duplicate"
+function hasAcceptedTaskGraphPlan(toolName: string, toolStatus: unknown, value: unknown): boolean {
+  const receiptStatus = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).status : null
+  return (toolName === "agent.plan" || toolName === "agent.tailor") && toolStatus === "completed" && (receiptStatus === "accepted" || receiptStatus === "duplicate")
 }
 function isInlineReadyWait(value: unknown): boolean { return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).status === "ready") }
