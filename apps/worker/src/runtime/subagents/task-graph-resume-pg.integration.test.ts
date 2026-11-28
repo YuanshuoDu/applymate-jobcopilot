@@ -15684,6 +15684,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootTaskId = "", replacementTaskId: string | undefined
     let scoutSearchCalls = 0, seattleHeld = false, dublinHeld = false
     let adapterStage = "not_started", proofKind = "not_read", requestHasConfirmation = false, requestHasDublin = false
+    let retirementWaitOldMatched: boolean | null = null, retirementWaitReplacementMatched: boolean | null = null
+    let retirementListOldMatched: boolean | null = null, retirementListReplacementMatched: boolean | null = null
+    let retirementFinalCandidateEmitted = false
     let preRetirementGuards: {
       acceptedPlanMatchesReplacement: boolean | null
       replacementHeld: boolean | null
@@ -15922,6 +15925,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             return
           }
           if (postReviseWaitIssued) {
+            adapterStage = "post_retirement_wait_read"
             const taskIds = [seattleTaskId, ...(typeof replacement?.taskId === "string" ? [replacement.taskId] : [])]
             const outcome = repairWaitOutcomeFromRequest(request, postReviseWaitCallId, taskIds)
             const taskStatuses = new Map<string, string>()
@@ -15932,6 +15936,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
             }
             const replacementTaskId = typeof replacement?.taskId === "string" ? replacement.taskId : null
+            retirementWaitOldMatched = taskStatuses.get(seattleTaskId) === "interrupted"
+            retirementWaitReplacementMatched = !!replacementTaskId && taskStatuses.get(replacementTaskId) === "completed"
             if (taskStatuses.get(seattleTaskId) !== "interrupted" || !replacementTaskId
               || taskStatuses.get(replacementTaskId) !== "completed") {
               throw new Error("Retirement wait did not prove both the interrupted target and completed replacement")
@@ -15946,10 +15952,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             adapterStage = "final_after_retirement_refresh"
             const listing = record(latestToolResult(request, postReviseListCallId))
             const listedTasks = Array.isArray(listing?.tasks) ? listing.tasks.map(record) : []
-            if (!listedTasks.some(task => task?.taskId === seattleTaskId && task?.status === "interrupted")
-              || !listedTasks.some(task => task?.taskId === replacementTaskId && task?.status === "completed")) {
+            retirementListOldMatched = listedTasks.some(task => task?.taskId === seattleTaskId && task?.status === "interrupted")
+            retirementListReplacementMatched = listedTasks.some(task => task?.taskId === replacementTaskId && task?.status === "completed")
+            if (!retirementListOldMatched || !retirementListReplacementMatched) {
               throw new Error("agent.list did not refresh the exact retirement acknowledgement")
             }
+            retirementFinalCandidateEmitted = true
             yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final",
               response: "The confirmed Dublin search is complete." }) }
             yield { type: "completed", finishReason: "stop" }
@@ -16194,8 +16202,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForPostReplanBoundary(rootTaskId)
       await waitForPostReplanReady(rootTaskId)
       await reconcileDurableWaits(pool!, { ownerId: `p3-1240-retirement-wake-${value.suffix}` })
-      await waitForTurnStatus(pool!, value.turnId, "completed", 60_000, postReviseWaitCallId,
-        [reviseCallId, retireCallId, postReviseListCallId])
+      try {
+        await waitForTurnStatus(pool!, value.turnId, "completed", 60_000, postReviseWaitCallId,
+          [reviseCallId, retireCallId, postReviseListCallId])
+      } catch (error: unknown) {
+        const knownStages = new Set(["not_started", "stream_entered", "initial_plan", "initial_wait", "replacement_plan",
+          "refresh_before_retirement", "retire_superseded_scout", "post_revise_wait", "post_retirement_wait_read",
+          "refresh_after_retirement_wait", "final_after_retirement_refresh", "unexpected_graph_state"])
+        console.info(`P1329_RETIREMENT_RESUME_DIAGNOSTIC:${JSON.stringify({
+          adapterStage: knownStages.has(adapterStage) ? adapterStage : "other", postReviseWaitIssued, postReviseListIssued,
+          retirementWaitOldMatched, retirementWaitReplacementMatched, retirementListOldMatched, retirementListReplacementMatched,
+          retirementFinalCandidateEmitted,
+        })}`)
+        throw error
+      }
 
       const checkpoint = await pool!.connect()
       try {
